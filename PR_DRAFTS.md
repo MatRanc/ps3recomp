@@ -37,3 +37,18 @@ Windows path compiles the same calls (`CreateThread`, `Sleep`) but wasn't run.
 
 Open question for the maintainers: the dedicated thread runs handlers concurrently with guest threads, as on hardware.
 The file's comments suggest serializing with guest execution was deliberate for some titles, so this stays opt-in.
+
+# PR 3: cellFs: implement cellFsAioWrite
+
+Branch: `cellfs-aio-write` (one commit on `4e8f3ca`, `runtime/ppu/ppu_fs.cpp`)
+
+`cellFsAioWrite` (NID `0x4CEF342E`) was unregistered, so it took the unresolved-NID path: CELL_OK, nothing written,
+and the completion callback never ran. MLB The Show 16 (BCUS01089) copies files into its `/dev_hdd1` cache in 64 KB
+chunks this way and polls a status word its callback sets, so its boot parked on the first screen for good.
+
+This adds it next to `cellFsAioRead`, with the same contract and the same synchronous completion: an absolute write
+at `offset` under the stream lock, the fd's position restored afterwards, then the callback
+`(aio, error, id, size)`. It reports CELL_FS_EIO on a short write. `PS3_FSLOG` logs it like the read.
+
+Tested: MLB 16 now makes about 500 of these writes during boot and goes on to its first menu (the experience-level
+screen) instead of stopping on the autosave notice.
