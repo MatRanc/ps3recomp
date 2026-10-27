@@ -2657,6 +2657,14 @@ static void gcm_rsx_process_fifo_unlocked(void)
                 if (wdiag) { static int live = -1;
                   if (live < 0) live = rsx_live_draw_enabled();
                   if (live) rsx_live_draw_method((subch << 13) | m, vm_read32(dea)); }
+                /* MLB_SEMA_TRACE=1 (temporary, mlb16 investigation): every
+                 * semaphore/label method the walker dispatches, any subchannel. */
+                { static int st = -1; if (st < 0) st = getenv("MLB_SEMA_TRACE") ? 1 : 0;
+                  const u32 mm = m & 0x1FFCu;
+                  if (st && (mm == 0x64u || mm == 0x68u || mm == 0x6Cu || mm == 0x1D6Cu || mm == 0x1D70u || mm == 0x1D74u || mm == 0x01A4u)) {
+                      static int sn = 0;
+                      if (sn++ < 200) fprintf(stderr, "[semtrace] subch=%u m=0x%04X v=0x%08X\n", subch, mm, vm_read32(dea));
+                  } }
                 /* GCM_METHOD_HIST=<secs>: every <secs>, the most frequent
                  * (subchannel, method) pairs dispatched since the last report --
                  * what a frame is actually made of when nothing draws. */
