@@ -963,7 +963,8 @@ static int vk_create_pipeline_objects(void)
     /* A 1x1 magenta dummy keeps the descriptor valid before any bind --
      * the same "not bound" colour the null backend's sampler returns. */
     static const u8 magenta[4] = { 0xFF, 0x00, 0xFF, 0xFF };
-    if (vk_upload_texture(&s_vk.dummy, magenta, 1, 1)) return -1;
+    static const u8 black[4] = { 0, 0, 0, 0 };   /* VK_DUMMY_BLACK=1 (experiment): what a disabled unit reads */
+    if (vk_upload_texture(&s_vk.dummy, (getenv("VK_DUMMY_BLACK") && *getenv("VK_DUMMY_BLACK") != '0') ? black : magenta, 1, 1)) return -1;
     vk_write_texture_descriptor();
     return 0;
 }
@@ -3410,11 +3411,13 @@ static VkImageView vk_eng_dummy_cube_view(void)
 {
     if (!vk_eng_get(s_e2.dummy_cube, VK_ENG_TEXTURE)) {
         static const u8 magenta[4] = { 0xFF, 0x00, 0xFF, 0xFF };
+        static const u8 black[4] = { 0, 0, 0, 0 };
+        const u8* fill = vk_env_on("VK_DUMMY_BLACK") ? black : magenta;
         s_e2.dummy_cube = vk_eng_texture_create(NULL, RSX_BE_FMT_R8G8B8A8, 1, 1, 1, 6,
                                                 0xAAE4u, 0x85u);
         if (!s_e2.dummy_cube) return VK_NULL_HANDLE;
         for (u32 f = 0; f < 6; f++)
-            vk_eng_texture_upload(NULL, s_e2.dummy_cube, f, 0, 1, 1, magenta, 4, 1);
+            vk_eng_texture_upload(NULL, s_e2.dummy_cube, f, 0, 1, 1, fill, 4, 1);
     }
     return s_eobj[s_e2.dummy_cube].im.view;
 }
