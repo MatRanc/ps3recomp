@@ -1719,7 +1719,7 @@ static void gcm_fifo_dump_around(u32 getoff)
      * are the one thing a run that wedged once in three can still tell us,
      * and GCM_RECDBG is far too loud to leave on for a 15-minute run. */
     static int d = 0;
-    if (!PS3_LOG_FIRST(d, 3)) return;
+    if (!PS3_LOG_FIRST(d, 40)) return;
     for (u32 t = 0; t < GCM_TRACE_N; t++) {
         u32 k = (s_tr_i + t) % GCM_TRACE_N;
         if (!s_tr_w[k]) continue;
@@ -1727,6 +1727,8 @@ static void gcm_fifo_dump_around(u32 getoff)
         fprintf(stderr, "[FIFOSTEP] io=%08X w=%08X  type=%u method=0x%04X count=%u\n",
                 s_tr_off[k], w, w >> 29, w & 0x1FFCu, (w >> 18) & 0x7FFu);
     }
+    for (u32 t = 8; t >= 1; t--) { u32 q = (s_cf_i - t) % 8;
+        fprintf(stderr, "[FIFOCF] io=%08X w=%08X\n", s_cf_off[q], s_cf_w[q]); }
     for (int k = -20; k <= 2; k++) {
         u32 io = getoff + (u32)(k * 4);
         u32 ea = gcm_io2ea(io);
@@ -2310,8 +2312,15 @@ static void gcm_rsx_process_fifo_unlocked(void)
          * run out, so the jump-park resync fired at once and dropped the
          * commands the title was about to link in. */
         if (park_off && (s_fifo_getoff != park_off ||
-                         (w & 0xE0000003u) != 0x20000000u || (w & 0x1FFFFFFCu) != park_off))
+                         (w & 0xE0000003u) != 0x20000000u || (w & 0x1FFFFFFCu) != park_off)) {
+            { static int st = -1; static int sn = 0; if (st < 0) st = getenv("MLB_SEMA_TRACE") ? 1 : 0;
+              if (st && s_fifo_getoff == park_off && sn++ < 20000) {
+                  extern unsigned long long ps3_ms_now(void);
+                  fprintf(stderr, "[parkfix] at=%08X after=%llums now=%08X next=%08X %08X put=%08X\n", park_off,
+                          ps3_ms_now() - park_since, w, vm_read32(ea + 4), vm_read32(ea + 8), put);
+              } }
             park_off = 0;
+        }
 
         if ((w & 0xFFFF0000u) == 0xFEAD0000u) {
             /* lv1 driver flip: statically-linked libgcm cellGcmSetFlip writes
@@ -2372,6 +2381,10 @@ static void gcm_rsx_process_fifo_unlocked(void)
               if (_rd) fprintf(stderr, "[JMP] %08X -> %08X (put=%08X)\n",
                                s_fifo_getoff, w & 0x1FFFFFFCu, put); }
             { u32 tgt = w & 0x1FFFFFFCu;
+              { static int st = -1; static int sn = 0; if (st < 0) st = getenv("MLB_SEMA_TRACE") ? 1 : 0;
+                if (st && ((tgt >= 0x00800000u && tgt < 0x01300000u) ||
+                           (s_fifo_getoff >= 0x00800000u && s_fifo_getoff < 0x01300000u)) && sn++ < 60000)
+                    fprintf(stderr, "[semtrace] at=%08X JUMP -> %08X\n", s_fifo_getoff, tgt); }
               if (!gcm_io2ea(tgt)) { gcm_fifo_bad_branch("JUMP", tgt, w); gcm_fifo_dump_around(s_fifo_getoff); gcm_fifo_resync_why("unmapped-JUMP", &s_fifo_getoff, put); break; }
               /* A JUMP to its own address is the "park the RSX here" idiom:
                * the title leaves it at the write head so the GPU stops if it
@@ -2432,7 +2445,10 @@ static void gcm_rsx_process_fifo_unlocked(void)
         }
         if ((w & 3) == 2) {                    /* CALL: offset | 2 */
             { u32 tgt = w & 0x1FFFFFFCu;
-              if (!gcm_io2ea(tgt)) { gcm_fifo_bad_branch("CALL", tgt, w); gcm_fifo_resync_why("unmapped-CALL", &s_fifo_getoff, put); break; }
+              if (!gcm_io2ea(tgt)) { gcm_fifo_bad_branch("CALL", tgt, w); gcm_fifo_dump_around(s_fifo_getoff); gcm_fifo_resync_why("unmapped-CALL", &s_fifo_getoff, put); break; }
+              { static int st = -1; static int sn = 0; if (st < 0) st = getenv("MLB_SEMA_TRACE") ? 1 : 0;
+                if (st && tgt >= 0x00800000u && tgt < 0x01300000u && sn++ < 60000)
+                    fprintf(stderr, "[semtrace] at=%08X CALL -> %08X\n", s_fifo_getoff, tgt); }
               s_fifo_calloff = s_fifo_getoff + 4;
               s_fifo_getoff  = tgt; }
             continue;
@@ -2663,7 +2679,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
                   const u32 mm = m & 0x1FFCu;
                   if (st && (mm == 0x64u || mm == 0x68u || mm == 0x6Cu || mm == 0x1D6Cu || mm == 0x1D70u || mm == 0x1D74u || mm == 0x01A4u)) {
                       static int sn = 0;
-                      if (sn++ < 200) fprintf(stderr, "[semtrace] subch=%u m=0x%04X v=0x%08X\n", subch, mm, vm_read32(dea));
+                      if (sn++ < 60000) fprintf(stderr, "[semtrace] at=%08X subch=%u m=0x%04X v=0x%08X\n", s_fifo_getoff, subch, mm, vm_read32(dea));
                   } }
                 /* GCM_METHOD_HIST=<secs>: every <secs>, the most frequent
                  * (subchannel, method) pairs dispatched since the last report --

@@ -672,6 +672,12 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
          * reserved between the scan and the end of the copy. That peer's
          * snapshot may be torn, so it gets its event and loses its reservation
          * rather than committing against a line it never saw whole. */
+        { static int st = -1; static int sn = 0; if (st < 0) st = getenv("MLB_SEMA_TRACE") ? 1 : 0;
+          if (st && (uint32_t)ea >= 0x12300000u && (uint32_t)ea < 0x12500000u && sn++ < 60000) {
+              const uint8_t* q = (const uint8_t*)ls_ptr;
+              fprintf(stderr, "[ringput] img=%d ea=%08X size=%u w=%02X%02X%02X%02X %02X%02X%02X%02X\n",
+                      spu->image_id, (uint32_t)ea, size, q[0],q[1],q[2],q[3], q[4],q[5],q[6],q[7]);
+          } }
         {
             extern int  spu_coh_is_reserved(uint32_t);
             extern void spu_coh_notify_write(uint32_t);
