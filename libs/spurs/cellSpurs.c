@@ -1825,14 +1825,24 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
                 if (!pm) continue;
                 u32 signal = vm_read16(ea + SPURS_WKL_SIGNAL1);
                 u32 ready = vm_read8(ea + SPURS_WKL_READY1 + wid);
+                /* SPURS_READY_LEVEL=1 (experiment): the ready count is a level -- up to
+                 * min(ready, maxContention) SPUs, left for the workload to lower. */
+                static int ready_level = -1;
+                if (ready_level < 0) ready_level = getenv("SPURS_READY_LEVEL") ? 1 : 0;
+                if (ready_level && ready && si->active[wid] >= ready) continue;
                 int kicked = ready || (signal & (0x8000u >> wid));
                 if (kicked) si->idle[wid] = 0;
+                /* SPURS_NO_IDLE_PROBE=1 (experiment): schedule only what real SPURS would --
+                 * a workload with ready count 0 and no signal never gets an SPU. */
+                static int no_probe = -1;
+                if (no_probe < 0) no_probe = getenv("SPURS_NO_IDLE_PROBE") ? 1 : 0;
+                if (!kicked && no_probe) continue;
                 if (!kicked && (kick_pass || (si->pass_no & ((1u << si->idle[wid]) - 1))))
                     continue;
                 spu_lockline_lock();
                 ready = vm_read8(ea + SPURS_WKL_READY1 + wid);
                 signal = vm_read16(ea + SPURS_WKL_SIGNAL1);
-                if (ready) vm_base[ea + SPURS_WKL_READY1 + wid] = (u8)(ready - 1);
+                if (ready && !ready_level) vm_base[ea + SPURS_WKL_READY1 + wid] = (u8)(ready - 1);
                 if (signal & (0x8000u >> wid))
                     ef_w16(ea + SPURS_WKL_SIGNAL1, (u16)(signal & ~(0x8000u >> wid)));
                 ef_line_end(ea);
