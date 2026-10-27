@@ -81,3 +81,31 @@ Branch: `cellvideoout-no-3d` (one commit on `4e8f3ca`, `libs/video/cellVideoOut.
 dual-view ones (0x80 and up; 0x81 is 720p frame packing). That tells a title a 3D TV is attached. MLB The Show 16
 then asks at boot whether to turn 3D on, and on yes renders every frame twice, stacked over-under. This reports ids
 from 0x80 up as unavailable.
+
+# PR 6: cellFs: implement cellFsFtruncate on the cellFsOpen fd table
+
+Branch: `cellfs-ftruncate` (one commit on `4e8f3ca`, `runtime/ppu/ppu_fs.cpp`)
+
+`cellFsFtruncate` (0x0E2939E5) resolved to `libs/filesystem/cellFs.c`, which looks the fd up in that file's own
+table. `cellFsOpen` in `runtime/ppu/ppu_fs.cpp` never fills that table, so every call returned EBADF and the file
+kept its old size. This adds `cellFsFtruncate` next to the other fd calls in `ppu_fs.cpp`, through the same
+`fd_file()` lookup, and registers it.
+
+MLB The Show 16 (BCUS01089) sizes its head/face cache (314,584,064 bytes) and arena logo cache (9 MB) this way
+before a match loads. Tested: both files now have the requested size and the call returns CELL_OK; the match load
+gets past the starting lineups.
+
+# PR 7: cellSpurs: carry argTaskset through the taskset attribute
+
+Branch: `spurs-taskset-args` (one commit on `4e8f3ca`, `libs/spurs/cellSpurs.c`)
+
+`_cellSpursTasksetAttributeInitialize` zeroed the attribute without storing `argTaskset`, and
+`cellSpursCreateTasksetWithAttribute` created the taskset with args 0. The taskset argument reaches every task in
+r4. MLB The Show 16's Bink task DMAs its setup block from it, so it got its event flag address as 0, and
+`cellSpursEventFlagWait` failed straight away with 0x80410911 (null pointer). The task retries in a loop, which kept
+one host core at 99% for the whole run.
+
+This stores `argTaskset` in the (HLE-private) attribute and passes it to `spurs_create_taskset`, which already
+writes it to the guest taskset. Priority and max contention are still not carried.
+
+Tested: the Bink task now starts with r4 = {args 0x01476E80, spurs 0x01243E00} and sleeps in its wait.
