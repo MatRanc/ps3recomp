@@ -192,10 +192,16 @@ add_executable(${PROJECT_NAME}
 # PS3RECOMP_SPU_FAST_FLOAT: lifted SPU code does single-precision arithmetic natively
 # (round to nearest, infinities on overflow) instead of the SPU-exact emulation.
 option(PS3RECOMP_SPU_FAST_FLOAT "Native, not SPU-exact, float arithmetic in lifted SPU code" OFF)
+# PS3RECOMP_SPU_FAST_LS: lifted SPU code reads/writes local store with one vector load/store and
+# shuffle per quadword, and without the local-store diagnostics (SPU_LS_WATCH etc.).
+option(PS3RECOMP_SPU_FAST_LS "Vector local-store access, no LS diagnostics, in lifted SPU code" OFF)
 if(SPU_SOURCES)
     set(_spu_defs SPU_USE_DISPATCH_MT)
     if(PS3RECOMP_SPU_FAST_FLOAT)
         list(APPEND _spu_defs SPU_FAST_FLOAT)
+    endif()
+    if(PS3RECOMP_SPU_FAST_LS)
+        list(APPEND _spu_defs SPU_LIFTED_FAST_LS)
     endif()
     set_source_files_properties(${SPU_SOURCES} PROPERTIES
         INCLUDE_DIRECTORIES "${PS3RECOMP_DIR}/runtime/spu"

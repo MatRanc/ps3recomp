@@ -16,6 +16,9 @@
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
+#if defined(SPU_LIFTED_FAST_LS) && defined(__SSSE3__)
+#include <tmmintrin.h>
+#endif
 
 #ifdef __cplusplus
 extern "C" {
@@ -622,11 +625,18 @@ static SPU_NOINLINE_COLD void spu_ls_read_diag(const spu_context* ctx, uint32_t 
 static inline u128 spu_ls_read128(const spu_context* ctx, uint32_t lsa)
 {
     u128 v;
+#if !defined(SPU_LIFTED_FAST_LS)
     if (__builtin_expect(g_spu_ls_rdiag != 0, 0))
         spu_ls_read_diag(ctx, lsa);
+#endif
     lsa &= SPU_LS_MASK & ~0xFu;
     const uint8_t* p = &ctx->ls[lsa];
-#if defined(__ARM_NEON)
+#if defined(SPU_LIFTED_FAST_LS) && defined(__SSSE3__)
+    /* Lifted code only: one load and one byte shuffle per quadword, and none of the
+     * local-store diagnostics (their flag test and cold call sit on every access). */
+    {   const __m128i sw = _mm_setr_epi8(3,2,1,0, 7,6,5,4, 11,10,9,8, 15,14,13,12);
+        _mm_storeu_si128((__m128i*)v._u32, _mm_shuffle_epi8(_mm_loadu_si128((const __m128i*)p), sw)); }
+#elif defined(__ARM_NEON)
     vst1q_u8(v._u8, vrev32q_u8(vld1q_u8(p)));     /* ldr q; rev32 */
 #elif SPU_LS_FAST
     uint32_t w0, w1, w2, w3;
@@ -723,7 +733,11 @@ static inline void spu_ls_write128(spu_context* ctx, uint32_t lsa, u128 val)
 {
     lsa &= SPU_LS_MASK & ~0xFu;
     uint8_t* p = &ctx->ls[lsa];
-#if defined(__ARM_NEON)
+#if defined(SPU_LIFTED_FAST_LS) && defined(__SSSE3__)
+    {   const __m128i sw = _mm_setr_epi8(3,2,1,0, 7,6,5,4, 11,10,9,8, 15,14,13,12);
+        _mm_storeu_si128((__m128i*)p, _mm_shuffle_epi8(_mm_loadu_si128((const __m128i*)val._u32), sw)); }
+    return;
+#elif defined(__ARM_NEON)
     vst1q_u8(p, vrev32q_u8(vld1q_u8(val._u8)));   /* rev32; str q */
 #elif SPU_LS_FAST
     uint32_t w0 = SPU_BSWAP32(val._u32[0]), w1 = SPU_BSWAP32(val._u32[1]);
