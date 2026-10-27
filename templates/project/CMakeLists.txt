@@ -189,10 +189,17 @@ add_executable(${PROJECT_NAME}
 #   -O2                 -- the target-wide -O1 exists for the huge PPU TUs; the
 #                          SPU sources are small and decode-hot, so they get
 #                          full optimization. The last -O on the line wins.
+# PS3RECOMP_SPU_FAST_FLOAT: lifted SPU code does single-precision arithmetic natively
+# (round to nearest, infinities on overflow) instead of the SPU-exact emulation.
+option(PS3RECOMP_SPU_FAST_FLOAT "Native, not SPU-exact, float arithmetic in lifted SPU code" OFF)
 if(SPU_SOURCES)
+    set(_spu_defs SPU_USE_DISPATCH_MT)
+    if(PS3RECOMP_SPU_FAST_FLOAT)
+        list(APPEND _spu_defs SPU_FAST_FLOAT)
+    endif()
     set_source_files_properties(${SPU_SOURCES} PROPERTIES
         INCLUDE_DIRECTORIES "${PS3RECOMP_DIR}/runtime/spu"
-        COMPILE_DEFINITIONS SPU_USE_DISPATCH_MT)
+        COMPILE_DEFINITIONS "${_spu_defs}")
     if(NOT MSVC OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
         set_source_files_properties(${SPU_SOURCES} PROPERTIES COMPILE_OPTIONS "-O2")
     endif()

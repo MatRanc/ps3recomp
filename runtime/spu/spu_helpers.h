@@ -1032,6 +1032,26 @@ SPU__NV_INLINE u128 spu_fm(u128 a, u128 b) { return spu__nv_rz() ? spu__rz_fm(a,
 SPU__NV_INLINE u128 spu_fma(u128 a, u128 b, u128 c)  { return SPU__NV_FMA(a, b, c, 0, 0); }            /* a*b + c */
 SPU__NV_INLINE u128 spu_fms(u128 a, u128 b, u128 c)  { return SPU__NV_FMA(a, b, c, 0, 0x80000000u); }  /* a*b - c */
 SPU__NV_INLINE u128 spu_fnms(u128 a, u128 b, u128 c) { return SPU__NV_FMA(a, b, c, 0x80000000u, 0); }  /* c - a*b */
+#elif defined(SPU_FAST_FLOAT) && defined(__FMA__) && !defined(SPU_SCALAR_HELPERS)
+/* SPU_FAST_FLOAT (opt-in, per build): native single precision, four lanes per instruction. The
+ * SPU's denormal flushing is kept (inputs and results with a zero exponent become +0), but it
+ * rounds to nearest where the SPU truncates, and an overflow gives an infinity where the SPU
+ * saturates. That last-bit difference is what an emulator's default ("approximate") SPU float
+ * mode accepts too; the exact paths above and below are many times slower. */
+#include <immintrin.h>
+#define SPU__FF_INLINE static inline __attribute__((always_inline))
+SPU__FF_INLINE __m128 spu__ff_ftz(__m128 v) {
+    const __m128i e = _mm_and_si128(_mm_castps_si128(v), _mm_set1_epi32(0x7F800000));
+    return _mm_andnot_ps(_mm_castsi128_ps(_mm_cmpeq_epi32(e, _mm_setzero_si128())), v);
+}
+SPU__FF_INLINE __m128 spu__ff_ld(u128 a) { return spu__ff_ftz(_mm_loadu_ps((const float*)a._u32)); }
+SPU__FF_INLINE u128 spu__ff_st(__m128 v) { u128 r; _mm_storeu_ps((float*)r._u32, spu__ff_ftz(v)); return r; }
+SPU__FF_INLINE u128 spu_fa(u128 a, u128 b) { return spu__ff_st(_mm_add_ps(spu__ff_ld(a), spu__ff_ld(b))); }
+SPU__FF_INLINE u128 spu_fs(u128 a, u128 b) { return spu__ff_st(_mm_sub_ps(spu__ff_ld(a), spu__ff_ld(b))); }
+SPU__FF_INLINE u128 spu_fm(u128 a, u128 b) { return spu__ff_st(_mm_mul_ps(spu__ff_ld(a), spu__ff_ld(b))); }
+SPU__FF_INLINE u128 spu_fma(u128 a, u128 b, u128 c)  { return spu__ff_st(_mm_fmadd_ps(spu__ff_ld(a), spu__ff_ld(b), spu__ff_ld(c))); }   /* a*b + c */
+SPU__FF_INLINE u128 spu_fms(u128 a, u128 b, u128 c)  { return spu__ff_st(_mm_fmsub_ps(spu__ff_ld(a), spu__ff_ld(b), spu__ff_ld(c))); }   /* a*b - c */
+SPU__FF_INLINE u128 spu_fnms(u128 a, u128 b, u128 c) { return spu__ff_st(_mm_fnmadd_ps(spu__ff_ld(a), spu__ff_ld(b), spu__ff_ld(c))); }  /* c - a*b */
 #elif defined(__AVX2__) && !defined(SPU_SCALAR_HELPERS)
 /* The NEON fast path above, on x86 with AVX2: the four lanes widened to one f64x4 (exact),
  * the operation, the 29 low significand bits cleared, narrowed (exact). Same lane rules: an
