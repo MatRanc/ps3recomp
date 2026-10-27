@@ -52,3 +52,32 @@ at `offset` under the stream lock, the fd's position restored afterwards, then t
 
 Tested: MLB 16 now makes about 500 of these writes during boot and goes on to its first menu (the experience-level
 screen) instead of stopping on the autosave notice.
+
+# PR 4: sys_memory: memory containers as the kernel defines them
+
+Branch: `sys-memory-containers` (one commit on `4e8f3ca`, `runtime/syscalls/sys_memory.{c,h}`)
+
+Three gaps, all hit by MLB The Show 16 (BCUS01089) when it loads a match:
+- `sys_memory_container_get_size` took the container id first and wrote `{total, used}`. The kernel's signature is
+  `(sys_memory_info_t* info, u32 cid)` and the struct is `{total, available}`.
+- `SYS_MEMORY_CONTAINER_ID_INVALID` (0xFFFFFFFF) is the process's default container. Titles carve containers out of
+  it: get its size, destroy it, recreate it smaller, create their own. ps3recomp answered ESRCH, so the carve gave
+  back container 0.
+- `sys_memory_allocate_from_container` (syscall 350) wasn't registered.
+
+MLB 16 builds its "SharedMemContAnim"/"SharedMemContMovie" buffer pools that way. The pool never got memory, and the
+first match load called a virtual method on a NULL buffer from it. This answers the default container from the same
+numbers as `sys_memory_get_user_memory_size`, writes the available size, and adds syscall 350 through the same
+allocator as `sys_memory_allocate` (charged to the container, credited back by `sys_memory_free`).
+
+Tested: MLB 16 now allocates its pools (25 MB and 7 MB from carved containers) and gets past that point of the match
+load.
+
+# PR 5: cellVideoOut: report the 3D resolutions unavailable
+
+Branch: `cellvideoout-no-3d` (one commit on `4e8f3ca`, `libs/video/cellVideoOut.c`)
+
+`cellVideoOutGetResolutionAvailability` answered 1 for every resolution id, including the stereoscopic 3D and
+dual-view ones (0x80 and up; 0x81 is 720p frame packing). That tells a title a 3D TV is attached. MLB The Show 16
+then asks at boot whether to turn 3D on, and on yes renders every frame twice, stacked over-under. This reports ids
+from 0x80 up as unavailable.
