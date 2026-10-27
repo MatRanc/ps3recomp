@@ -109,3 +109,19 @@ This stores `argTaskset` in the (HLE-private) attribute and passes it to `spurs_
 writes it to the guest taskset. Priority and max contention are still not carried.
 
 Tested: the Bink task now starts with r4 = {args 0x01476E80, spurs 0x01243E00} and sleeps in its wait.
+
+# PR 8: cellSpurs: read the workload attribute's maxContention from the guest stack
+
+Branch: `spurs-workload-maxcontention` (one commit on `4e8f3ca`, `libs/spurs/cellSpurs.c`, `runtime/ppu/ppu_sysprx.cpp`)
+
+`_cellSpursWorkloadAttributeInitialize` takes nine arguments. The ninth, `maxContention`, is passed on the caller's
+stack, beyond the generic 8-GPR adapter, so the HLE stored 1 and every workload added with an attribute ran on one
+SPU at a time. This registers a context handler (same pattern as `sceNpScore` and `cellSaveData`) that runs the
+existing initializer and stores the stack argument (`r1 + 112`).
+
+MLB The Show 16 (BCUS01089) asks for 5 on its mesh job lists and 4 on its DXT list. Tested: `AddWorkloadWA` now logs
+those values.
+
+Not included (separate discussion): the scheduler consumes a workload's ready count per dispatch, where the SDK
+describes it as a level, and it probes idle workloads with ready count 0. Both contributed to a match-load deadlock
+in MLB 16; they are opt-in switches on our working branch until tested on other titles.
