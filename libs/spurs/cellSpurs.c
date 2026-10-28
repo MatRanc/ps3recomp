@@ -700,6 +700,14 @@ s32 cellSpursGetNumSpuThread(const CellSpurs* spurs, u32* nThreads)
     return CELL_OK;
 }
 
+/* The instance keeps maxContention in one byte and no workload can occupy more
+ * than CELL_SPURS_MAX_SPU SPUs, so larger values clamp: a bare (u8) cast turned
+ * 256 into 0. */
+static u32 spurs_clamp_contention(u32 c)
+{
+    return c > CELL_SPURS_MAX_SPU ? CELL_SPURS_MAX_SPU : c;
+}
+
 s32 cellSpursSetMaxContention(CellSpurs* spurs, CellSpursWorkloadId wid,
                               u32 maxContention)
 {
@@ -712,6 +720,7 @@ s32 cellSpursSetMaxContention(CellSpurs* spurs, CellSpursWorkloadId wid,
         spurs_api_unlock(si); return CELL_SPURS_CORE_ERROR_SRCH;
     }
 
+    maxContention = spurs_clamp_contention(maxContention);
     s_workloads[wid].maxContention = maxContention;
     vm_write8(si->ea + SPURS_WKL_MAXCONT + wid, (u8)maxContention);
     spurs_api_unlock(si);
@@ -1392,6 +1401,7 @@ s32 cellSpursAddWorkload(CellSpurs* spurs, CellSpursWorkloadId* wid,
 {
     if (!spurs || !wid)
         return CELL_SPURS_CORE_ERROR_NULL_POINTER;
+    maxContention = spurs_clamp_contention(maxContention);
     /* spurs/wid/priority are guest EAs; pm stays a guest EA (it's the SPU
      * program address consumed later by the workload dispatch). */
     uint32_t spurs_ea = (uint32_t)(uintptr_t)spurs;
