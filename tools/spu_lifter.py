@@ -207,9 +207,17 @@ def _chan(token: str) -> str:
 # between the points where something else can look at ctx: a register is
 # written back before and reloaded after any statement that passes ctx to
 # anything but the local-store accessors, and written back before every exit.
-# Those statements run unchanged against ctx->gpr, so they need no knowledge of
-# what each callee (spu_drain_call, the interrupt save/restore, a channel op)
-# reads or writes.
+# Those statements run unchanged against ctx->gpr.
+#
+# Only a dirty register is written back: one a statement wrote since the entry
+# or the last sync on some path to that point (a may-dirty pass over the
+# labels and gotos); a clean one already holds its value in ctx->gpr. After a
+# sync only what it can change is reloaded: the registers it writes itself,
+# and for a call into this image whose callee returns through the link it was
+# given (callee_summaries), what the callee and everything it reaches write.
+# The channel layer and spu_drain_call's interrupt round trip (the iret
+# restores the whole file) leave ctx->gpr alone otherwise. Any other statement
+# reloads every register.
 _GPR_RE = re.compile(r"ctx->gpr\[(\d+)\]")
 _GPR_WRITE_RE = re.compile(
     r"ctx->gpr\[(\d+)\](?:\._\w+\[\d+\])?\s*(?:[-+*/|&^%]|<<|>>)?=(?!=)|&ctx->gpr\[(\d+)\]")
@@ -223,6 +231,26 @@ _SAFE_CTX_RE = re.compile(
 _LABEL_RE = re.compile(r"loc_[0-9A-Fa-f]+:")
 # --ib-known-targets probes inside an exit: each arm leaves too.
 _IB_KNOWN_RE = re.compile(r"if \(SPU_IB_OK\(ctx, 0x[0-9A-F]+\)\) \{ SPU_DIRECT\(ctx, 0x[0-9A-F]+, \w+\); \} ")
+_GOTO_RE = re.compile(r"\bgoto (loc_[0-9A-Fa-f]+);")
+# A line that never falls through to the next one.
+_UNCOND_GOTO_RE = re.compile(
+    r"\s*(?:ctx->gpr\[\d+\] = spu_link\(0x[0-9A-Fa-f]+\); )?goto loc_[0-9A-Fa-f]+;\s*")
+# Sync statements whose only register effect is what they write themselves:
+# the channel ops, and bisled (the link; its branch leaves the function).
+_CHAN_RE = re.compile(
+    r"\s*(?:ctx->gpr\[\d+\] = (?:spu_rdch\(ctx, \w+\)|spu_pref_u32\(spu_rchcnt\(ctx, \w+\)\))|"
+    r"spu_wrch\(ctx, \w+, ctx->gpr\[\d+\]\));\s*")
+_BISLED_RE = re.compile(
+    r"\s*\{ uint32_t _tg = ctx->gpr\[\d+\]\._u32\[0\]; ctx->gpr\[\d+\] = spu_link\(0x[0-9A-Fa-f]+\); "
+    r"if \(\(ctx->event_status & ctx->event_mask\) != 0\) \{ (?:ctx->int_enable = [01]; )?"
+    r"ctx->pc = _tg; g_spu_trampoline_fn = spu_indirect_branch; return; \} \}\s*")
+# A brsl/brasl call: link register, callee.
+_CALL_RE = re.compile(
+    r"\s*ctx->gpr\[(\d+)\] = spu_link\(0x[0-9A-Fa-f]+\); \{ int32_t _si = \(int32_t\)ctx->image_id; "
+    r"ctx->host_depth\+\+; (\w+)\(ctx\); spu_drain_call\(ctx, 0x[0-9A-Fa-f]+\); "
+    r"ctx->host_depth--; spu_img_restore\(ctx, _si\); \}\s*")
+_RET_RE = re.compile(r"\bSPU_RET\(ctx\)|\bSPU_RET_REG\(ctx, (\d+)\)")
+_TAIL_RE = re.compile(r"\bSPU_DIRECT\(ctx, 0x[0-9A-Fa-f]+, (\w+)\)|\bg_spu_trampoline_fn = (\w+);")
 
 
 def _lr_pure(s: str) -> bool:
@@ -281,7 +309,20 @@ def _lr_split_if(s: str):
     return m.group(1), s[m.end():i - 1], rest[1:-1]
 
 
-def localize_registers(lines: list[str]) -> list[str]:
+def _lr_mask(regs) -> int:
+    m = 0
+    for n in regs:
+        m |= 1 << int(n)
+    return m
+
+
+def _lr_writes(s: str) -> int:
+    return _lr_mask(a or b for a, b in _GPR_WRITE_RE.findall(s))
+
+
+def _lr_plan(lines: list[str]):
+    """Classify each line: raw (a label), pure, cond_exit, exit, bare_exit or
+    sync. Returns (plan, registers used, registers written)."""
     used: set[int] = set()
     written: set[int] = set()
     plan = []
@@ -311,33 +352,181 @@ def localize_registers(lines: list[str]) -> list[str]:
         if re.search(r"\b(?:goto|break|continue)\b", line):
             raise ValueError(f"--local-regs: control transfer in a ctx statement: {st}")
         plan.append(("sync", line))
+    return plan, used, written
+
+
+def _lr_falls_off(plan) -> bool:
+    last = next(((k, v) for k, v in reversed(plan) if k != "raw"), None)
+    if last is None:
+        return True
+    k, v = last
+    return k not in ("exit", "bare_exit") and not (k == "pure" and _UNCOND_GOTO_RE.fullmatch(v))
+
+
+def _lr_call_effect(summary, link: int):
+    """Registers a call through `link` can change, or None for any: the callee
+    must come back by returning through `link` with it intact, or the drain
+    goes on at whatever pc it returned to and runs code no summary covers."""
+    if summary is None:
+        return None
+    w, rr = summary
+    if rr & ~(1 << link) or (w >> link) & 1:
+        return None
+    return w | (1 << link)
+
+
+def _lr_sync_changes(line: str, summaries):
+    """Registers a sync statement can change, or None for any."""
+    direct = _lr_writes(line)
+    if _CHAN_RE.fullmatch(line) or _BISLED_RE.fullmatch(line):
+        return direct
+    m = _CALL_RE.fullmatch(line)
+    if m and summaries is not None:
+        e = _lr_call_effect(summaries.get(m.group(2)), int(m.group(1)))
+        if e is not None:
+            return direct | e
+    return None
+
+
+def _lr_facts(lines: list[str]):
+    """(registers written, registers returned through, calls as (link, callee),
+    tail transfers) of one function body; None when it can leave in a way its
+    caller cannot follow: an indirect branch, a stop or halt, an unrecognized
+    ctx statement, or the end of the body."""
+    try:
+        plan, _, _ = _lr_plan(lines)
+    except ValueError:
+        return None
+    if _lr_falls_off(plan):
+        return None
+    rr, calls, tails = 0, [], []
+    for kind, v in plan:
+        if kind == "sync":
+            m = _CALL_RE.fullmatch(v)
+            if m:
+                calls.append((int(m.group(1)), m.group(2)))
+            elif not _CHAN_RE.fullmatch(v):
+                return None
+            continue
+        if kind not in ("cond_exit", "exit", "bare_exit"):
+            continue
+        t = v[2] if kind == "cond_exit" else v[1] if kind == "exit" else v
+        if "spu_indirect_branch" in t:
+            return None
+        found = False
+        for m in _RET_RE.finditer(t):
+            rr |= 1 << int(m.group(1) or 0)
+            found = True
+        for m in _TAIL_RE.finditer(t):
+            tails.append(m.group(1) or m.group(2))
+            found = True
+        if not found:
+            return None
+    return _lr_writes("\n".join(lines)), rr, calls, tails
+
+
+def callee_summaries(bodies: dict) -> dict:
+    """{function name: (registers it may write, registers it returns through)}
+    over everything it calls and tail-transfers to, or None when that is
+    unbounded (_lr_facts, or a transfer out of `bodies`). A fixed point: the
+    sets only grow, and recursion adds nothing the body does not write."""
+    facts = {name: _lr_facts(lines) for name, lines in bodies.items()}
+    summ = {name: f and (f[0], f[1]) for name, f in facts.items()}
+    changed = True
+    while changed:
+        changed = False
+        for name, f in facts.items():
+            if summ[name] is None:
+                continue
+            w, rr = f[0], f[1]
+            new = (w, rr)
+            for link, callee in f[2]:
+                e = _lr_call_effect(summ.get(callee), link)
+                if e is None:
+                    new = None
+                    break
+                w |= e
+            for callee in f[3] if new else ():
+                s = summ.get(callee)
+                if s is None:
+                    new = None
+                    break
+                w, rr = w | s[0], rr | s[1]
+            new = new and (w, rr)
+            if new != summ[name]:
+                summ[name] = new
+                changed = True
+    return summ
+
+
+def localize_registers(lines: list[str], summaries=None) -> list[str]:
+    plan, used, written = _lr_plan(lines)
     if not used:
         return lines
-    wb = " ".join(f"ctx->gpr[{n}] = spu_v2u(sr{n});" for n in sorted(written))
-    rl = " ".join(f"sr{n} = spu_u2v(ctx->gpr[{n}]);" for n in sorted(used))
-    out = ["    " + " ".join(f"spu_v4u sr{n} = spu_u2v(ctx->gpr[{n}]);" for n in sorted(used))]
-    for kind, v in plan:
+    used_mask = _lr_mask(used)
+    # Dirty registers on entry to each plan entry (END = len(plan)).
+    labels = {v.strip()[:-1]: i for i, (k, v) in enumerate(plan) if k == "raw"}
+    n = len(plan)
+
+    def succs(i):
+        kind, v = plan[i]
+        if kind in ("exit", "bare_exit"):
+            return []
+        if kind != "pure":
+            return [i + 1]
+        try:
+            out = [labels[t] for t in _GOTO_RE.findall(v)]
+        except KeyError as e:
+            raise ValueError(f"--local-regs: goto to a label outside the function: {e}")
+        return out if _UNCOND_GOTO_RE.fullmatch(v) else out + [i + 1]
+
+    dirty = [0] * (n + 1)
+    reached = [False] * (n + 1)
+    reached[0] = True
+    work = [0]
+    while work:
+        i = work.pop()
+        if i == n:
+            continue
+        kind, v = plan[i]
+        out = 0 if kind == "sync" else dirty[i] | (_lr_writes(v) if kind == "pure" else 0)
+        for j in succs(i):
+            if not reached[j] or out & ~dirty[j]:
+                reached[j] = True
+                dirty[j] |= out
+                work.append(j)
+
+    def wb(mask):
+        return " ".join(f"ctx->gpr[{r}] = spu_v2u(sr{r});" for r in sorted(written) if (mask >> r) & 1)
+
+    out = ["    " + " ".join(f"spu_v4u sr{r} = spu_u2v(ctx->gpr[{r}]);" for r in sorted(used))]
+    for i, (kind, v) in enumerate(plan):
         if kind == "raw":
             out.append(v)
         elif kind == "pure":
             out.append(_lr_local(v))
         elif kind == "cond_exit":
             ind, cond, inner = v
-            out.append(f"{ind}if ({_lr_local(cond)}) {{ {wb} {inner.strip()} }}".replace("{  ", "{ "))
+            out.append(f"{ind}if ({_lr_local(cond)}) {{ {wb(dirty[i])} {inner.strip()} }}".replace("{  ", "{ "))
         elif kind == "exit":
             ind, inner = v
-            out.append(f"{ind}{{ {wb} {inner.strip()} }}".replace("{  ", "{ "))
+            out.append(f"{ind}{{ {wb(dirty[i])} {inner.strip()} }}".replace("{  ", "{ "))
         elif kind == "bare_exit":
-            out.append(f"    {wb}" if wb else "    /* no register written */;")
+            w = wb(dirty[i])
+            out.append(f"    {w}" if w else "    /* no register written */;")
             out.append(v)
         else:
-            if wb:
-                out.append(f"    {wb}")
+            w = wb(dirty[i])
+            if w:
+                out.append(f"    {w}")
             out.append(v)
-            out.append(f"    {rl}")
-    last = next((k for k, _ in reversed(plan) if k != "raw"), None)
-    if last not in ("exit", "bare_exit") and wb:
-        out.append(f"    {wb}")
+            changes = _lr_sync_changes(v, summaries)
+            reload = used_mask if changes is None else changes & used_mask
+            if reload:
+                out.append("    " + " ".join(f"sr{r} = spu_u2v(ctx->gpr[{r}]);"
+                                             for r in sorted(used) if (reload >> r) & 1))
+    if dirty[n]:
+        out.append(f"    {wb(dirty[n])}")
     return out
 
 # ---------------------------------------------------------------------------
@@ -1364,9 +1553,13 @@ class SPULifter:
     def emit_source(self,header_name: str) -> str:
         lines = [SOURCE_PREAMBLE.format(header_name=header_name), ""]
         weak = "__attribute__((weak)) " if getattr(self, "weak_emit", False) else ""
+        local = getattr(self, "local_regs", False)
+        # A weak function can be replaced at link time: summarize nothing.
+        summaries = (callee_summaries({f.name: f.body_lines for f in self.functions})
+                     if local and not weak else None)
         for f in self.functions:
             lines.append(f"void {weak}{f.name}(spu_context* ctx) {{")
-            body = localize_registers(f.body_lines) if getattr(self, "local_regs", False) else f.body_lines
+            body = localize_registers(f.body_lines, summaries) if local else f.body_lines
             for b in body:
                 lines.append(b if b.endswith(":") else f"    {b}")
             lines.append("}")
