@@ -2356,15 +2356,8 @@ static void gcm_rsx_process_fifo_unlocked(void)
          * run out, so the jump-park resync fired at once and dropped the
          * commands the title was about to link in. */
         if (park_off && (s_fifo_getoff != park_off ||
-                         (w & 0xE0000003u) != 0x20000000u || (w & 0x1FFFFFFCu) != park_off)) {
-            { static int st = -1; static int sn = 0; if (st < 0) st = getenv("MLB_SEMA_TRACE") ? 1 : 0;
-              if (st && s_fifo_getoff == park_off && sn++ < 20000) {
-                  extern unsigned long long ps3_ms_now(void);
-                  fprintf(stderr, "[parkfix] at=%08X after=%llums now=%08X next=%08X %08X put=%08X\n", park_off,
-                          ps3_ms_now() - park_since, w, vm_read32(ea + 4), vm_read32(ea + 8), put);
-              } }
+                         (w & 0xE0000003u) != 0x20000000u || (w & 0x1FFFFFFCu) != park_off))
             park_off = 0;
-        }
 
         if ((w & 0xFFFF0000u) == 0xFEAD0000u) {
             /* lv1 driver flip: statically-linked libgcm cellGcmSetFlip writes
@@ -2425,10 +2418,6 @@ static void gcm_rsx_process_fifo_unlocked(void)
               if (_rd) fprintf(stderr, "[JMP] %08X -> %08X (put=%08X)\n",
                                s_fifo_getoff, w & 0x1FFFFFFCu, put); }
             { u32 tgt = w & 0x1FFFFFFCu;
-              { static int st = -1; static int sn = 0; if (st < 0) st = getenv("MLB_SEMA_TRACE") ? 1 : 0;
-                if (st && ((tgt >= 0x00800000u && tgt < 0x01300000u) ||
-                           (s_fifo_getoff >= 0x00800000u && s_fifo_getoff < 0x01300000u)) && sn++ < 60000)
-                    fprintf(stderr, "[semtrace] at=%08X JUMP -> %08X\n", s_fifo_getoff, tgt); }
               if (!gcm_io2ea(tgt)) { gcm_fifo_bad_branch("JUMP", tgt, w); gcm_fifo_dump_around(s_fifo_getoff); gcm_fifo_resync_why("unmapped-JUMP", &s_fifo_getoff, put); break; }
               /* A JUMP to its own address is the "park the RSX here" idiom:
                * the title leaves it at the write head so the GPU stops if it
@@ -2490,9 +2479,6 @@ static void gcm_rsx_process_fifo_unlocked(void)
         if ((w & 3) == 2) {                    /* CALL: offset | 2 */
             { u32 tgt = w & 0x1FFFFFFCu;
               if (!gcm_io2ea(tgt)) { gcm_fifo_bad_branch("CALL", tgt, w); gcm_fifo_dump_around(s_fifo_getoff); gcm_fifo_resync_why("unmapped-CALL", &s_fifo_getoff, put); break; }
-              { static int st = -1; static int sn = 0; if (st < 0) st = getenv("MLB_SEMA_TRACE") ? 1 : 0;
-                if (st && tgt >= 0x00800000u && tgt < 0x01300000u && sn++ < 60000)
-                    fprintf(stderr, "[semtrace] at=%08X CALL -> %08X\n", s_fifo_getoff, tgt); }
               s_fifo_calloff = s_fifo_getoff + 4;
               s_fifo_getoff  = tgt; }
             continue;
@@ -2717,14 +2703,6 @@ static void gcm_rsx_process_fifo_unlocked(void)
                 if (wdiag) { static int live = -1;
                   if (live < 0) live = rsx_live_draw_enabled();
                   if (live) rsx_live_draw_method((subch << 13) | m, vm_read32(dea)); }
-                /* MLB_SEMA_TRACE=1 (temporary, mlb16 investigation): every
-                 * semaphore/label method the walker dispatches, any subchannel. */
-                { static int st = -1; if (st < 0) st = getenv("MLB_SEMA_TRACE") ? 1 : 0;
-                  const u32 mm = m & 0x1FFCu;
-                  if (st && (mm == 0x64u || mm == 0x68u || mm == 0x6Cu || mm == 0x1D6Cu || mm == 0x1D70u || mm == 0x1D74u || mm == 0x01A4u)) {
-                      static int sn = 0;
-                      if (sn++ < 60000) fprintf(stderr, "[semtrace] at=%08X subch=%u m=0x%04X v=0x%08X\n", s_fifo_getoff, subch, mm, vm_read32(dea));
-                  } }
                 /* GCM_METHOD_HIST=<secs>: every <secs>, the most frequent
                  * (subchannel, method) pairs dispatched since the last report --
                  * what a frame is actually made of when nothing draws. */
