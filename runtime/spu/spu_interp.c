@@ -403,6 +403,10 @@ static long s_is = -1;
 static volatile long long s_is_tot;
 static int s_is_img[IS_N]; static uint32_t s_is_page[IS_N]; static volatile long long s_is_cnt[IS_N];
 static int s_ie_img[IS_N]; static uint32_t s_ie_pc[IS_N]; static volatile long long s_ie_cnt[IS_N];
+/* Branch landings at LS 0x4000+ (job-module code): a hot one inside a lifted
+ * module is a function start the lift lacks, reached through a pointer. */
+static int s_ib_img[IS_N]; static uint32_t s_ib_pc[IS_N]; static volatile long long s_ib_cnt[IS_N];
+static SPU_THREAD_LOCAL uint32_t t_is_prev;
 static unsigned long long s_is_t0;
 
 static int interp_stats_on(void)
@@ -439,6 +443,9 @@ static void interp_stats_top(const char* what, int* img, uint32_t* key, volatile
 static void interp_stats_step(const spu_context* ctx)
 {
     interp_stats_bump(s_is_img, s_is_page, s_is_cnt, ctx->image_id, ctx->pc & ~0x3FFu);
+    if (ctx->pc != t_is_prev + 4 && ctx->pc >= 0x4000u)
+        interp_stats_bump(s_ib_img, s_ib_pc, s_ib_cnt, ctx->image_id, ctx->pc);
+    t_is_prev = ctx->pc;
     if ((++s_is_tot & 0xFFFF) != 0) return;
     struct timespec ts; timespec_get(&ts, TIME_UTC);   /* stdlib: fixtures link this file alone */
     unsigned long long now = (unsigned long long)ts.tv_sec * 1000ull + (unsigned long long)ts.tv_nsec / 1000000ull;
@@ -447,6 +454,7 @@ static void interp_stats_step(const spu_context* ctx)
     fprintf(stderr, "[spu-interp] %.1fM steps/s over %lds\n", s_is_tot / 1e6 / (double)s_is, s_is);
     interp_stats_top("pages (steps)", s_is_img, s_is_page, s_is_cnt, 6);
     interp_stats_top("entries (calls)", s_ie_img, s_ie_pc, s_ie_cnt, 8);
+    interp_stats_top("branch landings in job code", s_ib_img, s_ib_pc, s_ib_cnt, 12);
     s_is_tot = 0; s_is_t0 = now;
 }
 
