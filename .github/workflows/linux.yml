@@ -130,6 +130,17 @@ jobs:
             -o /tmp/test_spu_int_x86_sse41 runtime/spu/tests/test_spu_int_x86.c -lm
           /tmp/test_spu_int_x86_sse41
 
+      # runtime/spu/tests/test_spu_int_neon.c covers the rest of the per-lane integer ops.
+      - name: Run the SPU per-lane integer helper test (scalar, SSE4.1, AVX2)
+        run: |
+          for m in "" -msse4.1 -mavx2; do
+            if [ "$m" = -mavx2 ] && ! grep -q avx2 /proc/cpuinfo; then continue; fi
+            ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} \
+              -std=gnu17 -O2 $m -I include -I runtime -I runtime/spu \
+              -o /tmp/test_spu_int_neon runtime/spu/tests/test_spu_int_neon.c -lm
+            /tmp/test_spu_int_neon
+          done
+
       # The AVX2 forms of the same helpers, where the runner has AVX2.
       - name: Run the SPU integer helper test (AVX2)
         run: |

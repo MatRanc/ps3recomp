@@ -1,6 +1,9 @@
-/* The NEON integer/permute helpers must be bit-identical to their scalar
- * references (spu_*_ref) for random operands and every shift amount. Build on
- * arm64:  cc -O2 -I.. -I../.. -I../../.. test_spu_int_neon.c -o t && ./t */
+/* The vector integer/permute helpers (NEON on arm64, SSE4.1/AVX2/AVX-512 on x86-64) must be
+ * bit-identical to their scalar references (spu_*_ref) for random operands and every shift
+ * amount; ops without a vector form on the host compare their reference with itself.
+ *   arm64:  cc -O2 -I.. -I../.. -I../../.. test_spu_int_neon.c -o t && ./t
+ *   x86-64: the same with -march=x86-64-v2 (SSE4.1), -march=x86-64-v3 (AVX2) and, where the
+ *           CPU has it, -march=x86-64-v4 (the AVX-512 halfword shifts and lzcnt) */
 #include "../spu_helpers.h"
 #include <stdio.h>
 
@@ -24,10 +27,6 @@ static void check(const char* op, u128 got, u128 ref, u128 a, u128 b, int imm)
 
 int main(void)
 {
-#if !defined(__ARM_NEON)
-    puts("test_spu_int_neon: no NEON, nothing to compare");
-    return 0;
-#else
     const long N = 200000;
     for (long it = 0; it < N; it++) {
         u128 a = rnd128(), b = rnd128(), c = rnd128();
@@ -44,9 +43,11 @@ int main(void)
         check("selb", spu_selb(a, b, c), spu_selb_ref(a, b, c), a, b, 0);
         CI(shlqbyi, sh); CI(rotqbyi, sh); CI(rotqmbyi, sh); CI(cwd, sh);
         C2(shlqby); C2(rotqby); C2(shlqbybi); C2(rotqbybi); C2(rotqmby); C2(rotqmbybi);
+        CI(shlqbii, sh); CI(rotqbii, sh); CI(rotqmbii, sh);
+        C2(shlqbi); C2(rotqbi); C2(rotqmbi);
     }
     if (s_bad) { printf("test_spu_int_neon: %ld mismatches\n", s_bad); return 1; }
-    printf("test_spu_int_neon: ok (%ld random cases x 27 ops)\n", N);
+    printf("test_spu_int_neon: ok (%ld random cases x 33 ops)\n", N);
 
     /* The per-lane ops vectorised for tests/bench/spu. Shift and rotate counts come per lane,
      * so b is drawn three ways: random bits, a small count (0..80, past every lane width) in
@@ -76,8 +77,18 @@ int main(void)
         C1(orx); C1(xswd);
         { u128 z = spu_zero(); C1(clz); a = z; C1(clz); C1(orx); }
     }
+    /* clz: random words almost always have a high bit set; sweep every leading-one position
+     * with all-zero, all-one and random bits below it. */
+    for (long it = 0; it < N; it++) {
+        u128 a, b = spu_zero();
+        for (int i = 0; i < 4; i++) {
+            const int k = (int)(rnd32() % 33);
+            const uint32_t top = k ? 1u << (k - 1) : 0, below = top ? top - 1 : 0;
+            a._u32[i] = top | (rnd32() % 3 == 0 ? 0 : rnd32() % 2 ? below : rnd32() & below);
+        }
+        C1(clz);
+    }
     if (s_bad) { printf("test_spu_int_neon: %ld mismatches (vectorised per-lane ops)\n", s_bad); return 1; }
     printf("test_spu_int_neon: ok (%ld cases x 60 vectorised per-lane ops)\n", 4 * N);
     return 0;
-#endif
 }
