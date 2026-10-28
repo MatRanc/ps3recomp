@@ -1067,6 +1067,12 @@ void spu_direct_init(void);
 #define SPU_IB_OK(ctx, PC) (((ctx)->pc & SPU_LS_MASK) == (PC) && g_spu_direct > 0 && \
         (PC) != (ctx)->drain_ret_pc && !(ctx)->irq_saved)
 
+/* spu_lifter.py --const-bi: a constant-target `bi` inside the function becomes
+ * a goto, which skips the drain hop. Allowed when SPU_IB_OK would allow the
+ * direct branch and no interrupt is due (the hop is where one is taken). */
+#define SPU_GOTO_OK(ctx, PC) (g_spu_direct > 0 && (PC) != (ctx)->drain_ret_pc && \
+        !(ctx)->irq_saved && !((ctx)->int_enable && ((ctx)->event_status & (ctx)->event_mask)))
+
 /* Depth-aware SPU link return (`bi $r0`): host `return` while a matched
  * brsl/bisl frame is live (host_depth>0); at 0 the frame was destroyed (task
  * resume / restack unwind) so dispatch to the link register instead -- faithful
