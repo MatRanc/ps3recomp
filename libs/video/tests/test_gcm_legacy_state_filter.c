@@ -118,9 +118,12 @@ static int seen_exactly(const u32* want, u32 n)
 
 int main(int argc, char** argv)
 {
-    /* "trace": run under RSX_TRACE, which must keep the full stream. */
-    const int trace = argc > 1 && strcmp(argv[1], "trace") == 0;
-    if (trace) setenv("RSX_TRACE", "1", 1); else unsetenv("RSX_TRACE");
+    /* "trace": run under RSX_TRACE, which must keep the full stream;
+     * "legacy": under PS3RECOMP_FIFO_LEGACY=1, which must too. */
+    const int legacy = argc > 1 && strcmp(argv[1], "legacy") == 0;
+    const int trace = (argc > 1 && strcmp(argv[1], "trace") == 0) || legacy;
+    unsetenv("RSX_TRACE"); unsetenv("PS3RECOMP_FIFO_LEGACY");
+    if (legacy) setenv("PS3RECOMP_FIFO_LEGACY", "1", 1); else if (trace) setenv("RSX_TRACE", "1", 1);
     setvbuf(stdout, NULL, _IONBF, 0);
     const uint32_t vm_size = ppu_hle_inject_base + 0x10000u;
     vm_base = (uint8_t*)calloc(1, vm_size);
@@ -140,7 +143,7 @@ int main(int argc, char** argv)
     static const u32 effects[] = { 0x0050u, 0x0180u, 0x01A4u, 0x1D6Cu, 0x1D70u, 0x0104u, 0x1D74u };
     engine_on = 1; vtable = NULL; walk(ctrl);
     if (trace)
-        check(seen_exactly(bare, N_METHODS), "RSX_TRACE keeps every method with the draw engine and no vtable");
+        check(seen_exactly(bare, N_METHODS), "RSX_TRACE / PS3RECOMP_FIFO_LEGACY keep every method with the draw engine and no vtable");
     else
         check(seen_exactly(effects, 7), "draw engine without a vtable: only reference, notify, DMA context and label methods");
 

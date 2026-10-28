@@ -16,6 +16,7 @@
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 static int g_failures;
 
@@ -60,6 +61,31 @@ int main(void)
     rsx_dsp_vertex_texture vt;
     rsx_dsp_get_vertex_texture(rsx, 1, &vt);
     CHECK(vt.offset == 0x00100000u, "vertex unit 1 offset 0x80100000 decodes to 0x00100000 (got 0x%08X)", vt.offset);
+
+    /* tex_wgen: a unit's count moves only on a write that changes one of
+     * its registers (its 8-word block or its TEX_SIZE1), never another's. */
+    u32 w2 = rsx->tex_wgen[2], w3 = rsx->tex_wgen[3];
+    rsx_dispatch_method(rsx, 0x1A00 + 2 * 0x20, 0x82B74100u);           /* same value */
+    CHECK(rsx->tex_wgen[2] == w2, "rewriting a unit's offset unchanged leaves tex_wgen");
+    rsx_dispatch_method(rsx, 0x1A14 + 2 * 0x20, 0x12345678u);           /* filter */
+    CHECK(rsx->tex_wgen[2] == w2 + 1 && rsx->tex_wgen[3] == w3,
+          "a changed filter bumps that unit's tex_wgen only");
+    rsx_dispatch_method(rsx, 0x1840 + 2 * 4, 0x00100400u);              /* TEX_SIZE1 */
+    rsx_dispatch_method(rsx, 0x1840 + 2 * 4, 0x00100400u);
+    CHECK(rsx->tex_wgen[2] == w2 + 2, "TEX_SIZE1 counts for its unit, once per change");
+    rsx_dispatch_method(rsx, 0x1A1C + 15 * 0x20, 1u);                   /* last unit's border */
+    CHECK(rsx->tex_wgen[15] == 1, "the last unit's border colour counts");
+    u32 before[RSX_DSP_NUM_TEXTURES];
+    memcpy(before, rsx->tex_wgen, sizeof before);
+    rsx_dispatch_method(rsx, 0x0904 + 1 * 0x20, 0x00028102u);           /* vertex unit */
+    rsx_dispatch_method(rsx, 0x1840 - 4, 7u);                           /* below TEX_SIZE1 */
+    rsx_dispatch_method(rsx, 0x1880, 7u);                               /* past it */
+    rsx_dispatch_method(rsx, 0x1C00, 7u);                               /* past the unit blocks */
+    CHECK(!memcmp(before, rsx->tex_wgen, sizeof before),
+          "vertex-texture and neighbouring registers leave fragment units alone");
+    u32 seed[0x1A00 / 4] = {0};
+    rsx_dispatch_seed_registers(rsx, seed, 0x1A00 / 4);
+    CHECK(rsx->tex_wgen[2] == w2 + 3 && rsx->tex_wgen[7] == 1, "seeding the register file bumps every unit");
 
     free(rsx);
     if (g_failures) { printf("%d check(s) FAILED\n", g_failures); return 1; }

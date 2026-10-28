@@ -37,6 +37,21 @@ typedef struct rsx_vp_input_analysis {
 int rsx_vp_analyze_inputs(const u8* ucode, u32 max_bytes,
                           rsx_vp_input_analysis* analysis);
 
+/* Which vp_c[] rows a decompiled program can read. Every constant-typed
+ * source field of every instruction up to the end flag counts, used by its
+ * opcode or not -- the decompiler emits all three, so this is a superset of
+ * what the shader reads. `relative` means some read is vp_c[(N + aX) & 511]
+ * and any row may be read. `valid` is 0 when no end flag was found; treat the
+ * whole block as read then. lo > hi means no constant is read. Returns the
+ * instruction count, or -1. */
+typedef struct rsx_vp_const_usage {
+    u32 lo, hi;
+    int relative;
+    int valid;
+} rsx_vp_const_usage;
+int rsx_vp_analyze_constants(const u8* ucode, u32 max_bytes,
+                             rsx_vp_const_usage* usage);
+
 /* Decompile an NV40 vertex program into an HLSL vertex shader.
  *   ucode    : VP bytecode (little-endian words, as in RPCS3's shader cache).
  *   max_bytes: safety bound.

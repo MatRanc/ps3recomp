@@ -2113,11 +2113,15 @@ static void gcm_rsx_process_fifo_unlocked(void)
     /* rsx_state feeds only the legacy vtable backend. With the draw engine
      * up and no vtable registered, the state it builds is never read, and the
      * only methods worth handing it are the ones with effects outside it
-     * (gcm_legacy_method_has_effect). RSX_TRACE still sees every method. */
-    static int s_rsx_trace = -1;
-    if (s_rsx_trace < 0) s_rsx_trace = getenv("RSX_TRACE") ? 1 : 0;
+     * (gcm_legacy_method_has_effect). RSX_TRACE still sees every method, and
+     * PS3RECOMP_FIFO_LEGACY=1 feeds it everything without tracing (A/B). */
+    static int s_legacy_all = -1;
+    if (s_legacy_all < 0) {
+        const char* e = getenv("PS3RECOMP_FIFO_LEGACY");
+        s_legacy_all = (getenv("RSX_TRACE") || (e && strcmp(e, "0") != 0)) ? 1 : 0;
+    }
     const int legacy_state_live = rsx_get_backend() != NULL || !rsx_draw_engine_enabled() ||
-                                  s_rsx_trace;
+                                  s_legacy_all;
 
 
     /* Walk the FIFO exactly like the RSX: chase the guest-written `put` (an IO
