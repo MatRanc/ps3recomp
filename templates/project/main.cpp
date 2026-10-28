@@ -208,9 +208,14 @@ static DWORD WINAPI frame_clock(LPVOID)
 
     unsigned  last_flip = 0;
     ULONGLONG next_tick = GetTickCount64();
+    /* PS3_FRAME_CLOCK_MS: the idle wait between drains. A walker parked on a
+     * buffer an SPU job is still filling only looks again after it, so a
+     * title whose frame is many such parks waits it out many times a frame. */
+    const char* fc_ms = getenv("PS3_FRAME_CLOCK_MS");
+    const DWORD idle_ms = fc_ms && atoi(fc_ms) >= 0 ? (DWORD)atoi(fc_ms) : 4;
 
     for (;;) {
-        Sleep(4);
+        Sleep(idle_ms);
         ULONGLONG now = GetTickCount64();
 
         int fired = 0;

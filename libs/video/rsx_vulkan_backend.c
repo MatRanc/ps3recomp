@@ -3551,9 +3551,19 @@ static void vk_eng_flush(void)
             if (!t0) t0 = now;
             if (now - t0 >= 2000) {
                 unsigned long long* w = s_eb.why;
-                VK_LOG("batch stats 2s: %llu batched draws, %llu unbatched, %llu flushes; why: other %llu ring %llu"
-                       " unbatched %llu max %llu engine %llu destroy %llu present %llu begin %llu\n",
-                       s_eb.draws, s_eb.unbatched, s_eb.flushes, w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]);
+                /* The walker's own CPU time per draw: what CPU-side draw work costs, whatever the scene. */
+                static unsigned long long cpu0;
+                unsigned long long cpu = 0;
+#ifndef _WIN32
+                { struct timespec ct; clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ct);
+                  cpu = (unsigned long long)ct.tv_sec * 1000000ull + (unsigned long long)ct.tv_nsec / 1000ull; }
+#endif
+                const unsigned long long nd = s_eb.draws + s_eb.unbatched;
+                VK_LOG("batch stats 2s: %llu batched draws, %llu unbatched, %llu flushes; walker %.1f us cpu/draw;"
+                       " why: other %llu ring %llu unbatched %llu max %llu engine %llu destroy %llu present %llu begin %llu\n",
+                       s_eb.draws, s_eb.unbatched, s_eb.flushes, (cpu0 && nd) ? (double)(cpu - cpu0) / nd : 0.0,
+                       w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]);
+                cpu0 = cpu;
                 memset(w, 0, sizeof s_eb.why); s_eb.draws = s_eb.unbatched = s_eb.flushes = 0; t0 = now;
             }
         }
