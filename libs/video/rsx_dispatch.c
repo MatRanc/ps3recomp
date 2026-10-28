@@ -236,6 +236,7 @@ void rsx_dispatch_seed_registers(rsx_dispatch* rsx, const u32* regs, u32 count)
     if (count > RSX_DSP_NUM_REGS)
         count = RSX_DSP_NUM_REGS;
     memcpy(rsx->regs, regs, count * sizeof(u32));
+    for (u32 u = 0; u < RSX_DSP_NUM_TEXTURES; u++) rsx->tex_wgen[u]++;
 }
 
 void rsx_dispatch_seed_transform_program(rsx_dispatch* rsx, const u32* words, u32 count)
@@ -322,6 +323,11 @@ void rsx_dispatch_method(rsx_dispatch* rsx, u32 method, u32 arg)
         return;
     }
     rsx->seen[idx]++;
+    if ((u32)(method - M_TEX_OFFSET) < RSX_DSP_NUM_TEXTURES * 0x20u) {
+        if (rsx->regs[idx] != arg) rsx->tex_wgen[(method - M_TEX_OFFSET) >> 5]++;
+    } else if ((u32)(method - M_TEX_SIZE1) < RSX_DSP_NUM_TEXTURES * 4u) {
+        if (rsx->regs[idx] != arg) rsx->tex_wgen[(method - M_TEX_SIZE1) >> 2]++;
+    }
     rsx->regs[idx] = arg;
     if ((method >= 0x1500 && method < 0x1A00) || (method >= 0x1E40 && method < 0x1E80) ||
         (method >= 0x0A80 && method < 0x0B00))

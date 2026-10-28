@@ -1627,6 +1627,23 @@ static void eng_decode_sampler(u32 filter, u32 wrap, u32 control0,
     if (out->max_lod < out->min_lod) out->max_lod = out->min_lod;
 }
 
+/* Each fragment unit's decoded registers, decoded again only after a write
+ * changed one of them (rsx_dispatch.tex_wgen): the pipeline key and the
+ * binding read all 16 units on every draw. PS3RECOMP_ENG_TEXWGEN=0 (read at
+ * engine init) decodes every time. Port of the inFAMOUS 2 port's eng_tex
+ * (github.com/ThiagoFraga761/infamous2-pc, MIT). */
+static struct { rsx_dsp_texture t; u32 wgen; int valid; } s_tdec[RSX_DSP_NUM_TEXTURES];
+static int s_tex_wgen_on;
+static const rsx_dsp_texture* eng_tex(u32 u)
+{
+    if (!s_tex_wgen_on || !s_tdec[u].valid || s_tdec[u].wgen != g.rsx.tex_wgen[u]) {
+        rsx_dsp_get_texture(&g.rsx, u, &s_tdec[u].t);
+        s_tdec[u].wgen = g.rsx.tex_wgen[u];
+        s_tdec[u].valid = 1;
+    }
+    return &s_tdec[u].t;
+}
+
 /* ---- pipelines ----------------------------------------------------------- */
 
 static u32 eng_vtex_mask(void)
@@ -1648,8 +1665,7 @@ static u32 eng_unnorm_units(u32 dim[RSX_DSP_NUM_TEXTURES][3])
 {
     u32 mask = 0;
     for (u32 u = 0; u < RSX_DSP_NUM_TEXTURES; u++) {
-        rsx_dsp_texture t;
-        rsx_dsp_get_texture(&g.rsx, u, &t);
+        const rsx_dsp_texture t = *eng_tex(u);
         dim[u][0] = dim[u][1] = dim[u][2] = 0;
         if (!t.enabled || !(t.format & RSX_TEX_FMT_UNNORM) || !t.width || !t.height)
             continue;
@@ -1670,8 +1686,7 @@ static u32 eng_volume_mask(void)
     if (!g.be->texture_create_3d || !g.be->texture_upload_3d) return 0;
     u32 mask = 0;
     for (u32 u = 0; u < RSX_DSP_NUM_TEXTURES; u++) {
-        rsx_dsp_texture t;
-        rsx_dsp_get_texture(&g.rsx, u, &t);
+        const rsx_dsp_texture t = *eng_tex(u);
         if (t.enabled && !t.cubemap && t.dimension == 3 && t.depth > 1 && t.width && t.height)
             mask |= 1u << u;
     }
@@ -1682,8 +1697,7 @@ static u32 eng_cube_mask(void)
 {
     u32 mask = 0;
     for (u32 u = 0; u < RSX_DSP_NUM_TEXTURES; u++) {
-        rsx_dsp_texture t;
-        rsx_dsp_get_texture(&g.rsx, u, &t);
+        const rsx_dsp_texture t = *eng_tex(u);
         /* A cube face is square by construction, so a non-square image
          * cannot be one; the fragment program is compiled against this mask
          * and a texturecube slot filled with a 2D texture is a validation
@@ -1943,15 +1957,14 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
     const u32 sampled_units = fixed ? 0 : rsx_fp_texture_units(fp_uc, fp_size);
     for (u32 u = 0; u < RSX_DSP_NUM_TEXTURES; u++) {
         if (!(sampled_units & (1u << u))) continue;
-        rsx_dsp_texture t;
-        rsx_dsp_get_texture(&g.rsx, u, &t);
+        const rsx_dsp_texture t = *eng_tex(u);
         rsx_fp_shadow_desc_from_texture(&shadow[u], t.format, t.dimension,
             t.cubemap, t.mipmaps, t.filter, t.wrap, t.control0);
         if (shadow[u].enabled) shadow_mask |= 1u << u;
     }
     u8 gamma_masks[RSX_DSP_NUM_TEXTURES] = {0};
     if (!fixed) for (u32 u = 0; u < RSX_DSP_NUM_TEXTURES; ++u) {
-        rsx_dsp_texture t; rsx_dsp_get_texture(&g.rsx, u, &t);
+        const rsx_dsp_texture t = *eng_tex(u);
         if (t.enabled) gamma_masks[u] = rsx_texture_gamma_mask(t.format, t.remap, t.filter, t.wrap);
     }
     const u32 gamma_units = fixed ? 0 : rsx_fp_texture_gamma_units(fp_uc, fp_size, gamma_masks);
@@ -1962,7 +1975,7 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
      * gamma: only units the program samples count. */
     u8 expand_masks[RSX_DSP_NUM_TEXTURES] = {0};
     if (!fixed) for (u32 u = 0; u < RSX_DSP_NUM_TEXTURES; ++u) {
-        rsx_dsp_texture t; rsx_dsp_get_texture(&g.rsx, u, &t);
+        const rsx_dsp_texture t = *eng_tex(u);
         if (t.enabled) expand_masks[u] = rsx_texture_expand_mask(t.format, t.remap, t.filter, t.wrap);
     }
     const u32 expand_units = fixed ? 0 : rsx_fp_texture_expand_units(fp_uc, fp_size, expand_masks);
@@ -2473,8 +2486,7 @@ static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
     u32 mask = 0;
     u32 feedback[RSX_BE_MAX_COLOR_TARGETS] = {0};
     for (u32 u = 0; u < RSX_BE_MAX_TEXTURES; u++) {
-        rsx_dsp_texture t;
-        rsx_dsp_get_texture(&g.rsx, u, &t);
+        const rsx_dsp_texture t = *eng_tex(u);
         /* A unit left enabled by an earlier draw but not sampled by this
          * program is skipped: resolving it would cost a cache check, and an
          * aliased surface a store to guest memory, for nothing. */
@@ -2909,8 +2921,7 @@ static void pd_note(const u32* targets, u32 n_targets, u32 zslot,
         vp.scale[2], vp.translate[2]);
     for (u32 u = 0; u < RSX_BE_MAX_TEXTURES && at < sizeof s_pd.first; u++) {
         if (!(tex_mask & (1u << u))) continue;
-        rsx_dsp_texture t;
-        rsx_dsp_get_texture(&g.rsx, u, &t);
+        const rsx_dsp_texture t = *eng_tex(u);
         /* S<n> a colour surface, Z<n> a depth target, each with the serial
          * of its last write: the newer one is what the binding sampled. */
         char src[48] = "G";
@@ -3430,6 +3441,9 @@ int rsx_draw_engine_init(u32 width, u32 height)
       s_texhash_full_always = e && *e && strcmp(e, "0") != 0; }
     { const char* e = getenv("PS3RECOMP_ENG_DEPTH_VIA_GUEST");
       s_depth_via_guest = e && *e && strcmp(e, "0") != 0; }
+    { const char* e = getenv("PS3RECOMP_ENG_TEXWGEN");
+      s_tex_wgen_on = !(e && strcmp(e, "0") == 0); }
+    memset(s_tdec, 0, sizeof s_tdec);    /* the dispatcher's counts restart */
     g.vp_cb = (u8*)calloc(1, ENG_VP_CB_BYTES);
     if (!g.vp_cb) return -1;
     if (g.be->init && g.be->init(g.be->user, g.width, g.height) != 0) {

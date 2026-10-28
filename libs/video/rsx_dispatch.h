@@ -134,6 +134,10 @@ struct rsx_dispatch {
     /* coverage accounting */
     u32 seen[RSX_DSP_NUM_REGS];       /* per-register write count           */
     u8  klass[RSX_DSP_NUM_REGS];      /* RSX_DSP_CLASS_*                    */
+    /* Per fragment texture unit: bumped by a write that CHANGES one of the
+     * registers rsx_dsp_get_texture reads (and by seeding), so an unchanged
+     * count means an unchanged decode. */
+    u32 tex_wgen[RSX_DSP_NUM_TEXTURES];
 
     /* INLINE_ARRAY accumulation, reset at every BEGIN_END(prim). A fixed
      * buffer rather than a grown allocation because rsx_dispatch_init
