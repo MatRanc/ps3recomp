@@ -336,7 +336,7 @@ static SPU_NOINLINE_COLD int mfc_diag_env_init(int* cache)
         "SPU_GETHIST", "SPU_PUTHIST", "SPU_MFC_TRACE", "SPU_DMA_SKIP_DUMP",
         "SPU_STACKEA_WATCH", "SPU_DMATRACE_ALL", "YDKJ_DMA_IMG", "SPU_DUMP_GET",
         "SPU_DSP_IMAGE_EA", "LBP_SKIP_NULL_DMA", "SPU_OVL_DIAG", "SPU_SMC_WATCH",
-        "SPU_LS_WATCH", "MLB_SEMA_TRACE", "SPU_POISON_DMA_WATCH",
+        "SPU_LS_WATCH", "SPU_POISON_DMA_WATCH",
     };
     int on = 0;
     for (unsigned i = 0; i < sizeof names / sizeof names[0] && !on; i++)
@@ -882,12 +882,6 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
           } }
     } else if (mfc_is_put(cmd)) {
         /* PUT: local store -> main memory (mfc_put_coherent). */
-        { static int st = -1; static int sn = 0; if (st < 0) st = getenv("MLB_SEMA_TRACE") ? 1 : 0;
-          if (st && (uint32_t)ea >= 0x12300000u && (uint32_t)ea < 0x12500000u && sn++ < 60000) {
-              const uint8_t* q = (const uint8_t*)ls_ptr;
-              fprintf(stderr, "[ringput] img=%d ea=%08X size=%u w=%02X%02X%02X%02X %02X%02X%02X%02X\n",
-                      spu->image_id, (uint32_t)ea, size, q[0],q[1],q[2],q[3], q[4],q[5],q[6],q[7]);
-          } }
         mfc_put_coherent(spu, ea_ptr, (const uint8_t*)ls_ptr, ea, size);
         /* Tell whoever is listening where this PUT landed.
          *
