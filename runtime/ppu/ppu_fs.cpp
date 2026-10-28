@@ -1019,6 +1019,7 @@ static void cellFsAioWrite(ppu_context* ctx)
     int32_t err = CELL_FS_ENOENT;
     if (FILE* f = fd_file(fd)) {
         if (ppu_vm_size && (uint64_t)buf + size > ppu_vm_size) size = ppu_vm_size - buf;
+        fs_prefault(buf, size);   /* kernel READS the buffer; same reserved-page trap as cellFsWrite */
         /* Absolute, like the read: leave the fd's own position where it was. */
         HOST_LOCKFILE(f);
         const int64_t pos = (int64_t)HOST_FTELL64(f);
