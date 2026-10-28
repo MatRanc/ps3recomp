@@ -12,6 +12,7 @@
  * embed one), in a small lazily-populated registry.
  */
 
+#define SPU_WRCH_PLAIN   /* defines spu_wrch: no spu_wrch_fast macro here */
 #include "spu_dma.h"
 #include "spu_coherency.h" /* lock-line lock + PPU-write coherence bitmap */
 #include "spu_helpers.h"   /* spu_splat_u32 / spu_ls_read128 (SMC microstep) */
@@ -974,8 +975,44 @@ static int channel_is_mfc(uint32_t ch)
 /* ===========================================================================
  * Channel write
  * ===========================================================================*/
+/* Inline channel forms (spu_helpers.h, SPU_WRCH_INLINE: spu_wrch_fast /
+ * spu_rdch_fast). Lifted code writes the MFC parameter channels and reads
+ * MFC_RdTagStat in place, and calls the two below for MFC_Cmd and
+ * MFC_WrTagUpdate instead of going through spu_wrch's channel switch, while
+ * g_spu_wrch_slow is 0: no channel diagnostic (SPU_CHHIST, SPU_POLLTRACE,
+ * SPU_TAGPROBE) is on. -1 until spu_wrch, spu_rdch or spu_rchcnt first runs,
+ * so the first channel access of a run always takes the full path.
+ * Adapted from the inFAMOUS 2 port (github.com/ThiagoFraga761/infamous2-pc,
+ * MIT, the infamous2-recomp contributors). */
+volatile int g_spu_wrch_slow = -1;
+
+static void spu_ch_diag_init(void)
+{
+    if (__builtin_expect(g_spu_wrch_slow >= 0, 1)) return;
+    const int on = getenv("SPU_CHHIST") || getenv("SPU_POLLTRACE") || getenv("SPU_TAGPROBE");
+    g_spu_wrch_slow = on ? 1 : 0;
+}
+
+/* spu_wrch(MFC_Cmd): the same effects, without the channel switch. */
+void spu_mfc_cmd(spu_context* ctx, uint32_t cmd)
+{
+    if (spu_mfc_atomic(ctx, cmd)) return;
+    mfc_submit(mfc_for(ctx), ctx, cmd);
+}
+
+/* spu_wrch(MFC_WrTagUpdate) with SPU_TAGPROBE off: the same effects. */
+void spu_mfc_tag_update(spu_context* ctx, uint32_t v)
+{
+    ctx->mfc_tag_status = mfc_tag_wait(mfc_for(ctx), ctx->mfc_tag_mask, v);
+    if (v != 0 && (ctx->event_mask & 0x1u)) {
+        SPU_EVENT_SET(ctx, 0x1u);
+        spu_ch_wake(ctx);
+    }
+}
+
 void spu_wrch(spu_context* ctx, uint32_t channel, u128 value)
 {
+    spu_ch_diag_init();
     /* SPU_CHHIST=1: which channels a job actually touches, and how often. A
      * worker that never issues an MFC command is either not being handed its
      * work descriptor or is waiting on a channel we never satisfy; the channel
@@ -1233,6 +1270,7 @@ static void spu_ch_wait(spu_context* ctx, uint32_t channel, const char* op)
  * ===========================================================================*/
 u128 spu_rdch(spu_context* ctx, uint32_t channel)
 {
+    spu_ch_diag_init();
     spu_honour_stop_request(ctx);
     { static int s_c = -1; if (s_c < 0) { const char* e = getenv("SPU_CHHIST"); s_c = e ? (atoi(e) > 0 ? atoi(e) : 2000) : 0; }
       if (s_c) { static unsigned long long r[128]; static unsigned long long n;
@@ -1326,6 +1364,7 @@ u128 spu_rdch(spu_context* ctx, uint32_t channel)
  * ===========================================================================*/
 uint32_t spu_rchcnt(spu_context* ctx, uint32_t channel)
 {
+    spu_ch_diag_init();
     spu_honour_stop_request(ctx);
     /* SPU_WHOPOLLS=<n>: rchcnt/park accounting PER SPU, printed every n calls
      * with the pc each SPU is sitting at.

@@ -195,8 +195,16 @@ option(PS3RECOMP_SPU_FAST_FLOAT "Native, not SPU-exact, float arithmetic in lift
 # PS3RECOMP_SPU_FAST_LS: lifted SPU code reads/writes local store with one vector load/store and
 # shuffle per quadword, and without the local-store diagnostics (SPU_LS_WATCH etc.).
 option(PS3RECOMP_SPU_FAST_LS "Vector local-store access, no LS diagnostics, in lifted SPU code" OFF)
+# PS3RECOMP_SPU_WRCH_INLINE: lifted SPU code writes the MFC parameter channels (MFC_LSA, EAH, EAL,
+# Size, TagID) in place instead of calling spu_wrch, and calls straight into the MFC command and
+# tag-update handlers (spu_wrch_fast/spu_rdch_fast, runtime/spu/spu_helpers.h). Same effects; the
+# out-of-line calls come back by themselves while SPU_CHHIST, SPU_POLLTRACE or SPU_TAGPROBE is set.
+option(PS3RECOMP_SPU_WRCH_INLINE "Inline MFC channel writes in lifted SPU code" ON)
 if(SPU_SOURCES)
     set(_spu_defs SPU_USE_DISPATCH_MT)
+    if(PS3RECOMP_SPU_WRCH_INLINE)
+        list(APPEND _spu_defs SPU_WRCH_INLINE)
+    endif()
     if(PS3RECOMP_SPU_FAST_FLOAT)
         list(APPEND _spu_defs SPU_FAST_FLOAT)
     endif()

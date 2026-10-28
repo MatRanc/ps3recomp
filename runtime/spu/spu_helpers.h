@@ -2503,4 +2503,62 @@ static inline u128 spu_fsmh(u128 a) { return spu_fsmh_ref(a); }
 static inline u128 spu_fsmb(u128 a) { return spu_fsmb_ref(a); }
 #endif
 
+/* Inline SPU channel ops. The MFC parameter channels a DMA writes before its
+ * command (MFC_LSA, MFC_EAH, MFC_EAL, MFC_Size, MFC_TagID) and MFC_WrTagMask
+ * only latch a value into the context: done in place where the channel is a
+ * constant, which it is in lifted code, instead of a call into spu_wrch per
+ * parameter (five per DMA). MFC_Cmd and MFC_WrTagUpdate call straight into
+ * spu_mfc_cmd / spu_mfc_tag_update (spu_channels.c), past spu_wrch's channel
+ * switch, and MFC_RdTagStat reads the status the last MFC_WrTagUpdate latched.
+ * Each has exactly spu_wrch/spu_rdch's effects. The out-of-line call stays
+ * while a channel diagnostic is on (g_spu_wrch_slow, -1 until the first full
+ * channel call has read the environment), and an MFC_RdTagStat with a stop
+ * requested takes it to halt there.
+ * Opt-in: SPU_WRCH_INLINE, defined for the lifted sources (the project
+ * template's PS3RECOMP_SPU_WRCH_INLINE). A harness that defines its own
+ * spu_wrch keeps its calls; spu_channels.c defines SPU_WRCH_PLAIN.
+ * Adapted from the inFAMOUS 2 port (github.com/ThiagoFraga761/infamous2-pc,
+ * MIT, the infamous2-recomp contributors). */
+#if defined(SPU_WRCH_INLINE) && !defined(SPU_WRCH_PLAIN) && (defined(__GNUC__) || defined(__clang__))
+#ifdef __cplusplus
+extern "C" {
+#endif
+void spu_wrch(spu_context* ctx, uint32_t channel, u128 value);
+u128 spu_rdch(spu_context* ctx, uint32_t channel);
+void spu_mfc_cmd(spu_context* ctx, uint32_t cmd);
+void spu_mfc_tag_update(spu_context* ctx, uint32_t v);
+extern volatile int g_spu_wrch_slow;
+#ifdef __cplusplus
+}
+#endif
+static inline __attribute__((always_inline)) void spu_wrch_fast(spu_context* ctx, uint32_t ch, u128 v)
+{
+    if (__builtin_constant_p(ch) &&
+        (ch == MFC_LSA || ch == MFC_EAH || ch == MFC_EAL || ch == MFC_Size || ch == MFC_TagID ||
+         ch == MFC_WrTagMask || ch == MFC_Cmd || ch == MFC_WrTagUpdate) &&
+        __builtin_expect(g_spu_wrch_slow == 0, 1)) {
+        const uint32_t x = v._u32[0];   /* channel writes use the preferred slot */
+        if (ch == MFC_LSA)            ctx->mfc_lsa = x;
+        else if (ch == MFC_EAH)       ctx->mfc_eah = x;
+        else if (ch == MFC_EAL)       ctx->mfc_eal = x;
+        else if (ch == MFC_Size)      ctx->mfc_size = x;
+        else if (ch == MFC_TagID)     ctx->mfc_tag = x & 0x1F;
+        else if (ch == MFC_WrTagMask) ctx->mfc_tag_mask = x;
+        else if (ch == MFC_Cmd)       spu_mfc_cmd(ctx, x);
+        else                          spu_mfc_tag_update(ctx, x);
+        return;
+    }
+    spu_wrch(ctx, ch, v);
+}
+#define spu_wrch(ctx, ch, v) spu_wrch_fast((ctx), (ch), (v))
+static inline __attribute__((always_inline)) u128 spu_rdch_fast(spu_context* ctx, uint32_t ch)
+{
+    if (__builtin_constant_p(ch) && ch == MFC_RdTagStat &&
+        __builtin_expect(g_spu_wrch_slow == 0 && !ctx->stop_request, 1))
+        return spu_make_preferred_u32(ctx->mfc_tag_status);
+    return spu_rdch(ctx, ch);
+}
+#define spu_rdch(ctx, ch) spu_rdch_fast((ctx), (ch))
+#endif
+
 #endif /* SPU_HELPERS_H */
