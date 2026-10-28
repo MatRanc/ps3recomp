@@ -130,6 +130,17 @@ jobs:
             -o /tmp/test_spu_int_x86_sse41 runtime/spu/tests/test_spu_int_x86.c -lm
           /tmp/test_spu_int_x86_sse41
 
+      # The insertion controls (cbd/chd/cwd/cdd and the x forms) against the helpers they
+      # replaced and the ISA's definition, every position, scalar and SSE4.1.
+      - name: Run the SPU insertion-control test (scalar, SSE4.1)
+        run: |
+          for m in "" -msse4.1; do
+            ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} \
+              -std=gnu17 -O2 $m -I include -I runtime/spu \
+              -o /tmp/test_spu_insertion_controls runtime/spu/tests/test_spu_insertion_controls.c -lm
+            /tmp/test_spu_insertion_controls
+          done
+
       # runtime/spu/tests/test_spu_int_neon.c covers the rest of the per-lane integer ops.
       - name: Run the SPU per-lane integer helper test (scalar, SSE4.1, AVX2)
         run: |

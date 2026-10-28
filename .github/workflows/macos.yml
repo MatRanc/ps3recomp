@@ -96,6 +96,13 @@ jobs:
                 -o /tmp/test_spu_int_neon runtime/spu/tests/test_spu_int_neon.c -lm
           /tmp/test_spu_int_neon
 
+      # cbd/chd/cwd/cdd and the x forms against the helpers they replaced and the ISA.
+      - name: Run the SPU insertion-control test (NEON)
+        run: |
+          clang -std=gnu17 -O2 -I include -I runtime/spu \
+                -o /tmp/test_spu_insertion_controls runtime/spu/tests/test_spu_insertion_controls.c -lm
+          /tmp/test_spu_insertion_controls
+
       - name: Run the SPU float fast-path test (NEON)
         run: |
           clang -std=gnu17 -O2 -I include -I runtime/spu \

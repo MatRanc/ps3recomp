@@ -1818,28 +1818,77 @@ static inline u128 spu_cdd_pos(int pos) {
     r._u32[w] = 0x00010203u; r._u32[w + 1] = 0x04050607u;
     return r;
 }
-static inline u128 spu_cbd(u128 a, int i7){ return spu_cbd_pos((int)a._u32[0]+i7); }
-static inline u128 spu_chd(u128 a, int i7){ return spu_chd_pos((int)a._u32[0]+i7); }
-static inline u128 spu_cwd_ref(u128 a, int i7){ return spu_cwd_pos((int)a._u32[0]+i7); }
+/* The scalar forms patch the insert into the base pattern in memory, and the vector load of the
+ * result then waits on those narrow stores (no store forwarding). They stay as spu_c*_ref,
+ * which tests/test_spu_insertion_controls.c compares the vector forms against. The address
+ * adds wrap modulo 2^32, as the SPU's do; only its low four bits are used. */
+static inline u128 spu_cbd_ref(u128 a, int i7){ return spu_cbd_pos((int)(a._u32[0] + (uint32_t)i7)); }
+static inline u128 spu_chd_ref(u128 a, int i7){ return spu_chd_pos((int)(a._u32[0] + (uint32_t)i7)); }
+static inline u128 spu_cwd_ref(u128 a, int i7){ return spu_cwd_pos((int)(a._u32[0] + (uint32_t)i7)); }
+static inline u128 spu_cdd_ref(u128 a, int i7){ return spu_cdd_pos((int)(a._u32[0] + (uint32_t)i7)); }
+static inline u128 spu_cbx_ref(u128 a, u128 b){ return spu_cbd_pos((int)(a._u32[0] + b._u32[0])); }
+static inline u128 spu_chx_ref(u128 a, u128 b){ return spu_chd_pos((int)(a._u32[0] + b._u32[0])); }
+static inline u128 spu_cwx_ref(u128 a, u128 b){ return spu_cwd_pos((int)(a._u32[0] + b._u32[0])); }
+static inline u128 spu_cdx_ref(u128 a, u128 b){ return spu_cdd_pos((int)(a._u32[0] + b._u32[0])); }
 #if defined(__ARM_NEON) && !defined(SPU_SCALAR_HELPERS) && !defined(SPU_SCALAR_INT)
 static inline u128 spu_cwd(u128 a, int i7) {
     static const uint32_t base[4] = {0x10111213u, 0x14151617u, 0x18191A1Bu, 0x1C1D1E1Fu}, lane[4] = {0, 1, 2, 3};
     uint32x4_t m = vceqq_u32(vld1q_u32(lane), vdupq_n_u32((((uint32_t)a._u32[0] + (uint32_t)i7) >> 2) & 3));
     return spu__st(vbslq_u32(m, vdupq_n_u32(0x00010203u), vld1q_u32(base)));
 }
+static inline u128 spu_cbd(u128 a, int i7){ return spu_cbd_ref(a, i7); }
+static inline u128 spu_chd(u128 a, int i7){ return spu_chd_ref(a, i7); }
+static inline u128 spu_cdd(u128 a, int i7){ return spu_cdd_ref(a, i7); }
+static inline u128 spu_cbx(u128 a, u128 b){ return spu_cbx_ref(a, b); }
+static inline u128 spu_chx(u128 a, u128 b){ return spu_chx_ref(a, b); }
+static inline u128 spu_cwx(u128 a, u128 b){ return spu_cwx_ref(a, b); }
+static inline u128 spu_cdx(u128 a, u128 b){ return spu_cdx_ref(a, b); }
 #elif SPU_X86
-static inline u128 spu_cwd(u128 a, int i7) {
-    const __m128i m = _mm_cmpeq_epi32(_mm_setr_epi32(0, 1, 2, 3), _mm_set1_epi32((int)((((uint32_t)a._u32[0] + (uint32_t)i7) >> 2) & 3)));
-    return spu__xs(_mm_blendv_epi8(_mm_setr_epi32(0x10111213, 0x14151617, 0x18191A1B, 0x1C1D1E1F), _mm_set1_epi32(0x00010203), m));
+/* The control built in a register: the base pattern is a constant and the insert one blend
+ * under a lane-compare mask. Host byte h holds SPU byte h ^ 3 (SPU_W), so the inserted SPU
+ * byte p is host byte p ^ 3, SPU halfword p >> 1 is host halfword (p >> 1) ^ 1, and words and
+ * doublewords keep their lanes. In inFAMOUS 2's busiest SPU job the store-forwarding stall
+ * of the scalar forms was ~17% of its hottest function.
+ * Adapted from the inFAMOUS 2 port (github.com/ThiagoFraga761/infamous2-pc, MIT, the
+ * infamous2-recomp contributors). */
+SPU__XI __m128i spu__xctl_base(void) { return _mm_setr_epi32(0x10111213, 0x14151617, 0x18191A1B, 0x1C1D1E1F); }
+SPU__XI u128 spu__xcb(uint32_t pos) {
+    const __m128i m = _mm_cmpeq_epi8(_mm_setr_epi8(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15),
+                                     _mm_set1_epi8((char)((pos & 15u) ^ 3u)));
+    return spu__xs(_mm_blendv_epi8(spu__xctl_base(), _mm_set1_epi8(0x03), m));
 }
+SPU__XI u128 spu__xch(uint32_t pos) {
+    const __m128i m = _mm_cmpeq_epi16(_mm_setr_epi16(0, 1, 2, 3, 4, 5, 6, 7),
+                                      _mm_set1_epi16((short)(((pos & 15u) >> 1) ^ 1u)));
+    return spu__xs(_mm_blendv_epi8(spu__xctl_base(), _mm_set1_epi16(0x0203), m));
+}
+SPU__XI u128 spu__xcw(uint32_t pos) {
+    const __m128i m = _mm_cmpeq_epi32(_mm_setr_epi32(0, 1, 2, 3), _mm_set1_epi32((int)((pos >> 2) & 3u)));
+    return spu__xs(_mm_blendv_epi8(spu__xctl_base(), _mm_set1_epi32(0x00010203), m));
+}
+SPU__XI u128 spu__xcd(uint32_t pos) {
+    const __m128i m = _mm_cmpeq_epi32(_mm_setr_epi32(0, 0, 1, 1), _mm_set1_epi32((int)((pos >> 3) & 1u)));
+    return spu__xs(_mm_blendv_epi8(spu__xctl_base(),
+                                   _mm_setr_epi32(0x00010203, 0x04050607, 0x00010203, 0x04050607), m));
+}
+static inline u128 spu_cbd(u128 a, int i7){ return spu__xcb(a._u32[0] + (uint32_t)i7); }
+static inline u128 spu_chd(u128 a, int i7){ return spu__xch(a._u32[0] + (uint32_t)i7); }
+static inline u128 spu_cwd(u128 a, int i7){ return spu__xcw(a._u32[0] + (uint32_t)i7); }
+static inline u128 spu_cdd(u128 a, int i7){ return spu__xcd(a._u32[0] + (uint32_t)i7); }
+static inline u128 spu_cbx(u128 a, u128 b){ return spu__xcb(a._u32[0] + b._u32[0]); }
+static inline u128 spu_chx(u128 a, u128 b){ return spu__xch(a._u32[0] + b._u32[0]); }
+static inline u128 spu_cwx(u128 a, u128 b){ return spu__xcw(a._u32[0] + b._u32[0]); }
+static inline u128 spu_cdx(u128 a, u128 b){ return spu__xcd(a._u32[0] + b._u32[0]); }
 #else
-static inline u128 spu_cwd(u128 a, int i7) { return spu_cwd_ref(a, i7); }
+static inline u128 spu_cbd(u128 a, int i7){ return spu_cbd_ref(a, i7); }
+static inline u128 spu_chd(u128 a, int i7){ return spu_chd_ref(a, i7); }
+static inline u128 spu_cwd(u128 a, int i7){ return spu_cwd_ref(a, i7); }
+static inline u128 spu_cdd(u128 a, int i7){ return spu_cdd_ref(a, i7); }
+static inline u128 spu_cbx(u128 a, u128 b){ return spu_cbx_ref(a, b); }
+static inline u128 spu_chx(u128 a, u128 b){ return spu_chx_ref(a, b); }
+static inline u128 spu_cwx(u128 a, u128 b){ return spu_cwx_ref(a, b); }
+static inline u128 spu_cdx(u128 a, u128 b){ return spu_cdx_ref(a, b); }
 #endif
-static inline u128 spu_cdd(u128 a, int i7){ return spu_cdd_pos((int)a._u32[0]+i7); }
-static inline u128 spu_cbx(u128 a, u128 b){ return spu_cbd_pos((int)(a._u32[0]+b._u32[0])); }
-static inline u128 spu_chx(u128 a, u128 b){ return spu_chd_pos((int)(a._u32[0]+b._u32[0])); }
-static inline u128 spu_cwx(u128 a, u128 b){ return spu_cwd_pos((int)(a._u32[0]+b._u32[0])); }
-static inline u128 spu_cdx(u128 a, u128 b){ return spu_cdd_pos((int)(a._u32[0]+b._u32[0])); }
 
 /* ---- Phase 3: rotate-and-mask family ---- */
 static inline u128 spu_rotm_ref(u128 a, u128 b)   { u128 r; for(int i=0;i<4;i++){ uint32_t sh=(0-b._u32[i])&0x3F; r._u32[i]=(sh>31)?0:(a._u32[i]>>sh); } return r; }
