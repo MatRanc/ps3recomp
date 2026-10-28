@@ -989,6 +989,17 @@ void spu_wrch(spu_context* ctx, uint32_t channel, u128 value)
     uint32_t v = value._u32[0];  /* channel writes use the preferred slot */
 
     if (channel_is_mfc(channel)) {
+        /* The parameter channels only latch a value (as in mfc_channel_write):
+         * five of them per DMA, so they skip the engine lookup. */
+        switch (channel) {
+        case MFC_LSA:       ctx->mfc_lsa = v;        return;
+        case MFC_EAH:       ctx->mfc_eah = v;        return;
+        case MFC_EAL:       ctx->mfc_eal = v;        return;
+        case MFC_Size:      ctx->mfc_size = v;       return;
+        case MFC_TagID:     ctx->mfc_tag = v & 0x1F; return;
+        case MFC_WrTagMask: ctx->mfc_tag_mask = v;   return;
+        default: break;
+        }
         /* Atomic line ops (GETLLAR/PUTLLC/...) need real reservation semantics,
          * not the plain GET/PUT the DMA engine would do. */
         if (channel == MFC_Cmd && spu_mfc_atomic(ctx, v))
@@ -2600,7 +2611,12 @@ static int spu_smc_microstep(spu_context* ctx)
     return 0;
 }
 
-void spu_indirect_branch(spu_context* ctx)
+/* The full resolver. spu_indirect_branch below runs its common case. */
+#if defined(_MSC_VER)
+static __declspec(noinline) void spu_indirect_branch_slow(spu_context* ctx)
+#else
+static __attribute__((noinline)) void spu_indirect_branch_slow(spu_context* ctx)
+#endif
 {
     /* Real SPU bi/bisl mask the target to the 256 KB local store; the high bits
      * of a computed pointer (e.g. a packed handle like 0x7a028803) are ignored.
@@ -3215,6 +3231,78 @@ void spu_indirect_branch(spu_context* ctx)
             ctx->ls[0x2d4ec],ctx->ls[0x2d4ed],ctx->ls[0x2d4ee],ctx->ls[0x2d4ef]); }
     } }
     ctx->status = SPU_STATUS_STOPPED_BY_HALT;
+}
+
+/* Indirect-branch fast path. Every lifted indirect branch and every SPU_RET at
+ * depth 0 comes here, and the full resolver pays for its rare cases on each
+ * one. This takes only the case where the resolver would do nothing but look
+ * the target up and call it, decided by the tests the resolver makes, and
+ * leaves every other case to it with ctx untouched:
+ *  - an interrupt register restore pending (irq_saved);
+ *  - the policy-module service addresses, the taskset syscall address, the
+ *    resolver-only image, LS 0xA00 (policy entry trace);
+ *  - a task-region branch that would unwind to the driver (the longjmp case);
+ *  - the job-return address, a lookup miss, or any resolver diagnostic on.
+ * WWS job-module overlays (id >= 200) are taken here too: their resolver
+ * hooks are all diagnostics. Resolution order and the resident_task update
+ * are the resolver's. SPU_IB_FAST=0: always the full resolver.
+ * Adapted from the inFAMOUS 2 port (github.com/ThiagoFraga761/infamous2-pc,
+ * MIT, the infamous2-recomp contributors). */
+static int s_ib_slow = -1;
+#if defined(_MSC_VER)
+static __declspec(noinline) int spu_ib_slow_init(void)
+#else
+static __attribute__((noinline, cold)) int spu_ib_slow_init(void)
+#endif
+{
+    const char* f = getenv("SPU_IB_FAST");
+    const int on = (f && f[0] == '0') ||
+                   getenv("SPU_IBCOV") || getenv("SPU_POLLTRACE") || getenv("YDKJ_POLTRACE") ||
+                   getenv("SPU_JOBTRACE") || getenv("SPU_JOBEXEC") || getenv("LBP_HLE_JOBDONE");
+    __atomic_store_n(&s_ib_slow, on, __ATOMIC_RELAXED);
+    return on;
+}
+
+void spu_indirect_branch(spu_context* ctx)
+{
+    const uint32_t pc = ctx->pc & SPU_LS_MASK;
+    int slow = __atomic_load_n(&s_ib_slow, __ATOMIC_RELAXED);
+    if (__builtin_expect(slow < 0, 0)) slow = spu_ib_slow_init();
+    if (slow || ctx->irq_saved ||
+        pc == SPURS_TASKSET_PM_SYSCALL_LS || pc == 0xA00u ||
+        ctx->image_id == SPU_RESOLVER_ONLY_IMAGE_ID ||
+        (ctx->policy_mode && (pc == SPURS_PM_EXIT_TO_KERNEL_LS || pc == SPURS_PM_SELECT_WORKLOAD_LS)) ||
+        (!ctx->policy_mode && pc == SPU_JOB_RETURN_LS))
+        goto slow_path;
+    {
+        const int old_task = ctx->resident_task;
+        int rt = 0;
+        if (pc >= SPU_TASKSET_TASK_LO) {
+            rt = old_task;
+            int ti = s_task_elf_count ? spu_taskset_resident_image(ctx) : 0;
+            if (ti && !rt && ctx->host_depth && s_spu_halt_armed && !ctx->policy_mode)
+                goto slow_path;                       /* unwinds to the driver */
+            if (!ti && !rt && s_task_entry_count) ti = spu_taskset_task_image(pc);
+            if (ti) rt = ti;
+        }
+        ctx->resident_task = rt;                      /* the lookup reads it */
+        spu_fn fn = spu_lifted_lookup(ctx, pc);
+        if (!fn) { ctx->resident_task = old_task; goto slow_path; }
+        ctx->pc = pc;
+        spu_check_stack_reset(ctx, fn);
+#if defined(__clang__)
+        __attribute__((musttail)) return fn(ctx);
+#else
+        fn(ctx);
+        return;
+#endif
+    }
+slow_path:;
+#if defined(__clang__)
+    __attribute__((musttail)) return spu_indirect_branch_slow(ctx);
+#else
+    spu_indirect_branch_slow(ctx);
+#endif
 }
 
 /* ===========================================================================
