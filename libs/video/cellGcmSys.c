@@ -612,7 +612,11 @@ u32 cellGcmSetupContext(u32 ctx_out_addr, u32 cmdSize, u32 ioSize, u32 ioAddress
     u32 cdata  = galloc ? galloc(16, 16) : 0;
     if (cdata && gwrite32) {
         gwrite32(cdata + 0x0, cmdbuf);              /* begin   */
-        gwrite32(cdata + 0x4, cmdbuf + cmdSize);    /* end     */
+        /* The last word is the wrap JUMP's slot, as in the SDK: a title that
+         * writes its JUMP-to-begin AT `end` (MLB 16) otherwise puts it in the
+         * memory after the ring, and when that is overwritten the walker runs
+         * on into data. */
+        gwrite32(cdata + 0x4, cmdbuf + cmdSize - 4); /* end     */
         gwrite32(cdata + 0x8, cmdbuf);              /* current */
         /* Command-buffer-full callback: a guest OPD {func, toc} routed to
          * hle_gcm_callback -> cellGcm_fifo_recycle. Without a real callback the
@@ -1739,6 +1743,30 @@ static void gcm_fifo_dump_around(u32 getoff)
 }
 
 
+static u32 s_ring_io_end = 0xFFFFFFFFu;   /* IO offset of the title ring's `end`, for GCM_RINGDBG */
+static int gcm_ringdbg(void)
+{
+    static int d = -1;
+    if (d < 0) d = getenv("GCM_RINGDBG") ? 1 : 0;
+    return d;
+}
+static void gcm_ring_overrun_log(u32 from, u32 put)
+{
+    static int n = 0;
+    if (!PS3_LOG_FIRST(n, 30)) return;
+    extern unsigned long long ps3_ms_now(void);
+    fprintf(stderr, "[ringx] %llums walker stepped past ring end 0x%08X from 0x%08X put=0x%08X; last branches:",
+            ps3_ms_now(), s_ring_io_end, from, put);
+    for (u32 t = 4; t >= 1; t--) { u32 q = (s_cf_i - t) % 8; fprintf(stderr, " %08X@%08X", s_cf_w[q], s_cf_off[q]); }
+    { const u32 c = s_gcm_ctx_out_ea ? vm_read32(s_gcm_ctx_out_ea) : 0;
+      if (c) fprintf(stderr, " ctx=%08X begin=%08X end=%08X cur=%08X cb=%08X(%08X) ours=%08X", c, vm_read32(c), vm_read32(c + 4),
+                     vm_read32(c + 8), vm_read32(c + 12), vm_read32(c + 12) ? vm_read32(vm_read32(c + 12)) : 0, s_gcm_context_ea); }
+    fprintf(stderr, "\n[ringx] tail:");
+    for (u32 io = s_ring_io_end - 0x60u; io < s_ring_io_end + 0x10u; io += 4) {
+        const u32 ea = gcm_io2ea(io); fprintf(stderr, " %08X", ea ? vm_read32(ea) : 0xDEADDEADu); }
+    fprintf(stderr, "\n");
+}
+
 static void gcm_ref_push_at(u32 v, u32 getoff)
 {
     { static int _d = -1; if (_d < 0) _d = getenv("GCM_REFLOG") ? 1 : 0;
@@ -2223,6 +2251,10 @@ static void gcm_rsx_process_fifo_unlocked(void)
      * short of `put` every tick is the signature of a FIFO that can never
      * catch up, and the reason is the whole diagnosis. */
     const char* why = "caught-up";
+    if (gcm_ringdbg() && s_gcm_ctx_out_ea) {
+        const u32 c = vm_read32(s_gcm_ctx_out_ea);
+        if (c) s_ring_io_end = gcm_ea2io(vm_read32(c + 4));
+    }
     while (s_fifo_getoff != put && budget-- > 0) {
         u32 ea = gcm_io2ea(s_fifo_getoff);
         if (!ea) {
@@ -2251,6 +2283,11 @@ static void gcm_rsx_process_fifo_unlocked(void)
             break;
         }
         u32 w = vm_read32(ea);
+        /* GCM_RINGDBG=1: the walker stepped (not branched) past the end of the
+         * title's ring -- whatever it reads there is not commands. */
+        if (gcm_ringdbg() && s_tr_i && s_fifo_getoff > s_ring_io_end && s_fifo_getoff < s_ring_io_end + 0x1000u &&
+            s_tr_off[(s_tr_i - 1) % GCM_TRACE_N] < s_ring_io_end)
+            gcm_ring_overrun_log(s_tr_off[(s_tr_i - 1) % GCM_TRACE_N], put);
         /* Only remember offsets BELOW put -- those are positions in the
          * ring the title is writing. A park in another region is where the
          * walker gave up, not how far it got through the ring. */
@@ -2302,6 +2339,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
             const u32 lim = (put > s_fifo_getoff && put < page_end) ? put : page_end;
             u32 off = s_fifo_getoff + 4u, nea = ea + 4u;
             while (off < lim && budget > 0 && !vm_read32(nea)) { off += 4u; nea += 4u; budget--; }
+            if (gcm_ringdbg() && s_fifo_getoff < s_ring_io_end && off > s_ring_io_end) gcm_ring_overrun_log(s_fifo_getoff, put);
             if (s_fifo_getoff < put) s_last_ring_off = off;
             s_fifo_getoff = off;
             continue;
@@ -2908,7 +2946,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
                 && head_consumed && s_title_overran) {
             u32 io_begin = gcm_ea2io(begin);
             if (io_begin != 0xFFFFFFFFu) {
-                u32 jmp_at = (cur + 4 <= end) ? cur : end - 4;
+                u32 jmp_at = (cur <= end) ? cur : end;   /* `end` is the JUMP's own slot */
                 vm_write32(jmp_at, 0x20000000u | io_begin);   /* JUMP -> begin */
                 vm_write32(ctx + 0x8, begin);                 /* current = begin */
                 vm_write32(GCM_CONTROL_GUEST_ADDR + 0, io_begin);  /* put */
