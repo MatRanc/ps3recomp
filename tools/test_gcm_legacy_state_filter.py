@@ -2,7 +2,8 @@
 """The FIFO walker hands rsx_state only the methods that matter once the draw
 engine runs without a vtable backend (libs/video/tests/test_gcm_legacy_state_filter.c,
 which compiles cellGcmSys.c in).
-Run twice: as shipped, and with RSX_TRACE (argument "trace"), which keeps every method."""
+Run three times: as shipped, with RSX_TRACE (argument "trace") and with PS3RECOMP_FIFO_LEGACY=1
+(argument "legacy"), which both keep every method."""
 import os
 from pathlib import Path
 import subprocess
@@ -21,7 +22,7 @@ with tempfile.TemporaryDirectory(prefix='gcm-legacy-state-filter-') as tmp:
                     '-I' + str(root / 'include'), '-I' + str(root / 'libs/video'),
                     str(root / 'libs/video/tests/test_gcm_legacy_state_filter.c'), *linker,
                     '-o', str(binary)], check=True)
-    for args in ([], ['trace']):
+    for args in ([], ['trace'], ['legacy']):
         result = subprocess.run([str(binary), *args], timeout=30, capture_output=True, text=True)
         print(result.stdout.strip())
         if result.returncode:
