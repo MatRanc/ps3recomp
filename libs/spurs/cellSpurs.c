@@ -1829,11 +1829,23 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
                 if (!pm) continue;
                 u32 signal = vm_read16(ea + SPURS_WKL_SIGNAL1);
                 u32 ready = vm_read8(ea + SPURS_WKL_READY1 + wid);
+                {   /* SPURS_SCHED_TRACE=1 (diagnostic): the ready count, contention cap and activity seen per
+                     * workload, so a title that could use more SPUs at once shows it. */
+                    static int st = -1; static unsigned long long n_seen;
+                    if (st < 0) st = getenv("SPURS_SCHED_TRACE") ? 1 : 0;
+                    if (st && (++n_seen % 4096) == 0)
+                        fprintf(stderr, "[spurs-sched] wid %u ready %u idle %u maxcont %u active %u signal %u sn %u busy:%u%u%u%u%u%u\n",
+                                wid, ready, vm_read8(ea + SPURS_WKL_IDLE2 + wid), maxcont, si->active[wid], (signal >> (15 - wid)) & 1u, sn,
+                                si->slots[0].busy, si->nspus > 1 && si->slots[1].busy, si->nspus > 2 && si->slots[2].busy,
+                                si->nspus > 3 && si->slots[3].busy, si->nspus > 4 && si->slots[4].busy,
+                                si->nspus > 5 && si->slots[5].busy);
+                }
                 /* SPURS_READY_LEVEL=1 (experiment): the ready count is a level -- up to
                  * min(ready, maxContention) SPUs, left for the workload to lower. */
                 static int ready_level = -1;
                 if (ready_level < 0) ready_level = getenv("SPURS_READY_LEVEL") ? 1 : 0;
-                if (ready_level && ready && si->active[wid] >= ready) continue;
+                const u32 idle = vm_read8(ea + SPURS_WKL_IDLE2 + wid);   /* cellSpursRequestIdleSpu */
+                if (ready_level && ready && si->active[wid] >= ready + idle) continue;
                 int kicked = ready || (signal & (0x8000u >> wid));
                 if (kicked) si->idle[wid] = 0;
                 /* SPURS_NO_IDLE_PROBE=1 (experiment): schedule only what real SPURS would --
@@ -3168,10 +3180,25 @@ s32 cellSpursQueuePushBody(u64 queue_ea, u64 data_ea, u32 isBlocking)
  * Misc SPURS surface the title links (logged CELL_OK stubs).
  * =====================================================================*/
 
-s32 cellSpursRequestIdleSpu(u64 spurs_ea)
+/* cellSpursRequestIdleSpu(spurs, wid, count): the workload may also run on up to
+ * `count` SPUs beyond its ready count -- the kernel lets an SPU take it while
+ * ready + idle > contention. WWS job lists use it to spread one list over
+ * several SPUs (each grabs the next job). It used to be a stub that kept
+ * nothing, so every list ran on one SPU. Stored in the instance byte the
+ * kernel reads (SPURS_WKL_IDLE2). */
+s32 cellSpursRequestIdleSpu(u64 spurs_ea, u64 wid64, u64 count64)
 {
+    const u32 wid = (u32)wid64, count = (u32)count64;
+    if (!spurs_ea) return CELL_SPURS_CORE_ERROR_NULL_POINTER;
+    if (wid >= CELL_SPURS_MAX_WORKLOAD) return CELL_SPURS_CORE_ERROR_INVAL;
+    struct SpursInst* si;
+    s32 rc = spurs_api_lock((u32)spurs_ea, &si);
+    if (rc) return rc;
+    vm_write8(si->ea + SPURS_WKL_IDLE2 + wid, (u8)count);
     static int _n = 0;
-    if (PS3_LOG_FIRST(_n, 4)) printf("[cellSpurs] RequestIdleSpu(spurs=0x%08X)\n", (u32)spurs_ea);
+    if (PS3_LOG_FIRST(_n, 8))
+        printf("[cellSpurs] RequestIdleSpu(spurs=0x%08X wid=%u count=%u)\n", (u32)spurs_ea, wid, count);
+    spurs_api_unlock(si);
     return CELL_OK;
 }
 
