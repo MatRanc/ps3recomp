@@ -338,6 +338,20 @@ def compute_bi_r0_jumps(insns, bounds) -> set:
     return jumps
 
 
+def ib_known_entries(insns, func_starts) -> list:
+    """Function entries the image loads with il/ila: the targets
+    --ib-known-targets tests a computed branch against. 0xA70 is the taskset
+    policy syscall, which the resolver intercepts."""
+    consts = set()
+    for i in insns:
+        if i.mnemonic in ("il", "ila"):
+            try:
+                consts.add(int(i.operands.split(",")[-1].strip(), 0))
+            except ValueError:
+                pass
+    return sorted((consts & set(func_starts)) - {0, 0xA70})
+
+
 def merge_chunk_groups(insns, bounds, max_insns, entry_points=()) -> dict:
     """Group contiguous chunks into function-sized runs for --merge-chunks.
 
@@ -529,6 +543,17 @@ class SPULifter:
         # compute_link_returns(). Emitted as `return;` so they compose with the
         # brsl->C-call nesting instead of branching to an unregistered PC.
         self.link_return: set = set()
+        # --ib-known-targets: function entries the image loads with il/ila.
+        self.ib_entries: list = []
+
+    def _ib_known(self, addr: int) -> str:
+        """Direct branches for a computed branch at `addr` to the nearest
+        il/ila-loaded entries, tried before the resolver (SPU_IB_OK). ctx->pc
+        already holds the target."""
+        near = sorted((t for t in self.ib_entries if abs(t - addr) <= 0x800),
+                      key=lambda t: abs(t - addr))[:6]
+        return "".join(f"if (SPU_IB_OK(ctx, 0x{t:X})) {{ SPU_DIRECT(ctx, 0x{t:X}, "
+                       f"{self.prefix}spu_func_{t:08X}); }} " for t in near)
 
     # ------------------------------------------------------------------ #
     def lift_function(self, insns: list[SPUInstruction],
@@ -972,7 +997,7 @@ class SPULifter:
                     return f"{_ied}SPU_RET_REG(ctx, {tgt_reg});"
                 return f"{_ied}SPU_RET(ctx);"
             # Computed indirect tail: set pc + trampoline to the dispatcher, unwind.
-            return (f"{_ied}ctx->pc = {g(tgt_reg)}._u32[0]; "
+            return (f"{_ied}ctx->pc = {g(tgt_reg)}._u32[0]; {self._ib_known(addr)}"
                     f"g_spu_trampoline_fn = spu_indirect_branch; return;")
         # iret: interrupt return -> branch to the saved interrupt PC (SRR0).
         if mn == "iret":
@@ -1019,7 +1044,7 @@ class SPULifter:
                 if tgt_reg != "0":
                     return f"if ({cond}) {{ {_ied}SPU_RET_REG(ctx, {tgt_reg}); }}"
                 return f"if ({cond}) {{ {_ied}SPU_RET(ctx); }}"
-            return (f"if ({cond}) {{ {_ied}ctx->pc = {g(tgt_reg)}._u32[0]; "
+            return (f"if ({cond}) {{ {_ied}ctx->pc = {g(tgt_reg)}._u32[0]; {self._ib_known(addr)}"
                     f"g_spu_trampoline_fn = spu_indirect_branch; return; }}")
 
         # hint-for-branch: pure performance hint, safe to drop
@@ -1186,6 +1211,12 @@ def main() -> None:
                         "by trampolines. Every chunk is still emitted and "
                         "registered on its own for indirect entry, so this only "
                         "changes speed, not which code can be reached.")
+    p.add_argument("--ib-known-targets", action="store_true",
+                   help="At a computed `bi`/`biz`/... test the target register "
+                        "against the few nearby function entries the image loads "
+                        "with il/ila, and branch straight there on a match "
+                        "(SPU_IB_OK, spu_context.h) instead of a resolver pass. "
+                        "For job modules whose inner loops iterate through `bi`.")
     p.add_argument("--max-group-insns", type=int, default=4000,
                    help="Cap on instructions per merged group (keeps clang fast).")
     p.add_argument("--force-indirect", default="",
@@ -1332,6 +1363,8 @@ def main() -> None:
               f"(`bi $rN` where rN is a brsl/bisl link reg): "
               f"{', '.join(f'0x{a:X}' for a in sorted(lifter.link_return))}")
     lifter.func_starts = {s for s, e in bounds}  # for fall-through tail-call chaining
+    if args.ib_known_targets:
+        lifter.ib_entries = ib_known_entries(insns, lifter.func_starts)
     groups = {}
     if args.merge_chunks:
         seeds = {base}

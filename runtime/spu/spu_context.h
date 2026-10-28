@@ -1058,6 +1058,15 @@ void spu_direct_init(void);
     } while (0)
 #endif
 
+/* spu_lifter.py --ib-known-targets: a computed branch (bi/biz/...) whose target
+ * register holds PC, one of the few lifted entries the code loads as constants
+ * nearby, takes SPU_DIRECT (or a goto) instead of a resolver pass -- a guest
+ * loop that iterates through `bi` paid the full resolver every iteration. Not
+ * when the resolver must see the transfer: the enclosing drain's return pc, or
+ * the resume pc of a live interrupt handler (its IRET restore). */
+#define SPU_IB_OK(ctx, PC) (((ctx)->pc & SPU_LS_MASK) == (PC) && g_spu_direct > 0 && \
+        (PC) != (ctx)->drain_ret_pc && !(ctx)->irq_saved)
+
 /* Depth-aware SPU link return (`bi $r0`): host `return` while a matched
  * brsl/bisl frame is live (host_depth>0); at 0 the frame was destroyed (task
  * resume / restack unwind) so dispatch to the link register instead -- faithful
