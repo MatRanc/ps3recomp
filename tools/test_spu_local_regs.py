@@ -167,7 +167,8 @@ def main():
             objs.append(str(o))
         driver = DRIVER.replace('HANDLER', hex(HANDLER)).replace('MARK', hex(MARK))
         failed = []
-        for extra in ([], ['--merge-chunks'], ['--const-bi'], ['--merge-chunks', '--const-bi']):
+        for extra in ([], ['--merge-chunks'], ['--const-bi'], ['--merge-chunks', '--const-bi'],
+                      ['--merge-chunks', '--ib-known-targets', '--ib-goto']):
             results = {}
             for local in (False, True):
                 flags = extra + (['--local-regs'] if local else [])
@@ -181,6 +182,8 @@ def main():
                     assert 'SPU_IB_OK(ctx, 0x14C)' in src, flags          # chunk: direct branch
                     if '--merge-chunks' in flags:
                         assert 'SPU_GOTO_OK(ctx, 0x14C)' in src, flags    # group: goto
+                if '--ib-goto' in flags:
+                    assert 'SPU_GOTO_OK(ctx, 0x14C)) goto loc_0000014C;' in src, flags   # computed bi: goto
                 for name in ('spu_recomp.c', 'spu_recomp.h'):
                     p = out / name
                     p.write_text(p.read_text().replace('../../runtime/spu/', str(SPU) + '/'))

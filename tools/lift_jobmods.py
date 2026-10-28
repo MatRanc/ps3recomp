@@ -353,6 +353,8 @@ def main():
                          "instead of chunks linked by trampolines.")
     ap.add_argument("--ib-known-targets", action="store_true",
                     help="Pass --ib-known-targets to spu_lifter.py.")
+    ap.add_argument("--ib-goto", action="store_true",
+                    help="Pass --ib-goto to spu_lifter.py.")
     ap.add_argument("--const-bi", action="store_true",
                     help="Pass --const-bi to spu_lifter.py.")
     ap.add_argument("--local-regs", action="store_true",
@@ -360,6 +362,8 @@ def main():
     args = ap.parse_args()
     if args.ib_known_targets:
         LIFTER_FLAGS.append("--ib-known-targets")
+    if args.ib_goto:
+        LIFTER_FLAGS.append("--ib-goto")
     if args.const_bi:
         LIFTER_FLAGS.append("--const-bi")
     if args.local_regs:

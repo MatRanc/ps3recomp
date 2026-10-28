@@ -745,13 +745,35 @@ class SPULifter:
         # through the resolver (CONST_BI_UNSAFE + call-return addresses).
         self.const_bi: dict = {}
         self.const_bi_unsafe: set = set()
+        self.ib_goto = False
+
+    def _ib_near(self, addr: int) -> list:
+        return sorted((t for t in self.ib_entries if abs(t - addr) <= 0x800),
+                      key=lambda t: abs(t - addr))[:6]
+
+    def _ib_goto(self, insn, reg: str, func, cond: str = "") -> list:
+        """--ib-goto: a computed branch whose target turns out to be one of the
+        known entries inside this function jumps there with a goto, ahead of
+        the exit, so a loop that iterates through `bi`/`binz` keeps its
+        registers in locals instead of a write-back, a tail call and a reload
+        per iteration. Same guard as a --const-bi goto."""
+        c = f"{cond} && " if cond else ""
+        return [f"if ({c}(ctx->gpr[{reg}]._u32[0] & SPU_LS_MASK) == 0x{t:X} && SPU_GOTO_OK(ctx, 0x{t:X})) "
+                f"goto loc_{t:08X};" for t in self._ib_goto_targets(insn, func.start_addr, func.end_addr)]
+
+    def _ib_goto_targets(self, insn, start: int, end: int) -> list:
+        reg = _bi_target_reg(insn)
+        if not self.ib_goto or reg is None or insn.raw & 0xC0000:   # bie/bid: leave via the hop
+            return []
+        if (reg == "0" and insn.addr not in self.bi_r0_jump) or insn.addr in self.link_return:
+            return []                                               # a return, not a jump
+        return [t for t in self._ib_near(insn.addr) if start <= t < end and t not in CONST_BI_UNSAFE]
 
     def _ib_known(self, addr: int) -> str:
         """Direct branches for a computed branch at `addr` to the nearest
         il/ila-loaded entries, tried before the resolver (SPU_IB_OK). ctx->pc
         already holds the target."""
-        near = sorted((t for t in self.ib_entries if abs(t - addr) <= 0x800),
-                      key=lambda t: abs(t - addr))[:6]
+        near = self._ib_near(addr)
         return "".join(f"if (SPU_IB_OK(ctx, 0x{t:X})) {{ SPU_DIRECT(ctx, 0x{t:X}, "
                        f"{self.prefix}spu_func_{t:08X}); }} " for t in near)
 
@@ -771,6 +793,7 @@ class SPULifter:
             ct = self._const_bi_goto(insn, start, end)
             if ct is not None:
                 internal.add(ct)
+            internal.update(self._ib_goto_targets(insn, start, end))
 
         # Chunks merged into this function (--merge-chunks) are otherwise entered
         # through the drain loop, which delivers a pending SPU interrupt before
@@ -1217,8 +1240,9 @@ class SPULifter:
                             f"SPU_DIRECT(ctx, 0x{ct:X}, {self.prefix}spu_func_{ct:08X}); }} "
                             f"g_spu_trampoline_fn = spu_indirect_branch; return;")
             # Computed indirect tail: set pc + trampoline to the dispatcher, unwind.
-            return (f"{_ied}ctx->pc = {g(tgt_reg)}._u32[0]; {self._ib_known(addr)}"
-                    f"g_spu_trampoline_fn = spu_indirect_branch; return;")
+            return "\n".join(self._ib_goto(insn, tgt_reg, func) + [
+                f"{_ied}ctx->pc = {g(tgt_reg)}._u32[0]; {self._ib_known(addr)}"
+                f"g_spu_trampoline_fn = spu_indirect_branch; return;"])
         # iret: interrupt return -> branch to the saved interrupt PC (SRR0).
         if mn == "iret":
             return (f"{_ied}ctx->pc = ctx->srr0; "
@@ -1264,8 +1288,9 @@ class SPULifter:
                 if tgt_reg != "0":
                     return f"if ({cond}) {{ {_ied}SPU_RET_REG(ctx, {tgt_reg}); }}"
                 return f"if ({cond}) {{ {_ied}SPU_RET(ctx); }}"
-            return (f"if ({cond}) {{ {_ied}ctx->pc = {g(tgt_reg)}._u32[0]; {self._ib_known(addr)}"
-                    f"g_spu_trampoline_fn = spu_indirect_branch; return; }}")
+            return "\n".join(self._ib_goto(insn, tgt_reg, func, cond) + [
+                f"if ({cond}) {{ {_ied}ctx->pc = {g(tgt_reg)}._u32[0]; {self._ib_known(addr)}"
+                f"g_spu_trampoline_fn = spu_indirect_branch; return; }}"])
 
         # hint-for-branch: pure performance hint, safe to drop
         if mn in ("hbr", "hbra", "hbrr"):
@@ -1452,6 +1477,10 @@ def main() -> None:
                         "with il/ila, and branch straight there on a match "
                         "(SPU_IB_OK, spu_context.h) instead of a resolver pass. "
                         "For job modules whose inner loops iterate through `bi`.")
+    p.add_argument("--ib-goto", action="store_true",
+                   help="With --ib-known-targets: a known target inside the "
+                        "current function is reached with a goto (registers stay "
+                        "in --local-regs locals) instead of a tail call.")
     p.add_argument("--const-bi", action="store_true",
                    help="Branch directly at a `bi $rN` whose rN was just loaded "
                         "with il/ila: a goto for a forward target inside the "
@@ -1611,6 +1640,7 @@ def main() -> None:
     lifter.func_starts = {s for s, e in bounds}  # for fall-through tail-call chaining
     if args.ib_known_targets:
         lifter.ib_entries = ib_known_entries(insns, lifter.func_starts)
+        lifter.ib_goto = args.ib_goto
     if args.const_bi:
         lifter.const_bi = compute_const_bi_targets(insns, bounds)
         lifter.const_bi_unsafe = CONST_BI_UNSAFE | {
