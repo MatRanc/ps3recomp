@@ -1324,7 +1324,7 @@ class SPULifter:
         if insn.mnemonic != "bi":
             return None
         ct = self.const_bi.get(insn.addr)
-        if ct is None or ct == 0 or not (start <= ct < end) or ct <= insn.addr:
+        if ct is None or ct == 0 or not (start <= ct < end) or ct <= insn.addr or ct in self.const_bi_unsafe:
             return None
         if insn.addr in self.link_return or \
                 (_bi_target_reg(insn) == "0" and insn.addr not in self.bi_r0_jump):
