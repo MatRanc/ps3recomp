@@ -51,6 +51,14 @@ int main(void)
     assert(vm_read8(0x1000+SPURS_WKL_MAXCONT)==3);
     puts("SPURS maxContention above 8 clamps instead of wrapping PASS");
 
+    /* RequestIdleSpu on a slot that is not in use must fail and leave it alone. */
+    assert((u32)cellSpursRequestIdleSpu(0x1000,5,2)==CELL_SPURS_CORE_ERROR_SRCH);
+    assert(vm_read8(0x1000+SPURS_WKL_IDLE2+5)==0);
+    assert((u32)cellSpursRequestIdleSpu(0x1000,16,2)==CELL_SPURS_CORE_ERROR_INVAL);
+    assert(cellSpursRequestIdleSpu(0x1000,0,2)==0);
+    assert(vm_read8(0x1000+SPURS_WKL_IDLE2)==2);
+    puts("SPURS RequestIdleSpu rejects a workload slot that is not in use PASS");
+
     atomic_store(&gate,1);
     finalize(0x1000);
     free(vm_base);return 0;

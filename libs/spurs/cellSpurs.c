@@ -3204,6 +3204,9 @@ s32 cellSpursRequestIdleSpu(u64 spurs_ea, u64 wid64, u64 count64)
     struct SpursInst* si;
     s32 rc = spurs_api_lock((u32)spurs_ea, &si);
     if (rc) return rc;
+    if (!s_workloads[wid].in_use || s_workloads[wid].spurs_ea != si->ea) {
+        spurs_api_unlock(si); return CELL_SPURS_CORE_ERROR_SRCH;   /* same as SetMaxContention */
+    }
     vm_write8(si->ea + SPURS_WKL_IDLE2 + wid, (u8)count);
     static int _n = 0;
     if (PS3_LOG_FIRST(_n, 8))
