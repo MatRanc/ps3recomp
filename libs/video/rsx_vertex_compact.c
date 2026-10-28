@@ -351,7 +351,12 @@ int rsx_vertex_fetch_many(
         const rsx_vertex_fetch_attr* fetch = &plan->attr[attr];
         const u8* base = fetch->stable_base;
         const u32 type = fetch->desc.type;
-        if (!type || !fetch->desc.size || !base ||
+        if (!type || !fetch->desc.size) {   /* no array: every vertex reads the default */
+            for (u32 i = 0; i < count; i++)
+                memcpy(out + (size_t)i * stride + slot * 16u, fetch->default_value, 16);
+            continue;
+        }
+        if (!base ||
             type < RSX_VTX_TYPE_SNORM16 || type > RSX_VTX_TYPE_UINT8) {
             for (u32 i = 0; i < count; i++)
                 if (!rsx_vertex_fetch_attr_value(plan, attr, &refs[i],
@@ -415,6 +420,17 @@ int rsx_vertex_remap_build(
     *unique_count = count;
     if (!count)
         return 1;
+    /* A draw_arrays or an ascending index run: every reference is already
+     * unique, so skip the hash. No caller reads the table unless the unique
+     * count came back smaller. */
+    {
+        u32 i = 1;
+        while (i < count && refs[i].base_index == refs[0].base_index &&
+               refs[i].vertex_id == refs[i - 1].vertex_id + 1u)
+            i++;
+        if (i == count)
+            return 1;
+    }
 
     if (count > remap->occurrence_capacity) {
         u32* occurrences = (u32*)realloc(
