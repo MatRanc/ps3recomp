@@ -194,6 +194,153 @@ def _chan(token: str) -> str:
     return token
 
 # ---------------------------------------------------------------------------
+# Register localization (--local-regs)
+# ---------------------------------------------------------------------------
+# Ported from the inFAMOUS 2 port's ps3recomp patch
+# (github.com/ThiagoFraga761/infamous2-pc, MIT, the infamous2-recomp
+# contributors).
+#
+# Every lifted statement reads and writes the guest registers in ctx->gpr[],
+# and each local-store write (a store through a may_alias pointer) makes the
+# compiler reload every register it holds, so each value reaches its next use
+# through memory. With --local-regs a function's registers live in locals
+# between the points where something else can look at ctx: a register is
+# written back before and reloaded after any statement that passes ctx to
+# anything but the local-store accessors, and written back before every exit.
+# Those statements run unchanged against ctx->gpr, so they need no knowledge of
+# what each callee (spu_drain_call, the interrupt save/restore, a channel op)
+# reads or writes.
+_GPR_RE = re.compile(r"ctx->gpr\[(\d+)\]")
+_GPR_WRITE_RE = re.compile(
+    r"ctx->gpr\[(\d+)\](?:\._\w+\[\d+\])?\s*(?:[-+*/|&^%]|<<|>>)?=(?!=)|&ctx->gpr\[(\d+)\]")
+# ctx accesses that never touch ctx->gpr: the LS accessors, the MFC parameter
+# channel writes (mfc_channel_write only latches ctx->mfc_*), and the reads and
+# int_enable stores of the interrupt checks a goto replaces a drain hop with.
+_SAFE_CTX_RE = re.compile(
+    r"spu_ls_(?:read|write)128\(ctx,|spu_wrch\(ctx, MFC_(?:LSA|EAH|EAL|Size|TagID),|"
+    r"ctx->int_enable && \(ctx->event_status & ctx->event_mask\)|SPU_GOTO_OK\(ctx,|"
+    r"ctx->int_enable = [01];")
+_LABEL_RE = re.compile(r"loc_[0-9A-Fa-f]+:")
+# --ib-known-targets probes inside an exit: each arm leaves too.
+_IB_KNOWN_RE = re.compile(r"if \(SPU_IB_OK\(ctx, 0x[0-9A-F]+\)\) \{ SPU_DIRECT\(ctx, 0x[0-9A-F]+, \w+\); \} ")
+
+
+def _lr_pure(s: str) -> bool:
+    """No ctx access but the registers and _SAFE_CTX_RE, no exit, and no
+    register access _lr_local cannot rewrite."""
+    if "&ctx->gpr" in s or re.search(r"ctx->gpr\[\d+\]\._(?!u32\[\d+\]|u16\[\d+\])", s) \
+            or re.search(r"ctx->gpr\[\d+\](?:\._\w+\[\d+\])?\s*(?:[-+*/|&^%]|<<|>>)=", s) \
+            or re.search(r"ctx->gpr\[\d+\]\._\w+\[\d+\]\s*=(?!=)", s):
+        return False
+    t = _SAFE_CTX_RE.sub("(", _GPR_RE.sub("", s))
+    return (re.search(r"\bctx\b", t) is None and "return" not in t
+            and "g_spu_trampoline_fn" not in t and "longjmp" not in t.lower())
+
+
+# The locals are GCC vectors (spu_v4u, runtime/spu/spu_helpers.h), not u128: a
+# union with array members is kept in memory. Whole-register values cross into
+# and out of the u128 helpers through spu_u2v/spu_v2u, which compile to nothing.
+def _lr_reads(e: str) -> str:
+    e = re.sub(r"ctx->gpr\[(\d+)\]\._u32\[(\d+)\]", r"sr\1[\2]", e)
+    e = re.sub(r"ctx->gpr\[(\d+)\]\._u16\[(\d+)\]", r"((spu_v8u16)sr\1)[\2]", e)
+    return _GPR_RE.sub(lambda m: f"spu_v2u(sr{m.group(1)})", e)
+
+
+def _lr_local(s: str) -> str:
+    s = re.sub(r"ctx->gpr\[(\d+)\]\s*=(?!=)\s*([^;]*);",
+               lambda m: f"sr{m.group(1)} = spu_u2v({_lr_reads(m.group(2))});", s)
+    return _lr_reads(s)
+
+
+def _lr_exit(inner: str) -> bool:
+    """A block body that always leaves the function and does nothing a register
+    write-back placed in front of it could not cover."""
+    t = _IB_KNOWN_RE.sub("", inner.strip())
+    if re.fullmatch(r"(?:ctx->int_enable = \d; )?(?:SPU_RET(?:_REG)?\(ctx(?:, \d+)?\)|"
+                    r"SPU_DIRECT\(ctx, 0x[0-9A-F]+, \w+\));", t):
+        return True
+    if not t.endswith("return;") or re.search(r"\)\s*return;$", t):
+        return False
+    return re.search(r"\b(?:if|while|for|goto|switch)\b|[{}]", t) is None
+
+
+def _lr_split_if(s: str):
+    """`if (COND) { INNER }` -> (indent, COND, INNER), or None."""
+    m = re.match(r"^(\s*)if \(", s)
+    if not m or not s.rstrip().endswith("}"):
+        return None
+    i, depth = m.end(), 1
+    while i < len(s) and depth:
+        depth += {"(": 1, ")": -1}.get(s[i], 0)
+        i += 1
+    if depth:
+        return None
+    rest = s[i:].strip()
+    if not (rest.startswith("{") and rest.endswith("}")):
+        return None
+    return m.group(1), s[m.end():i - 1], rest[1:-1]
+
+
+def localize_registers(lines: list[str]) -> list[str]:
+    used: set[int] = set()
+    written: set[int] = set()
+    plan = []
+    for line in lines:
+        st = line.strip()
+        if _LABEL_RE.fullmatch(st):
+            plan.append(("raw", line))
+            continue
+        if _lr_pure(line):
+            used.update(int(n) for n in _GPR_RE.findall(line))
+            written.update(int(a or b) for a, b in _GPR_WRITE_RE.findall(line))
+            plan.append(("pure", line))
+            continue
+        sp = _lr_split_if(line)
+        if sp and _lr_pure(sp[1]) and _lr_exit(sp[2]):
+            used.update(int(n) for n in _GPR_RE.findall(sp[1]))
+            plan.append(("cond_exit", sp))
+            continue
+        if st.startswith("{") and st.endswith("}") and _lr_exit(st[1:-1]):
+            plan.append(("exit", (line[:len(line) - len(line.lstrip())], st[1:-1])))
+            continue
+        if _lr_exit(st):
+            plan.append(("bare_exit", line))
+            continue
+        # A sync statement is bracketed by a write-back and a reload; one that
+        # could leave sideways would skip the reload.
+        if re.search(r"\b(?:goto|break|continue)\b", line):
+            raise ValueError(f"--local-regs: control transfer in a ctx statement: {st}")
+        plan.append(("sync", line))
+    if not used:
+        return lines
+    wb = " ".join(f"ctx->gpr[{n}] = spu_v2u(sr{n});" for n in sorted(written))
+    rl = " ".join(f"sr{n} = spu_u2v(ctx->gpr[{n}]);" for n in sorted(used))
+    out = ["    " + " ".join(f"spu_v4u sr{n} = spu_u2v(ctx->gpr[{n}]);" for n in sorted(used))]
+    for kind, v in plan:
+        if kind == "raw":
+            out.append(v)
+        elif kind == "pure":
+            out.append(_lr_local(v))
+        elif kind == "cond_exit":
+            ind, cond, inner = v
+            out.append(f"{ind}if ({_lr_local(cond)}) {{ {wb} {inner.strip()} }}".replace("{  ", "{ "))
+        elif kind == "exit":
+            ind, inner = v
+            out.append(f"{ind}{{ {wb} {inner.strip()} }}".replace("{  ", "{ "))
+        elif kind == "bare_exit":
+            out.append(f"    {wb}" if wb else "    /* no register written */;")
+            out.append(v)
+        else:
+            if wb:
+                out.append(f"    {wb}")
+            out.append(v)
+            out.append(f"    {rl}")
+    last = next((k for k, _ in reversed(plan) if k != "raw"), None)
+    if last not in ("exit", "bare_exit") and wb:
+        out.append(f"    {wb}")
+    return out
+
+# ---------------------------------------------------------------------------
 # Lifter
 # ---------------------------------------------------------------------------
 
@@ -350,6 +497,54 @@ def ib_known_entries(insns, func_starts) -> list:
             except ValueError:
                 pass
     return sorted((consts & set(func_starts)) - {0, 0xA70})
+
+
+_FLOW_BREAKS = {"bi", "iret", "biz", "binz", "bihz", "bihnz", "br", "bra", "brz",
+                "brnz", "brhz", "brhnz", "brsl", "brasl", "bisl", "bisled",
+                "stop", "stopd"}
+
+
+def compute_const_bi_targets(insns, bounds) -> dict:
+    """`bi $rN` sites whose target is a constant (--const-bi): the nearest write
+    to rN in the same block, with no branch, call or stop between, is an
+    `il`/`ila`. That is how Sony's SPU code moves between the halves of an
+    interrupt window (`ila $r3,<resume> / bid $r3`). Unlike --ib-known-targets,
+    the target is proven at lift time, need not be a function entry, and needs
+    no runtime compare. Returns {bi addr: target}. (Ported from the inFAMOUS 2
+    port, see localize_registers.)"""
+    out = {}
+    ordered = sorted(insns, key=lambda x: x.addr)
+    # Every direct branch target is a place control can arrive from elsewhere:
+    # the scan stops there whatever the bounds are.
+    entries = {t for t in (SPULifter._branch_target(i) for i in ordered) if t is not None}
+    for (s, e) in bounds:
+        fn = [i for i in ordered if s <= i.addr < e]
+        for idx, insn in enumerate(fn):
+            if insn.mnemonic != "bi":
+                continue
+            reg = _bi_target_reg(insn)
+            if reg is None or not reg.isdigit():
+                continue
+            r = int(reg)
+            for j in range(idx - 1, -1, -1):
+                w = fn[j]
+                if w.mnemonic in _FLOW_BREAKS or fn[j + 1].addr in entries:
+                    break
+                if w.mnemonic in _NO_RT_WRITE or _dest_reg(w) != r:
+                    continue
+                if w.mnemonic == "ila":
+                    out[insn.addr] = ((w.raw >> 7) & 0x3FFFF) & 0x3FFFC
+                elif w.mnemonic == "il":
+                    v = (w.raw >> 7) & 0xFFFF
+                    out[insn.addr] = (v - 0x10000 if v & 0x8000 else v) & 0x3FFFC
+                break
+    return out
+
+
+# --const-bi targets the resolver must see (spu_indirect_branch does more than
+# dispatch there): LS 0, the SPURS kernel services, the policy entry and
+# syscall, and the job return. Call-return addresses are added per image.
+CONST_BI_UNSAFE = {0x0, 0x9C0, 0x9D0, 0xA00, 0xA70, 0x3FF00}
 
 
 def merge_chunk_groups(insns, bounds, max_insns, entry_points=()) -> dict:
@@ -545,6 +740,11 @@ class SPULifter:
         self.link_return: set = set()
         # --ib-known-targets: function entries the image loads with il/ila.
         self.ib_entries: list = []
+        # --const-bi: `bi $rN` sites with a constant target, {addr: target}
+        # (compute_const_bi_targets), and the targets that must still go
+        # through the resolver (CONST_BI_UNSAFE + call-return addresses).
+        self.const_bi: dict = {}
+        self.const_bi_unsafe: set = set()
 
     def _ib_known(self, addr: int) -> str:
         """Direct branches for a computed branch at `addr` to the nearest
@@ -568,6 +768,9 @@ class SPULifter:
             tgt = self._branch_target(insn)
             if tgt is not None and start <= tgt < end:
                 internal.add(tgt)
+            ct = self._const_bi_goto(insn, start, end)
+            if ct is not None:
+                internal.add(ct)
 
         # Chunks merged into this function (--merge-chunks) are otherwise entered
         # through the drain loop, which delivers a pending SPU interrupt before
@@ -590,7 +793,8 @@ class SPULifter:
             if c:
                 if self.trace:
                     func.body_lines.append(f"    spu_trace_pc(ctx, 0x{insn.addr:X});")
-                func.body_lines.append(f"    {c}")
+                # One statement per line: --local-regs classifies lines.
+                func.body_lines.extend(f"    {part}" for part in c.split("\n"))
                 if self.trace and insn.mnemonic not in _NO_RT_WRITE:
                     rt_idx = insn.raw & 0x7F
                     func.body_lines.append(f"    spu_trace_rt(ctx, {rt_idx});")
@@ -996,6 +1200,22 @@ class SPULifter:
                 if tgt_reg != "0":
                     return f"{_ied}SPU_RET_REG(ctx, {tgt_reg});"
                 return f"{_ied}SPU_RET(ctx);"
+            ct = self.const_bi.get(addr)
+            if ct is not None:
+                if self._const_bi_goto(insn, func.start_addr, func.end_addr) is not None:
+                    # A goto skips the drain hop, where a pending interrupt is
+                    # taken and spu_indirect_branch sees an iret: hop instead
+                    # whenever SPU_IB_OK would refuse or an interrupt is due.
+                    parts = [_ied.strip()] if _ied else []
+                    parts.append(f"if (!SPU_GOTO_OK(ctx, 0x{ct:X})) {{ ctx->pc = 0x{ct:X}; "
+                                 f"g_spu_trampoline_fn = spu_indirect_branch; return; }}")
+                    parts.append(f"goto loc_{ct:08X};")
+                    return "\n".join(parts)
+                if ct in getattr(self, "func_starts", set()) and ct not in self.const_bi_unsafe:
+                    self.branch_targets.add(ct)
+                    return (f"{_ied}ctx->pc = 0x{ct:X}; if (SPU_IB_OK(ctx, 0x{ct:X})) {{ "
+                            f"SPU_DIRECT(ctx, 0x{ct:X}, {self.prefix}spu_func_{ct:08X}); }} "
+                            f"g_spu_trampoline_fn = spu_indirect_branch; return;")
             # Computed indirect tail: set pc + trampoline to the dispatcher, unwind.
             return (f"{_ied}ctx->pc = {g(tgt_reg)}._u32[0]; {self._ib_known(addr)}"
                     f"g_spu_trampoline_fn = spu_indirect_branch; return;")
@@ -1072,6 +1292,20 @@ class SPULifter:
         }
         return table.get(mn, f"{word} != 0")
 
+    def _const_bi_goto(self, insn, start, end):
+        """The target of a constant `bi` that can be a goto: inside this
+        function and forward (a backward goto would be a loop with no hop in
+        it, which no stop request can end)."""
+        if insn.mnemonic != "bi":
+            return None
+        ct = self.const_bi.get(insn.addr)
+        if ct is None or ct == 0 or not (start <= ct < end) or ct <= insn.addr:
+            return None
+        if insn.addr in self.link_return or \
+                (_bi_target_reg(insn) == "0" and insn.addr not in self.bi_r0_jump):
+            return None
+        return ct
+
     def _uncond_branch(self, tgt, func: LiftedFunction) -> str:
         if tgt is None:
             return "/* TODO spu: unresolved branch */;"
@@ -1107,7 +1341,8 @@ class SPULifter:
         weak = "__attribute__((weak)) " if getattr(self, "weak_emit", False) else ""
         for f in self.functions:
             lines.append(f"void {weak}{f.name}(spu_context* ctx) {{")
-            for b in f.body_lines:
+            body = localize_registers(f.body_lines) if getattr(self, "local_regs", False) else f.body_lines
+            for b in body:
                 lines.append(b if b.endswith(":") else f"    {b}")
             lines.append("}")
             lines.append("")
@@ -1217,6 +1452,16 @@ def main() -> None:
                         "with il/ila, and branch straight there on a match "
                         "(SPU_IB_OK, spu_context.h) instead of a resolver pass. "
                         "For job modules whose inner loops iterate through `bi`.")
+    p.add_argument("--const-bi", action="store_true",
+                   help="Branch directly at a `bi $rN` whose rN was just loaded "
+                        "with il/ila: a goto for a forward target inside the "
+                        "function, SPU_DIRECT to a function entry otherwise; "
+                        "either falls back to the resolver when it must see the "
+                        "transfer (compute_const_bi_targets).")
+    p.add_argument("--local-regs", action="store_true",
+                   help="Keep each function's registers in C locals between the "
+                        "statements that hand ctx to the runtime (calls, channel "
+                        "ops, stops, exits); clang/gcc only (localize_registers).")
     p.add_argument("--max-group-insns", type=int, default=4000,
                    help="Cap on instructions per merged group (keeps clang fast).")
     p.add_argument("--force-indirect", default="",
@@ -1342,6 +1587,7 @@ def main() -> None:
     insns = disassemble_spu(data, base)
 
     lifter = SPULifter(trace=args.trace, prefix=args.symbol_prefix)
+    lifter.local_regs = args.local_regs
     lifter.bi_r0_jump = compute_bi_r0_jumps(insns, bounds)
     if lifter.bi_r0_jump:
         print(f"  {len(lifter.bi_r0_jump)} `bi $r0` computed-jump site(s) "
@@ -1365,6 +1611,12 @@ def main() -> None:
     lifter.func_starts = {s for s, e in bounds}  # for fall-through tail-call chaining
     if args.ib_known_targets:
         lifter.ib_entries = ib_known_entries(insns, lifter.func_starts)
+    if args.const_bi:
+        lifter.const_bi = compute_const_bi_targets(insns, bounds)
+        lifter.const_bi_unsafe = CONST_BI_UNSAFE | {
+            (i.addr + 4) & 0x3FFFC for i in insns
+            if i.mnemonic in ("brsl", "brasl", "bisl", "bisled")}
+        print(f"  {len(lifter.const_bi)} constant-target `bi` site(s) (--const-bi)")
     groups = {}
     if args.merge_chunks:
         seeds = {base}

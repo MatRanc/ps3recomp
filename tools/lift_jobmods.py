@@ -47,7 +47,7 @@ from wrap_spu_elf import wrap
 
 ROOT   = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 LIFTER = os.path.join(os.path.dirname(__file__), "spu_lifter.py")
-LIFTER_FLAGS = []   # passed through to every spu_lifter.py run (--ib-known-targets)
+LIFTER_FLAGS = []   # passed through to every spu_lifter.py run (--ib-known-targets, ...)
 BASE   = 0x4000
 
 # Per-module code/data boundary, keyed by the module's content hash -- so this
@@ -353,9 +353,17 @@ def main():
                          "instead of chunks linked by trampolines.")
     ap.add_argument("--ib-known-targets", action="store_true",
                     help="Pass --ib-known-targets to spu_lifter.py.")
+    ap.add_argument("--const-bi", action="store_true",
+                    help="Pass --const-bi to spu_lifter.py.")
+    ap.add_argument("--local-regs", action="store_true",
+                    help="Pass --local-regs to spu_lifter.py.")
     args = ap.parse_args()
     if args.ib_known_targets:
         LIFTER_FLAGS.append("--ib-known-targets")
+    if args.const_bi:
+        LIFTER_FLAGS.append("--const-bi")
+    if args.local_regs:
+        LIFTER_FLAGS.append("--local-regs")
     OUTDIR  = args.out
     register_c = args.register or os.path.join(OUTDIR, "jobmods_register.c")
 

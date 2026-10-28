@@ -21,6 +21,17 @@
 extern "C" {
 #endif
 
+#if defined(__GNUC__) || defined(__clang__)
+/* Registers held in locals by a --local-regs lift (spu_lifter.py,
+ * localize_registers): GCC vectors live in vector registers, where a u128
+ * local -- a union with array members -- is kept in memory. Element k is
+ * u128._u32[k]: the same 16 bytes. */
+typedef uint32_t spu_v4u   __attribute__((vector_size(16)));
+typedef uint16_t spu_v8u16 __attribute__((vector_size(16)));
+static inline spu_v4u spu_u2v(u128 u) { spu_v4u v; memcpy(&v, &u, 16); return v; }
+static inline u128    spu_v2u(spu_v4u v) { u128 u; memcpy(&u, &v, 16); return u; }
+#endif
+
 #ifdef _MSC_VER
 #include <intrin.h>
 static inline int spu_clz32(uint32_t x) {
