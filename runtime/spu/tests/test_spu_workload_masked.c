@@ -28,6 +28,10 @@ void spu_coh_watch_add(spu_coh_watch* w, uint32_t ea, void (*wake)(void*), void*
 void spu_coh_watch_remove(spu_coh_watch* w) { (void)w; }
 void spu_lockline_lock(void) { }
 void spu_lockline_unlock(void) { }
+uint64_t spu_lockline_mask_ea(uint32_t a) { (void)a; return 0; }
+uint64_t spu_lockline_mask_range(uint32_t a, uint32_t n) { (void)a; (void)n; return 0; }
+void spu_lockline_lock_mask(uint64_t m) { (void)m; }
+void spu_lockline_unlock_mask(uint64_t m) { (void)m; }
 void spu_mfc_release(spu_context* c) { (void)c; }
 int spu_run_spurs_job(spu_lifted_entry_fn e, int id, uint32_t ea, uint32_t sz)
 { (void)e; (void)id; (void)ea; (void)sz; return -1; }

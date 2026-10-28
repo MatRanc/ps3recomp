@@ -27,6 +27,10 @@ int spu_coh_is_reserved(uint32_t) { return 0; }
 void spu_coh_notify_write(uint32_t) {}
 void spu_lockline_lock() {}
 void spu_lockline_unlock() {}
+uint64_t spu_lockline_mask_ea(uint32_t a) { (void)a; return 0; }
+uint64_t spu_lockline_mask_range(uint32_t a, uint32_t n) { (void)a; (void)n; return 0; }
+void spu_lockline_lock_mask(uint64_t m) { (void)m; }
+void spu_lockline_unlock_mask(uint64_t m) { (void)m; }
 void ppu_resv_break_store(uint64_t) {}
 void ps3_ww_report_inline(uint32_t,uint64_t,int) {}
 uint32_t vm_read32(uint64_t a) { uint32_t x;std::memcpy(&x,vm_base+a,4);return __builtin_bswap32(x); }

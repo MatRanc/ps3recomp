@@ -22,6 +22,10 @@ u32 cellGcm_flip_request_count(void) { return 0; }   /* PAD_CLOCK=flips (#344) *
 void spu_coh_notify_write(uint32_t a) { (void)a; }
 void spu_lockline_lock(void) {}
 void spu_lockline_unlock(void) {}
+uint64_t spu_lockline_mask_ea(uint32_t a) { (void)a; return 0; }
+uint64_t spu_lockline_mask_range(uint32_t a, uint32_t n) { (void)a; (void)n; return 0; }
+void spu_lockline_lock_mask(uint64_t m) { (void)m; }
+void spu_lockline_unlock_mask(uint64_t m) { (void)m; }
 
 /* The fake controller. */
 static int s_fake_gc, s_gone_gc;

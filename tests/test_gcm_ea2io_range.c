@@ -16,6 +16,10 @@ int spu_coh_is_reserved(uint32_t addr) { (void)addr; return 0; }
 void spu_coh_notify_write(uint32_t addr) { (void)addr; abort(); }
 void spu_lockline_lock(void) { abort(); }
 void spu_lockline_unlock(void) { abort(); }
+uint64_t spu_lockline_mask_ea(uint32_t a) { (void)a; return 0; }
+uint64_t spu_lockline_mask_range(uint32_t a, uint32_t n) { (void)a; (void)n; return 0; }
+void spu_lockline_lock_mask(uint64_t m) { (void)m; abort(); }
+void spu_lockline_unlock_mask(uint64_t m) { (void)m; abort(); }
 
 /* The lookup over every slot: what gcm_ea2io_range returned before the bound. */
 static u32 full_scan(u32 ea, u32* room)

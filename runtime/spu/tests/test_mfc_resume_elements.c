@@ -29,6 +29,10 @@ void spu_coh_notify_write(uint32_t ea) { (void)ea; }
 void spu_coh_notify_write_except(uint32_t ea,const void* c) { (void)ea;(void)c; }
 void spu_lockline_lock(void) {}
 void spu_lockline_unlock(void) {}
+uint64_t spu_lockline_mask_ea(uint32_t a) { (void)a; return 0; }
+uint64_t spu_lockline_mask_range(uint32_t a, uint32_t n) { (void)a; (void)n; return 0; }
+void spu_lockline_lock_mask(uint64_t m) { (void)m; }
+void spu_lockline_unlock_mask(uint64_t m) { (void)m; }
 void spu_lockguard_check(spu_context* c,uint32_t ea,const uint8_t* p,uint32_t n,const char* what)
 { (void)c;(void)ea;(void)p;(void)n;(void)what; }
 void spu_ch_wake(spu_context* c) { (void)c; }

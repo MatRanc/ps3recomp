@@ -19,6 +19,10 @@ static uint32_t dispatched_size, dispatched_context;
  * single-threaded here, so the lock and the coherency note are no-ops. */
 void spu_lockline_lock(void) {}
 void spu_lockline_unlock(void) {}
+uint64_t spu_lockline_mask_ea(uint32_t a) { (void)a; return 0; }
+uint64_t spu_lockline_mask_range(uint32_t a, uint32_t n) { (void)a; (void)n; return 0; }
+void spu_lockline_lock_mask(uint64_t m) { (void)m; }
+void spu_lockline_unlock_mask(uint64_t m) { (void)m; }
 void spu_coh_notify_write(uint32_t ea) { (void)ea; }
 static int spu_workload_dispatch_async(const uint8_t* image, uint32_t size, uint32_t context)
 {

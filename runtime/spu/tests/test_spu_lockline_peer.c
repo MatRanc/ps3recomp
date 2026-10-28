@@ -558,42 +558,36 @@ static void test_unaligned_wide_put_around_a_reserved_line(void)
 /* ===========================================================================
  * The event acknowledge against a concurrent raise
  *
- * Built with the lock rather than raced for. The main thread holds the
- * lock-line lock, so the acknowledge cannot get past it, and that it has not
- * completed is asserted -- which is what makes the interleaving a fact of the
- * run rather than a hope. The raise then happens under the same lock, and the
- * acknowledge is let through afterwards: exactly the order that loses the edge
- * when the acknowledge is a bare read-modify-write.
- *
- * The two waits below decide nothing. An acknowledge that has not started yet
- * lands after the raise and keeps it just the same; what the assertion rules
- * out is the acknowledge COMPLETING while the lock is held, which is the only
- * way the raise can be read, overwritten and lost.
+ * The acknowledge used to take the (then global) lock-line lock so that a
+ * raise could not land between its read and its write-back. SPU_EVENT_SET and
+ * SPU_EVENT_CLEAR are atomic read-modify-writes, which closes that window on
+ * their own (test_spu_event_atomic.c races the two), and with the lock
+ * striped by line an LR producer holds only its own line's stripe, so the
+ * acknowledge no longer takes any. Asserted here: it completes while every
+ * stripe is held, clears only what it asked for, and a raise made while the
+ * stripes are still held survives it.
  * ===========================================================================*/
 #define ACK_TAG_EVENT  0x1u    /* MFC tag-status update: what the ack asks for */
 
-static volatile int g_ack_entered;
-static volatile int g_ack_done;
+static atomic_int g_ack_done;
 
 static void* ack_thread(void* arg)
 {
     (void)arg;
-    g_ack_entered = 1;
     wrch(&g_a, SPU_WrEventAck, ACK_TAG_EVENT);
-    g_ack_done = 1;
+    atomic_store(&g_ack_done, 1);
     return NULL;
 }
 
 static void test_ack_keeps_a_concurrent_raise(void)
 {
     reset_pair();
-    g_ack_entered = 0;
-    g_ack_done = 0;
+    atomic_store(&g_ack_done, 0);
 
     spu_atomic(&g_a, LSA_A, LINE_A, MFC_GETLLAR_CMD);
     g_a.event_status = ACK_TAG_EVENT;      /* the event the SPU is acking */
 
-    spu_lockline_lock();
+    spu_lockline_lock();                   /* every stripe */
 
     pthread_t t;
     if (pthread_create(&t, NULL, ack_thread, NULL) != 0) {
@@ -602,23 +596,18 @@ static void test_ack_keeps_a_concurrent_raise(void)
         CHECK(0);
         return;
     }
+    for (int i = 0; i < 2000 && !atomic_load(&g_ack_done); i++) Sleep(1);
 
-    while (!g_ack_entered) YieldProcessor();
-    Sleep(2);                              /* time to arrive at the lock */
+    TEST("the acknowledge completes while every lock-line stripe is held");
+    CHECK(atomic_load(&g_ack_done) == 1);
+    CHECK_EQ_U32(g_a.event_status, 0u);
 
-    TEST("the acknowledge cannot complete while the lock-line lock is held");
-    CHECK(g_ack_done == 0);
-    CHECK_EQ_U32(g_a.event_status, ACK_TAG_EVENT);
-
-    /* The raise a peer's commit would make, under the lock that peer holds. */
+    /* The raise a peer's commit would make, under the stripe that peer holds. */
     spu_coh_notify_write(LINE_A);
-    CHECK_EQ_U32(g_a.event_status, ACK_TAG_EVENT | SPU_EVENT_LR);
-
     spu_lockline_unlock();
     pthread_join(t, NULL);
 
-    TEST("the acknowledge clears what it asked for and keeps the raise");
-    CHECK(g_ack_done == 1);
+    TEST("the acknowledge cleared what it asked for and the raise is kept");
     CHECK_EQ_U32(g_a.event_status, SPU_EVENT_LR);
     CHECK(g_a.resv_valid == 0);
 }

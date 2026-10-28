@@ -859,8 +859,10 @@ extern "C" void ppu_log_host_chain(const char* tag);  /* fwd decl (defined below
  * a pointer that stays NULL until an SPU reserves its first line, so an
  * ordinary store pays one branch. */
 extern "C" int  spu_coh_is_reserved(uint32_t addr);
-extern "C" void spu_lockline_lock(void);
-extern "C" void spu_lockline_unlock(void);
+extern "C" uint64_t spu_lockline_mask_ea(uint32_t ea);
+extern "C" uint64_t spu_lockline_mask_range(uint32_t ea, uint32_t len);
+extern "C" void spu_lockline_lock_mask(uint64_t mask);
+extern "C" void spu_lockline_unlock_mask(uint64_t mask);
 extern "C" void spu_coh_notify_write(uint32_t addr);
 
 /* ---------------------------------------------------------------------------
@@ -1060,19 +1062,19 @@ extern "C" int ppu_stwcx32(uint64_t ea, uint32_t expected, uint32_t val)
             if ((++n % 100000) == 1)
                 fprintf(stderr, "[ppu-steals-resv] %llu: PPU CAS on reserved line 0x%08X\n",
                         n, (uint32_t)ea & ~127u); } }
-    if (coh) spu_lockline_lock();
+    /* The line's stripe of the lock-line lock (spu_coherency.h). */
+    const uint64_t llm = coh ? spu_lockline_mask_ea((uint32_t)ea) : 0;
+    if (llm) spu_lockline_lock_mask(llm);
     /* Re-check under the lock-line lock: an SPU commit to this line between
      * the check above and here has broken the reservation (SPU commits call
      * ppu_resv_break_line with this lock held). */
     if (coh && self && self->reserve_addr != (uint32_t)ea) {
-        spu_lockline_unlock(); resv_unlock(L); return 0;
+        spu_lockline_unlock_mask(llm); resv_unlock(L); return 0;
     }
     int ok = __atomic_compare_exchange_n((uint32_t*)(vm_base + ea), &exp_raw, new_raw,
                                          0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST) ? 1 : 0;
-    if (coh) {
-        if (ok) spu_coh_notify_write((uint32_t)ea);
-        spu_lockline_unlock();
-    }
+    if (coh && ok) spu_coh_notify_write((uint32_t)ea);
+    if (llm) spu_lockline_unlock_mask(llm);
     if (ok) ppu_resv_break(ea);
     resv_unlock(L);
     /* PPU_CASWATCH=<hex ea>: log successful stwcx. on that 128-byte line.
@@ -1137,15 +1139,14 @@ extern "C" int ppu_stdcx64(uint64_t ea, uint64_t expected, uint64_t val)
     resv_lock(L);
     if (self && self->reserve_addr != (uint32_t)ea) { resv_unlock(L); return 0; }
     int coh = spu_coh_is_reserved((uint32_t)ea);
-    if (coh) spu_lockline_lock();
-    if (coh && self && self->reserve_addr != (uint32_t)ea) {   /* as in ppu_stwcx32 */
-        spu_lockline_unlock(); resv_unlock(L); return 0;
+    const uint64_t llm = coh ? spu_lockline_mask_ea((uint32_t)ea) : 0;   /* as in ppu_stwcx32 */
+    if (llm) spu_lockline_lock_mask(llm);
+    if (coh && self && self->reserve_addr != (uint32_t)ea) {
+        spu_lockline_unlock_mask(llm); resv_unlock(L); return 0;
     }
     int ok = __atomic_compare_exchange_n((uint64_t*)(vm_base + ea), &exp_raw, new_raw, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST) ? 1 : 0;
-    if (coh) {
-        if (ok) spu_coh_notify_write((uint32_t)ea);
-        spu_lockline_unlock();
-    }
+    if (coh && ok) spu_coh_notify_write((uint32_t)ea);
+    if (llm) spu_lockline_unlock_mask(llm);
     if (ok) { ppu_resv_break(ea); ppu_resv_break(ea + 4); }  /* 8-byte store spans two words */
     resv_unlock(L);
     if (ok && g_ww_lo && (uint32_t)ea + 4u >= g_ww_lo && (uint32_t)ea < g_ww_hi) {
@@ -1572,10 +1573,12 @@ extern "C" int* ps3_ppu_vcall_sp_slot(void) { return &g_vcall_sp; }
 #define VM_WRITE_COH(a, src, n)                                               \
     do {                                                                      \
         if (spu_coh_line_reserved((uint32_t)(a))) {                           \
-            spu_lockline_lock();                                              \
+            const uint64_t _llm = spu_lockline_mask_range((uint32_t)(a),      \
+                                                          (uint32_t)(n));     \
+            spu_lockline_lock_mask(_llm);                                     \
             memcpy(vm_base + (uint32_t)(a), (src), (n));                      \
             spu_coh_notify_write((uint32_t)(a));                              \
-            spu_lockline_unlock();                                            \
+            spu_lockline_unlock_mask(_llm);                                   \
         } else {                                                              \
             memcpy(vm_base + (uint32_t)(a), (src), (n));                      \
         }                                                                     \

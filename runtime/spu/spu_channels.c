@@ -547,16 +547,18 @@ void spu_mfc_forget_range(uintptr_t lo, uintptr_t hi)
  * Without honoring the reservation, two SPUs both "claim" the same slot and the
  * queue corrupts (observed: the 2nd claim returns garbage [1,1,1,1] -> the SPU
  * traps). PUTLLC must FAIL when the line changed since GETLLAR. We implement the
- * compare-and-swap under one global lock across all SPU host threads.
+ * compare-and-swap under the line's stripe of the lock-line lock, shared by
+ * all SPU host threads and the PPU.
  * ===========================================================================*/
 extern uint8_t* vm_base;
 
-/* The spinlock guarding all atomic line ops now lives in spu_coherency.c as
- * spu_lockline_lock/unlock. It used to be a file-static here, which serialized
- * SPU against SPU but left the PPU free to store into a line in the middle of
- * a PUTLLC's compare-and-commit -- the update the SPU was about to make would
- * be written over, and the SPU would never learn the line had changed. Same
- * lock, same critical sections, now shared with the PPU store paths. */
+/* The lock guarding all atomic line ops now lives in spu_coherency.c, striped
+ * by line. It used to be a file-static here, which serialized SPU against SPU
+ * but left the PPU free to store into a line in the middle of a PUTLLC's
+ * compare-and-commit -- the update the SPU was about to make would be written
+ * over, and the SPU would never learn the line had changed. Same critical
+ * sections, now shared with the PPU store paths; each holds only the stripe
+ * of the line it touches (spu_lockline_mask_ea). */
 
 /* Total PUTLLC attempts (all SPUs). The PM flow trace (spurs_policy.c) reads
  * the delta across one policy run to find the run that performed a claim. */
@@ -718,8 +720,9 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
          * the lock; any write the copy misses ends that reservation (see
          * spu_coh_reserve_fast). Anything else takes the lock as before. */
         const int llar_fast = spu_coh_reserve_fast(ctx, ea);
+        const uint64_t llar_mask = llar_fast ? 0 : spu_lockline_mask_ea(ea);
         if (!llar_fast) {
-            spu_lockline_lock();
+            spu_lockline_lock_mask(llar_mask);
             /* Tell the PPU store paths this line is live, so a store into it goes
              * through the lock and raises SPU_EVENT_LR here instead of landing
              * unannounced. Nothing else about this transaction changes. */
@@ -758,7 +761,12 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
         /* MFC_RdAtomicStat after a GETLLAR reads 4 (GETLLAR complete), not 0:
          * Havok's SPU allocator (GH3 collide task, LS 0xA66C) re-issues the
          * GETLLAR until that bit is set, and spun forever on 0. PUTLLUC is 2. */
-        if (!llar_fast) { ctx->resv_ea = ea; ctx->resv_valid = 1; }   /* the fast path published it already */
+        if (!llar_fast) {   /* the fast path published it already */
+            /* Atomic: a writer of this context's previous line, under another
+             * stripe, reads these (spu_coh_holds). */
+            __atomic_store_n(&ctx->resv_ea, ea, __ATOMIC_RELAXED);
+            __atomic_store_n(&ctx->resv_valid, 1, __ATOMIC_RELAXED);
+        }
         ctx->atomic_stat = 4;
         ctx->dbg_getllar++;
         /* A GETLLAR re-issued millions of times on one line is an SPU spin-wait
@@ -774,7 +782,7 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
                       ctx->image_id, (unsigned)(ctx->pc & SPU_LS_MASK), ctx->gpr[0]._u32[0] & SPU_LS_MASK, ea,
                       m[0],m[1],m[2],m[3], m[4],m[5],m[6],m[7], m[8],m[9],m[10],m[11], m[12],m[13],m[14],m[15]);
           } }
-        if (!llar_fast) spu_lockline_unlock();
+        if (!llar_fast) spu_lockline_unlock_mask(llar_mask);
         /* SPU_LLARWATCH=<hex EA>: every GETLLAR of that line, with the LSA it
          * used and the first word as it lands in BOTH places.
          *
@@ -837,7 +845,8 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
         { extern uint32_t g_barrier_sync_watch;
           uint32_t b = g_barrier_sync_watch;
           if (b && (ea & ~127u) == (b & ~127u)) g_spu_putllc_sync_hit++; }
-        spu_lockline_lock();
+        const uint64_t putllc_mask = spu_lockline_mask_ea(ea);
+        spu_lockline_lock_mask(putllc_mask);
         if (ctx->resv_valid && ctx->resv_ea == ea &&
             memcmp(mem, ctx->resv_line, MFC_ATOMIC_LINE) == 0) {
             { extern void spu_lockguard_check(spu_context*, uint32_t, const uint8_t*, uint32_t, const char*);
@@ -854,8 +863,8 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
              * Our own reservation is dropped FIRST so the notify does not
              * raise a self-LR: hardware CONSUMES the reservation on a
              * successful PUTLLC, it does not report it lost. Already under the
-             * lock-line lock, which is what spu_coh_notify_write expects. */
-            ctx->resv_valid = 0;
+             * line's stripe, which is what spu_coh_notify_write expects. */
+            __atomic_store_n(&ctx->resv_valid, 0, __ATOMIC_RELAXED);
             { static int s_w = -1;
               if (s_w < 0) s_w = getenv("SPU_PUTLLC_WHY") ? 1 : 0;
               if (s_w) { static unsigned long long n;
@@ -926,8 +935,8 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
               fprintf(stderr, "[atom-ea] PUTLLC %s lr=0x%05X ea=0x%08X\n",
                       ctx->atomic_stat ? "FAIL" : "OK",
                       ctx->gpr[0]._u32[0] & SPU_LS_MASK, ea); }
-        ctx->resv_valid = 0;                           /* reservation consumed */
-        spu_lockline_unlock();
+        __atomic_store_n(&ctx->resv_valid, 0, __ATOMIC_RELAXED);   /* reservation consumed */
+        spu_lockline_unlock_mask(putllc_mask);
         if (ctx->atomic_stat == 0) {
             spu_taskset_line_committed(ea & ~127u);
             if (g_spu_line_commit_hook) g_spu_line_commit_hook(ea & ~127u);
@@ -935,8 +944,9 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
         return 1;
 
     case MFC_PUTLLUC_CMD:
-    case MFC_PUTQLLUC_CMD:
-        spu_lockline_lock();
+    case MFC_PUTQLLUC_CMD: {
+        const uint64_t putlluc_mask = spu_lockline_mask_ea(ea);
+        spu_lockline_lock_mask(putlluc_mask);
         { extern void spu_lockguard_check(spu_context*, uint32_t, const uint8_t*, uint32_t, const char*);
           spu_lockguard_check(ctx, ea, ls, MFC_ATOMIC_LINE, "PUTLLUC"); }
         memcpy(mem, ls, MFC_ATOMIC_LINE);              /* unconditional store */
@@ -946,11 +956,12 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
          * reservation here would commit a PUTLLC against a snapshot this store
          * has already overwritten. */
         spu_coh_notify_write(ea);
-        ctx->resv_valid = 0; ctx->atomic_stat = 2;   /* PUTLLUC complete */
-        spu_lockline_unlock();
+        __atomic_store_n(&ctx->resv_valid, 0, __ATOMIC_RELAXED); ctx->atomic_stat = 2;   /* PUTLLUC complete */
+        spu_lockline_unlock_mask(putlluc_mask);
         spu_taskset_line_committed(ea & ~127u);
         if (g_spu_line_commit_hook) g_spu_line_commit_hook(ea & ~127u);
         return 1;
+    }
 
     default:
         return 0;
@@ -1064,15 +1075,14 @@ void spu_wrch(spu_context* ctx, uint32_t channel, u128 value)
                              ctx->dec_base_ns = spu_host_ns();              break;
     case SPU_WrEventMask:    ctx->event_mask = v;                           break; /* WrEventMask */
     case SPU_WrEventAck:
-        /* Under the lock-line lock, because every producer of the LR bit sets
-         * it under that lock: the PPU coherent store, and a peer SPU's PUTLLC,
-         * PUTLLUC or plain PUT. A bare read-modify-write here can read
-         * event_status, have a concurrent |= SPU_EVENT_LR land in between, and
-         * write the stale value back. The edge is then gone, and an SPU that
-         * has just acknowledged the events it read goes back to sleep believing
-         * it still holds a reservation it has already lost, which is the parked
-         * SPURS kernel this whole mechanism exists to wake. */
-        spu_lockline_lock();
+        /* No lock: a bare read-modify-write here could read event_status,
+         * have a concurrent |= SPU_EVENT_LR land in between, and write the
+         * stale value back -- the edge gone, and an SPU that has just
+         * acknowledged the events it read goes back to sleep believing it
+         * still holds a reservation it has already lost. SPU_EVENT_SET and
+         * SPU_EVENT_CLEAR are atomic read-modify-writes, which closes that on
+         * their own; the LR producers now hold only their own line's stripe,
+         * so the old global lock here would not exclude them anyway. */
         SPU_EVENT_CLEAR(ctx, v);
         /* A stall-and-notify nobody has read yet stays pending. We run a
          * resumed list inline, inside the MFC_WrListStallAck that resumes it,
@@ -1082,7 +1092,6 @@ void spu_wrch(spu_context* ctx, uint32_t channel, u128 value)
          * (list_stall_stat set, Sn clear). */
         if ((v & 0x2u) && ctx->list_stall_stat)
             SPU_EVENT_SET(ctx, 0x2u);
-        spu_lockline_unlock();
         break;
     case SPU_WrSRR0:         ctx->srr0 = v;                                 break;
     default:

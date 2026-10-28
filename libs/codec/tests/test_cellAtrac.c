@@ -34,6 +34,10 @@ void ps3_ww_report_inline(uint32_t a, uint64_t v, int w) { (void)a; (void)v; (vo
 int spu_coh_is_reserved(uint32_t a) { (void)a; return 0; }
 void spu_lockline_lock(void) {}
 void spu_lockline_unlock(void) {}
+uint64_t spu_lockline_mask_ea(uint32_t a) { (void)a; return 0; }
+uint64_t spu_lockline_mask_range(uint32_t a, uint32_t n) { (void)a; (void)n; return 0; }
+void spu_lockline_lock_mask(uint64_t m) { (void)m; }
+void spu_lockline_unlock_mask(uint64_t m) { (void)m; }
 void spu_coh_notify_write(uint32_t a) { (void)a; }
 
 enum { MEM = 64u << 20, H = 0x100, WORK = 0x200, OUT = 0x10000, ARGS = 0x20,

@@ -13,6 +13,10 @@ int spu_coh_is_reserved(uint32_t a) { (void)a; return 0; }
 void spu_coh_notify_write(uint32_t a) { (void)a; }
 void spu_lockline_lock(void) {}
 void spu_lockline_unlock(void) {}
+uint64_t spu_lockline_mask_ea(uint32_t a) { (void)a; return 0; }
+uint64_t spu_lockline_mask_range(uint32_t a, uint32_t n) { (void)a; (void)n; return 0; }
+void spu_lockline_lock_mask(uint64_t m) { (void)m; }
+void spu_lockline_unlock_mask(uint64_t m) { (void)m; }
 void np_psnr_pump(void) {}
 void ps3_np_eula_tick(void) {}
 
