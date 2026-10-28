@@ -1986,14 +1986,27 @@ static void vk_present_window(void)
     else if (r != VK_SUCCESS) VK_LOG("vkQueuePresentKHR failed (VkResult %d)\n", (int)r);
 }
 
+/* One write of a packed copy: a 3-byte fwrite per pixel cost the walker's
+ * thread ~20% of its time at one dump every 10 frames. Written beside the
+ * target and renamed over it, so a reader never sees half a frame. */
 static void vk_dump_ppm(const unsigned char* rgba)
 {
-    FILE* f = fopen(s_vk.dump_path, "wb");
-    if (!f) { VK_LOG("cannot open %s for the frame dump\n", s_vk.dump_path); return; }
+    const size_t n = (size_t)s_vk.width * s_vk.height;
+    unsigned char* rgb = (unsigned char*)malloc(n * 3);
+    if (!rgb) return;
+    for (size_t i = 0; i < n; i++) memcpy(rgb + i * 3, rgba + i * 4, 3);
+    char tmp[1024];
+    snprintf(tmp, sizeof tmp, "%s.tmp", s_vk.dump_path);
+    FILE* f = fopen(tmp, "wb");
+    if (!f) { VK_LOG("cannot open %s for the frame dump\n", tmp); free(rgb); return; }
     fprintf(f, "P6\n%u %u\n255\n", s_vk.width, s_vk.height);
-    for (size_t i = 0; i < (size_t)s_vk.width * s_vk.height; i++)
-        fwrite(rgba + i * 4, 1, 3, f);
+    fwrite(rgb, 1, n * 3, f);
     fclose(f);
+    free(rgb);
+#ifdef _WIN32
+    remove(s_vk.dump_path);   /* rename does not replace on Windows */
+#endif
+    rename(tmp, s_vk.dump_path);
 }
 
 /* ---------------------------------------------------------------------------
