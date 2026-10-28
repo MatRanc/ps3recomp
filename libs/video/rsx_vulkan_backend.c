@@ -2872,6 +2872,8 @@ static struct {
     u32          scratch_w, scratch_h;
     u32          pipeline;
     u32          vs_bytes, ps_bytes;
+    int          vs_ranged;           /* only vs_lo..+vs_n rows and the tail are live */
+    u32          vs_lo, vs_n, vs_tail_off, vs_tail_bytes;
     u8*          ucpu;                /* the constants, in the shared UBO's layout */
     u32          tex[RSX_BE_MAX_TEXTURES];
     rsx_be_sampler_desc samp[RSX_BE_MAX_TEXTURES];
@@ -3289,11 +3291,44 @@ static u8* vk_eng_ucpu(void)
 static void vk_eng_bind_vs_constants(void* user, const void* data, u32 bytes)
 {
     (void)user;
+    s_e2.vs_ranged = 0;
     if (!s_g.on || !data || !vk_eng_ucpu()) { s_e2.vs_bytes = 0; return; }
     const u32 cap = (u32)s_g.ps_off;
     if (bytes > cap) { bytes = cap; if (!(s_e2.warned & 2u)) { VK_LOG("engine: VS constants truncated\n"); s_e2.warned |= 2u; } }
     memcpy(s_e2.ucpu, data, bytes);
     s_e2.vs_bytes = bytes;
+}
+/* The rows the vertex program reads and the viewport tail, copied without
+ * comparing; the rest of the block is never read. Ported from the inFAMOUS 2
+ * port (github.com/ThiagoFraga761/infamous2-pc, MIT). */
+static void vk_eng_bind_vs_constants_range(void* user, const void* rows, u32 first, u32 count,
+                                           const void* tail, u32 tail_bytes, u32 total_bytes)
+{
+    (void)user;
+    const u32 cap = (u32)s_g.ps_off;
+    s_e2.vs_ranged = 0;
+    if (!s_g.on || !rows || !vk_eng_ucpu()) { s_e2.vs_bytes = 0; return; }
+    /* The engine's block always fits the VPConst slot (VK_VPCONST_BYTES). */
+    if (total_bytes > cap || tail_bytes > total_bytes ||
+        (first + count) * 16u > total_bytes - tail_bytes) {
+        if (!(s_e2.warned & 2u)) { VK_LOG("engine: VS constant range does not fit\n"); s_e2.warned |= 2u; }
+        s_e2.vs_bytes = 0;
+        return;
+    }
+    const u32 tail_off = total_bytes - tail_bytes;
+    memcpy(s_e2.ucpu + first * 16u, (const u8*)rows + first * 16u, count * 16u);
+    memcpy(s_e2.ucpu + tail_off, tail, tail_bytes);
+    s_e2.vs_bytes = total_bytes;
+    s_e2.vs_ranged = 1;
+    s_e2.vs_lo = first; s_e2.vs_n = count;
+    s_e2.vs_tail_off = tail_off; s_e2.vs_tail_bytes = tail_bytes;
+}
+/* The VS block into the UBO slice the draw reads. */
+static void vk_eng_put_vs_constants(u8* dst, u32 vsb)
+{
+    if (!s_e2.vs_ranged) { memcpy(dst, s_e2.ucpu, vsb); return; }
+    memcpy(dst + s_e2.vs_lo * 16u, s_e2.ucpu + s_e2.vs_lo * 16u, s_e2.vs_n * 16u);
+    memcpy(dst + s_e2.vs_tail_off, s_e2.ucpu + s_e2.vs_tail_off, s_e2.vs_tail_bytes);
 }
 static void vk_eng_bind_ps_constants(void* user, const void* data, u32 bytes)
 {
@@ -3825,7 +3860,7 @@ static void vk_eng_draw(void* user, rsx_topology topology, const void* vertices,
                 if (pvkAllocateDescriptorSets(s_vk.device, &dai, &set) == VK_SUCCESS) {
                     s_eb.sets++;
                     s_eb.vb_head = vh; s_eb.ib_head = ih; s_eb.ub_head = uh;
-                    memcpy((u8*)s_eb.ub.ptr + uvs, vk_eng_ucpu(), vsb);
+                    vk_eng_put_vs_constants((u8*)s_eb.ub.ptr + uvs, vsb);
                     memcpy((u8*)s_eb.ub.ptr + ups, vk_eng_ucpu() + s_g.ps_off, psb);
                     if (!vk_eng_write_descriptors_to(P, set, s_eb.ub.buf, uvs, ups)) return;
                     break;
@@ -3855,7 +3890,7 @@ static void vk_eng_draw(void* user, rsx_topology topology, const void* vertices,
         }
         vbuf = s_vk.vertices.buf; ibuf = s_e2.indices.buf; voff = ioff = 0;
         if (!vk_eng_ucpu()) return;
-        memcpy(s_g.ubo.ptr, s_e2.ucpu, vsb);
+        vk_eng_put_vs_constants((u8*)s_g.ubo.ptr, vsb);
         memcpy((u8*)s_g.ubo.ptr + s_g.ps_off, s_e2.ucpu + s_g.ps_off, psb);
         set = vk_eng_write_descriptors(P);
         if (!set) return;
@@ -3924,6 +3959,7 @@ static const rsx_draw_backend s_vk_engine_backend = {
     .bind_targets         = vk_eng_bind_targets,
     .bind_pipeline        = vk_eng_bind_pipeline,
     .bind_vs_constants    = vk_eng_bind_vs_constants,
+    .bind_vs_constants_range = vk_eng_bind_vs_constants_range,
     .bind_ps_constants    = vk_eng_bind_ps_constants,
     .bind_textures        = vk_eng_bind_textures,
     .bind_vertex_textures = vk_eng_bind_vertex_textures,

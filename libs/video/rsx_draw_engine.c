@@ -153,6 +153,8 @@ typedef struct {
     u8 fixed;
     u16 tex_used;           /* units the pixel program samples */
     u64 fp_hash;            /* eng_fp_debug_hash of the guest fragment program */
+    u16 vpc_lo, vpc_n;      /* the vp_c[] rows its vertex program can read... */
+    u8 vpc_full;            /* ...or any row (relative reads, built-in program) */
 } eng_pipeline;
 
 typedef struct { u32 first, count; } eng_batch;
@@ -1941,6 +1943,10 @@ static u64 eng_fp_debug_hash(const u8* fp_uc, u32 fp_size)
         ? rsx_fp_structural_hash(fp_uc, fp_size, 1469598103934665603ull) : 0;
 }
 
+/* The vp_c[] rows of the pipeline eng_pipeline_get last returned. */
+static struct { u32 lo, n; int full; } s_vpc = { 0, 0, 1 };
+static int s_vpc_force_full;
+
 static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
                             const rsx_be_render_state* rs,
                             rsx_be_format rt_fmt, u32 rt_count, int* out_fixed,
@@ -2064,6 +2070,7 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
             *out_fixed = p->fixed;
             *out_tex_used = p->tex_used;
             *out_fp_hash = p->fp_hash;
+            s_vpc.lo = p->vpc_lo; s_vpc.n = p->vpc_n; s_vpc.full = p->vpc_full;
             return p->handle;
         }
     }
@@ -2148,6 +2155,15 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
                 vi, fi, nconst, (unsigned long long)fp_hash,
                 handle ? "ok" : "FAILED (draw dropped)"); }
 
+    { eng_pipeline* p = &g.pipelines[g.n_pipelines];
+      rsx_vp_const_usage cu;
+      p->vpc_full = 1; p->vpc_lo = p->vpc_n = 0;
+      if (!fixed && rsx_vp_analyze_constants(vp_uc, vp_instrs * 16u, &cu) >= 0 &&
+          cu.valid && !cu.relative) {
+          p->vpc_full = 0;
+          if (cu.lo <= cu.hi) { p->vpc_lo = (u16)cu.lo; p->vpc_n = (u16)(cu.hi - cu.lo + 1u); }
+      }
+      s_vpc.lo = p->vpc_lo; s_vpc.n = p->vpc_n; s_vpc.full = p->vpc_full; }
     g.pipelines[g.n_pipelines].key = key;
     g.pipelines[g.n_pipelines].fp_hash = fp_hash;
     g.pipelines[g.n_pipelines].handle = handle;
@@ -3206,8 +3222,15 @@ static void sink_end(void* user, const rsx_dispatch* r)
         xf[5] = -((vp.translate[1] - Hv * 0.5f) / (Hv * 0.5f));
         xf[6] = vp.translate[2];
     }
-    memcpy(g.vp_cb, g.rsx.constants, RSX_DSP_NUM_CONSTANTS * 16u);
-    memcpy(g.vp_cb + RSX_DSP_NUM_CONSTANTS * 16u, xf, sizeof xf);
+    /* Only the rows the vertex program can read, when the backend takes a
+     * range: copying the whole 8 KB block per draw, twice, was most of the
+     * constant traffic. PS3RECOMP_ENG_VPC_FULL=1 (read at engine init)
+     * always hands over the whole block. */
+    const int vpc_range = g.be->bind_vs_constants_range && !s_vpc.full && !s_vpc_force_full;
+    if (!vpc_range) {
+        memcpy(g.vp_cb, g.rsx.constants, RSX_DSP_NUM_CONSTANTS * 16u);
+        memcpy(g.vp_cb + RSX_DSP_NUM_CONSTANTS * 16u, xf, sizeof xf);
+    }
 
     /* The buffered fragment constants, then fp_alpha: the layout
      * rsx_fp_decompile_buffered_ex compiled the shader against. */
@@ -3249,7 +3272,11 @@ static void sink_end(void* user, const rsx_dispatch* r)
     for (u32 i = 0; i < n_targets; i++) handles[i] = g.surfaces[targets[i]].handle;
     g.be->bind_targets(g.be->user, handles, n_targets, depth_handle);
     g.be->bind_pipeline(g.be->user, pipeline);
-    g.be->bind_vs_constants(g.be->user, g.vp_cb, ENG_VP_CB_BYTES);
+    if (vpc_range)
+        g.be->bind_vs_constants_range(g.be->user, g.rsx.constants, s_vpc.lo, s_vpc.n,
+                                      xf, sizeof xf, ENG_VP_CB_BYTES);
+    else
+        g.be->bind_vs_constants(g.be->user, g.vp_cb, ENG_VP_CB_BYTES);
     g.be->bind_ps_constants(g.be->user, g.fp_cb, fp_bytes);
     g.be->bind_textures(g.be->user, textures, samplers, tex_mask);
     g.be->bind_vertex_textures(g.be->user, vtextures, vsamplers, vtex_mask);
@@ -3503,6 +3530,8 @@ int rsx_draw_engine_init(u32 width, u32 height)
     { const char* e = getenv("PS3RECOMP_ENG_TEXWGEN");
       s_tex_wgen_on = !(e && strcmp(e, "0") == 0); }
     memset(s_tdec, 0, sizeof s_tdec);    /* the dispatcher's counts restart */
+    { const char* e = getenv("PS3RECOMP_ENG_VPC_FULL");
+      s_vpc_force_full = e && *e && strcmp(e, "0") != 0; }
     { const char* e = getenv("PS3RECOMP_ENG_TEXMEMO");
       s_texmemo_on = !(e && strcmp(e, "0") == 0); }
     memset(s_tmemo, 0, sizeof s_tmemo);

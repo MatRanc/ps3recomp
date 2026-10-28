@@ -296,6 +296,15 @@ typedef struct rsx_draw_backend {
                                      float depth_value, u8 stencil,
                                      u32 x, u32 y, u32 w, u32 h);
 
+    /* Optional, in place of bind_vs_constants: the transform constant block
+     * of `total_bytes` (the same layout bind_vs_constants gets) of which the
+     * vertex program reads only rows [first, first + count) of `rows` (the
+     * whole 512-row file) and the `tail_bytes` of `tail` after the 512 rows
+     * (the viewport epilogue). Rows outside the range are never read and may
+     * hold anything. count may be 0. */
+    void (*bind_vs_constants_range)(void* user, const void* rows, u32 first, u32 count,
+                                    const void* tail, u32 tail_bytes, u32 total_bytes);
+
 } rsx_draw_backend;
 
 /* ---- the engine --------------------------------------------------------- */
