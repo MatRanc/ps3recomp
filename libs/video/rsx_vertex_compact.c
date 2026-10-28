@@ -742,10 +742,20 @@ int rsx_vertex_fetch_many(
 #endif
             break;
         default:   /* RSX_VTX_TYPE_CMP32: one packed word, whatever the size */
-            for (u32 i = 0; i < count; i++)
-                if (!rsx_vertex_fetch_attr_value(plan, attr, &refs[i],
-                        (float*)(out + (size_t)i * stride + slot * 16u)))
-                    return 0;
+            /* Inside the stable range, decode from the known source instead of
+             * resolving each element again (packed normals are common). */
+            for (u32 i = 0; i < count; i++) {
+                float* v = (float*)(out + (size_t)i * stride + slot * 16u);
+                const u32 element = plain
+                    ? ((refs[i].vertex_id + refs[i].base_index) & 0x000FFFFFu)
+                    : rsx_vertex_element_index(refs[i].vertex_id, refs[i].base_index,
+                                               fetch->desc.frequency, modulo);
+                if (element - first > span ||
+                    !rsx_vertex_decode_element(type, fetch->desc.size,
+                                               base + (u64)(element - first) * fstride, v)) {
+                    if (!rsx_vertex_fetch_attr_value(plan, attr, &refs[i], v)) return 0;
+                }
+            }
             break;
         }
     }
