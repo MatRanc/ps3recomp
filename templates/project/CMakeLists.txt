@@ -190,10 +190,12 @@ add_executable(${PROJECT_NAME}
 #                          SPU sources are small and decode-hot, so they get
 #                          full optimization. The last -O on the line wins.
 # PS3RECOMP_SPU_FAST_FLOAT: lifted SPU code does single-precision arithmetic natively
-# (round to nearest, infinities on overflow) instead of the SPU-exact emulation.
+# (round to nearest, infinities on overflow) instead of the SPU-exact emulation. An x86 path: the
+# SPU sources are compiled with -mfma, so the build then needs a CPU with FMA (2013 or later).
 option(PS3RECOMP_SPU_FAST_FLOAT "Native, not SPU-exact, float arithmetic in lifted SPU code" OFF)
 # PS3RECOMP_SPU_FAST_LS: lifted SPU code reads/writes local store with one vector load/store and
-# shuffle per quadword, and without the local-store diagnostics (SPU_LS_WATCH etc.).
+# shuffle per quadword, and without the local-store diagnostics (SPU_LS_WATCH etc.). On x86 the
+# SPU sources are compiled with -mssse3 for the shuffle; arm64 has it in NEON.
 option(PS3RECOMP_SPU_FAST_LS "Vector local-store access, no LS diagnostics, in lifted SPU code" OFF)
 # PS3RECOMP_SPU_WRCH_INLINE: lifted SPU code writes the MFC parameter channels (MFC_LSA, EAH, EAL,
 # Size, TagID) in place instead of calling spu_wrch, and calls straight into the MFC command and
@@ -202,20 +204,46 @@ option(PS3RECOMP_SPU_FAST_LS "Vector local-store access, no LS diagnostics, in l
 option(PS3RECOMP_SPU_WRCH_INLINE "Inline MFC channel writes in lifted SPU code" ON)
 if(SPU_SOURCES)
     set(_spu_defs SPU_USE_DISPATCH_MT)
+    set(_spu_opts "")
+    if(NOT MSVC OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+        set(_spu_gnu_flags ON)
+        list(APPEND _spu_opts -O2)
+    endif()
+    # The fast paths are chosen by the instruction set the TU is compiled for (spu_helpers.h,
+    # spu_context.h). Without the -m flag below the define alone selected nothing, so an option
+    # that cannot take effect on this toolchain stops the configure rather than doing nothing.
+    if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64|i[3-6]86|x86)$")
+        set(_spu_x86 ON)
+    endif()
     if(PS3RECOMP_SPU_WRCH_INLINE)
         list(APPEND _spu_defs SPU_WRCH_INLINE)
     endif()
     if(PS3RECOMP_SPU_FAST_FLOAT)
+        if(NOT _spu_x86)
+            message(FATAL_ERROR "PS3RECOMP_SPU_FAST_FLOAT is an x86 (FMA) path; "
+                "this target is ${CMAKE_SYSTEM_PROCESSOR}")
+        elseif(NOT _spu_gnu_flags)
+            message(FATAL_ERROR "PS3RECOMP_SPU_FAST_FLOAT needs FMA code generation (-mfma): "
+                "build with Clang (clang-cl) or GCC, not MSVC")
+        endif()
         list(APPEND _spu_defs SPU_FAST_FLOAT)
+        list(APPEND _spu_opts -mfma)
     endif()
     if(PS3RECOMP_SPU_FAST_LS)
+        if(_spu_x86 AND NOT _spu_gnu_flags)
+            message(FATAL_ERROR "PS3RECOMP_SPU_FAST_LS needs SSSE3 code generation (-mssse3): "
+                "build with Clang (clang-cl) or GCC, not MSVC")
+        endif()
         list(APPEND _spu_defs SPU_LIFTED_FAST_LS)
+        if(_spu_x86)
+            list(APPEND _spu_opts -mssse3)
+        endif()
     endif()
     set_source_files_properties(${SPU_SOURCES} PROPERTIES
         INCLUDE_DIRECTORIES "${PS3RECOMP_DIR}/runtime/spu"
         COMPILE_DEFINITIONS "${_spu_defs}")
-    if(NOT MSVC OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
-        set_source_files_properties(${SPU_SOURCES} PROPERTIES COMPILE_OPTIONS "-O2")
+    if(_spu_opts)
+        set_source_files_properties(${SPU_SOURCES} PROPERTIES COMPILE_OPTIONS "${_spu_opts}")
     endif()
 endif()
 

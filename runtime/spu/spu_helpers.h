@@ -798,6 +798,10 @@ SPU__SF_V2(spu__fm_s, spu__fm_any(x, y))
 SPU__SF_V3(spu__fma_s,  spu__fma_any(x, y, z, 0, 0))
 SPU__SF_V3(spu__fms_s,  spu__fma_any(x, y, z, 0, 0x80000000u))
 SPU__SF_V3(spu__fnms_s, spu__fma_any(x, y, z, 0x80000000u, 0))
+/* SPU_FAST_FLOAT is the x86 FMA path below; without FMA it would select nothing. */
+#if defined(SPU_FAST_FLOAT) && (!defined(__FMA__) || defined(__ARM_NEON)) && !defined(SPU_SCALAR_HELPERS)
+#error "SPU_FAST_FLOAT needs FMA on x86 (-mfma)"
+#endif
 #if defined(__ARM_NEON) && !defined(SPU_SCALAR_HELPERS)
 /* Four lanes at a time, every lane exact, with no FPCR change. The host rounds to nearest (the
  * thread's default FPCR: RN, no flush-to-zero -- writing FPCR per op serializes, ~17 ns on an

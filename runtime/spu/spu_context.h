@@ -19,6 +19,11 @@
 #if defined(SPU_LIFTED_FAST_LS) && defined(__SSSE3__)
 #include <tmmintrin.h>
 #endif
+/* SPU_LIFTED_FAST_LS is the vector local-store path, SSSE3's byte shuffle on x86 and NEON on arm64.
+ * Without either it would only take the local-store diagnostics away. */
+#if defined(SPU_LIFTED_FAST_LS) && !defined(__SSSE3__) && !defined(__ARM_NEON)
+#error "SPU_LIFTED_FAST_LS needs SSSE3 on x86 (-mssse3) or NEON"
+#endif
 
 #ifdef __cplusplus
 extern "C" {
