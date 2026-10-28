@@ -2941,7 +2941,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
          * and near-end recycling is enabled from then on. */
         static int s_title_overran = 0;
         if (s_fifo_recycle_waiting) head_consumed = 0;   /* its callback is recycling */
-        else if (begin && end > begin && cur >= end) { head_consumed = 1; s_title_overran = 1; }
+        else if (begin && end > begin && cur > end) { head_consumed = 1; s_title_overran = 1; }   /* `end` is the last word: cur == end is full, not overrun */
         if (begin && end > begin && cur >= begin && cur + GCM_RECYCLE_SLACK >= end
                 && head_consumed && s_title_overran) {
             u32 io_begin = gcm_ea2io(begin);
