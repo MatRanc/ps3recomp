@@ -64,6 +64,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <time.h>
 #include <string.h>
 
 /* ---------------------------------------------------------------------------
@@ -452,6 +453,9 @@ static void vk_present_wait_gpu(void);
  * results flushes them first, so everything else keeps the invariant that
  * all earlier work has completed. */
 static u32 s_eb_pending;
+/* VK_EB_STATS=1 (diagnostic): why batches end. Set before a flush; vk_eng_flush counts and resets it. */
+static u32 s_eb_why;                /* 0 other, 1 ring/pool full, 2 unbatched draw, 3 max draws,
+                                     * 4 engine submit, 5 destroy, 6 present, 7 vk_begin */
 static void vk_eng_flush(void);
 static int vk_eb_active(void);       /* batching decided on and on */
 static u32 vk_eb_max(void);
@@ -462,7 +466,7 @@ static int vk_eb_upload(VkImage img, VkBufferImageCopy* region, const void* src,
 
 static void vk_destroy_image(vk_image* im)
 {
-    if (s_eb_pending) vk_eng_flush();
+    if (s_eb_pending) { s_eb_why = 5; vk_eng_flush(); }
     /* Never under a present's copy that may still read it. */
     if (im->img) vk_present_wait_gpu();
     if (im->view) pvkDestroyImageView(s_vk.device, im->view, NULL);
@@ -586,7 +590,7 @@ static void vk_cmd_after_everything(VkCommandBuffer cb)
 
 static int vk_begin(void)
 {
-    if (s_eb_pending) vk_eng_flush();
+    if (s_eb_pending) { if (!s_eb_why) s_eb_why = 7; vk_eng_flush(); }
     VK_CHECK(pvkResetCommandBuffer(s_vk.cmd, 0), "vkResetCommandBuffer");
     VkCommandBufferBeginInfo bi = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
                                     .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT };
@@ -2309,7 +2313,7 @@ static void vk_eng_shutdown(void* user)
 static void vk_eng_submit_and_wait(void* user, u32 reason)
 {
     (void)user; (void)reason;      /* every other submission has already completed */
-    if (s_eb_pending) vk_eng_flush();
+    if (s_eb_pending) { s_eb_why = 4; vk_eng_flush(); }
 }
 
 static u32 vk_eng_color_target_create(void* user, rsx_be_format fmt, u32 w, u32 h,
@@ -2426,7 +2430,7 @@ static void vk_eng_present(void* user, u32 surface)
 {
     (void)user;
     if (!s_vk.device) return;
-    if (s_eb_pending) vk_eng_flush();   /* the present records on its own buffer */
+    if (s_eb_pending) { s_eb_why = 6; vk_eng_flush(); }   /* the present records on its own buffer */
     vk_eng_obj* o = vk_eng_get(surface, VK_ENG_COLOR);
     pthread_mutex_lock(&s_vk.present_mu);
     VkCommandBuffer cb = vk_present_record_begin();
@@ -3452,7 +3456,7 @@ static struct {
     VkDeviceSize     vb_head, ib_head, ub_head, sb_head, ub_align;
     VkDescriptorPool pool;
     u32              sets;
-    unsigned long long draws, flushes;
+    unsigned long long draws, flushes, unbatched, why[8];
 } s_eb = { .on = -1 };
 
 static int vk_eb_on(void)
@@ -3538,6 +3542,22 @@ static int vk_eb_upload(VkImage img, VkBufferImageCopy* region, const void* src,
 static void vk_eng_flush(void)
 {
     if (!s_eb_pending) return;
+    {   static int st = -1; static unsigned long long t0;
+        if (st < 0) st = getenv("VK_EB_STATS") ? 1 : 0;
+        if (st) {
+            s_eb.why[s_eb_why & 7]++;
+            struct timespec ts; timespec_get(&ts, TIME_UTC);
+            unsigned long long now = (unsigned long long)ts.tv_sec * 1000ull + (unsigned long long)ts.tv_nsec / 1000000ull;
+            if (!t0) t0 = now;
+            if (now - t0 >= 2000) {
+                unsigned long long* w = s_eb.why;
+                VK_LOG("batch stats 2s: %llu batched draws, %llu unbatched, %llu flushes; why: other %llu ring %llu"
+                       " unbatched %llu max %llu engine %llu destroy %llu present %llu begin %llu\n",
+                       s_eb.draws, s_eb.unbatched, s_eb.flushes, w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]);
+                memset(w, 0, sizeof s_eb.why); s_eb.draws = s_eb.unbatched = s_eb.flushes = 0; t0 = now;
+            }
+        }
+        s_eb_why = 0; }
     s_eb_pending = 0;               /* first: the submit below must not re-enter */
     vk_submit_and_wait();
     s_eb.vb_head = s_eb.ib_head = s_eb.ub_head = s_eb.sb_head = 0;
@@ -3681,7 +3701,7 @@ static void vk_eng_draw(void* user, rsx_topology topology, const void* vertices,
                 set = VK_NULL_HANDLE;
             }
             if (tries || !s_eb_pending) { batched = 0; break; }
-            vk_eng_flush();
+            s_eb_why = 1; vk_eng_flush();
         }
         if (batched && !set) batched = 0;
     }
@@ -3694,7 +3714,7 @@ static void vk_eng_draw(void* user, rsx_topology topology, const void* vertices,
          * or blends over: order it after all of them. */
         vk_cmd_after_everything(s_vk.cmd);
     } else {
-        if (s_eb_pending) vk_eng_flush();
+        if (s_eb_pending) { s_eb_why = 2; vk_eng_flush(); }
         if (vk_ensure_vertex_buffer(vbytes)) return;
         memcpy(s_vk.vertices.ptr, vertices, (size_t)vbytes);
         if (ibytes) {
@@ -3747,9 +3767,9 @@ static void vk_eng_draw(void* user, rsx_topology topology, const void* vertices,
         pvkCmdDraw(s_vk.cmd, vertex_count, 1, 0, 0);
     }
     pvkCmdEndRenderPass(s_vk.cmd);
-    if (!batched) { vk_submit_and_wait(); return; }
+    if (!batched) { s_eb.unbatched++; vk_submit_and_wait(); return; }
     s_eb.draws++;
-    if (++s_eb_pending >= s_eb.max_draws) vk_eng_flush();
+    if (++s_eb_pending >= s_eb.max_draws) { s_eb_why = 3; vk_eng_flush(); }
 }
 
 static const rsx_draw_backend s_vk_engine_backend = {
