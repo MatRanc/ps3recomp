@@ -444,6 +444,7 @@ struct SpursPmSlot {
     u32 spu_num, wid, ea, pm_size;
     spu_lifted_entry_fn fn;
     int image_id, busy;
+    int idle_join;   /* taken on the workload's idle SPU request, not its ready count */
     const uint8_t* pm;
     u64 data;
     HANDLE thread;
@@ -458,6 +459,7 @@ static struct SpursInst {
     HANDLE coordinator;
     struct SpursPmSlot slots[6];
     u8 active[16], idle[16];
+    u8 idle_joined[16];   /* of active[], the SPUs taken on the idle request */
     u32 cursor, pass_no;
 } s_inst[MAX_SPURS_INST];
 static SRWLOCK s_inst_directory_lock = SRWLOCK_INIT;
@@ -1405,8 +1407,10 @@ s32 cellSpursAddWorkload(CellSpurs* spurs, CellSpursWorkloadId* wid,
         if (!s_workloads[i].in_use) {
             spurs_scheduler_forget(i);
             si->idle[i] = 0;
+            si->idle_joined[i] = 0;
             spu_lockline_lock();
             vm_base[spurs_ea + SPURS_WKL_READY1 + i] = 0;
+            vm_base[spurs_ea + SPURS_WKL_IDLE2 + i] = 0;    /* not the last workload's idle request */
             vm_base[spurs_ea + SPURS_WKL_CURCONT + i] = 0;
             ef_w16(spurs_ea + SPURS_WKL_SIGNAL1,
                    (u16)(vm_read16(spurs_ea + SPURS_WKL_SIGNAL1) & ~(0x8000u >> i)));
@@ -1769,6 +1773,7 @@ static DWORD WINAPI spurs_pm_worker(LPVOID p)
         AcquireSRWLockExclusive(&si->lock);
         u32 wid = slot->wid;
         if (si->active[wid]) si->active[wid]--;
+        if (slot->idle_join && si->idle_joined[wid]) si->idle_joined[wid]--;
         spu_lockline_lock();
         vm_base[slot->ea + SPURS_WKL_CURCONT + wid] = si->active[wid];
         ef_line_end(slot->ea);
@@ -1847,6 +1852,14 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
                 const u32 idle = vm_read8(ea + SPURS_WKL_IDLE2 + wid);   /* cellSpursRequestIdleSpu */
                 if (ready_level && ready && si->active[wid] >= ready + idle) continue;
                 int kicked = ready || (signal & (0x8000u >> wid));
+                /* Here the ready count is consumed as SPUs take the workload, so
+                 * it is 0 while the workload runs. The idle request lets up to
+                 * `idle` more SPUs join one that a ready count or signal put on
+                 * an SPU: ready + idle > contention, as the real kernel has it. */
+                int idle_join = 0;
+                if (!kicked && !ready_level && idle && si->active[wid] > si->idle_joined[wid] &&
+                    si->idle_joined[wid] < idle)
+                    kicked = idle_join = 1;
                 if (kicked) si->idle[wid] = 0;
                 /* SPURS_NO_IDLE_PROBE=1 (experiment): schedule only what real SPURS would --
                  * a workload with ready count 0 and no signal never gets an SPU. */
@@ -1861,13 +1874,16 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
                 if (ready && !ready_level) vm_base[ea + SPURS_WKL_READY1 + wid] = (u8)(ready - 1);
                 if (signal & (0x8000u >> wid))
                     ef_w16(ea + SPURS_WKL_SIGNAL1, (u16)(signal & ~(0x8000u >> wid)));
+                if ((ready && !ready_level) || (signal & (0x8000u >> wid))) idle_join = 0;
                 ef_line_end(ea);
                 slot->fn = pm->fn; slot->image_id = pm->image_id;
                 slot->pm = vm_base + (u32)(uintptr_t)s_workloads[wid].pm;
                 slot->pm_size = s_workloads[wid].sizePm;
                 slot->data = vm_read64(ea + SPURS_WKL_INFO1 + wid * SPURS_WKL_INFO_SZ + 8);
                 slot->wid = wid; slot->ea = ea;
+                slot->idle_join = idle_join;
                 si->active[wid]++;
+                if (idle_join) si->idle_joined[wid]++;
                 spu_lockline_lock();
                 vm_base[ea + SPURS_WKL_CURCONT + wid] = si->active[wid];
                 ef_line_end(ea);
@@ -1890,6 +1906,7 @@ static s32 spurs_scheduler_start(struct SpursInst* si)
       g_spu_line_commit_hook = spurs_commit_hook; }
     memset(si->active, 0, sizeof(si->active));
     memset(si->idle, 0, sizeof(si->idle));
+    memset(si->idle_joined, 0, sizeof(si->idle_joined));
     for (u32 sn = 0; sn < si->nspus; sn++) {
         struct SpursPmSlot* slot = &si->slots[sn];
         memset(slot, 0, sizeof(*slot));
