@@ -789,8 +789,16 @@ static inline uint64_t spu_preferred_u64(const u128* reg)
 static inline u128 spu_make_preferred_u32(uint32_t val)
 {
     u128 r;
+#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__ || defined(_WIN32)
+    /* Whole 64-bit halves (_u32[0] is the low half of _u64[0] here). A 4-byte
+     * store under the 8-byte reload of the returned value cannot be
+     * store-forwarded: that stall was most of spu_rdch in inFAMOUS 2. */
+    r._u64[0] = val;
+    r._u64[1] = 0;
+#else
     memset(&r, 0, sizeof(r));
     r._u32[0] = val;
+#endif
     return r;
 }
 
