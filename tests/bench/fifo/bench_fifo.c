@@ -3,9 +3,11 @@
  *
  * One synthetic frame (~300k method words, a realistic mix: 90% register
  * writes in runs of 1-16, incrementing and non-incrementing, on subchannels
- * 0 and 1; 10% methods with side effects -- draws, clears, immediate and
- * inline vertices, NV406E semaphores, back-end labels, SET_REFERENCE,
- * GET_REPORT, notifies, a user command -- plus JUMPs, CALL/RET and a flip)
+ * 0 and 1, and transform constant and program uploads the way the SDK
+ * writes them, 4-256 and 32-508 words; 10% methods with side effects --
+ * draws, clears, immediate and inline vertices, NV406E semaphores, back-end
+ * labels, SET_REFERENCE, GET_REPORT, notifies, a user command -- plus NOP
+ * runs of 1-3 and 32-1023 words, JUMPs, CALL/RET and a flip)
  * is written into IO memory and replayed through the real walker
  * (cellGcmSys.c, included below) into the real dispatcher (rsx_dispatch.c,
  * linked). The graphics backends are stubbed: every callback they would get
@@ -20,6 +22,9 @@
  *             that call, so a store moved across a draw shows up.
  *   state  -- a hash of the final dispatcher state, the label window, the
  *             fence queue, the report values and the walker's own counters.
+ *   walk   -- the walker's bookkeeping: its trace ring (the last words it
+ *             read, the [FIFOSTEP] dump), how many it has read, the last
+ *             ring offset and the park; with --verify at every sink call too.
  *   ns     -- best frame of the run, per method word and per header.
  *
  * bench_fifo [--engine|--legacy|--vtable] [--verify] [--frames N]
@@ -57,7 +62,7 @@ void rsx_state_init(rsx_state* state) { (void)state; }
 
 /* ---- the record ---------------------------------------------------------- */
 
-static u64 g_hash = 0xcbf29ce484222325ull, g_calls;
+static u64 g_hash = 0xcbf29ce484222325ull, g_calls, g_walk = 0xcbf29ce484222325ull;
 static int g_verify, g_engine_on;
 static rsx_dispatch g_rsx;
 
@@ -80,10 +85,18 @@ static void call(u32 kind, u32 a, u32 b)
     g_calls++;
     mix(((u64)kind << 56) ^ ((u64)a << 24) ^ b);
 }
+static void walk_state(void)
+{
+    const u32 w[] = { s_tr_i, s_last_ring_off, park_off, park_put };
+    u64 h = hash_words(g_walk, s_tr_off, sizeof s_tr_off);
+    h = hash_words(h, s_tr_w, sizeof s_tr_w);
+    g_walk = hash_words(h, w, sizeof w);
+}
 /* The dispatcher's state as a sink callback sees it. */
 static void call_state(void)
 {
     if (!g_verify) return;
+    walk_state();
     u64 h = hash_words(0, g_rsx.regs, sizeof g_rsx.regs);
     h = hash_words(h, g_rsx.seen, sizeof g_rsx.seen);
     h = hash_words(h, g_rsx.vp, sizeof g_rsx.vp);
@@ -166,7 +179,7 @@ static u32 g_rng = 0x2545F491u;
 static u32 rnd(void) { g_rng ^= g_rng << 13; g_rng ^= g_rng >> 17; g_rng ^= g_rng << 5; return g_rng; }
 
 static u32 g_io;                                  /* write cursor */
-static u32 n_words, n_hdrs, n_se_words;           /* method words, headers, side-effect words */
+static u32 n_words, n_hdrs, n_se_words, n_nops;   /* method words, headers, side-effect words, NOPs */
 static void emit(u32 w) { vm_write32(IO_ADDR + g_io, w); g_io += 4; }
 static void method(u32 subch, u32 m, int ni, u32 count, const u32* args, int se)
 {
@@ -186,23 +199,57 @@ static const u32 k_blocks[][2] = {
     {0x1C00, 16}, {0x0A80, 16}, {0x1E40, 8}, {0x1500, 12}, {0x1DAC, 2}, {0x0B40, 16},
 };
 
+/* Transform constants as cellGcmSetVertexProgramConstants writes them: per
+ * 32 words, one header from SET_TRANSFORM_CONSTANT_LOAD on, the load slot
+ * and then the values. Mostly a few vec4s (matrices), now and then a bone
+ * palette; the load can run past the 512 slots. */
+static void const_upload(u32 subch)
+{
+    u32 args[33];
+    u32 words = 4u * (1u + ((rnd() % 4u) ? rnd() % 16u : rnd() % 64u));
+    u32 slot = rnd() % 500u;
+    while (words) {
+        const u32 n = words < 32u ? words : 32u;
+        args[0] = slot;
+        for (u32 i = 0; i < n; i++) args[1 + i] = rnd();
+        method(subch, 0x1EFC, 0, 1 + n, args, 0);
+        words -= n; slot += n / 4u;
+    }
+}
+
+/* A vertex program as cellGcmSetVertexProgram uploads it: the load slot,
+ * then 32 words (8 instructions) per header. */
+static void program_upload(u32 subch)
+{
+    u32 args[32];
+    u32 words = 4u * (8u + rnd() % 120u);
+    args[0] = rnd() % 500u;
+    method(subch, 0x1E9C, 0, 1, args, 0);
+    while (words) {
+        const u32 n = words < 32u ? words : 32u;
+        for (u32 i = 0; i < n; i++) args[i] = rnd();
+        method(subch, 0x0B80, 0, n, args, 0);
+        words -= n;
+    }
+}
+
 static void reg_run(void)
 {
     u32 args[16];
     const u32 subch = (rnd() % 10u) == 0 ? 1u : 0u;
-    const u32 r = rnd() % 20u;
-    if (r == 0) {                                 /* transform constants */
-        u32 id = rnd() % 480u;
-        method(subch, 0x1EFC, 0, 1, &id, 0);
-        for (u32 i = 0; i < 16; i++) args[i] = rnd();
-        method(subch, 0x1F00, 0, 16, args, 0);
+    const u32 r = rnd() % 120u;
+    if (r < 6) {                                  /* transform constants */
+        if (r == 0) {                             /* the load in a header of its own */
+            u32 id = rnd() % 480u;
+            method(subch, 0x1EFC, 0, 1, &id, 0);
+            for (u32 i = 0; i < 16; i++) args[i] = rnd();
+            method(subch, 0x1F00, 0, 16, args, 0);
+        } else
+            const_upload(subch);
         return;
     }
-    if (r == 1) {                                 /* vertex program microcode */
-        u32 id = rnd() % 500u;
-        method(subch, 0x1E9C, 0, 1, &id, 0);
-        for (u32 i = 0; i < 16; i++) args[i] = rnd();
-        method(subch, 0x0B80, 0, 16, args, 0);
+    if (r == 6) {                                 /* vertex program microcode */
+        program_upload(subch);
         return;
     }
     const u32* b = k_blocks[rnd() % (sizeof k_blocks / sizeof k_blocks[0])];
@@ -307,12 +354,19 @@ static u32 build_frame(void)
             for (int i = 0; i < 8; i++) emit(0xDEAD0000u | (u32)i);
         } else if (r == 1) {
             emit(SUB_IO | 2u);                    /* CALL */
+        } else if (r == 2 || (r == 3 && (rnd() & 1u))) {
+            /* NOPs: alignment padding, or the unused end of a reservation
+             * an SPU job filled (God of War HD: ~4 NOPs a header). */
+            const u32 n = r == 2 ? 1u + rnd() % 3u : 32u + rnd() % 992u;
+            for (u32 i = 0; i < n; i++) emit(0);
+            n_nops += n;
         } else if (n_se_words * 10u < n_words && (r & 3u) == 0)
             side_effect();
         else
             reg_run();
     }
     emit(GCM_FLIP_MARKER | 1u);
+    if (g_io > SUB_IO) { printf("the frame runs into the CALL target at 0x%08X\n", SUB_IO); exit(1); }
     return g_io;
 }
 
@@ -380,10 +434,12 @@ int main(int argc, char** argv)
         while (s_ref_qhead != s_ref_qtail) { mix(s_ref_q[s_ref_qhead % GCM_REF_QLEN]); s_ref_qhead++; }
     }
     printf("config %s%s frames %d\n", cfg, g_verify ? " verify" : "", frames);
-    printf("frame %u method words, %u headers, %.1f%% side-effect words, %u bytes\n",
-           n_words, n_hdrs, 100.0 * n_se_words / n_words, put - FRAME_IO);
+    printf("frame %u method words, %u headers, %.1f%% side-effect words, %u NOP words, %u bytes\n",
+           n_words, n_hdrs, 100.0 * n_se_words / n_words, n_nops, put - FRAME_IO);
     printf("calls %llu %016llx\n", (unsigned long long)g_calls, (unsigned long long)g_hash);
     printf("state %016llx\n", (unsigned long long)state_hash());
+    walk_state();
+    printf("walk %016llx\n", (unsigned long long)g_walk);
     printf("time best frame %.0f us: %.2f ns/word %.2f ns/header\n",
            best / 1e3, best / n_words, best / n_hdrs);
     free(vm_base);
