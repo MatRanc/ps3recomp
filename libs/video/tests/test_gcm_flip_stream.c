@@ -63,6 +63,11 @@ void rsx_draw_engine_method(u32 method, u32 arg)
 {
     if ((method & 0x1FFCu) == 0x1D8Cu && g_n_zs_engine < 4) g_zs_engine[g_n_zs_engine++] = arg;
 }
+void rsx_draw_engine_methods(u32 method, u32 step, const u8* src, u32 count)
+{
+    for (u32 i = 0; i < count; i++, src += 4)
+        rsx_draw_engine_method(method + i * step, ((u32)src[0] << 24) | ((u32)src[1] << 16) | ((u32)src[2] << 8) | src[3]);
+}
 
 /* No microcode or constant runs here: the walker hands every word to
  * rsx_process_method instead (#554). */

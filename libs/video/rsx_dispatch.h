@@ -164,6 +164,12 @@ void rsx_dispatch_seed_transform_constants(rsx_dispatch* rsx, const u32* words, 
 /* Dispatch one register write. */
 void rsx_dispatch_method(rsx_dispatch* rsx, u32 method, u32 arg);
 
+/* A FIFO run of NV4097 methods: rsx_dispatch_method for method + i * step,
+ * wrapped to 0..0x1FFC, with word i of `src` (big-endian, as the FIFO holds
+ * it), in order. step is 4 for an incrementing header, 0 for a
+ * non-incrementing one. */
+void rsx_dispatch_method_run(rsx_dispatch* rsx, u32 method, u32 step, const u8* src, u32 count);
+
 /* ---- decoded state getters -------------------------------------------- */
 
 static inline u32 rsx_dsp_reg(const rsx_dispatch* rsx, u32 method)

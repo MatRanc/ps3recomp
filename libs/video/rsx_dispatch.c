@@ -464,6 +464,38 @@ void rsx_dispatch_method(rsx_dispatch* rsx, u32 method, u32 arg)
     }
 }
 
+/* NV4097 methods rsx_dispatch_method only counts and stores: none of what
+ * it treats specially above -- the packed vertex constants vtx_const_fold
+ * decodes (0x0A80, 0x1500, 0x1880..0x19FF, 0x1E40), the texture registers
+ * that bump a write generation (0x1840, 0x1A00..0x1BFF), the immediate
+ * vertex at DATA4F W (0x1C0C), the program and constant upload windows and
+ * the switch's executes. Keep it in step with that function;
+ * test_rsx_dispatch_plain checks every method below 0x2000 against it. */
+static int dsp_method_plain(u32 m)
+{
+    if (m < 0x0A80) return 1;
+    if (m < 0x1500) return m >= 0x0B00 && (m < M_VP_UPLOAD_INST || m >= M_VP_UPLOAD_INST + 32 * 4);
+    if (m < M_TEX_SIZE1)
+        return m >= 0x1600 && m != M_VERTEX_BEGIN_END && m != M_VB_VERTEX_BATCH &&
+               m != M_INLINE_ARRAY && m != M_VB_INDEX_BATCH;
+    if (m < 0x1C00) return 0;
+    return m != 0x1C0C && m != M_CLEAR_BUFFERS && (m < 0x1E40 || m >= 0x1E80) &&
+           (m < M_VP_UPLOAD_CONST || m >= M_VP_UPLOAD_CONST + 32 * 4);
+}
+
+void rsx_dispatch_method_run(rsx_dispatch* rsx, u32 method, u32 step, const u8* src, u32 count)
+{
+    for (u32 i = 0; i < count; i++, method += step, src += 4) {
+        const u32 m = method & 0x1FFCu;
+        const u32 arg = ((u32)src[0] << 24) | ((u32)src[1] << 16) | ((u32)src[2] << 8) | src[3];
+        if (dsp_method_plain(m)) {
+            rsx->seen[m >> 2]++;
+            rsx->regs[m >> 2] = arg;
+        } else
+            rsx_dispatch_method(rsx, m, arg);
+    }
+}
+
 /* ---- getters ----------------------------------------------------------- */
 
 u32 rsx_dsp_clear_color(const rsx_dispatch* rsx)

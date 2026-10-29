@@ -334,6 +334,11 @@ void rsx_draw_engine_shutdown(void);
  * write its state into the wrong register bank. */
 void rsx_draw_engine_method(u32 method, u32 arg);
 
+/* rsx_draw_engine_method for a run of `count` NV4097 methods method,
+ * method + step, ... (step 4 or 0) on a 3D subchannel, with their words
+ * still big-endian in guest memory at `src`. */
+void rsx_draw_engine_methods(u32 method, u32 step, const u8* src, u32 count);
+
 /* cellGcmSetDisplayBuffer, so the flip can resolve a buffer id to a surface
  * the engine has actually rendered rather than to whatever is bound. */
 void rsx_draw_engine_set_display_buffer(u32 buffer_id, u32 location, u32 offset,

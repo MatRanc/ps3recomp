@@ -403,6 +403,10 @@ jobs:
           # Texture offsets are 31 bits; bit 31 is not an address bit.
           ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -Wall -Wextra -Wno-unused-parameter -I include -I libs/video -o /tmp/test_rsx_texture_offset libs/video/tests/test_rsx_texture_offset.c libs/video/rsx_dispatch.c
           /tmp/test_rsx_texture_offset
+          # The FIFO walker's register runs: the methods the dispatcher stores
+          # without its long path, every one checked against that path.
+          ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -Wall -Wextra -Wno-unused-parameter -I include -I libs/video -o /tmp/test_rsx_dispatch_plain libs/video/tests/test_rsx_dispatch_plain.c
+          /tmp/test_rsx_dispatch_plain
           ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -Wall -Wextra -I include -I libs/video -o /tmp/test_rsx_command_texture_offset libs/video/tests/test_rsx_command_texture_offset.c libs/video/rsx_commands.c
           /tmp/test_rsx_command_texture_offset
 
