@@ -21,6 +21,7 @@
  * lwmutex exclusion) and the POSIX shims elsewhere -- Sleep, DWORD, QPC. */
 #include "../platform/win32_compat.h"
 #include "../memory/vm.h"   /* VM_HLE_INJECT_BASE -- not platform-specific */
+#include "lwcond_real.h"    /* PS3_LWCOND_REAL: host condition variable per lwcond */
 #ifndef _WIN32
 /* sys_timer.h: not included, its lv2 headers redefine ppu_context. */
 extern "C" uint64_t host_monotonic_ns(void);
@@ -400,7 +401,25 @@ static void sys_lwmutex_unlock(ppu_context* ctx)
  * adequate here: the CRT/SPURS paths that reach us use these for one-shot init
  * handshakes, not long-term blocking. sys_lwcond_t is 8 bytes: +0x00 u32
  * lwmutex EA, +0x04 u32 lwcond queue id. Titles read +0x00 themselves (an
- * lwcond whose lwmutex reads 0 is treated as invalid). */
+ * lwcond whose lwmutex reads 0 is treated as invalid).
+ *
+ * PS3_LWCOND_REAL=1 swaps the poll for a real condition variable
+ * (lwcond_real.h): signal/signal_all/signal_to wake waiters, a timed wait
+ * returns ETIMEDOUT, and an infinite wait still returns CELL_OK after
+ * PS3_LWCOND_FALLBACK_MS (default 10, 0 = never) without a signal, so a
+ * signal the HLE never sees cannot park the thread. Default OFF. */
+static int lwc_real(void)
+{
+    static int v = -1;
+    if (v < 0) { const char* e = getenv("PS3_LWCOND_REAL"); v = (e && *e && *e != '0') ? 1 : 0; }
+    return v;
+}
+static uint32_t lwc_fallback_ms(void)
+{
+    static long v = -1;
+    if (v < 0) { const char* e = getenv("PS3_LWCOND_FALLBACK_MS"); v = e ? atol(e) : 10; if (v < 0) v = 0; }
+    return (uint32_t)v;
+}
 static void sys_lwcond_create(ppu_context* ctx)
 {
     static uint32_t s_lwcond_id = 0x4C000000u;
@@ -410,10 +429,63 @@ static void sys_lwcond_create(ppu_context* ctx)
     vm_write32(lwcond + 0x04, ++s_lwcond_id);
     ctx->gpr[3] = 0;
 }
-static void sys_lwcond_destroy(ppu_context* ctx)    { ctx->gpr[3] = 0; }
-static void sys_lwcond_signal(ppu_context* ctx)     { ctx->gpr[3] = 0; }
-static void sys_lwcond_signal_all(ppu_context* ctx) { ctx->gpr[3] = 0; }
-static void sys_lwcond_signal_to(ppu_context* ctx)  { ctx->gpr[3] = 0; }
+/* Real mode: EBUSY while a thread is parked on it, as lv2 does. */
+static void sys_lwcond_destroy(ppu_context* ctx)
+{
+    lwc_slot* s = lwc_real() ? lwc_slot_get((uint32_t)ctx->gpr[3], 0) : nullptr;
+    ctx->gpr[3] = (s && lwc_waiting(s)) ? (uint64_t)(int64_t)(int32_t)0x8001000Au : 0;   // EBUSY
+}
+/* Signalling an lwcond nobody waits on does nothing, as on lv2. signal_to
+ * (r4 = ppu thread id) whose target is not parked is CELL_OK too, not lv2's
+ * EPERM: the fallback wake can have let the target go already. */
+static void lwcond_signal(ppu_context* ctx, int all, uint32_t to_tid)
+{
+    lwc_slot* s = lwc_real() ? lwc_slot_get((uint32_t)ctx->gpr[3], 0) : nullptr;
+    if (s) lwc_signal(s, all, to_tid);
+    ctx->gpr[3] = 0;
+}
+static void sys_lwcond_signal(ppu_context* ctx)     { lwcond_signal(ctx, 0, 0); }
+static void sys_lwcond_signal_all(ppu_context* ctx) { lwcond_signal(ctx, 1, 0); }
+static void sys_lwcond_signal_to(ppu_context* ctx)
+{
+    /* -1 = any waiter (lv2's "no particular thread"); 0 is no registered
+     * thread, so it names the same sentinel LWM_SELF gives one. */
+    uint32_t tid = (uint32_t)ctx->gpr[4];
+    lwcond_signal(ctx, 0, tid == 0xFFFFFFFFu ? 0 : tid ? tid : 0x7FFFFFFEu);
+}
+static void lwc_unlock_lwm(void* p) { lwm_release((struct LwmSlot*)p); }
+static void lwc_relock_lwm(void* p) { lwm_acquire((struct LwmSlot*)p, 0); }
+/* Real mode. The lwmutex goes and comes back exactly as in the poll below
+ * (owner/recursion stamps cleared, slot released; re-taken, stamps restored),
+ * but released only once this thread is on the lwcond's queue. lv2 rules:
+ * ESRCH for an lwcond without an lwmutex, EPERM unless the caller holds it,
+ * and the lwmutex is held again on return, ETIMEDOUT included. */
+static void sys_lwcond_wait_real(ppu_context* ctx, struct LwmSlot* sl, lwc_slot* s)
+{
+    uint32_t lwmutex = vm_read32((uint32_t)ctx->gpr[3] + 0x00);
+    uint64_t timeout_us = ctx->gpr[4];
+    const uint32_t self = LWM_SELF(ctx);
+    uint32_t rc = vm_read32(lwmutex + LWM_RECUR);
+    if (vm_read32(lwmutex + LWM_OWNER) != self || rc == 0) {
+        static long _np = 0;
+        if (++_np <= 8) fprintf(stderr, "[LWCOND] tid=%u waits on lwcond=0x%08X without its lwmutex 0x%08X (owner=%u) -> EPERM\n",
+            self, (uint32_t)ctx->gpr[3], lwmutex, vm_read32(lwmutex + LWM_OWNER));
+        ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)0x80010009u;   // EPERM
+        return;
+    }
+    vm_write32(lwmutex + LWM_RECUR, 0);
+    vm_write32(lwmutex + LWM_OWNER, 0);
+    ppu_thread_note_block(ctx->thread_id);
+    int r = lwc_wait(s, self, timeout_us, lwc_fallback_ms(), lwc_unlock_lwm, lwc_relock_lwm, sl);
+    vm_write32(lwmutex + LWM_OWNER, self);
+    vm_write32(lwmutex + LWM_RECUR, rc);
+    if (r == LWC_FALLBACK) {
+        static long _nf = 0;
+        if (++_nf <= 8) fprintf(stderr, "[LWCOND] tid=%u lwcond=0x%08X: no signal in %ums, fallback wake (CELL_OK)\n",
+            self, (uint32_t)ctx->gpr[3], lwc_fallback_ms());
+    }
+    ctx->gpr[3] = (r == LWC_TIMEDOUT) ? (uint64_t)(int64_t)(int32_t)0x8001000Bu : 0;   // ETIMEDOUT
+}
 /* Now that the lwmutex is REAL, a no-op wait that keeps holding it deadlocks the
  * signaler. Release the paired lwmutex, wait briefly, reacquire (poll-style: the
  * guest's while(!predicate) loop re-checks; signalers stay no-ops). Handles the
@@ -423,6 +495,12 @@ static void sys_lwcond_wait(ppu_context* ctx)
     uint32_t lwcond  = (uint32_t)ctx->gpr[3];
     uint32_t lwmutex = vm_read32(lwcond + 0x00);
     struct LwmSlot* sl = lwm_slot(lwmutex);
+    if (lwc_real()) {
+        if (!sl) { ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)0x80010005u; return; }   // ESRCH
+        lwc_slot* s = lwc_slot_get(lwcond, 1);
+        if (s) { sys_lwcond_wait_real(ctx, sl, s); return; }
+        /* lwcond table full: poll as below */
+    }
     if (sl) {
         uint32_t own = vm_read32(lwmutex + LWM_OWNER);
         uint32_t rc  = vm_read32(lwmutex + LWM_RECUR);
