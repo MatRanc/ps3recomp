@@ -305,6 +305,23 @@ typedef struct rsx_draw_backend {
     void (*bind_vs_constants_range)(void* user, const void* rows, u32 first, u32 count,
                                     const void* tail, u32 tail_bytes, u32 total_bytes);
 
+    /* Optional, in place of draw: the same draw, with the vertices written
+     * straight into the backend's own vertex memory instead of copied there
+     * from a CPU-side array. Once the backend has reserved vertex_count *
+     * stride bytes for the draw (16-byte aligned, write-only: it may be
+     * uncached, write-combined memory), it calls fill(ctx, dst) exactly once
+     * to have the engine convert the vertices into them, then records the
+     * draw -- or, if fill returns 0, records nothing. Between the reservation
+     * and fill the backend calls nothing that could reuse those bytes.
+     * Returns 1 when the draw was handled (drawn, dropped by the backend's own
+     * rules, or failed in fill), 0 when the backend could not reserve the
+     * memory and has recorded nothing: the engine then converts into a CPU
+     * array and calls draw. Left NULL, every draw goes through draw. */
+    int  (*draw_fill)(void* user, rsx_topology topology,
+                      int (*fill)(void* ctx, void* dst), void* ctx,
+                      u32 vertex_count, u32 stride, const u32* indices,
+                      u32 index_count);
+
 } rsx_draw_backend;
 
 /* ---- the engine --------------------------------------------------------- */

@@ -247,6 +247,9 @@ static struct {
     rsx_vertex_layout_plan layout;
     rsx_vertex_fetch_plan fetch_plan;
     int fetch_ok;
+    /* The vertices are converted at the draw, into the backend's own memory
+     * (draw_fill), not into verts at the fetch. */
+    int fetch_deferred;
 
     /* INLINE_ARRAY stream for this group, when the vertices came down the
      * FIFO rather than from a vertex array. */
@@ -2186,6 +2189,7 @@ static void dc_reset(void)
     dc.n_refs = dc.n_source_refs = dc.n_verts = dc.n_cuts = 0;
     dc.refs_remapped = 0;
     dc.fetch_ok = 1;
+    dc.fetch_deferred = 0;
     dc.inl = NULL;
     dc.inl_bytes = 0;
     dc.n_immediate = 0;
@@ -2289,6 +2293,29 @@ static int dc_reserve_indices(u32 count)
     return 1;
 }
 
+/* PS3RECOMP_ENG_VTX_DIRECT=0 (read at engine init): convert every draw's
+ * vertices into dc.verts and hand them to the backend's draw, as before
+ * draw_fill, even when the backend has it. */
+static int s_vtx_direct = 1;
+
+/* draw_fill's callback: the first *(u32*)ctx unique vertices into dst. */
+static int s_fill_ok;   /* the last fill's result; -1 before it is called */
+static int dc_fill_verts(void* ctx, void* dst)
+{
+    s_fill_ok = rsx_vertex_fetch_many(&dc.fetch_plan, dc.refs, *(const u32*)ctx,
+                                      (u8*)dst);
+    return s_fill_ok;
+}
+
+/* Every unique vertex into dc.verts. */
+static int dc_convert_verts(void)
+{
+    if (!dc_reserve_verts((u64)dc.n_refs * dc.layout.stride))
+        return 0;
+    return rsx_vertex_fetch_many(&dc.fetch_plan, dc.refs, dc.n_refs,
+                                 dc.layout.stride ? dc.verts : NULL);
+}
+
 /* Turn this group's batches into a reference list, recording a CUT rather
  * than fetching a phantom vertex wherever the restart sentinel appears, then
  * collapse repeated references and fetch each unique vertex once.
@@ -2371,12 +2398,18 @@ static void dc_fetch(const rsx_vertex_layout_plan* layout, int allow_remap)
     rsx_vertex_fetch_plan_init(&dc.fetch_plan, &g.rsx, layout, eng_guest_ptr, NULL);
     rsx_vertex_fetch_plan_set_inline(&dc.fetch_plan, &g.rsx, dc.inl, dc.inl_bytes);
     rsx_vertex_fetch_plan_prepare(&dc.fetch_plan, dc.refs, dc.n_refs);
-    if (!dc_reserve_verts((u64)dc.n_refs * layout->stride)) {
-        dc.fetch_ok = 0;
+    /* A backend that takes the vertices in its own memory has them converted
+     * at the draw, straight into the memory the GPU reads: one write of the
+     * converted bytes instead of a write here and a copy there, which read
+     * them back cold. Only when the conversion cannot fail, since a failure
+     * drops the draw before anything is bound. */
+    if (g.be->draw_fill && s_vtx_direct && layout->stride &&
+        !rsx_vertex_fetch_plan_can_fail(&dc.fetch_plan)) {
+        dc.fetch_deferred = 1;
+        dc.n_verts = dc.n_refs;
         return;
     }
-    if (!rsx_vertex_fetch_many(&dc.fetch_plan, dc.refs, dc.n_refs,
-                               layout->stride ? dc.verts : NULL)) {
+    if (!dc_convert_verts()) {
         dc.fetch_ok = 0;
         return;
     }
@@ -3321,9 +3354,31 @@ static void sink_end(void* user, const rsx_dispatch* r)
                              sf.depth_format == 1u ? 16u : 24u);
     }
 
-    const u32 uploaded = indexed ? dc.n_verts : n_draw;
-    g.be->draw(g.be->user, topology, dc.verts, uploaded, layout.stride,
-               indexed ? g.indices : NULL, indexed ? n_draw : 0);
+    u32 uploaded = indexed ? dc.n_verts : n_draw;
+    if (dc.fetch_deferred) {
+        s_fill_ok = -1;
+        if (g.be->draw_fill(g.be->user, topology, dc_fill_verts, &uploaded,
+                            uploaded, layout.stride, indexed ? g.indices : NULL,
+                            indexed ? n_draw : 0)) {
+            /* A conversion that failed drew nothing, as a failed fetch never
+             * did; a draw the backend dropped by its own rules counts as one,
+             * as it always has. */
+            if (!s_fill_ok) return;
+            static u32 logs = 0;
+            if (s_fill_ok > 0 && PS3_LOG_FIRST(logs, 1))
+                fprintf(stderr, "[rsx engine] vertices converted straight into the "
+                                "backend's vertex memory (PS3RECOMP_ENG_VTX_DIRECT=0 copies)\n");
+        } else {
+            /* The backend had no room for them: convert here and hand them
+             * over the old way. */
+            if (!dc_convert_verts()) return;
+            g.be->draw(g.be->user, topology, dc.verts, uploaded, layout.stride,
+                       indexed ? g.indices : NULL, indexed ? n_draw : 0);
+        }
+    } else {
+        g.be->draw(g.be->user, topology, dc.verts, uploaded, layout.stride,
+                   indexed ? g.indices : NULL, indexed ? n_draw : 0);
+    }
     /* Counted only when the draw ran the guest's OWN programs, which is what
      * the test hook means: a draw through the built-in pair is a draw, not
      * evidence that the decompile-translate-compile path worked. */
@@ -3534,6 +3589,8 @@ int rsx_draw_engine_init(u32 width, u32 height)
       s_vpc_force_full = e && *e && strcmp(e, "0") != 0; }
     { const char* e = getenv("PS3RECOMP_ENG_TEXMEMO");
       s_texmemo_on = !(e && strcmp(e, "0") == 0); }
+    { const char* e = getenv("PS3RECOMP_ENG_VTX_DIRECT");
+      s_vtx_direct = !(e && strcmp(e, "0") == 0); }
     memset(s_tmemo, 0, sizeof s_tmemo);
     s_tex_gen++;
     g.vp_cb = (u8*)calloc(1, ENG_VP_CB_BYTES);

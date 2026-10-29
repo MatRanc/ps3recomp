@@ -124,6 +124,13 @@ int rsx_vertex_fetch_many(
     const rsx_vertex_fetch_plan* plan, const rsx_vertex_ref* refs, u32 count,
     u8* out);
 
+/* 1 when rsx_vertex_fetch_many over the references the plan was prepared
+ * with (or a prefix of them) may return 0: ATTR0 is read and its array has
+ * no stable span, comes from an INLINE_ARRAY stream, or has a type no decoder
+ * knows. 0 means it cannot fail, so a caller may put the conversion off until
+ * it has somewhere to write it. */
+int rsx_vertex_fetch_plan_can_fail(const rsx_vertex_fetch_plan* plan);
+
 /* Collapse repeated (vertex_id, base_index) references in first-use order.
  * refs is rewritten in place with the unique prefix.  The occurrence map
  * remains valid until the next call using the same remap object. */

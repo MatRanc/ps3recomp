@@ -764,6 +764,25 @@ int rsx_vertex_fetch_many(
 #undef RSX_FETCH_LOOP_EXPAND
 #undef RSX_SCALAR_LOOP
 
+int rsx_vertex_fetch_plan_can_fail(const rsx_vertex_fetch_plan* plan)
+{
+    if (!plan)
+        return 1;
+    if (!(plan->layout.mask & 1u))
+        return 0;
+    /* Every element of the prepared references lies in a guest array's
+     * stable span, and a known type decodes from one without failing: only
+     * ATTR0 resolved element by element can fail. An INLINE_ARRAY span is the
+     * stream's length, not the references' range, so a reference past it
+     * fails there too. */
+    const rsx_vertex_fetch_attr* fetch = &plan->attr[0];
+    if (!fetch->desc.type || !fetch->desc.size)
+        return 0;
+    return !fetch->stable_base || plan->inline_data ||
+           fetch->desc.type < RSX_VTX_TYPE_SNORM16 ||
+           fetch->desc.type > RSX_VTX_TYPE_UINT8;
+}
+
 static u64 rsx_vertex_remap_hash(u64 value)
 {
     value ^= value >> 33;
