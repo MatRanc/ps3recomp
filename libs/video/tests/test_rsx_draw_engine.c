@@ -2438,6 +2438,111 @@ static void test_clear_rect(void)
     engine_down();
 }
 
+/* ---- draw_fill: vertices converted into the backend's memory ------------- */
+
+static u32 s_fills, s_fill_declines;
+static int s_fill_decline;
+static _Alignas(16) u8 s_fill_mem[16 * 256];
+
+/* A backend's vertex ring: reserve, have the engine write it, then draw from it. */
+static int stub_draw_fill(void* u, rsx_topology topology, int (*fill)(void* ctx, void* dst),
+                          void* ctx, u32 count, u32 stride, const u32* indices, u32 index_count)
+{
+    if (s_fill_decline || (u64)count * stride > sizeof s_fill_mem) { s_fill_declines++; return 0; }
+    memset(s_fill_mem, 0xCD, sizeof s_fill_mem);   /* anything not written shows */
+    s_fills++;
+    if (fill(ctx, s_fill_mem))
+        stub_draw(u, topology, s_fill_mem, count, stride, indices, index_count);
+    return 1;
+}
+
+typedef struct {
+    int n_draw;
+    u32 topology, vertices, stride, indices;
+    u32 index[24];
+    float first[16][64];
+} fill_seen;
+
+/* The same draws -- a list, a strip, an indexed list with repeats, lines,
+ * points -- each recorded as the backend received it. */
+static void fill_draws(const rsx_draw_backend* be, fill_seen seen[5])
+{
+    engine_up_with(be);
+    u8 saved[8 * 16]; memcpy(saved, vm_base + VTX_OFFSET, sizeof saved);
+    for (u32 i = 0; i < 8; i++) {
+        const float f[4] = { (float)i + 0.25f, -(float)i, 0.5f * (float)i, 1.0f };
+        for (u32 c = 0; c < 4; c++) { u32 w; memcpy(&w, &f[c], 4); put_be(vm_base + VTX_OFFSET + i * 16 + c * 4, w, 4); }
+    }
+    static const u32 tris[] = { 3, 1, 2, 3, 2, 7 };
+    for (u32 i = 0; i < 6; i++) put_be(vm_base + IDX_OFFSET + 8 + i * 2, tris[i], 2);
+    for (int d = 0; d < 5; d++) {
+        switch (d) {
+        case 0: draw_triangle(); break;
+        case 1: m(M_BEGIN_END, RSX_PRIMITIVE_TRIANGLE_STRIP);
+                m(M_DRAW_ARRAYS, 0u | ((6u - 1u) << 24)); m(M_BEGIN_END, 0u); break;
+        case 2: m(0x181C, IDX_OFFSET); m(0x1820, 1u | (1u << 4));
+                m(M_BEGIN_END, RSX_PRIMITIVE_TRIANGLES);
+                m(0x1824, 4u | ((6u - 1u) << 24)); m(M_BEGIN_END, 0u); break;
+        case 3: m(M_BEGIN_END, RSX_PRIMITIVE_LINES);
+                m(M_DRAW_ARRAYS, 0u | ((4u - 1u) << 24)); m(M_BEGIN_END, 0u); break;
+        case 4: m(M_BEGIN_END, RSX_PRIMITIVE_POINTS);
+                m(M_DRAW_ARRAYS, 2u | ((2u - 1u) << 24)); m(M_BEGIN_END, 0u); break;
+        }
+        fill_seen* f = &seen[d];
+        f->n_draw = stub.n_draw; f->topology = stub.draw_topology;
+        f->vertices = stub.draw_vertices; f->stride = stub.draw_stride;
+        f->indices = stub.draw_indices;
+        memcpy(f->index, stub.captured_indices, sizeof f->index);
+        memcpy(f->first, stub.captured_vertices, sizeof f->first);
+    }
+    memcpy(vm_base + VTX_OFFSET, saved, sizeof saved);
+    memset(vm_base + IDX_OFFSET, 0, 64);
+    engine_down();
+}
+
+static void test_draw_fill(void)
+{
+    printf("-- draw_fill\n");
+    rsx_draw_backend be = g_stub_backend;
+    be.draw_fill = stub_draw_fill;
+    static fill_seen copied[5], filled[5], declined[5];
+    fill_draws(&g_stub_backend, copied);
+    s_fills = s_fill_declines = 0; s_fill_decline = 0;
+    fill_draws(&be, filled);
+    CHECK(s_fills == 5 && s_fill_declines == 0,
+          "every draw's vertices are written into the backend's memory (%u fills, %u declined)",
+          s_fills, s_fill_declines);
+    s_fills = s_fill_declines = 0; s_fill_decline = 1;
+    fill_draws(&be, declined);
+    s_fill_decline = 0;
+    CHECK(s_fills == 0 && s_fill_declines == 5,
+          "a backend with no room declines every draw (%u fills, %u declined)",
+          s_fills, s_fill_declines);
+    for (int d = 0; d < 5; d++) {
+        CHECK(copied[d].n_draw == d + 1 && copied[d].vertices > 0,
+              "draw %d reaches the backend (%d draws, %u vertices)", d, copied[d].n_draw,
+              copied[d].vertices);
+        CHECK(!memcmp(&copied[d], &filled[d], sizeof copied[d]),
+              "draw %d: the same draw and the same vertices, filled in place as copied", d);
+        CHECK(!memcmp(&copied[d], &declined[d], sizeof copied[d]),
+              "draw %d: a declined fill falls back to the copy unchanged", d);
+    }
+    CHECK(copied[2].indices == 6 && copied[2].vertices == 4,
+          "the indexed list shares its repeated vertices (%u verts, %u indices)",
+          copied[2].vertices, copied[2].indices);
+
+    /* An ATTR0 that cannot be read fails the group before anything is bound,
+     * as it always has: no fill is asked for and nothing is drawn. */
+    engine_up_with(&be);
+    s_fills = 0;
+    m(M_VTXBUF_OFFSET, 0x80000000u | (GUEST_BYTES - 8u));
+    draw_triangle();
+    CHECK(s_fills == 0 && stub.n_draw == 0,
+          "an unreadable ATTR0 draws nothing and asks for no fill (%u fills, %d draws)",
+          s_fills, stub.n_draw);
+    engine_down();
+}
+
 int main(void)
 {
     vm_base = (u8*)calloc(1, GUEST_BYTES);
@@ -2483,6 +2588,7 @@ int main(void)
     test_immediate_compositor();
     test_immediate_packed_zero_and_inline();
     test_clear_rect();
+    test_draw_fill();
 
     free(vm_base);
     printf(g_failures ? "\n%d check(s) FAILED\n" : "\nall checks passed\n",

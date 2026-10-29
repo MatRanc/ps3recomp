@@ -3813,39 +3813,44 @@ static VkDescriptorSet vk_eng_write_descriptors_to(const vk_eng_pipe* P, VkDescr
     return set;
 }
 
-static void vk_eng_draw(void* user, rsx_topology topology, const void* vertices, u32 vertex_count,
-                        u32 stride, const u32* indices, u32 index_count)
+/* vk_eng_draw and vk_eng_draw_fill: the vertices come from `vertices`, or are
+ * written by `fill` into the slice reserved for them, exactly where the copy
+ * would have gone, so the rings, the flushes and the frame pipelining are the
+ * same either way. Returns 0 only for a fill draw that found no vertex memory
+ * and recorded nothing; every other outcome, drawn or dropped, is 1. */
+static int vk_eng_draw_from(rsx_topology topology, const void* vertices,
+                            int (*fill)(void* ctx, void* dst), void* fill_ctx,
+                            u32 vertex_count, u32 stride, const u32* indices, u32 index_count)
 {
-    (void)user;
-    if (!s_e2.pipeline || !vertices || !vertex_count || !stride) return;
-    if (topology < RSX_TOPOLOGY_POINTS || topology > RSX_TOPOLOGY_TRIANGLE_STRIP) return;
+    if (!s_e2.pipeline || (!vertices && !fill) || !vertex_count || !stride) return 1;
+    if (topology < RSX_TOPOLOGY_POINTS || topology > RSX_TOPOLOGY_TRIANGLE_STRIP) return 1;
     vk_eng_pipe* P = &s_epipe[s_e2.pipeline - 1];
-    if (!P->used || stride != P->stride) return;
+    if (!P->used || stride != P->stride) return 1;
 
     /* Targets: every member of a set is target A's size (engine contract). */
     const u32 n = s_eng_bound.nrt;
     if (n < 1 || n != P->rt_count) {
         if (!(s_e2.warned & 16u)) { VK_LOG("engine: draw with %u colour targets for a %u-target pipeline skipped\n", n, P->rt_count); s_e2.warned |= 16u; }
-        return;
+        return 1;
     }
     vk_eng_obj* rt0 = vk_eng_get(s_eng_bound.rt[0], VK_ENG_COLOR);
-    if (!rt0) return;
+    if (!rt0) return 1;
     for (u32 i = 1; i < n; i++)
-        if (!vk_eng_get(s_eng_bound.rt[i], VK_ENG_COLOR)) return;
+        if (!vk_eng_get(s_eng_bound.rt[i], VK_ENG_COLOR)) return 1;
     if (rt0->fmt != P->rt_fmt) {
         if (!(s_e2.warned & 32u)) { VK_LOG("engine: draw into colour format %d with a pipeline built for %d skipped\n", (int)rt0->fmt, (int)P->rt_fmt); s_e2.warned |= 32u; }
-        return;
+        return 1;
     }
     const u32 w = rt0->w, h = rt0->h;
     vk_eng_obj* zo = vk_eng_get(s_eng_bound.depth, VK_ENG_DEPTH);
     VkImageView dview = (zo && zo->w >= w && zo->h >= h) ? zo->im.view : vk_eng_scratch_depth(w, h);
-    if (!dview) return;
+    if (!dview) return 1;
     const u32 dkey = (zo && dview == zo->im.view) ? s_eng_bound.depth : 0xFFFFFFFFu;
 
     VkPipeline pipe = vk_eng_variant(P, (u32)topology - 1u);
     VkRenderPass rp = vk_eng_render_pass(P->rt_fmt, n);
     VkFramebuffer fb = vk_eng_framebuffer(rp, s_eng_bound.rt, n, dview, dkey, w, h);
-    if (!pipe || !rp || !fb) return;
+    if (!pipe || !rp || !fb) return 1;
 
     const VkDeviceSize vbytes = (VkDeviceSize)vertex_count * stride;
     const VkDeviceSize ibytes = (indices && index_count) ? (VkDeviceSize)index_count * 4u : 0;
@@ -3854,7 +3859,7 @@ static void vk_eng_draw(void* user, rsx_topology topology, const void* vertices,
     VkDescriptorSet set = VK_NULL_HANDLE;
     const u32 vsb = s_e2.vs_bytes ? s_e2.vs_bytes : 16u, psb = s_e2.ps_bytes ? s_e2.ps_bytes : 16u;
     int batched = vk_eb_on() && vbytes <= VK_EB_VB_BYTES && ibytes <= VK_EB_IB_BYTES;
-    if (batched && P->cube_mask && !vk_eng_dummy_cube_view()) return;   /* may flush: before any slice */
+    if (batched && P->cube_mask && !vk_eng_dummy_cube_view()) return 1;   /* may flush: before any slice */
     if (batched) {
         /* Slices of the rings and a set from the pool; a full one flushes the
          * batch (which empties them all) and the draw takes its slices again. */
@@ -3875,7 +3880,7 @@ static void vk_eng_draw(void* user, rsx_topology topology, const void* vertices,
                     s_eb.vb_head = vh; s_eb.ib_head = ih; s_eb.ub_head = uh;
                     vk_eng_put_vs_constants((u8*)s_eb.ub.ptr + uvs, vsb);
                     memcpy((u8*)s_eb.ub.ptr + ups, vk_eng_ucpu() + s_g.ps_off, psb);
-                    if (!vk_eng_write_descriptors_to(P, set, s_eb.ub.buf, uvs, ups)) return;
+                    if (!vk_eng_write_descriptors_to(P, set, s_eb.ub.buf, uvs, ups)) return 1;
                     break;
                 }
                 set = VK_NULL_HANDLE;
@@ -3886,28 +3891,30 @@ static void vk_eng_draw(void* user, rsx_topology topology, const void* vertices,
         if (batched && !set) batched = 0;
     }
     if (batched) {
-        memcpy((u8*)s_eb.vb.ptr + voff, vertices, (size_t)vbytes);
+        if (fill) { if (!fill(fill_ctx, (u8*)s_eb.vb.ptr + voff)) return 1; }
+        else memcpy((u8*)s_eb.vb.ptr + voff, vertices, (size_t)vbytes);
         if (ibytes) memcpy((u8*)s_eb.ib.ptr + ioff, indices, (size_t)ibytes);
         vbuf = s_eb.vb.buf; ibuf = s_eb.ib.buf;
-        if (!s_eb_pending && vk_begin()) return;
+        if (!s_eb_pending && vk_begin()) return 1;
         /* Earlier draws of this batch may have rendered what this one samples
          * or blends over: order it after all of them. */
         vk_cmd_after_everything(s_vk.cmd);
     } else {
         if (s_eb_pending) { s_eb_why = 2; vk_eng_flush(); }
-        if (vk_ensure_vertex_buffer(vbytes)) return;
-        memcpy(s_vk.vertices.ptr, vertices, (size_t)vbytes);
+        if (vk_ensure_vertex_buffer(vbytes)) return fill ? 0 : 1;
+        if (fill) { if (!fill(fill_ctx, s_vk.vertices.ptr)) return 1; }
+        else memcpy(s_vk.vertices.ptr, vertices, (size_t)vbytes);
         if (ibytes) {
-            if (vk_eng_ensure_indices(ibytes)) return;
+            if (vk_eng_ensure_indices(ibytes)) return 1;
             memcpy(s_e2.indices.ptr, indices, (size_t)ibytes);
         }
         vbuf = s_vk.vertices.buf; ibuf = s_e2.indices.buf; voff = ioff = 0;
-        if (!vk_eng_ucpu()) return;
+        if (!vk_eng_ucpu()) return 1;
         vk_eng_put_vs_constants((u8*)s_g.ubo.ptr, vsb);
         memcpy((u8*)s_g.ubo.ptr + s_g.ps_off, s_e2.ucpu + s_g.ps_off, psb);
         set = vk_eng_write_descriptors(P);
-        if (!set) return;
-        if (vk_begin()) return;
+        if (!set) return 1;
+        if (vk_begin()) return 1;
     }
     /* Everything submitted before is complete (each submission is waited
      * on); this orders memory for the surfaces this draw touches. */
@@ -3947,9 +3954,28 @@ static void vk_eng_draw(void* user, rsx_topology topology, const void* vertices,
         pvkCmdDraw(s_vk.cmd, vertex_count, 1, 0, 0);
     }
     pvkCmdEndRenderPass(s_vk.cmd);
-    if (!batched) { s_eb.unbatched++; vk_submit_and_wait(); return; }
+    if (!batched) { s_eb.unbatched++; vk_submit_and_wait(); return 1; }
     s_eb.draws++;
     if (++s_eb_pending >= s_eb.max_draws) { s_eb_why = 3; vk_eng_flush_async(); }   /* full: no CPU wait needed */
+    return 1;
+}
+
+static void vk_eng_draw(void* user, rsx_topology topology, const void* vertices, u32 vertex_count,
+                        u32 stride, const u32* indices, u32 index_count)
+{
+    (void)user;
+    if (!vertices) return;
+    vk_eng_draw_from(topology, vertices, NULL, NULL, vertex_count, stride, indices, index_count);
+}
+
+/* PS3RECOMP_ENG_VTX_DIRECT (the engine's switch) decides whether this is used. */
+static int vk_eng_draw_fill(void* user, rsx_topology topology, int (*fill)(void* ctx, void* dst),
+                            void* ctx, u32 vertex_count, u32 stride, const u32* indices,
+                            u32 index_count)
+{
+    (void)user;
+    if (!fill) return 0;
+    return vk_eng_draw_from(topology, NULL, fill, ctx, vertex_count, stride, indices, index_count);
 }
 
 static const rsx_draw_backend s_vk_engine_backend = {
@@ -3981,6 +4007,7 @@ static const rsx_draw_backend s_vk_engine_backend = {
     .set_stencil_ref      = vk_eng_set_stencil_ref,
     .set_depth_bounds     = vk_eng_set_depth_bounds,
     .draw                 = vk_eng_draw,
+    .draw_fill            = vk_eng_draw_fill,
     .clear_color          = vk_eng_clear_color,
     .clear_depth_stencil  = vk_eng_clear_depth_stencil,
     .present              = vk_eng_present,
