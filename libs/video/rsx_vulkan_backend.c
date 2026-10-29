@@ -203,6 +203,8 @@ typedef struct vk_state {
     VkCommandBuffer  present_cmd;
     VkFence          present_fence;   /* the copy out of the presented surface */
     VkFence          window_fence;    /* the blit into the swapchain image     */
+    VkCommandBuffer  window_cmd;      /* VK_WINDOW_ASYNC=1: the blit's own     */
+    int              window_inflight; /* VK_WINDOW_ASYNC=1: blit not waited on */
     int              present_inflight;/* copy submitted, not yet finished      */
     int              present_split;   /* inside rsx_vulkan_backend_present_begin */
     int              present_order;   /* the walker's next command buffer waits */
@@ -228,6 +230,7 @@ typedef struct vk_state {
     VkImage          sc_images[8];
     VkSemaphore      sc_done[8];      /* per image: the present waits on it */
     VkSemaphore      sem_acquire;
+    VkPresentModeKHR present_mode;
     double           hold_seconds;
 
     const rsx_state* state;           /* live RSX state, for draws       */
@@ -457,8 +460,12 @@ static u32 s_eb_pending;
  * present submits the frame's batch without waiting and the next frame records
  * into the other set, so the walker records frame N+1 while the GPU renders N.
  * A set is waited on only before it is recorded into again; every other flush
- * still waits for both, so the rest of the backend keeps its invariant that all
- * earlier work has completed. */
+ * still waits for all of them, so the rest of the backend keeps its invariant
+ * that all earlier work has completed.
+ * VK_BATCH_SETS=3|4 makes it a ring of that many sets: a flush then waits on
+ * the submission two (or three) back instead of the one just before, so a
+ * present no longer waits on the frame's own first batch (docs/present-wait.md). */
+#define VK_EB_SETS_MAX 4
 typedef struct {
     VkCommandBuffer  cmd;
     VkFence          fence;
@@ -467,9 +474,10 @@ typedef struct {
     u32              sets;
     int              inflight;
 } vk_eb_set;
-static vk_eb_set s_ebs[2];
-static int s_ebs_cur, s_ebs_on;
+static vk_eb_set s_ebs[VK_EB_SETS_MAX];
+static int s_ebs_cur, s_ebs_on, s_ebs_n;
 static void vk_ebs_wait_other(void);
+static void vk_ebs_free(vk_eb_set* o);
 static void vk_eng_flush_async(void);
 /* VK_EB_STATS=1 (diagnostic): why batches end. Set before a flush; vk_eng_flush counts and resets it. */
 static u32 s_eb_why;                /* 0 other, 1 ring/pool full, 2 unbatched draw, 3 max draws,
@@ -622,8 +630,9 @@ static int vk_begin(void)
     return 0;
 }
 
-static unsigned long long s_eb_wait_us[10];  /* VK_EB_STATS: walker time blocked on the GPU: [why] for a batch
-                                             * flush, 8 a submit of its own (readback, create, snapshot), 9 present */
+static unsigned long long s_eb_wait_us[11];  /* VK_EB_STATS: walker time blocked on the GPU: [why] for a batch
+                                             * flush, 8 a submit of its own (readback, create, snapshot), 9 present,
+                                             * 10 the window (acquire, blit, vkQueuePresentKHR) */
 static u32 s_wait_tag = 8;
 static unsigned long long vk_now_us(void)
 {
@@ -1812,6 +1821,32 @@ static void vk_window_open(const char* title)
            SDL_GetCurrentVideoDriver(), n);
 }
 
+/* VK_PRESENT_MODE=fifo|mailbox|immediate|relaxed. FIFO, the default, is the
+ * one mode every driver has; it is also the one that can block: the walker
+ * presents on its own thread, and with every image queued for display
+ * vkAcquireNextImageKHR waits for a vblank. The others never wait for one
+ * (MAILBOX replaces the queued image, IMMEDIATE tears, RELAXED tears only when
+ * late). A mode the surface lacks falls back to FIFO. */
+static VkPresentModeKHR vk_pick_present_mode(void)
+{
+    const char* e = getenv("VK_PRESENT_MODE");
+    VkPresentModeKHR want = VK_PRESENT_MODE_FIFO_KHR;
+    if (!e || !*e || !strcmp(e, "fifo")) return want;
+    if      (!strcmp(e, "mailbox"))   want = VK_PRESENT_MODE_MAILBOX_KHR;
+    else if (!strcmp(e, "immediate")) want = VK_PRESENT_MODE_IMMEDIATE_KHR;
+    else if (!strcmp(e, "relaxed"))   want = VK_PRESENT_MODE_FIFO_RELAXED_KHR;
+    else { VK_LOG("VK_PRESENT_MODE=%s: not fifo, mailbox, immediate or relaxed; FIFO\n", e); return VK_PRESENT_MODE_FIFO_KHR; }
+    PFN_vkGetPhysicalDeviceSurfacePresentModesKHR modes = (PFN_vkGetPhysicalDeviceSurfacePresentModesKHR)
+        pvkGetInstanceProcAddr(s_vk.instance, "vkGetPhysicalDeviceSurfacePresentModesKHR");
+    VkPresentModeKHR have[16];
+    u32 n = 16;
+    if (modes && modes(s_vk.phys, s_vk.surface, &n, have) >= 0)
+        for (u32 i = 0; i < n; i++)
+            if (have[i] == want) return want;
+    VK_LOG("VK_PRESENT_MODE=%s: the surface does not have it, FIFO\n", e);
+    return VK_PRESENT_MODE_FIFO_KHR;
+}
+
 static int vk_create_swapchain(void)
 {
     VkSurfaceCapabilitiesKHR caps;
@@ -1878,7 +1913,7 @@ static int vk_create_swapchain(void)
         .imageUsage = VK_IMAGE_USAGE_TRANSFER_DST_BIT,
         .imageSharingMode = VK_SHARING_MODE_EXCLUSIVE,
         .preTransform = caps.currentTransform, .compositeAlpha = alpha,
-        .presentMode = VK_PRESENT_MODE_FIFO_KHR,   /* the one mode every driver has */
+        .presentMode = s_vk.present_mode = vk_pick_present_mode(),
         .clipped = VK_TRUE, .oldSwapchain = old,
     };
     VkSwapchainKHR sc = VK_NULL_HANDLE;
@@ -1904,7 +1939,8 @@ static int vk_create_swapchain(void)
 
     s_vk.sc_extent = ext;
     s_vk.sc_count = n;
-    VK_LOG("window swapchain %ux%u, %u images, format %d\n", ext.width, ext.height, n, (int)fmt.format);
+    VK_LOG("window swapchain %ux%u, %u images, format %d, present mode %d\n", ext.width, ext.height, n,
+           (int)fmt.format, (int)s_vk.present_mode);
     return 0;
 }
 
@@ -1914,22 +1950,43 @@ static void vk_swapchain_lost(void)
     if (vk_create_swapchain()) vk_window_drop("the swapchain could not be recreated");
 }
 
+/* VK_WINDOW_ASYNC=1: the blit records into a command buffer of its own and
+ * is waited on before the next blit rather than straight after its submit.
+ * That wait used to block the walker until the GPU had finished everything
+ * submitted before the blit -- with VK_FRAME_PIPELINE=1 the frame it had just
+ * sent off -- since the blit is ordered after all of it. Waiting before the
+ * next acquire also keeps sem_acquire and the blit's buffer free for reuse. */
+static int vk_window_async(void)
+{
+    static int on = -1;
+    if (on < 0) on = vk_env_on("VK_WINDOW_ASYNC");
+    return on;
+}
+
 /* Blit the offscreen target into the next swapchain image and present it. */
 static void vk_present_window(void)
 {
     if (!s_vk.windowed || !s_vk.swapchain) return;
+    const int async = vk_window_async();
+    const unsigned long long w0 = vk_now_us();
+    if (async && s_vk.window_inflight) {
+        pvkWaitForFences(s_vk.device, 1, &s_vk.window_fence, VK_TRUE, UINT64_MAX);
+        s_vk.window_inflight = 0;
+    }
 
     u32 idx = 0;
     VkResult r = pvkAcquireNextImageKHR(s_vk.device, s_vk.swapchain, UINT64_MAX,
                                         s_vk.sem_acquire, VK_NULL_HANDLE, &idx);
+    s_eb_wait_us[10] += vk_now_us() - w0;
     if (r == VK_ERROR_OUT_OF_DATE_KHR) { vk_swapchain_lost(); return; }
     if (r != VK_SUCCESS && r != VK_SUBOPTIMAL_KHR) {
         VK_LOG("vkAcquireNextImageKHR failed (VkResult %d)\n", (int)r); return;
     }
 
     /* The present's own command buffer: free, since every caller has waited
-     * for its copy (present_fence) first. */
-    VkCommandBuffer cb = s_vk.present_cmd;
+     * for its copy (present_fence) first. Async, the blit's own, free since
+     * the wait above. */
+    VkCommandBuffer cb = async ? s_vk.window_cmd : s_vk.present_cmd;
     if (pvkResetCommandBuffer(cb, 0) != VK_SUCCESS) { VK_LOG("vkResetCommandBuffer (window) failed\n"); return; }
     VkCommandBufferBeginInfo bi = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
                                     .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT };
@@ -1974,7 +2031,9 @@ static void vk_present_window(void)
     if (vk_queue_submit(&si, s_vk.window_fence) != VK_SUCCESS) {
         VK_LOG("vkQueueSubmit (window) failed\n"); return;
     }
-    pvkWaitForFences(s_vk.device, 1, &s_vk.window_fence, VK_TRUE, UINT64_MAX);
+    const unsigned long long w1 = vk_now_us();
+    if (async) s_vk.window_inflight = 1;
+    else       pvkWaitForFences(s_vk.device, 1, &s_vk.window_fence, VK_TRUE, UINT64_MAX);
 
     VkPresentInfoKHR pi = {
         .sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR,
@@ -1982,6 +2041,7 @@ static void vk_present_window(void)
         .swapchainCount = 1, .pSwapchains = &s_vk.swapchain, .pImageIndices = &idx,
     };
     r = vk_queue_present(&pi);
+    s_eb_wait_us[10] += vk_now_us() - w1;
     if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR) vk_swapchain_lost();
     else if (r != VK_SUCCESS) VK_LOG("vkQueuePresentKHR failed (VkResult %d)\n", (int)r);
 }
@@ -2068,8 +2128,21 @@ static VkCommandBuffer vk_present_record_begin(void)
     return cb;
 }
 
+/* VK_FLIP_DEFER=1: a present the command stream's own flip method makes
+ * (rsx_draw_engine.c sink_flip, on the walker) leaves its second half to the
+ * next present or to rsx_vulkan_backend_present_finish, as a host's present
+ * does under VK_FRAME_PIPELINE=1. Without it that second half waits, on the
+ * walker, for the GPU to finish the whole frame. Engine path only: there
+ * nothing but a present touches the target or `readback`. */
+static int vk_flip_defer(void)
+{
+    static int on = -1;
+    if (on < 0) on = vk_env_on("VK_FLIP_DEFER");
+    return on;
+}
+
 /* present_mu held: copy the target out, submit, and finish at once unless a
- * host asked for the halves separately on the engine path. */
+ * host asked for the halves separately on the engine path (or VK_FLIP_DEFER). */
 static void vk_present_record_end(VkCommandBuffer cb)
 {
     vk_barrier_image_on(cb, s_vk.color.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL);
@@ -2096,7 +2169,7 @@ static void vk_present_record_end(VkCommandBuffer cb)
     }
     __atomic_store_n(&s_vk.present_inflight, 1, __ATOMIC_RELEASE);
     s_vk.present_order = 1;
-    if (!(s_vk.present_split && s_vk.eng_active)) vk_present_complete_locked();
+    if (!s_vk.eng_active || !(s_vk.present_split || vk_flip_defer())) vk_present_complete_locked();
 }
 
 static void vk_cb_present(void* ud, u32 buffer_id)
@@ -3574,20 +3647,32 @@ static int vk_eb_on(void)
     s_eb.on = 1;
     const char* fp = getenv("VK_FRAME_PIPELINE");
     if (fp && *fp == '1') {
-        vk_eb_set* o = &s_ebs[1];
-        VkCommandBufferAllocateInfo cai = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
-                                            .commandPool = s_vk.pool, .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
-                                            .commandBufferCount = 1 };
-        VkFenceCreateInfo fci = { .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
-        if (pvkAllocateCommandBuffers(s_vk.device, &cai, &o->cmd) == VK_SUCCESS &&
-            pvkCreateFence(s_vk.device, &fci, NULL, &o->fence) == VK_SUCCESS &&
-            !vk_create_host_buffer(&o->vb, VK_EB_VB_BYTES, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT) && o->vb.coherent &&
-            !vk_create_host_buffer(&o->ib, VK_EB_IB_BYTES, VK_BUFFER_USAGE_INDEX_BUFFER_BIT) && o->ib.coherent &&
-            !vk_create_host_buffer(&o->ub, VK_EB_UB_BYTES, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT) && o->ub.coherent &&
-            !vk_create_host_buffer(&o->sb, VK_EB_SB_BYTES, VK_BUFFER_USAGE_TRANSFER_SRC_BIT) && o->sb.coherent &&
-            pvkCreateDescriptorPool(s_vk.device, &pci, NULL, &o->pool) == VK_SUCCESS) {
-            s_ebs_cur = 0; s_ebs_on = 1;
-            VK_LOG("frame pipelining: on (two batch sets)\n");
+        const char* ns = getenv("VK_BATCH_SETS");
+        int want = ns && atoi(ns) > 2 ? atoi(ns) : 2;
+        if (want > VK_EB_SETS_MAX) want = VK_EB_SETS_MAX;
+        /* Set 0 is s_vk.cmd / s_vk.fence and s_eb's rings, filled in at the first swap. */
+        int have = 1;
+        for (; have < want; have++) {
+            vk_eb_set* o = &s_ebs[have];
+            VkCommandBufferAllocateInfo cai = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+                                                .commandPool = s_vk.pool, .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+                                                .commandBufferCount = 1 };
+            VkFenceCreateInfo fci = { .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
+            if (pvkAllocateCommandBuffers(s_vk.device, &cai, &o->cmd) == VK_SUCCESS &&
+                pvkCreateFence(s_vk.device, &fci, NULL, &o->fence) == VK_SUCCESS &&
+                !vk_create_host_buffer(&o->vb, VK_EB_VB_BYTES, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT) && o->vb.coherent &&
+                !vk_create_host_buffer(&o->ib, VK_EB_IB_BYTES, VK_BUFFER_USAGE_INDEX_BUFFER_BIT) && o->ib.coherent &&
+                !vk_create_host_buffer(&o->ub, VK_EB_UB_BYTES, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT) && o->ub.coherent &&
+                !vk_create_host_buffer(&o->sb, VK_EB_SB_BYTES, VK_BUFFER_USAGE_TRANSFER_SRC_BIT) && o->sb.coherent &&
+                pvkCreateDescriptorPool(s_vk.device, &pci, NULL, &o->pool) == VK_SUCCESS)
+                continue;
+            vk_ebs_free(o);   /* what this one got before it failed */
+            break;
+        }
+        if (have >= 2) {
+            s_ebs_cur = 0; s_ebs_n = have; s_ebs_on = 1;
+            VK_LOG("frame pipelining: on (%d batch sets)\n", have);
+            if (have < want) VK_LOG("frame pipelining: no memory for batch set %d of %d\n", have + 1, want);
         } else {
             VK_LOG("frame pipelining: no memory for a second batch set, staying off\n");
         }
@@ -3595,20 +3680,31 @@ static int vk_eb_on(void)
     return 1;
 }
 
-/* The set the walker records into goes to the GPU without a wait; the other
- * becomes current once the GPU is done with it. */
-static void vk_ebs_swap(void)
+/* A set other than the current one: what it holds, then the slot cleared.
+ * Its command buffer goes back with s_vk.pool. */
+static void vk_ebs_free(vk_eb_set* o)
+{
+    vk_destroy_buffer(&o->vb); vk_destroy_buffer(&o->ib);
+    vk_destroy_buffer(&o->ub); vk_destroy_buffer(&o->sb);
+    if (o->pool) pvkDestroyDescriptorPool(s_vk.device, o->pool, NULL);
+    if (o->fence) pvkDestroyFence(s_vk.device, o->fence, NULL);
+    memset(o, 0, sizeof *o);
+}
+
+/* The set the walker records into goes to the GPU without a wait; the next
+ * one in the ring becomes current once the GPU is done with it. */
+static void vk_ebs_swap(u32 why)
 {
     vk_eb_set* c = &s_ebs[s_ebs_cur];
     c->cmd = s_vk.cmd; c->fence = s_vk.fence;
     c->vb = s_eb.vb; c->ib = s_eb.ib; c->ub = s_eb.ub; c->sb = s_eb.sb;
     c->pool = s_eb.pool; c->sets = s_eb.sets; c->inflight = 1;
-    s_ebs_cur ^= 1;
+    s_ebs_cur = (s_ebs_cur + 1) % s_ebs_n;
     vk_eb_set* n = &s_ebs[s_ebs_cur];
     if (n->inflight) {
         const unsigned long long w0 = vk_now_us();
         pvkWaitForFences(s_vk.device, 1, &n->fence, VK_TRUE, UINT64_MAX);
-        s_eb_wait_us[6] += vk_now_us() - w0;
+        s_eb_wait_us[why & 7] += vk_now_us() - w0;
         n->inflight = 0;
     }
     s_vk.cmd = n->cmd; s_vk.fence = n->fence;
@@ -3621,8 +3717,9 @@ static void vk_ebs_swap(void)
 static void vk_ebs_wait_other(void)
 {
     if (!s_ebs_on) return;
-    vk_eb_set* o = &s_ebs[s_ebs_cur ^ 1];
-    if (o->inflight) {
+    for (int i = 0; i < s_ebs_n; i++) {
+        vk_eb_set* o = &s_ebs[i];
+        if (i == s_ebs_cur || !o->inflight) continue;
         pvkWaitForFences(s_vk.device, 1, &o->fence, VK_TRUE, UINT64_MAX);
         o->inflight = 0;
     }
@@ -3633,6 +3730,7 @@ static void vk_eng_flush_async(void)
 {
     if (!s_ebs_on) { vk_eng_flush(); return; }
     if (!s_eb_pending) return;
+    const u32 why = s_eb_why;      /* VK_EB_STATS: the wait below is counted under it */
     s_eb_pending = 0;
     s_eb_why = 0;
     if (pvkEndCommandBuffer(s_vk.cmd) != VK_SUCCESS) { VK_LOG("vkEndCommandBuffer (pipelined) failed\n"); return; }
@@ -3641,7 +3739,7 @@ static void vk_eng_flush_async(void)
     pvkResetFences(s_vk.device, 1, &s_vk.fence);
     if (vk_queue_submit(&si, s_vk.fence) != VK_SUCCESS) { VK_LOG("vkQueueSubmit (pipelined) failed\n"); return; }
     s_eb.flushes++;
-    vk_ebs_swap();
+    vk_ebs_swap(why);
 }
 
 /* The rings and the pool live until the engine shuts down; a later vk_eb_on
@@ -3650,13 +3748,10 @@ static void vk_eb_release(void)
 {
     if (s_eb_pending) vk_eng_flush();
     vk_ebs_wait_other();
-    if (s_ebs_on) {   /* the set not current; the current one is s_eb / s_vk below */
-        vk_eb_set* o = &s_ebs[s_ebs_cur ^ 1];
-        vk_destroy_buffer(&o->vb); vk_destroy_buffer(&o->ib);
-        vk_destroy_buffer(&o->ub); vk_destroy_buffer(&o->sb);
-        if (o->pool) pvkDestroyDescriptorPool(s_vk.device, o->pool, NULL);
-        if (o->fence) pvkDestroyFence(s_vk.device, o->fence, NULL);
-        memset(s_ebs, 0, sizeof s_ebs); s_ebs_on = 0; s_ebs_cur = 0;
+    if (s_ebs_on) {   /* the sets not current; the current one is s_eb / s_vk below */
+        for (int i = 0; i < s_ebs_n; i++)
+            if (i != s_ebs_cur) vk_ebs_free(&s_ebs[i]);
+        memset(s_ebs, 0, sizeof s_ebs); s_ebs_on = 0; s_ebs_cur = 0; s_ebs_n = 0;
     }
     vk_destroy_buffer(&s_eb.vb);
     vk_destroy_buffer(&s_eb.ib);
@@ -3669,7 +3764,7 @@ static void vk_eb_release(void)
 
 static int vk_eb_active(void) { return s_eb.on == 1; }
 static u32 vk_eb_max(void) { return s_eb.max_draws; }
-static void vk_eb_recorded(void) { if (++s_eb_pending >= s_eb.max_draws) vk_eng_flush_async(); }
+static void vk_eb_recorded(void) { if (++s_eb_pending >= s_eb.max_draws) { s_eb_why = 3; vk_eng_flush_async(); } }
 
 static VkDeviceSize vk_eb_take(VkDeviceSize* head, VkDeviceSize cap, VkDeviceSize bytes, VkDeviceSize align);
 
@@ -3686,7 +3781,7 @@ static int vk_eb_upload(VkImage img, VkBufferImageCopy* region, const void* src,
     if (!bytes || bytes > VK_EB_SB_BYTES) return -2;
     VkDeviceSize off = vk_eb_take(&s_eb.sb_head, VK_EB_SB_BYTES, bytes, 16u);
     if (off == (VkDeviceSize)-1) {
-        vk_eng_flush();
+        s_eb_why = 1; vk_eng_flush();
         off = vk_eb_take(&s_eb.sb_head, VK_EB_SB_BYTES, bytes, 16u);
         if (off == (VkDeviceSize)-1) return -2;
     }
@@ -3697,7 +3792,7 @@ static int vk_eb_upload(VkImage img, VkBufferImageCopy* region, const void* src,
     region->bufferOffset = off;
     pvkCmdCopyBufferToImage(s_vk.cmd, s_eb.sb.buf, img, VK_IMAGE_LAYOUT_GENERAL, 1, region);
     vk_barrier_image(img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL);
-    if (++s_eb_pending >= s_eb.max_draws) vk_eng_flush_async();
+    if (++s_eb_pending >= s_eb.max_draws) { s_eb_why = 3; vk_eng_flush_async(); }
     return 0;
 }
 
@@ -3727,9 +3822,9 @@ static void vk_eng_flush(void)
                        w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]);
                 unsigned long long* gw = s_eb_wait_us;
                 VK_LOG("gpu wait ms/2s: flush other %.0f ring %.0f unbatched %.0f max %.0f engine %.0f destroy %.0f"
-                       " present %.0f begin %.0f; own submits %.0f; present completion %.0f\n",
+                       " present %.0f begin %.0f; own submits %.0f; present completion %.0f; window %.0f\n",
                        gw[0] / 1e3, gw[1] / 1e3, gw[2] / 1e3, gw[3] / 1e3, gw[4] / 1e3, gw[5] / 1e3, gw[6] / 1e3,
-                       gw[7] / 1e3, gw[8] / 1e3, gw[9] / 1e3);
+                       gw[7] / 1e3, gw[8] / 1e3, gw[9] / 1e3, gw[10] / 1e3);
                 memset(s_eb_wait_us, 0, sizeof s_eb_wait_us);
                 cpu0 = cpu;
                 memset(w, 0, sizeof s_eb.why); s_eb.draws = s_eb.unbatched = s_eb.flushes = 0; t0 = now;
@@ -4107,6 +4202,7 @@ static int vk_init_all(u32 width, u32 height, const char* title)
     VK_CHECK(pvkAllocateCommandBuffers(s_vk.device, &cai, &s_vk.present_cmd), "vkAllocateCommandBuffers");
     VK_CHECK(pvkCreateFence(s_vk.device, &fci, NULL, &s_vk.present_fence), "vkCreateFence");
     VK_CHECK(pvkCreateFence(s_vk.device, &fci, NULL, &s_vk.window_fence), "vkCreateFence");
+    VK_CHECK(pvkAllocateCommandBuffers(s_vk.device, &cai, &s_vk.window_cmd), "vkAllocateCommandBuffers");
 
     if (vk_pick_depth_format()) return -1;
     if (vk_create_image(&s_vk.color, VK_FORMAT_R8G8B8A8_UNORM, s_vk.width, s_vk.height,
@@ -4190,6 +4286,7 @@ void rsx_vulkan_backend_shutdown(void)
         while (s_vk.windowed && !SDL_TICKS_PASSED(SDL_GetTicks(), end)) {
             if (rsx_vulkan_backend_pump_messages() != 0) break;
             vk_present_window();         /* FIFO: paced by the display */
+            if (s_vk.present_mode != VK_PRESENT_MODE_FIFO_KHR) SDL_Delay(16);
         }
     }
     if (s_vk.windowed || s_vk.window) vk_window_drop(NULL);
