@@ -42,6 +42,7 @@ int  rsx_process_vp_run(rsx_state* state, u32 method, const u8* src, u32 count)
 { (void)state; (void)method; (void)src; (void)count; return 0; }
 rsx_backend* rsx_get_backend(void) { return NULL; }
 void rsx_draw_engine_method(u32 method, u32 arg) { (void)method; (void)arg; }
+void rsx_draw_engine_methods(u32 method, u32 step, const u8* src, u32 count) { (void)method; (void)step; (void)src; (void)count; }
 void rsx_draw_engine_note_flip(u32 buffer_id) { (void)buffer_id; }
 void rsx_draw_engine_guest_read(u32 l, u32 o, u32 p, u32 w, u32 h) { (void)l; (void)o; (void)p; (void)w; (void)h; }
 void rsx_draw_engine_guest_wrote(u32 l, u32 o, u32 p, u32 w, u32 h) { (void)l; (void)o; (void)p; (void)w; (void)h; }

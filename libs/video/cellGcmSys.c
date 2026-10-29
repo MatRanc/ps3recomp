@@ -2040,6 +2040,14 @@ static int gcm_legacy_method_has_effect(u32 m)
     }
 }
 
+/* gcm_3d_method does nothing for this method while rsx_state is not live.
+ * Every method it acts on is below 0x1B0 or in 0x1800..0x1D74. */
+static int gcm_3d_method_quiet(u32 m)
+{
+    if ((m >= 0x1B0u && m < 0x1800u) || m > 0x1D74u) return 1;
+    return !gcm_legacy_method_has_effect(m) && m != 0x50u && m != 0x1A8u && m != 0x1800u;
+}
+
 /* GCM_GET_EQ_PUT=1: see where get is published at the end of a pass. */
 static int gcm_get_eq_put(void)
 {
@@ -2649,18 +2657,30 @@ static void gcm_rsx_process_fifo_unlocked(void)
             /* The same run with only the engines mirroring the stream: each
              * word goes to them and then to gcm_3d_method, in the order the
              * loop below hands it over, read once. None of that loop's other
-             * checks can match a 3D subchannel with no switch set. */
+             * checks can match a 3D subchannel with no switch set. Words
+             * gcm_3d_method has nothing to do for reach the draw engine as
+             * one run, so the order is the same. */
             if (wmirror && count && (subch == 0 || (subch == 1 && !s1_2d)) &&
                 ((s_fifo_getoff + 4) >> 20) == ((s_fifo_getoff + count * 4) >> 20)) {
                 const u32 dea = gcm_io2ea(s_fifo_getoff + 4);
                 if (dea) {
                     if (s_live < 0) s_live = rsx_live_draw_enabled();
                     if (s_eng < 0) s_eng = rsx_draw_engine_enabled();
-                    for (u32 i = 0; i < count; i++) {
-                        const u32 m = type == 0 ? method + i * 4 : method, v = vm_read32(dea + i * 4);
+                    const u32 step = type == 0 ? 4u : 0u;
+                    for (u32 i = 0; i < count; ) {
+                        u32 j = i;
+                        if (!s_live && !legacy_state_live)
+                            while (j < count && gcm_3d_method_quiet(method + j * step)) j++;
+                        if (j > i) {
+                            if (s_eng) rsx_draw_engine_methods(method + i * step, step, vm_base + dea + i * 4, j - i);
+                            i = j;
+                            continue;
+                        }
+                        const u32 m = method + i * step, v = vm_read32(dea + i * 4);
                         if (s_live) rsx_live_draw_method((subch << 13) | m, v);
                         if (s_eng) rsx_draw_engine_method((subch << 13) | m, v);
                         gcm_3d_method(&s_state, m, v, legacy_state_live);
+                        i++;
                     }
                     s_fifo_getoff += 4 + count * 4;
                     continue;

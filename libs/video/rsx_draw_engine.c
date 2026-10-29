@@ -3603,6 +3603,12 @@ void rsx_draw_engine_method(u32 method, u32 arg)
     rsx_dispatch_method(&g.rsx, m, arg);
 }
 
+void rsx_draw_engine_methods(u32 method, u32 step, const u8* src, u32 count)
+{
+    if (!g.ready) return;
+    rsx_dispatch_method_run(&g.rsx, method, step, src, count);
+}
+
 void rsx_draw_engine_set_display_buffer(u32 buffer_id, u32 location, u32 offset,
                                         u32 pitch, u32 width, u32 height)
 {
