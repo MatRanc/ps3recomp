@@ -7,8 +7,11 @@
 # against the working tree -- then, for each configuration (bench_fifo.c),
 # runs a --verify replay (register state hashed at every handler call) and a
 # timed replay of each, and fails if the handler-call record or the final
-# state differs. FIFO_BENCH_FRAMES sets the timed frames (100). Output in
-# tests/bench/fifo/out/ (or $FIFO_BENCH_OUT).
+# state differs, or the walker's own bookkeeping (the walk line). Against a
+# base from before fifo-dispatch-2, expect walk to differ in the vtable
+# config only: the engine-off NOP skip kept one trace-ring slot per run and
+# left a park standing. FIFO_BENCH_FRAMES sets the timed frames (100).
+# Output in tests/bench/fifo/out/ (or $FIFO_BENCH_OUT).
 set -eu
 here=$(cd "$(dirname "$0")" && pwd)
 root=$(cd "$here/../../.." && pwd)
@@ -38,13 +41,18 @@ for cfg in engine legacy vtable; do
     for mode in "--verify --frames 2" "--frames ${FIFO_BENCH_FRAMES:-100}"; do
         "$out/bench_base" --$cfg $mode 2>/dev/null | grep -v '^\[' > "$out/base.txt"
         "$out/bench_new"  --$cfg $mode 2>/dev/null | grep -v '^\[' > "$out/new.txt"
-        grep -v '^time' "$out/base.txt" > "$out/base.rec"
-        grep -v '^time' "$out/new.txt"  > "$out/new.rec"
+        grep -v '^time\|^walk' "$out/base.txt" > "$out/base.rec"
+        grep -v '^time\|^walk' "$out/new.txt"  > "$out/new.rec"
         head -2 "$out/new.txt"
         if cmp -s "$out/base.rec" "$out/new.rec"; then
             echo "  record identical: $(grep '^calls' "$out/new.txt") / $(grep '^state' "$out/new.txt")"
         else
             echo "  RECORD DIFFERS"; diff "$out/base.rec" "$out/new.rec" || true; fail=1
+        fi
+        if [ "$(grep '^walk' "$out/base.txt")" = "$(grep '^walk' "$out/new.txt")" ]; then
+            echo "  walk identical: $(grep '^walk' "$out/new.txt")"
+        else
+            echo "  WALK DIFFERS: base $(grep '^walk' "$out/base.txt" || echo none) / new $(grep '^walk' "$out/new.txt")"; fail=1
         fi
         case $mode in --verify*) continue ;; esac   # hashing at every call: not a timing
         echo "  before: $(grep '^time' "$out/base.txt")"
