@@ -306,6 +306,19 @@ static void vtx_const_fold(rsx_dispatch* rsx, u32 m, u32 arg)
     }
 }
 
+/* RSX_CONST_LOG=<lo>,<hi>: every transform-constant upload into that slot
+ * range (first 400) -- what a shader's constants really were. */
+static int s_const_log_lo = -2, s_const_log_hi, s_const_log_n;
+static int const_log_on(void)
+{
+    if (s_const_log_lo == -2) {
+        const char* e = getenv("RSX_CONST_LOG");
+        s_const_log_lo = -1;
+        if (e) sscanf(e, "%d,%d", &s_const_log_lo, &s_const_log_hi);
+    }
+    return s_const_log_lo >= 0;
+}
+
 void rsx_dispatch_method(rsx_dispatch* rsx, u32 method, u32 arg)
 {
     method &= 0xFFFFC;
@@ -374,14 +387,10 @@ void rsx_dispatch_method(rsx_dispatch* rsx, u32 method, u32 arg)
         const u32 slot = rsx->regs[M_VP_UPLOAD_CONST_ID >> 2] + (word >> 2);
         if (slot < RSX_DSP_NUM_CONSTANTS)
             rsx->constants[slot][word & 3] = arg;
-        /* RSX_CONST_LOG=<lo>,<hi>: every transform-constant upload into that
-         * slot range (first 400) -- what a shader's constants really were. */
-        { static int lo = -2, hi = 0, n = 0;
-          if (lo == -2) { const char* e = getenv("RSX_CONST_LOG"); lo = -1;
-                          if (e) sscanf(e, "%d,%d", &lo, &hi); }
-          if (lo >= 0 && (int)slot >= lo && (int)slot <= hi && n < 400) { n++;
-              fprintf(stderr, "[const-load] c[%u].%c = 0x%08X (method 0x%04X id=%u)\n", slot,
-                      "xyzw"[word & 3], arg, method, rsx->regs[M_VP_UPLOAD_CONST_ID >> 2]); } }
+        if (const_log_on() && (int)slot >= s_const_log_lo && (int)slot <= s_const_log_hi &&
+            s_const_log_n < 400) { s_const_log_n++;
+            fprintf(stderr, "[const-load] c[%u].%c = 0x%08X (method 0x%04X id=%u)\n", slot,
+                    "xyzw"[word & 3], arg, method, rsx->regs[M_VP_UPLOAD_CONST_ID >> 2]); }
         return;
     }
 
@@ -483,16 +492,68 @@ static int dsp_method_plain(u32 m)
            (m < M_VP_UPLOAD_CONST || m >= M_VP_UPLOAD_CONST + 32 * 4);
 }
 
+static inline u32 dsp_be32(const u8* p)
+{
+    return ((u32)p[0] << 24) | ((u32)p[1] << 16) | ((u32)p[2] << 8) | p[3];
+}
+
+/* The words of an incrementing run, from method m, that fall in the
+ * transform program or constant upload window, as rsx_dispatch_method does
+ * them one at a time: each is counted and stored in its register, then
+ * copied to vp[VP_UPLOAD_FROM_ID * 4 + lane] (the pointer advancing after
+ * every lane 3) or to constants[VP_UPLOAD_CONST_ID][0] + word (the pointer
+ * fixed). Either way word k of the run lands one word after word k - 1, so
+ * the run is a single copy out of the register window, clipped where the
+ * array ends. Nothing else happens for these words: no sink is called.
+ * Returns the words taken, or 0 to leave them to rsx_dispatch_method: m
+ * outside the windows, a load pointer high enough that the slot arithmetic
+ * wraps to a low slot, or RSX_CONST_LOG, which logs each word. */
+static u32 dsp_upload_run(rsx_dispatch* rsx, u32 m, const u8* src, u32 count)
+{
+    u32 w0, start, room;
+    u32* dst;
+    if ((u32)(m - M_VP_UPLOAD_INST) < 32 * 4) {
+        u32* load = &rsx->regs[M_VP_UPLOAD_FROM_ID >> 2];
+        if (*load >= 0x3FFFFFF0u) return 0;
+        w0 = (m - M_VP_UPLOAD_INST) >> 2;
+        start = *load * 4 + (w0 & 3);
+        dst = rsx->vp; room = RSX_DSP_VP_WORDS;
+    } else if ((u32)(m - M_VP_UPLOAD_CONST) < 32 * 4) {
+        const u32 id = rsx->regs[M_VP_UPLOAD_CONST_ID >> 2];
+        if (id > 0xFFFFFFF8u || const_log_on()) return 0;
+        w0 = (m - M_VP_UPLOAD_CONST) >> 2;
+        start = id < RSX_DSP_NUM_CONSTANTS ? id * 4 + w0 : RSX_DSP_NUM_CONSTANTS * 4;
+        dst = &rsx->constants[0][0]; room = RSX_DSP_NUM_CONSTANTS * 4;
+    } else
+        return 0;
+    const u32 n = count < 32 - w0 ? count : 32 - w0, r = m >> 2;
+    for (u32 k = 0; k < n; k++) {
+        rsx->seen[r + k]++;
+        rsx->regs[r + k] = dsp_be32(src + k * 4);
+    }
+    if (start < room)
+        memcpy(dst + start, &rsx->regs[r], (n < room - start ? n : room - start) * 4);
+    if (dst == rsx->vp)
+        rsx->regs[M_VP_UPLOAD_FROM_ID >> 2] += ((w0 & 3) + n) >> 2;
+    return n;
+}
+
 void rsx_dispatch_method_run(rsx_dispatch* rsx, u32 method, u32 step, const u8* src, u32 count)
 {
-    for (u32 i = 0; i < count; i++, method += step, src += 4) {
+    for (u32 i = 0; i < count; ) {
         const u32 m = method & 0x1FFCu;
-        const u32 arg = ((u32)src[0] << 24) | ((u32)src[1] << 16) | ((u32)src[2] << 8) | src[3];
         if (dsp_method_plain(m)) {
             rsx->seen[m >> 2]++;
-            rsx->regs[m >> 2] = arg;
-        } else
-            rsx_dispatch_method(rsx, m, arg);
+            rsx->regs[m >> 2] = dsp_be32(src);
+        } else {
+            const u32 n = step ? dsp_upload_run(rsx, m, src, count - i) : 0;
+            if (n) {
+                i += n; method += n * 4; src += n * 4;
+                continue;
+            }
+            rsx_dispatch_method(rsx, m, dsp_be32(src));
+        }
+        i++; method += step; src += 4;
     }
 }
 
