@@ -29,16 +29,26 @@
  * vertices come from a stored copy that is cold by the time the draw comes
  * round again; the uncached path's come from a reused, hot scratch buffer.
  *
+ * The direct section runs the same frame the way the engine can hand it to a
+ * backend: converted into scratch and copied into the ring (the copy), or
+ * converted straight into the ring (draw_fill), each with the converter as it
+ * was before the rewrite (rsx_vertex_fetch_legacy.h) and as it is now. The
+ * rows run interleaved, best of many, so a noisy host moves them together.
+ *
  * Build and run (from the repo root): tests/bench/vertex_cache/run.sh
- * (--frame skips the per-draw table).
+ * (--frame skips the per-draw table, --direct runs only the direct section).
  */
 #include "rsx_vertex_compact.h"
 #include "rsx_vertex_formats.h"
+#include "rsx_vertex_fetch_legacy.h"   /* libs/video/tests: the converter before the rewrite */
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#if defined(__SSE2__)
+#include <immintrin.h>
+#endif
 
 typedef struct src_span {
     const u8* p;
@@ -500,6 +510,106 @@ static void run_frame(int mode, double* total, double* vertex_only)
     *vertex_only = *total - ring;
 }
 
+/* ---- direct conversion into the ring -------------------------------------- */
+
+enum { D_COPY_LEGACY, D_DIRECT_LEGACY, D_COPY, D_DIRECT_PLAIN, D_DIRECT, D_FLOOR, D_FLOOR_READ, N_DMODES };
+static const char* s_dmode[N_DMODES] = {
+    "copy:   legacy fetch -> scratch -> ring",
+    "direct: legacy fetch -> ring",
+    "copy:   fetch -> scratch -> ring",
+    "direct: fetch -> ring",
+    "direct: fetch_stream -> ring (draw_fill)",
+    "floor:  prepare + stream the ring bytes",
+    "floor:  ... + read the source spans",
+};
+
+/* The frame of bench_frame (already set up in s_fd), with the vertices either
+ * converted into the hot scratch and copied into the ring, or converted
+ * straight into the ring. Returns us. The caches are scrubbed first: a
+ * frame's guest arrays are read once a frame, and the rest of the frame (and
+ * of the title) runs in between; on a host whose last-level cache holds the
+ * 25 MB of them, a frame streamed past the cache would otherwise find them
+ * all still there. */
+static double run_direct(int mode)
+{
+    scrub_caches();
+    u64 ring_at = 0;
+    const int legacy = mode == D_COPY_LEGACY || mode == D_DIRECT_LEGACY;
+    const int direct = mode != D_COPY_LEGACY && mode != D_COPY;
+    const double t0 = now_us();
+    for (u32 d = 0; d < FRAME_DRAWS; d++) {
+        frame_draw* fd = &s_fd[d];
+        memcpy(s_refs, fd->refs, fd->n * 8u);
+        rsx_vertex_fetch_plan_prepare(&fd->plan, s_refs, fd->n);
+        const u32 out_bytes = fd->n * fd->plan.layout.stride;
+        if (ring_at + out_bytes > RING_BYTES) ring_at = 0;
+        u8* dst = direct ? s_ring + ring_at : s_scratch;
+        if (mode == D_FLOOR || mode == D_FLOOR_READ) {
+            /* What no conversion into the ring can beat: its bytes written,
+             * and the guest bytes it converts read. */
+            if (mode == D_FLOOR_READ) {
+                src_span sp[RSX_DSP_NUM_VERTEX_ATTR];
+                const int ns = source_spans(&fd->plan, sp);
+                u64 acc = 0;
+                for (int i = 0; i < ns; i++) acc |= read_floor(sp[i].p, sp[i].bytes);
+                s_sink += acc;
+            }
+#if defined(__SSE2__)
+            const __m128i z = _mm_set1_epi32((int)d);
+            for (u32 q = 0; q < out_bytes / 16u; q++) _mm_stream_si128((__m128i*)dst + q, z);
+#else
+            memset(dst, (int)d, out_bytes);
+#endif
+            ring_at += (out_bytes + 15u) & ~15u;
+            continue;
+        }
+        const int ok = legacy ? rsx_vertex_fetch_many_legacy(&fd->plan, s_refs, fd->n, dst)
+                     : mode == D_DIRECT ? rsx_vertex_fetch_many_stream(&fd->plan, s_refs, fd->n, dst)
+                     : rsx_vertex_fetch_many(&fd->plan, s_refs, fd->n, dst);
+        if (!ok) abort();
+        if (!direct) memcpy(s_ring + ring_at, s_scratch, out_bytes);
+        ring_at += (out_bytes + 15u) & ~15u;
+    }
+#if defined(__SSE2__)
+    _mm_sfence();
+#endif
+    return now_us() - t0;
+}
+
+static void bench_direct(void)
+{
+    /* VTX_BENCH_PROFILE=<row>: that row alone, 200 times, for a profiler. */
+    const char* prof = getenv("VTX_BENCH_PROFILE");
+    if (prof) {
+        const int m = atoi(prof);
+        if (m < 0 || m >= N_DMODES) return;
+        double t = 0;
+        for (int i = 0; i < 200; i++) t += run_direct(m);
+        printf("\n%s: %.2f ms a frame\n", s_dmode[m], t / 200 / 1e3);
+        return;
+    }
+    double best[N_DMODES];
+    for (int m = 0; m < N_DMODES; m++) best[m] = 1e30;
+    for (int trial = 0; trial < 40; trial++)
+        for (int m = 0; m < N_DMODES; m++) {
+            const double t = run_direct(m);
+            if (t < best[m]) best[m] = t;
+        }
+    /* Every conversion wrote the same bytes into the ring. */
+    static u8* want;
+    if (!want) want = (u8*)malloc(RING_BYTES);
+    for (int m = D_COPY_LEGACY; m <= D_DIRECT; m++) {
+        memset(s_ring, 0, RING_BYTES);
+        run_direct(m);
+        if (m == D_COPY_LEGACY) memcpy(want, s_ring, RING_BYTES);
+        else if (memcmp(want, s_ring, RING_BYTES)) { printf("ring differs in mode %d\n", m); abort(); }
+    }
+    printf("\nDirect: the frame above from cold caches, ms (best of 40, interleaved)\n");
+    for (int m = 0; m < N_DMODES; m++)
+        printf("  %-40s %8.2f ms   %.2fx\n", s_dmode[m], best[m] / 1e3, best[D_COPY_LEGACY] / best[m]);
+}
+
+static int s_direct_only;
 static void bench_frame(void)
 {
     /* Log-uniform reference counts in 100..5000, a random layout per draw,
@@ -542,6 +652,7 @@ static void bench_frame(void)
     rsx_vertex_remap_destroy(&remap);
     printf("\nFrame: %u draws, %llu unique refs, %.1f MB source spans, %.1f MB converted\n",
            FRAME_DRAWS, (unsigned long long)refs_total, src_total / 1048576.0, out_total / 1048576.0);
+    if (s_direct_only) return;
     printf("  %-38s %10s %10s   %s\n", "", "frame us", "vertex us", "(vertex = without the backend's ring copy)");
     double base_t = 0, base_v = 0;
     for (int mode = 0; mode < N_FMODES; mode++) {
@@ -567,7 +678,9 @@ int main(int argc, char** argv)
     if (!s_guest || !s_scrub || !s_scratch || !s_refs || !s_ring) return 1;
     memset(s_ring, 0, RING_BYTES);
     const int frame_only = argc > 1 && !strcmp(argv[1], "--frame");
-    if (!frame_only) bench_primitives();
+    s_direct_only = argc > 1 && !strcmp(argv[1], "--direct");
+    if (!frame_only && !s_direct_only) bench_primitives();
     bench_frame();
+    bench_direct();
     return 0;
 }
