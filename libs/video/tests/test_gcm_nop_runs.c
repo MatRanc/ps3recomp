@@ -6,6 +6,15 @@
  * next pass must carry on from there), and a run that reaches the end of an
  * IO page must not skip what the next page holds.
  *
+ * The walk's own bookkeeping must be what a word-at-a-time walk leaves: the
+ * trace ring holds the last GCM_TRACE_N words the walker read, NOPs
+ * included, and a park whose JUMP was overwritten with NOPs is forgotten.
+ *
+ * -DENGINE_ON builds it with the register-file draw engine on, the methods
+ * arriving through rsx_draw_engine_method(s). Run that build with
+ * TCONST_FIFO=1 as well: that switch keeps NOPs on the per-word path, so
+ * both walks are checked against the same expectations.
+ *
  * gcc -std=gnu17 -I include -I libs/video
  *   libs/video/tests/test_gcm_nop_runs.c -ffunction-sections
  *   -fdata-sections -Wl,--gc-sections -pthread -o /tmp/test_gcm_nop_runs
@@ -46,9 +55,21 @@ int  rsx_process_method(rsx_state* state, u32 method, u32 data)
     seen_n++;
     return 0;
 }
-int  rsx_draw_engine_enabled(void) { return 0; }
-void rsx_draw_engine_method(u32 method, u32 arg) { (void)method; (void)arg; }
-void rsx_draw_engine_methods(u32 method, u32 step, const u8* src, u32 count) { (void)method; (void)step; (void)src; (void)count; }
+#ifndef ENGINE_ON
+#define ENGINE_ON 0
+#endif
+int  rsx_draw_engine_enabled(void) { return ENGINE_ON; }
+void rsx_draw_engine_method(u32 method, u32 arg)
+{
+    if (seen_n < 16) { seen_m[seen_n] = method & 0x1FFCu; seen_d[seen_n] = arg; }
+    seen_n++;
+}
+void rsx_draw_engine_methods(u32 method, u32 step, const u8* src, u32 count)
+{
+    for (u32 i = 0; i < count; i++, src += 4)
+        rsx_draw_engine_method(method + i * step,
+                               ((u32)src[0] << 24) | ((u32)src[1] << 16) | ((u32)src[2] << 8) | src[3]);
+}
 void rsx_draw_engine_note_flip(u32 buffer_id) { (void)buffer_id; }
 void rsx_draw_engine_guest_read(u32 l, u32 o, u32 p, u32 w, u32 h) { (void)l; (void)o; (void)p; (void)w; (void)h; }
 void rsx_draw_engine_guest_wrote(u32 l, u32 o, u32 p, u32 w, u32 h) { (void)l; (void)o; (void)p; (void)w; (void)h; }
@@ -91,11 +112,30 @@ static void check(int ok, const char* what)
     fails += !ok;
 }
 
+/* The words a word-at-a-time walk reads at the top of its loop (headers,
+ * NOPs, JUMPs; not method data), in order: what the trace ring must hold. */
+static u32 e_off[512], e_w[512], e_n;
+static void visit(u32 io, u32 w) { e_off[e_n] = io; e_w[e_n] = w; e_n++; }
+static void visit_nops(u32 from, u32 to) { for (u32 io = from; io < to; io += 4) visit(io, 0); }
+static void check_trace(const char* what)
+{
+    int ok = s_tr_i == e_n;
+    for (u32 j = 0; j < GCM_TRACE_N && j < e_n && ok; j++) {
+        const u32 k = (s_tr_i - 1u - j) % GCM_TRACE_N;
+        ok = s_tr_off[k] == e_off[e_n - 1u - j] && s_tr_w[k] == e_w[e_n - 1u - j];
+    }
+    if (!ok) printf("  trace: %u words read, %u expected; last 0x%08X/0x%08X, expected 0x%08X/0x%08X\n",
+                    s_tr_i, e_n, s_tr_off[(s_tr_i - 1u) % GCM_TRACE_N], s_tr_w[(s_tr_i - 1u) % GCM_TRACE_N],
+                    e_off[e_n - 1u], e_w[e_n - 1u]);
+    check(ok, what);
+}
+
 /* One method, count 1, subchannel 0. */
 static u32 put_probe(u32 io, u32 arg)
 {
     gw32(IO_ADDR + io, (1u << 18) | PROBE_METHOD);
     gw32(IO_ADDR + io + 4, arg);
+    visit(io, (1u << 18) | PROBE_METHOD);
     return io + 8;
 }
 
@@ -113,13 +153,17 @@ int main(void)
 
     /* Pass 1: probe 0, 50 NOPs, a two-word incrementing run, 3 NOPs, and put
      * five words into the zeros that follow. */
+    printf("  engine %s, TCONST_FIFO %s\n", ENGINE_ON ? "on" : "off", getenv("TCONST_FIFO") ? "set" : "unset");
     u32 io = put_probe(0, 0);
+    visit_nops(io, io + 50 * 4);
     io += 50 * 4;
     gw32(IO_ADDR + io, (2u << 18) | PROBE_METHOD);
     gw32(IO_ADDR + io + 4, 1);
     gw32(IO_ADDR + io + 8, 2);
+    visit(io, (2u << 18) | PROBE_METHOD);
     io += 12 + 3 * 4;
     const u32 put1 = io + 5 * 4;
+    visit_nops(io - 3 * 4, put1);
 
     s_fifo_getoff = 0;
     vm_write32(ctrl + 4, 0);
@@ -131,9 +175,11 @@ int main(void)
     check(seen_m[1] == PROBE_METHOD && seen_d[1] == 1 &&
           seen_m[2] == PROBE_METHOD + 4 && seen_d[2] == 2, "pass 1: the run after the NOPs, in order");
     check(s_fifo_getoff == put1, "pass 1: the NOP run stops at put, inside the zeros");
+    check_trace("pass 1: the trace ring holds every word read, NOPs included");
 
     /* Pass 2: more zeros, then probe 3. */
     const u32 p3 = put1 + 6 * 4;
+    visit_nops(put1, p3);
     const u32 put2 = put_probe(p3, 3);
     vm_write32(ctrl + 0, put2);
     cellGcm_rsx_process_fifo();
@@ -144,12 +190,31 @@ int main(void)
      * probe 5 as the first word of the second page. */
     const u32 tail = PAGE2 - 0x40;
     gw32(IO_ADDR + put2, 0x20000000u | tail);
+    visit(put2, 0x20000000u | tail);
+    visit_nops(tail, PAGE2);
     const u32 put3 = put_probe(PAGE2, 5);
     vm_write32(ctrl + 0, put3);
     cellGcm_rsx_process_fifo();
     check(seen_n == 5 && seen_m[4] == PROBE_METHOD && seen_d[4] == 5,
           "pass 3: the first word of the next IO page is not skipped");
     check(s_fifo_getoff == put3, "pass 3: get reaches put");
+    check_trace("pass 3: the trace ring holds the JUMP and the NOPs to the page end");
+
+    /* Pass 4: a self-JUMP park at put3, with put past it. */
+    const u32 put4 = put3 + 0x200;   /* 128 words: longer than the trace ring */
+    gw32(IO_ADDR + put3, 0x20000000u | put3);
+    visit(put3, 0x20000000u | put3);
+    vm_write32(ctrl + 0, put4);
+    cellGcm_rsx_process_fifo();
+    check(s_fifo_getoff == put3 && park_off == put3, "pass 4: the walker parks on the self-JUMP");
+
+    /* Pass 5: the park is overwritten with zeros, as far as put. */
+    gw32(IO_ADDR + put3, 0);
+    visit_nops(put3, put4);
+    cellGcm_rsx_process_fifo();
+    check(s_fifo_getoff == put4, "pass 5: get runs through the zeros to put");
+    check(park_off == 0, "pass 5: a park overwritten with NOPs is forgotten");
+    check_trace("pass 5: the trace ring holds the last NOPs of a run longer than it");
 
     printf("[gcm_nop_runs] %s (%d failed)\n", fails ? "FAIL" : "PASS", fails);
     free(vm_base);

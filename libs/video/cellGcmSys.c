@@ -2208,6 +2208,13 @@ static void gcm_rsx_process_fifo_unlocked(void)
     if (!s_gcm_context_ea && !s_gcm_syscall_mode) return;
     if (!s_inited) { rsx_state_init(&s_state); s_inited = 1; }
     const int wdiag = gcm_word_diag(), wmirror = gcm_word_mirror_only();
+    /* NOP runs are skipped unless a switch looks at each NOP word: the
+     * per-word ones, and with an engine on (where the skip is new) the two
+     * that see NOPs in the method path below, TCONST_FIFO's histogram and
+     * GCM_RINGDBG's per-word ring-end check. */
+    static int s_nop_watch = -1;
+    if (s_nop_watch < 0) s_nop_watch = (getenv("TCONST_FIFO") || gcm_ringdbg()) ? 1 : 0;
+    const int nop_skip = !wdiag || (wmirror && !s_nop_watch);
     /* The mirrored engines, read where the first method word reaches them. */
     static int s_live = -1, s_eng = -1;
     /* rsx_state feeds only the legacy vtable backend. With the draw engine
@@ -2405,14 +2412,25 @@ static void gcm_rsx_process_fifo_unlocked(void)
          * elsewhere). Each NOP still spends a word of this tick's budget: the
          * skip is a faster decode, not a bigger tick, and VF5 depends on the
          * walker yielding at the cap (it lost 7 milestones when a whole run
-         * cost one word). */
-        if (!w && !wdiag) {
+         * cost one word).
+         *
+         * The engines never see a NOP: one decodes as a method header with
+         * no data, which the method path below reads and steps over. What
+         * that walk leaves besides `get` is done here as it would: every
+         * word goes into the trace ring (only the last GCM_TRACE_N stay),
+         * and a NOP is not the park's JUMP, so a park is forgotten. With
+         * the skip on, an engine sees the same words in the same order. */
+        if (!w && nop_skip) {
             const u32 page_end = (s_fifo_getoff | 0xFFFFFu) + 1u;
             const u32 lim = (put > s_fifo_getoff && put < page_end) ? put : page_end;
             u32 off = s_fifo_getoff + 4u, nea = ea + 4u;
             while (off < lim && budget > 0 && !vm_read32(nea)) { off += 4u; nea += 4u; budget--; }
             if (gcm_ringdbg() && s_fifo_getoff < s_ring_io_end && off > s_ring_io_end) gcm_ring_overrun_log(s_fifo_getoff, put);
             if (s_fifo_getoff < put) s_last_ring_off = off;
+            u32 t = s_fifo_getoff + 4u;
+            if (off - t > 4u * GCM_TRACE_N) { s_tr_i += (off - t) / 4u - GCM_TRACE_N; t = off - 4u * GCM_TRACE_N; }
+            for (; t < off; t += 4u) { s_tr_off[s_tr_i % GCM_TRACE_N] = t; s_tr_w[s_tr_i % GCM_TRACE_N] = 0; s_tr_i++; }
+            park_off = 0;
             s_fifo_getoff = off;
             continue;
         }
