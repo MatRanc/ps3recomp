@@ -118,9 +118,20 @@ int rsx_vertex_fetch_one(
 
 /* rsx_vertex_fetch_one for refs[0..count) into consecutive compact vertices
  * at out (layout.stride apart), with the same values and the same failure:
- * 0 when some vertex's enabled ATTR0 cannot be fetched. Walks attribute by
- * attribute so each vertex type decodes in a loop of its own. */
+ * 0 when some vertex's enabled ATTR0 cannot be fetched. Goes through the
+ * vertices in small blocks, each attribute of a block in a loop of its own
+ * for its format. */
 int rsx_vertex_fetch_many(
+    const rsx_vertex_fetch_plan* plan, const rsx_vertex_ref* refs, u32 count,
+    u8* out);
+
+/* rsx_vertex_fetch_many into memory the CPU only writes and something else
+ * reads -- a GPU's mapped vertex ring, possibly uncached and write-combined.
+ * Each block is assembled in cache and written out whole and in order with
+ * non-temporal stores, so no line of out is read, or written twice. The same
+ * bytes and the same failure; out 16-byte aligned (otherwise, or without
+ * SSE4.1, it is rsx_vertex_fetch_many). */
+int rsx_vertex_fetch_many_stream(
     const rsx_vertex_fetch_plan* plan, const rsx_vertex_ref* refs, u32 count,
     u8* out);
 

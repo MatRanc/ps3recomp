@@ -3,6 +3,7 @@
 #include "rsx_vertex_formats.h"
 
 #include <limits.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -20,14 +21,8 @@
 #endif
 
 #if !defined(RSX_NO_SIMD)
-#if defined(__SSSE3__) || defined(__AVX2__)
-#define RSX_HAVE_SSSE3 1
-#endif
 #if defined(__SSE4_1__) || defined(__AVX2__)
 #define RSX_HAVE_SSE41 1
-#endif
-#if defined(__F16C__) || (defined(_MSC_VER) && defined(__AVX2__))
-#define RSX_HAVE_F16C 1
 #endif
 #endif
 
@@ -345,424 +340,452 @@ int rsx_vertex_fetch_one(
     return 1;
 }
 
-#if defined(RSX_HAVE_SSSE3)
-static inline __m128i rsx_load_16(const u8* p)
+/* ---- rsx_vertex_fetch_many ----------------------------------------------
+ *
+ * The draw's references go through in blocks of RSX_FETCH_BLOCK vertices.
+ * Per block the plain element of every reference is worked out once and
+ * shared by every ordinary attribute; then each attribute converts the whole
+ * block in a loop of its own, one per format, chosen once per draw, so no
+ * vertex pays a call or a branch on its format. Loads are full width (a
+ * float3 is read as 16 bytes), so an element must lie where that stays inside
+ * the span the plan mapped; the block's lowest and highest elements say
+ * whether all of them do, and they nearly always do. A block where some do
+ * not (the last element of a float3 array, or one outside the stable span)
+ * runs the loop that checks each element, and the few it skips are done
+ * exactly, one by one, afterwards.
+ *
+ * Into ordinary memory the block is converted where it lands. Into memory the
+ * CPU only writes (rsx_vertex_fetch_many_stream) it is assembled in a tile on
+ * the stack and written out whole with non-temporal stores, vertex after
+ * vertex: attribute by attribute, each line of a write-combined GPU ring would
+ * be written once per attribute, and a cached one read in first.
+ *
+ * Every conversion is the scalar one's, bit for bit: big-endian floats are
+ * only byte-swapped; halves are rebuilt with integer operations exactly as
+ * rsx_compact_be_f16 does (denormals flushed, NaN payloads kept), not with
+ * F16C, which does neither; x / 255 and x / 32767 are x * 2^-8 + x * c and
+ * x * 2^-15 + x * c, whose first product is exact, which gives the quotient's
+ * own rounding for every 8- and 16-bit x (and with a fused multiply-add too).
+ * test_vertex_fetch_direct.c holds this against the converter it replaced. */
+
+#define RSX_FETCH_BLOCK 32u
+
+enum {
+    RSX_FETCH_DEFAULT,      /* no array: the attribute's current value       */
+    RSX_FETCH_LOOP,         /* a stable span and a format loop               */
+    RSX_FETCH_EXACT,        /* a stable span, decoded element by element     */
+    RSX_FETCH_RESOLVE       /* no stable span, or no decoder: per element    */
+};
+
+typedef struct rsx_fetch_slot rsx_fetch_slot;
+typedef u32 (*rsx_fetch_loop_fn)(const rsx_fetch_slot* s, const u32* elem, u32 nb,
+                                 u8* dst, u32 ostride, u32* slow);
+
+struct rsx_fetch_slot {
+    u32 kind;
+    u32 attr;
+    u32 offset;             /* slot * 16 within a vertex                     */
+    int plain;              /* element = (vertex_id + base_index) & 0xFFFFF  */
+    u32 frequency, modulo;
+    const u8* base;
+    u32 first, span, fstride;
+    u32 lim;                /* rel <= lim: in the span, and a full-width load
+                             * at rel * fstride stays inside it              */
+    rsx_fetch_loop_fn loop;     /* checks every element                      */
+    rsx_fetch_loop_fn loop_all; /* every element known to be <= lim          */
+#if defined(RSX_HAVE_SSE41)
+    __m128i shuf;           /* byte swap, and zero for absent components     */
+    __m128i fill;           /* 1.0 in w when there are fewer than 4          */
+#else
+    u32 fill_n;             /* components to decode                          */
+#endif
+};
+
+/* An element inside the stable span, exactly as the per-element path decodes
+ * it (rsx_vertex_decode_element never fails for a known type). */
+static void rsx_fetch_exact(const rsx_vertex_fetch_attr* fetch, const u8* src, u8* v)
 {
-    return _mm_loadu_si128((const __m128i*)p);
+    float value[4];
+    rsx_vertex_decode_element(fetch->desc.type, fetch->desc.size, src, value);
+    memcpy(v, value, 16);
 }
 
-static inline __m128i rsx_load_12(const u8* p)
-{
-    u64 lo;
-    u32 hi;
-    memcpy(&lo, p, 8);
-    memcpy(&hi, p + 8, 4);
-    return _mm_unpacklo_epi64(_mm_cvtsi64_si128((s64)lo), _mm_cvtsi32_si128((s32)hi));
-}
-
-static inline __m128i rsx_load_8(const u8* p)
-{
-    u64 v;
-    memcpy(&v, p, 8);
-    return _mm_cvtsi64_si128((s64)v);
-}
-
-static inline __m128i rsx_load_6(const u8* p)
-{
-    u32 lo;
-    u16 hi;
-    memcpy(&lo, p, 4);
-    memcpy(&hi, p + 4, 2);
-    return _mm_cvtsi64_si128((s64)((u64)lo | ((u64)hi << 32)));
-}
-
-static inline __m128i rsx_load_4(const u8* p)
+#if defined(RSX_HAVE_SSE41)
+static inline __m128i rsx_ld32(const u8* p)
 {
     u32 v;
     memcpy(&v, p, 4);
     return _mm_cvtsi32_si128((s32)v);
 }
 
-static inline __m128i rsx_load_3(const u8* p)
+static inline __m128i rsx_ld64(const u8* p)
 {
-    u32 v = 0;
-    memcpy(&v, p, 3);
-    return _mm_cvtsi32_si128((s32)v);
+    u64 v;
+    memcpy(&v, p, 8);
+    return _mm_cvtsi64_si128((s64)v);
 }
 
-static inline __m128i rsx_load_2(const u8* p)
+/* Each format's loop comes twice: checking every element, and for a block
+ * whose elements are all known to be in reach (the usual case), not. */
+#if defined(_MSC_VER) && !defined(__clang__)
+#define RSX_ALWAYS_INLINE __forceinline
+#else
+#define RSX_ALWAYS_INLINE inline __attribute__((always_inline))
+#endif
+#define RSX_FETCH_LOOP_BEGIN                                                    \
+    const u8* const base = s->base;                                             \
+    const u32 first = s->first, lim = s->lim, fs = s->fstride;                  \
+    const __m128i shuf = s->shuf, fill = s->fill;                               \
+    u32 ns = 0;                                                                 \
+    for (u32 i = 0; i < nb; i++, dst += ostride) {                              \
+        const u32 rel = elem[i] - first;                                        \
+        if (checked && __builtin_expect(rel > lim, 0)) { slow[ns++] = i; continue; } \
+        const u8* src = base + (size_t)rel * fs;
+#define RSX_FETCH_LOOP_END                                                      \
+    }                                                                           \
+    return ns;
+#define RSX_FETCH_LOOP_PAIR(name)                                               \
+static u32 name##_checked(const rsx_fetch_slot* s, const u32* elem, u32 nb,     \
+                          u8* dst, u32 ostride, u32* slow)                      \
+{ return name(s, elem, nb, dst, ostride, slow, 1); }                            \
+static u32 name##_all(const rsx_fetch_slot* s, const u32* elem, u32 nb,         \
+                      u8* dst, u32 ostride, u32* slow)                          \
+{ return name(s, elem, nb, dst, ostride, slow, 0); }
+
+/* Full width: 16 bytes for a float, 8 for 16-bit components, 4 for bytes. */
+static RSX_ALWAYS_INLINE u32 rsx_loop_f32(const rsx_fetch_slot* s, const u32* elem, u32 nb,
+                                          u8* dst, u32 ostride, u32* slow, const int checked)
 {
-    u16 v;
-    memcpy(&v, p, 2);
-    return _mm_cvtsi32_si128((s32)v);
+    RSX_FETCH_LOOP_BEGIN
+        const __m128i v = _mm_loadu_si128((const __m128i*)src);
+        _mm_storeu_si128((__m128i*)dst, _mm_or_si128(_mm_shuffle_epi8(v, shuf), fill));
+    RSX_FETCH_LOOP_END
+}
+RSX_FETCH_LOOP_PAIR(rsx_loop_f32)
+
+/* rsx_compact_be_f16 on four halves, one per 32-bit lane (the high 16 bits
+ * clear): exponent 0 is a signed zero, 31 keeps its mantissa as an infinity
+ * or NaN, the rest rebias by 112. */
+static inline __m128i rsx_f16_bits(__m128i h)
+{
+    const __m128i e = _mm_and_si128(h, _mm_set1_epi32(0x7C00));
+    const __m128i rebias = _mm_set1_epi32(112 << 23);
+    __m128i v = _mm_add_epi32(_mm_slli_epi32(_mm_and_si128(h, _mm_set1_epi32(0x7FFF)), 13), rebias);
+    v = _mm_add_epi32(v, _mm_and_si128(_mm_cmpeq_epi32(e, _mm_set1_epi32(0x7C00)), rebias));
+    v = _mm_andnot_si128(_mm_cmpeq_epi32(e, _mm_setzero_si128()), v);
+    return _mm_or_si128(v, _mm_slli_epi32(_mm_and_si128(h, _mm_set1_epi32(0x8000)), 16));
 }
 
-static inline __m128i rsx_load_1(const u8* p)
+static RSX_ALWAYS_INLINE u32 rsx_loop_f16(const rsx_fetch_slot* s, const u32* elem, u32 nb,
+                                          u8* dst, u32 ostride, u32* slow, const int checked)
 {
-    return _mm_cvtsi32_si128((s32)*p);
+    RSX_FETCH_LOOP_BEGIN
+        const __m128i h = _mm_shuffle_epi8(rsx_ld64(src), shuf);
+        _mm_storeu_si128((__m128i*)dst, _mm_or_si128(rsx_f16_bits(h), fill));
+    RSX_FETCH_LOOP_END
+}
+RSX_FETCH_LOOP_PAIR(rsx_loop_f16)
+
+static inline __m128 rsx_div255(__m128 x)
+{
+    return _mm_add_ps(_mm_mul_ps(x, _mm_set1_ps(0x1p-8f)),
+                      _mm_mul_ps(x, _mm_set1_ps(0x1.010102p-16f)));
 }
 
-static inline void rsx_decode_f32_simd(const u8* src, float* out, u32 n)
+static inline __m128 rsx_div32767(__m128 x)
 {
-    const __m128i w1 = _mm_set_epi32(0x3f800000, 0, 0, 0);
-    switch (n) {
-    case 4: {
-        const __m128i m4 = _mm_setr_epi8(3,2,1,0, 7,6,5,4, 11,10,9,8, 15,14,13,12);
-        _mm_storeu_ps(out, _mm_castsi128_ps(_mm_shuffle_epi8(rsx_load_16(src), m4)));
-        break;
-    }
-    case 3: {
-        const __m128i m3 = _mm_setr_epi8(3,2,1,0, 7,6,5,4, 11,10,9,8, -1,-1,-1,-1);
-        _mm_storeu_ps(out, _mm_castsi128_ps(_mm_or_si128(_mm_shuffle_epi8(rsx_load_12(src), m3), w1)));
-        break;
-    }
-    case 2: {
-        const __m128i m2 = _mm_setr_epi8(3,2,1,0, 7,6,5,4, -1,-1,-1,-1, -1,-1,-1,-1);
-        _mm_storeu_ps(out, _mm_castsi128_ps(_mm_or_si128(_mm_shuffle_epi8(rsx_load_8(src), m2), w1)));
-        break;
-    }
-    case 1: {
-        const __m128i m1 = _mm_setr_epi8(3,2,1,0, -1,-1,-1,-1, -1,-1,-1,-1, -1,-1,-1,-1);
-        _mm_storeu_ps(out, _mm_castsi128_ps(_mm_or_si128(_mm_shuffle_epi8(rsx_load_4(src), m1), w1)));
-        break;
-    }
-    }
+    return _mm_add_ps(_mm_mul_ps(x, _mm_set1_ps(0x1p-15f)),
+                      _mm_mul_ps(x, _mm_set1_ps(0x1.0002p-30f)));
 }
+
+static RSX_ALWAYS_INLINE u32 rsx_loop_unorm8(const rsx_fetch_slot* s, const u32* elem, u32 nb,
+                                             u8* dst, u32 ostride, u32* slow, const int checked)
+{
+    RSX_FETCH_LOOP_BEGIN
+        const __m128 f = rsx_div255(_mm_cvtepi32_ps(_mm_shuffle_epi8(rsx_ld32(src), shuf)));
+        _mm_storeu_si128((__m128i*)dst, _mm_or_si128(_mm_castps_si128(f), fill));
+    RSX_FETCH_LOOP_END
+}
+RSX_FETCH_LOOP_PAIR(rsx_loop_unorm8)
+
+static RSX_ALWAYS_INLINE u32 rsx_loop_uint8(const rsx_fetch_slot* s, const u32* elem, u32 nb,
+                                            u8* dst, u32 ostride, u32* slow, const int checked)
+{
+    RSX_FETCH_LOOP_BEGIN
+        const __m128 f = _mm_cvtepi32_ps(_mm_shuffle_epi8(rsx_ld32(src), shuf));
+        _mm_storeu_si128((__m128i*)dst, _mm_or_si128(_mm_castps_si128(f), fill));
+    RSX_FETCH_LOOP_END
+}
+RSX_FETCH_LOOP_PAIR(rsx_loop_uint8)
+
+static RSX_ALWAYS_INLINE u32 rsx_loop_snorm16(const rsx_fetch_slot* s, const u32* elem, u32 nb,
+                                              u8* dst, u32 ostride, u32* slow, const int checked)
+{
+    RSX_FETCH_LOOP_BEGIN
+        const __m128i v = _mm_cvtepi16_epi32(_mm_shuffle_epi8(rsx_ld64(src), shuf));
+        const __m128 f = rsx_div32767(_mm_cvtepi32_ps(v));
+        _mm_storeu_si128((__m128i*)dst, _mm_or_si128(_mm_castps_si128(f), fill));
+    RSX_FETCH_LOOP_END
+}
+RSX_FETCH_LOOP_PAIR(rsx_loop_snorm16)
+
+static RSX_ALWAYS_INLINE u32 rsx_loop_sint16(const rsx_fetch_slot* s, const u32* elem, u32 nb,
+                                             u8* dst, u32 ostride, u32* slow, const int checked)
+{
+    RSX_FETCH_LOOP_BEGIN
+        const __m128i v = _mm_cvtepi16_epi32(_mm_shuffle_epi8(rsx_ld64(src), shuf));
+        const __m128 f = _mm_cvtepi32_ps(v);
+        _mm_storeu_si128((__m128i*)dst, _mm_or_si128(_mm_castps_si128(f), fill));
+    RSX_FETCH_LOOP_END
+}
+RSX_FETCH_LOOP_PAIR(rsx_loop_sint16)
+#undef RSX_FETCH_LOOP_BEGIN
+#undef RSX_FETCH_LOOP_END
+#undef RSX_FETCH_LOOP_PAIR
+
+/* The shuffle that byte-swaps `n` components of `bytes` each into the low
+ * end of 32-bit lanes (16-bit ones into the low half of a lane pair for
+ * _mm_cvtepi16_epi32 when `pack16`), zeroing the rest. */
+static __m128i rsx_fetch_shuffle(u32 bytes, u32 n, int pack16)
+{
+    s8 m[16];
+    memset(m, -1, sizeof m);
+    for (u32 c = 0; c < n; c++)
+        for (u32 b = 0; b < bytes; b++)
+            m[(pack16 ? c * 2u : c * 4u) + b] = (s8)(c * bytes + bytes - 1u - b);
+    __m128i r;
+    memcpy(&r, m, 16);
+    return r;
+}
+#else
+/* Without SSE4.1 the loops are the scalar conversions, one per format. */
+#define RSX_FETCH_LOOP_SCALAR(name, decode_expr)                                \
+static u32 name##_checked(const rsx_fetch_slot* s, const u32* elem, u32 nb,     \
+                u8* dst, u32 ostride, u32* slow)                                \
+{                                                                               \
+    const u8* const base = s->base;                                             \
+    const u32 first = s->first, lim = s->lim, fs = s->fstride;                  \
+    const u32 n = s->fill_n;                                                    \
+    u32 ns = 0;                                                                 \
+    for (u32 i = 0; i < nb; i++, dst += ostride) {                              \
+        const u32 rel = elem[i] - first;                                        \
+        if (rel > lim) { slow[ns++] = i; continue; }                            \
+        const u8* src = base + (size_t)rel * fs;                                \
+        float v[4] = { 0.0f, 0.0f, 0.0f, 1.0f };                                \
+        for (u32 c = 0; c < n; c++) { decode_expr; }                            \
+        memcpy(dst, v, 16);                                                     \
+    }                                                                           \
+    return ns;                                                                  \
+}
+#define rsx_loop_f32_all rsx_loop_f32_checked
+#define rsx_loop_f16_all rsx_loop_f16_checked
+#define rsx_loop_unorm8_all rsx_loop_unorm8_checked
+#define rsx_loop_uint8_all rsx_loop_uint8_checked
+#define rsx_loop_snorm16_all rsx_loop_snorm16_checked
+#define rsx_loop_sint16_all rsx_loop_sint16_checked
+RSX_FETCH_LOOP_SCALAR(rsx_loop_f32, v[c] = rsx_compact_be_f32(src + c * 4))
+RSX_FETCH_LOOP_SCALAR(rsx_loop_f16, v[c] = rsx_compact_be_f16(src + c * 2))
+RSX_FETCH_LOOP_SCALAR(rsx_loop_unorm8, v[c] = src[c] / 255.0f)
+RSX_FETCH_LOOP_SCALAR(rsx_loop_uint8, v[c] = (float)src[c])
+RSX_FETCH_LOOP_SCALAR(rsx_loop_snorm16,
+                      v[c] = (s16)((src[c * 2] << 8) | src[c * 2 + 1]) / 32767.0f)
+RSX_FETCH_LOOP_SCALAR(rsx_loop_sint16,
+                      v[c] = (float)(s16)((src[c * 2] << 8) | src[c * 2 + 1]))
+#undef RSX_FETCH_LOOP_SCALAR
 #endif
 
-#if defined(RSX_HAVE_F16C) && defined(RSX_HAVE_SSSE3) && defined(RSX_HAVE_SSE41)
-static inline void rsx_decode_f16_simd(const u8* src, float* out, u32 n)
+/* How one used attribute is fetched this draw. */
+static void rsx_fetch_slot_init(const rsx_vertex_fetch_plan* plan, u32 slot,
+                                rsx_fetch_slot* s)
 {
-    const __m128i shuf = _mm_setr_epi8(1,0, 3,2, 5,4, 7,6, -1,-1,-1,-1,-1,-1,-1,-1);
-    const __m128 w1_f = _mm_setr_ps(0.0f, 0.0f, 0.0f, 1.0f);
-    __m128i raw;
-    switch (n) {
-    case 4: raw = rsx_load_8(src); break;
-    case 3: raw = rsx_load_6(src); break;
-    case 2: raw = rsx_load_4(src); break;
-    case 1: raw = rsx_load_2(src); break;
-    default: return;
-    }
-    __m128i h16 = _mm_shuffle_epi8(raw, shuf);
-    /* F16C _mm_cvtph_ps flushes/normalizes denormals and sets the quiet bit on NaNs.
-     * Scalar rsx_compact_be_f16 flushes all exp==0 to zero and preserves NaN payload
-     * without quieting. Check if any active component has exp==0 or exp==31 with man!=0;
-     * if so, fall back to the exact scalar converter for bit-exact results. */
-    __m128i exp = _mm_and_si128(_mm_srli_epi16(h16, 10), _mm_set1_epi16(0x1F));
-    __m128i is_special = _mm_or_si128(_mm_cmpeq_epi16(exp, _mm_setzero_si128()),
-                                     _mm_cmpeq_epi16(exp, _mm_set1_epi16(0x1F)));
-    __m128i man = _mm_and_si128(h16, _mm_set1_epi16(0x3FF));
-    __m128i bad = _mm_and_si128(is_special, _mm_cmpgt_epi16(man, _mm_setzero_si128()));
-    static const int valid_masks[5] = {0, 0x03, 0x0F, 0x3F, 0xFF};
-    if (__builtin_expect((_mm_movemask_epi8(bad) & valid_masks[n]) != 0, 0)) {
-        out[0] = out[1] = out[2] = 0.0f;
-        out[3] = 1.0f;
-        for (u32 c = 0; c < n; c++)
-            out[c] = rsx_compact_be_f16(src + c * 2);
+    const u32 attr = plan->layout.attrs[slot];
+    const rsx_vertex_fetch_attr* fetch = &plan->attr[attr];
+    memset(s, 0, sizeof *s);
+    s->attr = attr;
+    s->offset = slot * 16u;
+    s->modulo = (plan->divider_mask >> attr) & 1u;
+    s->frequency = fetch->desc.frequency;
+    s->plain = rsx_vertex_freq_plain(s->frequency, s->modulo);
+    const u32 type = fetch->desc.type;
+    if (!type || !fetch->desc.size) {
+        s->kind = RSX_FETCH_DEFAULT;
         return;
     }
-    __m128 f = _mm_cvtph_ps(h16);
-    switch (n) {
-    case 4: _mm_storeu_ps(out, f); break;
-    case 3: _mm_storeu_ps(out, _mm_blend_ps(f, w1_f, 0x8)); break;
-    case 2: _mm_storeu_ps(out, _mm_blend_ps(f, w1_f, 0xC)); break;
-    case 1: _mm_storeu_ps(out, _mm_blend_ps(f, w1_f, 0xE)); break;
+    if (!fetch->stable_base || type < RSX_VTX_TYPE_SNORM16 || type > RSX_VTX_TYPE_UINT8) {
+        s->kind = RSX_FETCH_RESOLVE;
+        return;
     }
-}
-#endif
-
+    s->base = fetch->stable_base;
+    s->first = fetch->stable_first;
+    s->span = fetch->stable_last - fetch->stable_first;
+    s->fstride = fetch->stride;
+    s->kind = RSX_FETCH_EXACT;
+    const u32 n = fetch->desc.size < 4 ? fetch->desc.size : 4;
+    u32 width = 0, bytes = 0;
+    int pack16 = 0;
+    switch (type) {
+#define RSX_FETCH_LOOPS(name) (s->loop = name##_checked, s->loop_all = name##_all)
+    case RSX_VTX_TYPE_FLOAT:   RSX_FETCH_LOOPS(rsx_loop_f32); width = 16; bytes = 4; break;
+    case RSX_VTX_TYPE_HALF:    RSX_FETCH_LOOPS(rsx_loop_f16); width = 8; bytes = 2; break;
+    case RSX_VTX_TYPE_UNORM8:  RSX_FETCH_LOOPS(rsx_loop_unorm8); width = 4; bytes = 1; break;
+    case RSX_VTX_TYPE_UINT8:   RSX_FETCH_LOOPS(rsx_loop_uint8); width = 4; bytes = 1; break;
+    case RSX_VTX_TYPE_SNORM16: RSX_FETCH_LOOPS(rsx_loop_snorm16); width = 8; bytes = 2; pack16 = 1; break;
+    case RSX_VTX_TYPE_SINT16:  RSX_FETCH_LOOPS(rsx_loop_sint16); width = 8; bytes = 2; pack16 = 1; break;
+#undef RSX_FETCH_LOOPS
+    default:                   return;   /* CMP32: one packed word, decoded exactly */
+    }
+    /* The span the plan mapped ends elem_size past its last element's start;
+     * a full-width load may start no later than `width` before that. */
+    const u64 span_bytes = (u64)s->span * s->fstride + fetch->elem_size;
+    if (span_bytes < width)
+        return;
+    const u64 last_wide = s->fstride ? (span_bytes - width) / s->fstride : s->span;
+    s->lim = last_wide < s->span ? (u32)last_wide : s->span;
+    s->kind = RSX_FETCH_LOOP;
 #if defined(RSX_HAVE_SSE41)
-static inline void rsx_decode_unorm8_simd(const u8* src, float* out, u32 n)
-{
-    const __m128 div255 = _mm_set1_ps(255.0f);
-    const __m128 w1_f = _mm_setr_ps(0.0f, 0.0f, 0.0f, 1.0f);
-    __m128i raw;
-    switch (n) {
-    case 4: raw = rsx_load_4(src); break;
-    case 3: raw = rsx_load_3(src); break;
-    case 2: raw = rsx_load_2(src); break;
-    case 1: raw = rsx_load_1(src); break;
-    default: return;
-    }
-    __m128i i32 = _mm_cvtepu8_epi32(raw);
-    __m128 f = _mm_div_ps(_mm_cvtepi32_ps(i32), div255);
-    switch (n) {
-    case 4: _mm_storeu_ps(out, f); break;
-    case 3: _mm_storeu_ps(out, _mm_blend_ps(f, w1_f, 0x8)); break;
-    case 2: _mm_storeu_ps(out, _mm_blend_ps(f, w1_f, 0xC)); break;
-    case 1: _mm_storeu_ps(out, _mm_blend_ps(f, w1_f, 0xE)); break;
-    }
-}
-
-static inline void rsx_decode_uint8_simd(const u8* src, float* out, u32 n)
-{
-    const __m128 w1_f = _mm_setr_ps(0.0f, 0.0f, 0.0f, 1.0f);
-    __m128i raw;
-    switch (n) {
-    case 4: raw = rsx_load_4(src); break;
-    case 3: raw = rsx_load_3(src); break;
-    case 2: raw = rsx_load_2(src); break;
-    case 1: raw = rsx_load_1(src); break;
-    default: return;
-    }
-    __m128i i32 = _mm_cvtepu8_epi32(raw);
-    __m128 f = _mm_cvtepi32_ps(i32);
-    switch (n) {
-    case 4: _mm_storeu_ps(out, f); break;
-    case 3: _mm_storeu_ps(out, _mm_blend_ps(f, w1_f, 0x8)); break;
-    case 2: _mm_storeu_ps(out, _mm_blend_ps(f, w1_f, 0xC)); break;
-    case 1: _mm_storeu_ps(out, _mm_blend_ps(f, w1_f, 0xE)); break;
-    }
-}
+    s->shuf = rsx_fetch_shuffle(bytes, n, pack16);
+    s->fill = n < 4 ? _mm_setr_epi32(0, 0, 0, 0x3F800000) : _mm_setzero_si128();
+#else
+    (void)bytes; (void)pack16;
+    s->fill_n = n;
 #endif
-
-#if defined(RSX_HAVE_SSSE3) && defined(RSX_HAVE_SSE41)
-static inline void rsx_decode_snorm16_simd(const u8* src, float* out, u32 n)
-{
-    const __m128i shuf = _mm_setr_epi8(1,0, 3,2, 5,4, 7,6, -1,-1,-1,-1,-1,-1,-1,-1);
-    const __m128 div32767 = _mm_set1_ps(32767.0f);
-    const __m128 w1_f = _mm_setr_ps(0.0f, 0.0f, 0.0f, 1.0f);
-    __m128i raw;
-    switch (n) {
-    case 4: raw = rsx_load_8(src); break;
-    case 3: raw = rsx_load_6(src); break;
-    case 2: raw = rsx_load_4(src); break;
-    case 1: raw = rsx_load_2(src); break;
-    default: return;
-    }
-    __m128i s16 = _mm_shuffle_epi8(raw, shuf);
-    __m128i i32 = _mm_cvtepi16_epi32(s16);
-    __m128 f = _mm_div_ps(_mm_cvtepi32_ps(i32), div32767);
-    switch (n) {
-    case 4: _mm_storeu_ps(out, f); break;
-    case 3: _mm_storeu_ps(out, _mm_blend_ps(f, w1_f, 0x8)); break;
-    case 2: _mm_storeu_ps(out, _mm_blend_ps(f, w1_f, 0xC)); break;
-    case 1: _mm_storeu_ps(out, _mm_blend_ps(f, w1_f, 0xE)); break;
-    }
 }
 
-static inline void rsx_decode_sint16_simd(const u8* src, float* out, u32 n)
+/* Block [b, b + nb) of one attribute into dst (vertex i at dst + i * ostride).
+ * `plain` holds the block's plain elements, lo..hi. 0 when an ATTR0 element
+ * fails. */
+static int rsx_fetch_slot_block(const rsx_vertex_fetch_plan* plan, const rsx_fetch_slot* s,
+                                const rsx_vertex_ref* refs, u32 b, u32 nb,
+                                const u32* plain, u32 lo, u32 hi, u8* dst, u32 ostride)
 {
-    const __m128i shuf = _mm_setr_epi8(1,0, 3,2, 5,4, 7,6, -1,-1,-1,-1,-1,-1,-1,-1);
-    const __m128 w1_f = _mm_setr_ps(0.0f, 0.0f, 0.0f, 1.0f);
-    __m128i raw;
-    switch (n) {
-    case 4: raw = rsx_load_8(src); break;
-    case 3: raw = rsx_load_6(src); break;
-    case 2: raw = rsx_load_4(src); break;
-    case 1: raw = rsx_load_2(src); break;
-    default: return;
+    const rsx_vertex_fetch_attr* fetch = &plan->attr[s->attr];
+    if (s->kind == RSX_FETCH_DEFAULT) {
+        for (u32 i = 0; i < nb; i++)
+            memcpy(dst + (size_t)i * ostride, fetch->default_value, 16);
+        return 1;
     }
-    __m128i s16 = _mm_shuffle_epi8(raw, shuf);
-    __m128i i32 = _mm_cvtepi16_epi32(s16);
-    __m128 f = _mm_cvtepi32_ps(i32);
-    switch (n) {
-    case 4: _mm_storeu_ps(out, f); break;
-    case 3: _mm_storeu_ps(out, _mm_blend_ps(f, w1_f, 0x8)); break;
-    case 2: _mm_storeu_ps(out, _mm_blend_ps(f, w1_f, 0xC)); break;
-    case 1: _mm_storeu_ps(out, _mm_blend_ps(f, w1_f, 0xE)); break;
+    if (s->kind == RSX_FETCH_RESOLVE) {
+        for (u32 i = 0; i < nb; i++)
+            if (!rsx_vertex_fetch_attr_value(plan, s->attr, &refs[b + i],
+                                             (float*)(dst + (size_t)i * ostride)))
+                return 0;
+        return 1;
     }
+    u32 local[RSX_FETCH_BLOCK];
+    const u32* elem = plain;
+    if (!s->plain) {
+        lo = UINT_MAX; hi = 0;
+        for (u32 i = 0; i < nb; i++) {
+            const u32 e = rsx_vertex_element_index(refs[b + i].vertex_id, refs[b + i].base_index,
+                                                   s->frequency, s->modulo);
+            local[i] = e;
+            lo = e < lo ? e : lo;
+            hi = e > hi ? e : hi;
+        }
+        elem = local;
+    }
+    u32 slow[RSX_FETCH_BLOCK];
+    u32 ns = nb;
+    if (s->kind == RSX_FETCH_LOOP) {
+        ns = lo >= s->first && hi - s->first <= s->lim
+            ? s->loop_all(s, elem, nb, dst, ostride, slow)
+            : s->loop(s, elem, nb, dst, ostride, slow);
+    } else {
+        for (u32 i = 0; i < nb; i++) slow[i] = i;
+    }
+    for (u32 k = 0; k < ns; k++) {
+        const u32 i = slow[k];
+        u8* v = dst + (size_t)i * ostride;
+        const u32 rel = elem[i] - s->first;
+        if (rel <= s->span)
+            rsx_fetch_exact(fetch, s->base + (size_t)rel * s->fstride, v);
+        else if (!rsx_vertex_fetch_attr_value(plan, s->attr, &refs[b + i], (float*)v))
+            return 0;
+    }
+    return 1;
 }
+
+static int rsx_vertex_fetch_blocks(
+    const rsx_vertex_fetch_plan* plan, const rsx_vertex_ref* refs, u32 count,
+    u8* out, int stream)
+{
+    if (!plan || (!refs && count) || (!out && plan->layout.stride && count))
+        return 0;
+    const u32 stride = plan->layout.stride;
+    const u32 nslots = plan->layout.count;
+    if (!count || !nslots)
+        return 1;
+    rsx_fetch_slot slots[RSX_DSP_NUM_VERTEX_ATTR];
+    int any_plain = 0;
+    for (u32 slot = 0; slot < nslots; slot++) {
+        rsx_fetch_slot_init(plan, slot, &slots[slot]);
+        any_plain |= slots[slot].plain && slots[slot].kind >= RSX_FETCH_LOOP &&
+                     slots[slot].kind <= RSX_FETCH_EXACT;
+    }
+#if defined(RSX_HAVE_SSE41)
+    /* A tile of the block in cache, written out whole, in order. Each block's
+     * tile sits half a page from where it goes (mod 4 KB), well clear of 4K
+     * aliasing between its loads and the non-temporal stores still in flight
+     * ahead of them: at some placements the copy stalled on every load and a
+     * benchmark frame took 1.8x as long. */
+    _Alignas(64) u8 tile_mem[RSX_FETCH_BLOCK * RSX_DSP_NUM_VERTEX_ATTR * 16u + 4096u];
+    stream = stream && !((uintptr_t)out & 15u);
+#else
+    u8 tile_mem[1];
+    stream = 0;
 #endif
-
-#define RSX_FETCH_LOOP_EXPAND(call_decode)                                      \
-    if (plain) {                                                                \
-        switch (n) {                                                            \
-        case 4: {                                                               \
-            u8* out_ptr = out + slot * 16u;                                     \
-            for (u32 i = 0; i < count; i++, out_ptr += stride) {               \
-                float* v = (float*)out_ptr;                                     \
-                const u32 element =                                             \
-                    (refs[i].vertex_id + refs[i].base_index) & 0x000FFFFFu;     \
-                if (__builtin_expect(element - first > span, 0)) {              \
-                    if (!rsx_vertex_fetch_attr_value(plan, attr, &refs[i], v))  \
-                        return 0;                                               \
-                    continue;                                                   \
-                }                                                               \
-                const u8* src = base + (u64)(element - first) * fstride;        \
-                call_decode(src, v, 4);                                         \
-            }                                                                   \
-            break;                                                              \
-        }                                                                       \
-        case 3: {                                                               \
-            u8* out_ptr = out + slot * 16u;                                     \
-            for (u32 i = 0; i < count; i++, out_ptr += stride) {               \
-                float* v = (float*)out_ptr;                                     \
-                const u32 element =                                             \
-                    (refs[i].vertex_id + refs[i].base_index) & 0x000FFFFFu;     \
-                if (__builtin_expect(element - first > span, 0)) {              \
-                    if (!rsx_vertex_fetch_attr_value(plan, attr, &refs[i], v))  \
-                        return 0;                                               \
-                    continue;                                                   \
-                }                                                               \
-                const u8* src = base + (u64)(element - first) * fstride;        \
-                call_decode(src, v, 3);                                         \
-            }                                                                   \
-            break;                                                              \
-        }                                                                       \
-        case 2: {                                                               \
-            u8* out_ptr = out + slot * 16u;                                     \
-            for (u32 i = 0; i < count; i++, out_ptr += stride) {               \
-                float* v = (float*)out_ptr;                                     \
-                const u32 element =                                             \
-                    (refs[i].vertex_id + refs[i].base_index) & 0x000FFFFFu;     \
-                if (__builtin_expect(element - first > span, 0)) {              \
-                    if (!rsx_vertex_fetch_attr_value(plan, attr, &refs[i], v))  \
-                        return 0;                                               \
-                    continue;                                                   \
-                }                                                               \
-                const u8* src = base + (u64)(element - first) * fstride;        \
-                call_decode(src, v, 2);                                         \
-            }                                                                   \
-            break;                                                              \
-        }                                                                       \
-        default: {                                                              \
-            u8* out_ptr = out + slot * 16u;                                     \
-            for (u32 i = 0; i < count; i++, out_ptr += stride) {               \
-                float* v = (float*)out_ptr;                                     \
-                const u32 element =                                             \
-                    (refs[i].vertex_id + refs[i].base_index) & 0x000FFFFFu;     \
-                if (__builtin_expect(element - first > span, 0)) {              \
-                    if (!rsx_vertex_fetch_attr_value(plan, attr, &refs[i], v))  \
-                        return 0;                                               \
-                    continue;                                                   \
-                }                                                               \
-                const u8* src = base + (u64)(element - first) * fstride;        \
-                call_decode(src, v, 1);                                         \
-            }                                                                   \
-            break;                                                              \
-        }                                                                       \
-        }                                                                       \
-    } else {                                                                    \
-        u8* out_ptr = out + slot * 16u;                                         \
-        for (u32 i = 0; i < count; i++, out_ptr += stride) {                   \
-            float* v = (float*)out_ptr;                                         \
-            const u32 element = rsx_vertex_element_index(                       \
-                refs[i].vertex_id, refs[i].base_index,                          \
-                fetch->desc.frequency, modulo);                                 \
-            if (__builtin_expect(element - first > span, 0)) {                  \
-                if (!rsx_vertex_fetch_attr_value(plan, attr, &refs[i], v))      \
-                    return 0;                                                   \
-                continue;                                                       \
-            }                                                                   \
-            const u8* src = base + (u64)(element - first) * fstride;            \
-            call_decode(src, v, n);                                             \
-        }                                                                       \
+    u32 plain[RSX_FETCH_BLOCK];
+    int ok = 1;
+    for (u32 b = 0; b < count && ok; b += RSX_FETCH_BLOCK) {
+        const u32 nb = count - b < RSX_FETCH_BLOCK ? count - b : RSX_FETCH_BLOCK;
+        u8* const block_out = out + (size_t)b * stride;
+        u8* const dst = stream
+            ? tile_mem + (((uintptr_t)block_out + 2048u - (uintptr_t)tile_mem) & 4095u)
+            : block_out;
+        u32 lo = UINT_MAX, hi = 0;
+        if (any_plain)
+            for (u32 i = 0; i < nb; i++) {
+                const u32 e = (refs[b + i].vertex_id + refs[b + i].base_index) & 0x000FFFFFu;
+                plain[i] = e;
+                lo = e < lo ? e : lo;
+                hi = e > hi ? e : hi;
+            }
+        for (u32 slot = 0; slot < nslots; slot++) {
+            const rsx_fetch_slot* s = &slots[slot];
+            if (!rsx_fetch_slot_block(plan, s, refs, b, nb, plain, lo, hi, dst + s->offset, stride)) {
+                ok = 0;
+                break;
+            }
+        }
+#if defined(RSX_HAVE_SSE41)
+        if (stream && ok) {
+            const __m128i* src = (const __m128i*)dst;
+            __m128i* d = (__m128i*)block_out;
+            for (u32 q = 0, nq = nb * stride / 16u; q < nq; q++)
+                _mm_stream_si128(d + q, _mm_load_si128(src + q));
+        }
+#endif
     }
-
-#define RSX_SCALAR_LOOP(decode_expr)                                            \
-    for (u32 i = 0; i < count; i++) {                                           \
-        float* v = (float*)(out + (size_t)i * stride + slot * 16u);             \
-        const u32 element = plain                                               \
-            ? ((refs[i].vertex_id + refs[i].base_index) & 0x000FFFFFu)          \
-            : rsx_vertex_element_index(refs[i].vertex_id, refs[i].base_index,   \
-                                       fetch->desc.frequency, modulo);          \
-        if (element - first > span) {                                           \
-            if (!rsx_vertex_fetch_attr_value(plan, attr, &refs[i], v))          \
-                return 0;                                                       \
-            continue;                                                           \
-        }                                                                       \
-        const u8* src = base + (u64)(element - first) * fstride;                \
-        v[0] = v[1] = v[2] = 0.0f; v[3] = 1.0f;                                 \
-        for (u32 c = 0; c < n; c++) { decode_expr; }                            \
-    }
+#if defined(RSX_HAVE_SSE41)
+    if (stream)
+        _mm_sfence();   /* ordered before whatever hands the memory to the GPU */
+#endif
+    return ok;
+}
 
 int rsx_vertex_fetch_many(
     const rsx_vertex_fetch_plan* plan, const rsx_vertex_ref* refs, u32 count,
     u8* out)
 {
-    if (!plan || (!refs && count) || (!out && plan->layout.stride && count))
-        return 0;
-    const u32 stride = plan->layout.stride;
-    for (u32 slot = 0; slot < plan->layout.count; slot++) {
-        const u32 attr = plan->layout.attrs[slot];
-        const rsx_vertex_fetch_attr* fetch = &plan->attr[attr];
-        const u8* base = fetch->stable_base;
-        const u32 type = fetch->desc.type;
-        if (!type || !fetch->desc.size) {   /* no array: every vertex reads the default */
-            for (u32 i = 0; i < count; i++)
-                memcpy(out + (size_t)i * stride + slot * 16u, fetch->default_value, 16);
-            continue;
-        }
-        if (!base ||
-            type < RSX_VTX_TYPE_SNORM16 || type > RSX_VTX_TYPE_UINT8) {
-            for (u32 i = 0; i < count; i++)
-                if (!rsx_vertex_fetch_attr_value(plan, attr, &refs[i],
-                        (float*)(out + (size_t)i * stride + slot * 16u)))
-                    return 0;
-            continue;
-        }
-        const u32 first = fetch->stable_first;
-        const u32 span = fetch->stable_last - first;
-        const u32 fstride = fetch->stride;
-        const u32 modulo = (plan->divider_mask >> attr) & 1u;
-        const int plain = rsx_vertex_freq_plain(fetch->desc.frequency, modulo);
-        const u32 n = fetch->desc.size < 4 ? fetch->desc.size : 4;
-        switch (type) {
-        case RSX_VTX_TYPE_FLOAT:
-#if defined(RSX_HAVE_SSSE3)
-            RSX_FETCH_LOOP_EXPAND(rsx_decode_f32_simd)
-#else
-            RSX_SCALAR_LOOP(v[c] = rsx_compact_be_f32(src + c * 4))
-#endif
-            break;
-        case RSX_VTX_TYPE_HALF:
-#if defined(RSX_HAVE_F16C) && defined(RSX_HAVE_SSSE3) && defined(RSX_HAVE_SSE41)
-            RSX_FETCH_LOOP_EXPAND(rsx_decode_f16_simd)
-#else
-            RSX_SCALAR_LOOP(v[c] = rsx_compact_be_f16(src + c * 2))
-#endif
-            break;
-        case RSX_VTX_TYPE_UNORM8:
-#if defined(RSX_HAVE_SSE41)
-            RSX_FETCH_LOOP_EXPAND(rsx_decode_unorm8_simd)
-#else
-            RSX_SCALAR_LOOP(v[c] = src[c] / 255.0f)
-#endif
-            break;
-        case RSX_VTX_TYPE_UINT8:
-#if defined(RSX_HAVE_SSE41)
-            RSX_FETCH_LOOP_EXPAND(rsx_decode_uint8_simd)
-#else
-            RSX_SCALAR_LOOP(v[c] = (float)src[c])
-#endif
-            break;
-        case RSX_VTX_TYPE_SNORM16:
-#if defined(RSX_HAVE_SSSE3) && defined(RSX_HAVE_SSE41)
-            RSX_FETCH_LOOP_EXPAND(rsx_decode_snorm16_simd)
-#else
-            RSX_SCALAR_LOOP(v[c] = (s16)((src[c * 2] << 8) | src[c * 2 + 1]) / 32767.0f)
-#endif
-            break;
-        case RSX_VTX_TYPE_SINT16:
-#if defined(RSX_HAVE_SSSE3) && defined(RSX_HAVE_SSE41)
-            RSX_FETCH_LOOP_EXPAND(rsx_decode_sint16_simd)
-#else
-            RSX_SCALAR_LOOP(v[c] = (float)(s16)((src[c * 2] << 8) | src[c * 2 + 1]))
-#endif
-            break;
-        default:   /* RSX_VTX_TYPE_CMP32: one packed word, whatever the size */
-            /* Inside the stable range, decode from the known source instead of
-             * resolving each element again (packed normals are common). */
-            for (u32 i = 0; i < count; i++) {
-                float* v = (float*)(out + (size_t)i * stride + slot * 16u);
-                const u32 element = plain
-                    ? ((refs[i].vertex_id + refs[i].base_index) & 0x000FFFFFu)
-                    : rsx_vertex_element_index(refs[i].vertex_id, refs[i].base_index,
-                                               fetch->desc.frequency, modulo);
-                if (element - first > span ||
-                    !rsx_vertex_decode_element(type, fetch->desc.size,
-                                               base + (u64)(element - first) * fstride, v)) {
-                    if (!rsx_vertex_fetch_attr_value(plan, attr, &refs[i], v)) return 0;
-                }
-            }
-            break;
-        }
-    }
-    return 1;
+    return rsx_vertex_fetch_blocks(plan, refs, count, out, 0);
 }
-#undef RSX_FETCH_LOOP_EXPAND
-#undef RSX_SCALAR_LOOP
+
+int rsx_vertex_fetch_many_stream(
+    const rsx_vertex_fetch_plan* plan, const rsx_vertex_ref* refs, u32 count,
+    u8* out)
+{
+    return rsx_vertex_fetch_blocks(plan, refs, count, out, 1);
+}
 
 int rsx_vertex_fetch_plan_can_fail(const rsx_vertex_fetch_plan* plan)
 {

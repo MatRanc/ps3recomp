@@ -62,6 +62,7 @@ FIXTURES = {
     'test_shadow_metadata': ENGINE,
     'test_texture_layout': ENGINE,
     'test_user_command': ENGINE,
+    'test_vertex_fetch_direct': ENGINE,
     'test_vertex_fetch_exhaustive': ENGINE,
     'test_vertex_fetch_plan': ENGINE,
     'test_vertex_remap': ENGINE,

@@ -2302,8 +2302,9 @@ static int s_vtx_direct = 1;
 static int s_fill_ok;   /* the last fill's result; -1 before it is called */
 static int dc_fill_verts(void* ctx, void* dst)
 {
-    s_fill_ok = rsx_vertex_fetch_many(&dc.fetch_plan, dc.refs, *(const u32*)ctx,
-                                      (u8*)dst);
+    /* Write-only, possibly write-combined memory: streamed, whole vertices. */
+    s_fill_ok = rsx_vertex_fetch_many_stream(&dc.fetch_plan, dc.refs, *(const u32*)ctx,
+                                             (u8*)dst);
     return s_fill_ok;
 }
 
