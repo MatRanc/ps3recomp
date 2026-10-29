@@ -15,6 +15,12 @@
  * rsx_dispatch_method_run against the same words one rsx_dispatch_method at
  * a time -- the same dispatcher afterwards and the same sink calls in order.
  *
+ * Then the same comparison for runs through the transform program and
+ * constant upload windows, which rsx_dispatch_method_run copies in one go:
+ * runs up to 48 words starting before, in and after a window, load pointers
+ * at the start, the end and past the end of vp[] and constants[], and ones
+ * high enough that the slot arithmetic wraps.
+ *
  * Build (standalone):
  *   cc -std=gnu17 -Wall -Wextra -Wno-unused-parameter -I include -I libs/video \
  *      libs/video/tests/test_rsx_dispatch_plain.c -o /tmp/test_rsx_dispatch_plain
@@ -116,6 +122,43 @@ int main(void)
         }
     }
     check(!run_bad, "a run leaves the dispatcher and the sink calls as its words one at a time");
+
+    /* 3. Upload runs against the same words one at a time. */
+    static u8 upw[48 * 4];
+    static const u32 loads[] = { 0, 1, 7, 255, 400, 503, 504, 505, 510, 511, 512, 513, 539, 540,
+                                 541, 543, 544, 545, 600, 0x3FFFFFEFu, 0x3FFFFFF0u, 0x3FFFFFFFu,
+                                 0x40000000u, 0x40000001u, 0xFFFFFFF7u, 0xFFFFFFF8u, 0xFFFFFFF9u,
+                                 0xFFFFFFFEu, 0xFFFFFFFFu };
+    const u32 nloads = sizeof loads / sizeof loads[0];
+    int up_bad = 0;
+    unsigned up_runs = 0;
+    for (int t = 0; t < 40000 && !up_bad; t++) {
+        noise(&start, (int)(rnd() & 1u));
+        start.regs[M_VP_UPLOAD_FROM_ID >> 2] = (rnd() & 1u) ? loads[rnd() % nloads] : rnd() % 560u;
+        start.regs[M_VP_UPLOAD_CONST_ID >> 2] = (rnd() & 1u) ? loads[rnd() % nloads] : rnd() % 520u;
+        const u32 count = 1u + rnd() % 48u, step = (rnd() % 8u) ? 4u : 0u;
+        const u32 window = (rnd() & 1u) ? M_VP_UPLOAD_INST : M_VP_UPLOAD_CONST;
+        const u32 method = window - 16u + (rnd() % 52u) * 4u;   /* 4 words before .. 4 after */
+        for (u32 i = 0; i < count * 4; i++) upw[i] = (u8)rnd();
+        a = start; g_sig = 0; g_calls = 0;
+        rsx_dispatch_method_run(&a, method, step, upw, count);
+        const unsigned long long sig_a = g_sig; const unsigned calls_a = g_calls;
+        b = start; g_sig = 0; g_calls = 0;
+        for (u32 i = 0; i < count; i++) {
+            const u8* p = upw + i * 4;
+            rsx_dispatch_method(&b, (method + i * step) & 0x1FFCu,
+                                ((u32)p[0] << 24) | ((u32)p[1] << 16) | ((u32)p[2] << 8) | p[3]);
+        }
+        up_runs++;
+        if (sig_a != g_sig || calls_a != g_calls || memcmp(&a, &b, sizeof a)) {
+            printf("  upload run 0x%04X x%u step %u (program load %u, constant load %u) differs\n",
+                   method, count, step, start.regs[M_VP_UPLOAD_FROM_ID >> 2],
+                   start.regs[M_VP_UPLOAD_CONST_ID >> 2]);
+            up_bad = 1;
+        }
+    }
+    printf("  %u upload runs\n", up_runs);
+    check(!up_bad, "an upload run leaves the dispatcher as its words one at a time");
 
     printf("[rsx_dispatch_plain] %s (%d failed)\n", fails ? "FAIL" : "PASS", fails);
     return fails ? 1 : 0;
