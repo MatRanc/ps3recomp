@@ -2090,17 +2090,35 @@ static int gcm_get_eq_put(void)
     return eq;
 }
 
-/* Any per-word FIFO switch set, or a mirrored draw engine on. Read once per
- * drain: the walker hands every data word through these checks, a million a
- * second in God of War HD gameplay, and it used to test each switch on its
- * own for every word. */
-static int gcm_word_diag(void)
+/* Any per-word FIFO switch set (gcm_word_switches), or a mirrored draw engine
+ * on (gcm_word_diag). Read once per drain: the walker hands every data word
+ * through these checks, a million a second in God of War HD gameplay, and it
+ * used to test each switch on its own for every word. */
+static int gcm_word_switches(void)
 {
     static int on = -1;
     if (on < 0)
         on = (getenv("GCM_SUBCH7") || getenv("GCM_OBJDBG") || getenv("GCM_SUBCH_GATE") || getenv("GCM_WORD_STATS") ||
-              getenv("GCM_VAL_WATCH") || getenv("GCM_METHOD_HIST") || getenv("RSX_LIVE_FEED_DBG") ||
-              rsx_live_draw_enabled() || rsx_draw_engine_enabled()) ? 1 : 0;
+              getenv("GCM_VAL_WATCH") || getenv("GCM_METHOD_HIST") || getenv("RSX_LIVE_FEED_DBG")) ? 1 : 0;
+    return on;
+}
+static int gcm_word_diag(void)
+{
+    static int on = -1;
+    if (on < 0)
+        on = (gcm_word_switches() || rsx_live_draw_enabled() || rsx_draw_engine_enabled()) ? 1 : 0;
+    return on;
+}
+
+/* gcm_word_diag is on only because an engine mirrors the method stream: no
+ * per-word switch is set. The draw engine is on by
+ * default under Metal and Vulkan, so this is the common case there, and a
+ * run of 3D methods then needs nothing from the per-word loop but the
+ * engines and gcm_3d_method. */
+static int gcm_word_mirror_only(void)
+{
+    static int on = -1;
+    if (on < 0) on = (gcm_word_diag() && !gcm_word_switches()) ? 1 : 0;
     return on;
 }
 
@@ -2179,7 +2197,9 @@ static void gcm_rsx_process_fifo_unlocked(void)
      * by s_gcm_ctx_out_ea, which stays 0 on that path. */
     if (!s_gcm_context_ea && !s_gcm_syscall_mode) return;
     if (!s_inited) { rsx_state_init(&s_state); s_inited = 1; }
-    const int wdiag = gcm_word_diag();
+    const int wdiag = gcm_word_diag(), wmirror = gcm_word_mirror_only();
+    /* The mirrored engines, read where the first method word reaches them. */
+    static int s_live = -1, s_eng = -1;
     /* rsx_state feeds only the legacy vtable backend. With the draw engine
      * up and no vtable registered, the state it builds is never read, and the
      * only methods worth handing it are the ones with effects outside it
@@ -2666,6 +2686,26 @@ static void gcm_rsx_process_fifo_unlocked(void)
                     continue;
                 }
             }
+            /* The same run with only the engines mirroring the stream: each
+             * word goes to them and then to gcm_3d_method, in the order the
+             * loop below hands it over, read once. None of that loop's other
+             * checks can match a 3D subchannel with no switch set. */
+            if (wmirror && count && (subch == 0 || (subch == 1 && !s1_2d)) &&
+                ((s_fifo_getoff + 4) >> 20) == ((s_fifo_getoff + count * 4) >> 20)) {
+                const u32 dea = gcm_io2ea(s_fifo_getoff + 4);
+                if (dea) {
+                    if (s_live < 0) s_live = rsx_live_draw_enabled();
+                    if (s_eng < 0) s_eng = rsx_draw_engine_enabled();
+                    for (u32 i = 0; i < count; i++) {
+                        const u32 m = type == 0 ? method + i * 4 : method, v = vm_read32(dea + i * 4);
+                        if (s_live) rsx_live_draw_method((subch << 13) | m, v);
+                        if (s_eng) rsx_draw_engine_method((subch << 13) | m, v);
+                        gcm_3d_method(&s_state, m, v, legacy_state_live);
+                    }
+                    s_fifo_getoff += 4 + count * 4;
+                    continue;
+                }
+            }
             for (u32 i = 0; i < count; i++) {
                 u32 dea = gcm_io2ea(s_fifo_getoff + 4 + i * 4);
                 if (!dea) break;
@@ -2752,9 +2792,9 @@ static void gcm_rsx_process_fifo_unlocked(void)
                  * engine (caner / canersaka). Inert unless RSX_LIVE_DRAW is set.
                  * It wants the raw method with its subchannel bits -- it
                  * canonicalises with & 0x1FFC itself. */
-                if (wdiag) { static int live = -1;
-                  if (live < 0) live = rsx_live_draw_enabled();
-                  if (live) rsx_live_draw_method((subch << 13) | m, vm_read32(dea)); }
+                if (wdiag) {
+                  if (s_live < 0) s_live = rsx_live_draw_enabled();
+                  if (s_live) rsx_live_draw_method((subch << 13) | m, vm_read32(dea)); }
                 /* GCM_METHOD_HIST=<secs>: every <secs>, the most frequent
                  * (subchannel, method) pairs dispatched since the last report --
                  * what a frame is actually made of when nothing draws. */
@@ -2784,9 +2824,9 @@ static void gcm_rsx_process_fifo_unlocked(void)
                  * which is the macOS path under PS3RECOMP_RSX_ENGINE=dispatch.
                  * It wants the raw method with its subchannel bits for the
                  * same reason the live engine does, and masks them itself. */
-                if (wdiag) { static int eng = -1;
-                  if (eng < 0) eng = rsx_draw_engine_enabled();
-                  if (eng) rsx_draw_engine_method((subch << 13) | m, vm_read32(dea)); }
+                if (wdiag) {
+                  if (s_eng < 0) s_eng = rsx_draw_engine_enabled();
+                  if (s_eng) rsx_draw_engine_method((subch << 13) | m, vm_read32(dea)); }
 
                 /* RSX_LIVE_FEED_DBG=1: what the FIFO actually carries. Counted
                  * for any run, live engine or not, so the method stream and the
