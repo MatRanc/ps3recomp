@@ -2182,12 +2182,80 @@ static void gcm_3d_method(rsx_state* st, u32 m, u32 v, int legacy_state_live)
     }
 }
 
+/* ============================================================================
+ * RSX FIFO Stream Dumper (PS3RECOMP_DUMP_FIFO)
+ * Captures raw command dwords into a .bin file for replay with tools/replay_rsx
+ * ============================================================================ */
+static FILE* s_fifo_dump_fp = NULL;
+static int s_fifo_dump_frames_left = -1;
+static int s_fifo_dump_skip = -1;
+static u64 s_fifo_dump_words = 0;
+
+static void gcm_fifo_dump_close(void)
+{
+    if (s_fifo_dump_fp) {
+        fflush(s_fifo_dump_fp);
+        fclose(s_fifo_dump_fp);
+        s_fifo_dump_fp = NULL;
+        fprintf(stderr, "[cellGcmSys] FIFO dump closed: %llu words written\n",
+                (unsigned long long)s_fifo_dump_words);
+    }
+}
+
+static void gcm_fifo_dump_init(void)
+{
+    if (s_fifo_dump_frames_left >= 0) return;
+    const char* path = getenv("PS3RECOMP_DUMP_FIFO");
+    if (!path || !path[0]) {
+        s_fifo_dump_frames_left = 0;
+        return;
+    }
+    const char* f_env = getenv("PS3RECOMP_DUMP_FIFO_FRAMES");
+    s_fifo_dump_frames_left = (f_env && atoi(f_env) > 0) ? atoi(f_env) : 100;
+    const char* s_env = getenv("PS3RECOMP_DUMP_FIFO_SKIP");
+    s_fifo_dump_skip = (s_env && atoi(s_env) > 0) ? atoi(s_env) : 0;
+    s_fifo_dump_fp = fopen(path, "wb");
+    if (s_fifo_dump_fp) {
+        atexit(gcm_fifo_dump_close);
+        fprintf(stderr, "[cellGcmSys] FIFO dump started -> %s (frames=%d, skip=%d)\n",
+                path, s_fifo_dump_frames_left, s_fifo_dump_skip);
+    } else {
+        fprintf(stderr, "[cellGcmSys] Failed to create FIFO dump: %s\n", path);
+        s_fifo_dump_frames_left = 0;
+    }
+}
+
+static inline void gcm_fifo_dump_word(u32 w)
+{
+    if (s_fifo_dump_fp && s_fifo_dump_skip <= 0 && s_fifo_dump_frames_left > 0) {
+        fwrite(&w, sizeof(u32), 1, s_fifo_dump_fp);
+        s_fifo_dump_words++;
+    }
+}
+
+static void gcm_fifo_dump_flip(u32 w)
+{
+    if (!s_fifo_dump_fp) return;
+    if (s_fifo_dump_skip > 0) {
+        s_fifo_dump_skip--;
+        return;
+    }
+    if (s_fifo_dump_frames_left > 0) {
+        u32 flip_cmd = 0xFEAD0000u | (w & 7u);
+        gcm_fifo_dump_word(flip_cmd);
+        s_fifo_dump_frames_left--;
+        if (s_fifo_dump_frames_left == 0) {
+            gcm_fifo_dump_close();
+        }
+    }
+}
 
 /* The diagnostic switches below are tested on every drain pass, and GCM_RECDBG
  * on every semaphore method. getenv walks the whole environment and showed in
  * RSX-thread profiles, so each is read once and cached, like the other knobs. */
 static void gcm_rsx_process_fifo_unlocked(void)
 {
+    gcm_fifo_dump_init();
     { static unsigned _n = 0; static unsigned long long _t0 = 0;
       extern unsigned long long ps3_ms_now(void);
       _n++;
@@ -2485,11 +2553,13 @@ static void gcm_rsx_process_fifo_unlocked(void)
                 gcm_set_current_display_buffer(w & 7u);
                 s_flip_pending = 1;
                 s_flip_request_count++;
+                gcm_fifo_dump_flip(w);
                 /* Not past `queued`: a resync may already have written off
                  * this flip. */
                 if (s_fifo_flips_reached != s_fifo_flips_queued) s_fifo_flips_reached++;
             } else {
                 cellGcmSetFlipCommand(w & 0xFFu);
+                gcm_fifo_dump_flip(w);
             }
             /* ...unless the FIFO is badly backlogged. One flip per drain is
              * right while `get` is keeping up with `put`; when it is megabytes
@@ -2590,6 +2660,13 @@ static void gcm_rsx_process_fifo_unlocked(void)
             u32 count  = (w >> 18) & 0x7FF;
             u32 method = w & 0x1FFCu;
             u32 subch  = (w >> 13) & 7;
+            if (s_fifo_dump_fp && s_fifo_dump_skip <= 0 && s_fifo_dump_frames_left > 0) {
+                gcm_fifo_dump_word(w);
+                for (u32 di = 0; di < count; di++) {
+                    u32 dea = gcm_io2ea(s_fifo_getoff + 4 + di * 4);
+                    if (dea) gcm_fifo_dump_word(vm_read32(dea));
+                }
+            }
             /* TCONST_FIFO=1: how the title actually streams vertex constants.
              * NV4097_SET_TRANSFORM_CONSTANT is a 32-register window; if a block
              * arrives NON-INCREMENTING then every dword carries the same method
