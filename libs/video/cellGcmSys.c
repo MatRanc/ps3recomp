@@ -585,6 +585,8 @@ s32 cellGcmInit(u32 cmdSize, u32 ioSize, u32 ioAddress)
       gcm_forget_spu_blocks();
       g_spu_put_hook = gcm_note_spu_put; }
 
+    rsx_draw_engine_set_display_query(cellGcmOffsetIsDisplay);
+
     s_gcm_initialized = 1;
     return CELL_OK;
 }
@@ -2148,7 +2150,11 @@ static void gcm_3d_method(rsx_state* st, u32 m, u32 v, int legacy_state_live)
     /* NV406E_SET_REFERENCE: queue the fence value for PACED
      * publication (gcm_ref_publish below) instead of letting a
      * later fence in the same batch overwrite it. */
-    if (m == 0x50) gcm_ref_push_at(g_rsx_last_reference, s_fifo_getoff);
+    if (m == 0x50) {
+        if (rsx_draw_engine_enabled())
+            rsx_draw_engine_flush_dirty_to_guest();
+        gcm_ref_push_at(g_rsx_last_reference, s_fifo_getoff);
+    }
     /* NV4097_GET_REPORT: (type << 24) | offset into the report
      * area. Sample counts are not measured, so a ZPASS query
      * reports "visible" -- the conservative answer; reading 0
@@ -2456,6 +2462,8 @@ static void gcm_rsx_process_fifo_unlocked(void)
              * frame split across 4 presents, layout flashing/zooming). */
             extern s32 cellGcmSetFlipCommand(u32 bufferId);
             s_fifo_getoff += 4;
+            if (rsx_draw_engine_enabled())
+                rsx_draw_engine_flush_dirty_to_guest();
             gcm_fifo_flip_resets_state(&s_state);
             /* Count the flip WORDS the title actually writes into the FIFO,
              * separately from the presents that result. When a title stops
@@ -2636,6 +2644,8 @@ static void gcm_rsx_process_fifo_unlocked(void)
                     }
                     if (m == 0x64u)      s_sema_offset = v;
                     else if (m == 0x6Cu) {
+                        if (rsx_draw_engine_enabled())
+                            rsx_draw_engine_flush_dirty_to_guest();
                         /* The RSX has fetched past a RELEASE before its
                          * semaphore write lands, so a guest that sees the
                          * label must also see `get` past the command. `get`

@@ -422,6 +422,22 @@ if(PS3RECOMP_BUILD_TESTS)
     target_include_directories(test_log_first PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
     add_test(NAME log_first COMMAND test_log_first)
 
+    # Deterministic RSX FIFO Replay & Benchmark Tool
+    add_executable(replay_rsx
+        tools/replay_rsx.cpp
+        tools/replay_rsx_core.c
+        libs/video/rsx_dispatch.c
+    )
+    target_include_directories(replay_rsx PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/include"
+        "${CMAKE_CURRENT_SOURCE_DIR}/libs/video"
+        "${CMAKE_CURRENT_SOURCE_DIR}/tools"
+    )
+    set_target_properties(replay_rsx PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON)
+    if(TARGET Threads::Threads)
+        target_link_libraries(replay_rsx PRIVATE Threads::Threads)
+    endif()
+
     if(NOT WIN32)
         # The vector single-precision ops against the exact per-lane references.
         add_executable(test_spu_float_exact
@@ -445,6 +461,23 @@ if(PS3RECOMP_BUILD_TESTS)
     target_include_directories(test_rsx_present_policy PRIVATE
         "${CMAKE_CURRENT_SOURCE_DIR}/libs/video")
     add_test(NAME rsx_present_policy COMMAND test_rsx_present_policy)
+
+    add_executable(test_color_readback_guest
+        libs/video/tests/test_color_readback_guest.c
+        libs/video/rsx_dispatch.c
+        libs/video/rsx_vertex_compact.c
+        libs/video/rsx_texture_layout.c
+        libs/video/rsx_vp_decompiler.c
+        libs/video/rsx_fp_decompiler.c
+    )
+    target_include_directories(test_color_readback_guest PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/include"
+        "${CMAKE_CURRENT_SOURCE_DIR}/libs/video"
+        "${CMAKE_CURRENT_SOURCE_DIR}/libs/video/tests"
+    )
+    add_test(NAME color_readback_guest COMMAND test_color_readback_guest)
+
+    add_test(NAME replay_rsx_sample_fifo COMMAND replay_rsx "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/sample_fifo.bin" --frames 5)
 
 
     find_package(Python3 3.10 COMPONENTS Interpreter QUIET)

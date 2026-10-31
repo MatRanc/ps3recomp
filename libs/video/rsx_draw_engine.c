@@ -1502,7 +1502,8 @@ static int eng_surface_to_guest(u32 slot)
 {
     eng_surface* s = &g.surfaces[slot];
     if (!s->guest_dirty) return 1;
-    if (s->fmt != RSX_BE_FMT_R8G8B8A8 || s->pitch < s->w * 4u || !g.be->readback)
+    const u32 bpp = eng_transfer_bpp(s->fmt);
+    if (!bpp || s->pitch < s->w * bpp || !g.be->readback)
         return 0;
     rsx_draw_engine_guest_read(s->location, s->offset, s->pitch, s->w, s->h);
     s->guest_dirty = 0;
@@ -3513,9 +3514,58 @@ static u32 eng_present_surface(u32 buffer_id)
     return eng_current_surface();
 }
 
+static int (*s_is_display_fn)(u32 offset) = NULL;
+
+void rsx_draw_engine_set_display_query(int (*fn)(u32 offset))
+{
+    s_is_display_fn = fn;
+}
+
+static int eng_is_display_offset(u32 location, u32 offset)
+{
+    if (s_is_display_fn && s_is_display_fn(offset)) return 1;
+    for (int i = 0; i < 8; i++) {
+        if (g.display_buffers[i].valid &&
+            g.display_buffers[i].location == location &&
+            g.display_buffers[i].offset == offset)
+            return 1;
+    }
+    return 0;
+}
+
+void rsx_draw_engine_flush_dirty_to_guest(void)
+{
+    if (!g.ready || !g.be) return;
+    static int s_wcb = -1;
+    if (s_wcb < 0) {
+        const char* e = getenv("PS3RECOMP_RSX_WCB");
+        s_wcb = e ? atoi(e) : 1;
+    }
+    if (!s_wcb) return;
+
+    if (g.be->readback) {
+        for (u32 i = 0; i < g.n_surfaces; i++) {
+            eng_surface* s = &g.surfaces[i];
+            if (s->guest_dirty) {
+                if (eng_is_display_offset(s->location, s->offset))
+                    continue;
+                eng_surface_to_guest(i);
+            }
+        }
+    }
+    if (g.be->depth_readback) {
+        for (u32 i = 0; i < g.n_zdepths; i++) {
+            if (g.zdepths[i].guest_dirty) {
+                eng_zdepth_to_guest(i);
+            }
+        }
+    }
+}
+
 static void eng_present(u32 buffer_id)
 {
     if (!g.ready) return;
+    rsx_draw_engine_flush_dirty_to_guest();
     const u32 target = eng_present_surface(buffer_id);
     if (target == ENG_INVALID) return;
     g.surfaces[target].last_use = g.frames;
@@ -3682,6 +3732,7 @@ void rsx_draw_engine_set_display_buffer(u32 buffer_id, u32 location, u32 offset,
 
 void rsx_draw_engine_flush(void)
 {
+    rsx_draw_engine_flush_dirty_to_guest();
     if (g.ready && g.be->submit_and_wait)
         g.be->submit_and_wait(g.be->user, RSX_BE_FLUSH_GUEST_REFERENCE);
 }

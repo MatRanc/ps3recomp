@@ -341,6 +341,7 @@ void rsx_draw_engine_set_default(int on);
 /* A runner with its own RSX IO map supplies its address resolver before init.
  * NULL restores the toolkit's cellGcm mapping. */
 void rsx_draw_engine_set_guest_memory(rsx_vertex_guest_ptr_fn reader, void* user);
+void rsx_draw_engine_set_display_query(int (*fn)(u32 offset));
 
 int  rsx_draw_engine_init(u32 width, u32 height);
 void rsx_draw_engine_shutdown(void);
@@ -389,6 +390,13 @@ void rsx_draw_engine_note_flip(u32 buffer_id);
  * out with the same pitch take part; anything else is left alone. */
 void rsx_draw_engine_guest_read(u32 location, u32 offset, u32 pitch, u32 w, u32 h);
 void rsx_draw_engine_guest_wrote(u32 location, u32 offset, u32 pitch, u32 w, u32 h);
+
+/* Flush all dirty offscreen render surfaces (and depth buffers) back to guest
+ * memory before CPU/SPU synchronization points (SET_REFERENCE, SEMAPHORE_RELEASE,
+ * flip). This ensures titles reading back offscreen-rendered textures from guest
+ * memory (e.g. MLB The Show 16 dynamic player faces and crowd textures) observe
+ * valid rendered texels instead of uninitialized RAM. */
+void rsx_draw_engine_flush_dirty_to_guest(void);
 
 /* --- test hooks ---------------------------------------------------------- */
 

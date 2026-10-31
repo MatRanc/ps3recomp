@@ -456,6 +456,9 @@ void cellGcmSortRemapEaIoAddress(void);
 CellGcmReportData* cellGcmGetReportDataAddressLocation(u32 index, u32 location);
 u32 cellGcmGetReportDataLocation(u32 index, u32 location);
 
+/* Backend query: is this RSX offset a registered display buffer? */
+int cellGcmOffsetIsDisplay(u32 offset);
+
 
 #ifdef __cplusplus
 }
