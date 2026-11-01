@@ -271,20 +271,26 @@ Current Frame (41.6 ms)
      - *Headless Baseline (`WCB=0`)*: Instantly restored full **23.98 fps** baseline (1-sec mean 24.84 fps, peak 34.25 fps).
      - *Windowed Swapchain (`WINDOW=1`, `WCB=0`)*: Reached **23.34 fps** (instantaneous mean 23.52 fps ±2.17 fps). The 12.00 FPS clamp is **completely eliminated**, with windowed presentation incurring only a ~0.64 FPS (~2.6%) delta from headless.
 
-#### Macro Target 2: GPU Vertex Offloading & Compute Unpack (Shaves ~15.0–20.0 ms) -- IMMEDIATE FOCUS
-* **The Problem**: `mlb16-next` (`PS3RECOMP_ENG_VTX_DIRECT`) routed vertex data into the GPU ring, but the host CPU walker is still spending **~26 ms per frame** manually decoding, remapping, and converting vertex formats across ~750 draw calls. In heavy scenes (dugout close-ups, mound visits with LOD0 models), this CPU overhead balloons to 45–60 ms, dropping framerates to 15–20 FPS.
-* **The Architectural Fix**:
-  1. Stop converting vertex formats on the host CPU.
-  2. **Option A (Direct Binding)**: Remap RSX vertex layout descriptors directly to Vulkan `VkVertexInputAttributeDescription` strides and offsets, binding guest memory directly to the Vulkan pipeline.
-  3. **Option B (Compute Shader)**: Dispatch a lightweight Vulkan compute shader (`vtx_unpack.comp`) on the RTX 3060 Ti to unpack and transform raw PS3 vertex streams in parallel before draw calls.
-  4. **Expected Impact**: Eliminates **15–20 ms** of host CPU walker churn. Walker CPU time per draw drops from ~35 µs to $<5\text{ µs}$. Fully verified headlessly via `replay_rsx kauffman_pitch.bin`.
+#### Macro Target 2: Descriptor-Driven GPU Vertex Offload & Compute Unpack (COMPLETED & VERIFIED)
+* **The Problem**: Host CPU walker spent ~26 ms per frame decoding, byte-swapping, and remapping vertex formats across ~750 draw calls in software (`rsx_vertex_compact.c`). In heavy close-up scenes (mound visits, dugout LOD0 models), this CPU overhead exploded to 45–60 ms, dropping framerates to 15–20 FPS.
+* **The Architectural Fix (Implemented in `feat/gpu-vertex-offload`, commit `1f6dc0cd`)**:
+  1. **Compute Pipeline (`vtx_unpack.comp`)**: Integrated a dedicated compute pipeline into the Vulkan backend (`rsx_vulkan_backend.c`) and draw engine (`rsx_draw_engine.c`).
+  2. **Descriptor-Driven Architecture**:
+     - *Modes 0, 1, 2*: Fast unrolled paths for 24-byte 3D meshes and 16/20-byte 2D UI quads.
+     - *Mode 3 (Generic Unpack)*: Accepts up to 8 packed `AttrDesc` structs in push constants. Uses bitwise funnel shifts (`load_unaligned_be32`, `load_unaligned_be16`, `load_u8`) to natively unpack 2-byte aligned 22-byte streams (e.g., Short3 Pos + CMP Normal + CMP Tangent + Short2 UV0 + Short2 UV1) without alignment faults. Supports all 7 RSX vertex attribute types.
+     - *Dynamic Index Remapping*: Normalized non-contiguous vertex references (`elem = ((vertex_id + base_index) & 0xFFFFF) - stable_first`), streaming index remap buffers to compute threads to fetch and unpack sequential hardware vertex buffers.
+  3. **Empirical Results (Kauffman Stadium Pitch Scene)**:
+     - **98.28% GPU Offload Rate**: Offloaded 2,239,363 draws out of 2,278,559 evaluated.
+     - **CPU Software Fallbacks Collapsed**: Dropped from 85.0% down to **1.72%** (39,196 draws).
+     - **100% Deterministic Replay**: `replay_rsx` verified bit-exact state matching (`0x85fc2ff5a1655c26`).
+     - **Visual Fidelity**: `same.py` pitch-wait match diff 13.4 ($\le 25.0$), end frame diff 2.6 (sub-pixel match across full 1280x720 viewport, zero mesh tears, zero spikes).
 
-#### Macro Target 3: PPU/RSX Frame $N+1$ Pipelined Overlap (Shaves ~10.0–15.0 ms PPU Sleep)
+#### Macro Target 3: PPU/RSX Frame $N+1$ Pipelined Overlap (Shaves ~10.0–15.0 ms PPU Sleep) -- IMMEDIATE FOCUS
 * **The Problem**: The main PPU thread finishes building Frame $N$ and then immediately enters a blocking sleep in `Gfx_FrameEnd` waiting on the closing fence of the current frame before it even begins generating Frame $N+1$. CPU and GPU are serialized instead of overlapped.
 * **The Architectural Fix**:
   1. Pipeline command buffer ring generation so the PPU thread begins constructing Frame $N+1$ while the RSX walker and GPU are actively processing Frame $N$.
   2. Implement double/triple buffering for frame-level sync fences.
-  3. **Expected Impact**: Eliminates PPU idle sleep, ensuring continuous feeding of the RSX FIFO ring without backpressure bubbles.
+  3. **Expected Impact**: Eliminates PPU idle sleep, ensuring continuous feeding of the RSX FIFO ring without backpressure bubbles. Target: Solid 60 FPS (16.6 ms).
 
 ### 7.3 Tooling & Verification Protocol for Linux Agents
 
