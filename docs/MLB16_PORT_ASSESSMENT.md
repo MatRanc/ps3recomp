@@ -282,8 +282,10 @@ Current Frame (41.6 ms)
   3. **Empirical Results (Kauffman Stadium Pitch Scene)**:
      - **98.28% GPU Offload Rate**: Offloaded 2,239,363 draws out of 2,278,559 evaluated.
      - **CPU Software Fallbacks Collapsed**: Dropped from 85.0% down to **1.72%** (39,196 draws).
+     - **Live Game Benchmark**: Pitch-wait FPS rose to **24.19 fps** (1-sec mean 24.39 fps, instantaneous mean 24.43 fps ±2.62 fps), with instantaneous peaks reaching **32.15 fps** (+1.55 fps / +6.8% vs prior 22.64 fps run).
      - **100% Deterministic Replay**: `replay_rsx` verified bit-exact state matching (`0x85fc2ff5a1655c26`).
      - **Visual Fidelity**: `same.py` pitch-wait match diff 13.4 ($\le 25.0$), end frame diff 2.6 (sub-pixel match across full 1280x720 viewport, zero mesh tears, zero spikes).
+     - **Diagnostic Takeaway**: Headless `replay_rsx` executes the 646-draw Kauffman frame in **0.59 ms (~1,700 fps)**. Target 2 permanently eliminated the walker's 26 ms CPU vertex anchor (making 60 FPS mathematically possible). The live game ~24 FPS floor is now isolated to SPU Edge Geometry skinning (`jobmod_c690c2f7b09a`, ~35 ms) and PPU serialization in `Gfx_FrameEnd`.
 
 #### Macro Target 3: PPU/RSX Frame $N+1$ Pipelined Overlap (Shaves ~10.0–15.0 ms PPU Sleep) -- IMMEDIATE FOCUS
 * **The Problem**: The main PPU thread finishes building Frame $N$ and then immediately enters a blocking sleep in `Gfx_FrameEnd` waiting on the closing fence of the current frame before it even begins generating Frame $N+1$. CPU and GPU are serialized instead of overlapped.
