@@ -1,6 +1,6 @@
 # MLB The Show 16 (mlb16-recomp) — Project Overview & Progress Assessment
 
-*Updated: October 31, 2026*
+*Updated: November 1, 2026*
 *Repository:* [MatRanc/mlb16-recomp](https://github.com/MatRanc/mlb16-recomp) | *Upstream:* [sp00nznet/ps3recomp](https://github.com/sp00nznet/ps3recomp)
 
 ---
@@ -297,8 +297,11 @@ Current Frame (41.6 ms)
 ### 7.3 Tooling & Verification Protocol for Linux Agents
 
 > [!NOTE]
-> **Active Git Branches:**
-> All tools (`replay_rsx`, `generate_test_fifo.py`, `tools/run.sh`), the runtime FIFO dumper (`PS3RECOMP_DUMP_FIFO`), and Vulkan WCB are committed directly to **`mlb16-work`** and mirrored on **`feat/rsx-replay-and-wcb`** in [`MatRanc/ps3recomp`](https://github.com/MatRanc/ps3recomp).
+> **Active Git Branches in [`MatRanc/ps3recomp`](https://github.com/MatRanc/ps3recomp):**
+> * **`mlb16-work`**: Master working branch containing the baseline engine, direct vertex streaming, PGO recipes, and merged Macro Target 1 (presentation thread).
+> * **`feat/gpu-vertex-offload`**: Macro Target 2 implementation (Descriptor-Driven GPU Compute Unpack via `vtx_unpack.comp` + dynamic index remapping, commit `1f6dc0cd`).
+> * **`feat/presentation-thread`**: Macro Target 1 implementation (uncoupled 2-queue presentation thread).
+> * **`feat/rsx-replay-and-wcb`**: Headless RSX Replay tool (`replay_rsx`), FIFO dumper (`PS3RECOMP_DUMP_FIFO`), and Vulkan WCB readback.
 > 
 > Before starting work, sync the working tree on the Linux PC:
 > ```bash
