@@ -52,6 +52,7 @@
 #include "rsx_draw_engine.h"
 #include "vulkan/rsx_vk_fallback_vert.spv.h"
 #include "vulkan/rsx_vk_fallback_frag.spv.h"
+#include "vulkan/vtx_unpack_comp.spv.h"
 
 /* SDL2 is already required off Windows (cellPad, cellAudio); here it only
  * opens the optional window. Same include style as those two. */
@@ -93,13 +94,13 @@
     X(vkCreateDescriptorPool) X(vkDestroyDescriptorPool) \
     X(vkAllocateDescriptorSets) X(vkUpdateDescriptorSets) X(vkResetDescriptorPool) \
     X(vkCreatePipelineLayout) X(vkDestroyPipelineLayout) \
-    X(vkCreateGraphicsPipelines) X(vkDestroyPipeline) \
+    X(vkCreateGraphicsPipelines) X(vkCreateComputePipelines) X(vkDestroyPipeline) \
     X(vkCreateSampler) X(vkDestroySampler) \
     X(vkCmdPipelineBarrier) X(vkCmdClearColorImage) X(vkCmdClearDepthStencilImage) \
     X(vkCmdCopyImageToBuffer) X(vkCmdCopyBufferToImage) X(vkCmdCopyImage) \
     X(vkCmdBeginRenderPass) X(vkCmdEndRenderPass) X(vkCmdBindPipeline) \
     X(vkCmdBindVertexBuffers) X(vkCmdBindDescriptorSets) X(vkCmdPushConstants) \
-    X(vkCmdSetViewport) X(vkCmdSetScissor) X(vkCmdDraw) \
+    X(vkCmdSetViewport) X(vkCmdSetScissor) X(vkCmdDraw) X(vkCmdDispatch) \
     X(vkCmdSetStencilReference) X(vkCmdSetDepthBounds) \
     X(vkCmdBindIndexBuffer) X(vkCmdDrawIndexed) \
     X(vkCreateSemaphore) X(vkDestroySemaphore) X(vkCmdBlitImage)
@@ -176,6 +177,14 @@ typedef struct vk_state {
     VkPipelineLayout pipe_layout;
     VkPipeline       pipelines[VK_PIPELINE_SLOTS];
     VkSampler        sampler;
+
+    /* Macro Target 2: GPU Vertex Unpack Compute Pipeline */
+    VkShaderModule        vtx_unpack_module;
+    VkDescriptorSetLayout vtx_unpack_dsl;
+    VkPipelineLayout      vtx_unpack_layout;
+    VkPipeline            vtx_unpack_pipe;
+    VkDescriptorPool      vtx_unpack_pool;
+    VkDescriptorSet       vtx_unpack_ds[2];
 
     vk_image         dummy;           /* 1x1 magenta: "nothing bound"    */
     vk_image         tex[RSX_MAX_TEXTURES];   /* decoded guest textures  */
@@ -491,6 +500,7 @@ typedef struct {
     VkCommandBuffer  cmd;
     VkFence          fence;
     vk_buffer        vb, ib, ub, sb;
+    vk_buffer        raw_vb, remap_buf;
     VkDescriptorPool pool;
     u32              sets;
     int              inflight;
@@ -3762,21 +3772,169 @@ static VkImageView vk_eng_dummy_cube_view(void)
  * memory barrier keeps render-to-texture ordering without tracking.
  * VK_DRAW_BATCH_MAX (default 512) caps the draws per submission.
  * -------------------------------------------------------------------------*/
-#define VK_EB_VB_BYTES   (64u << 20)
-#define VK_EB_IB_BYTES   (16u << 20)
-#define VK_EB_UB_BYTES   (32u << 20)
-#define VK_EB_SB_BYTES   (64u << 20)   /* texture upload staging */
-#define VK_EB_MAX_SETS   1024u
+#define VK_EB_VB_BYTES       (64u << 20)
+#define VK_EB_RAW_VB_BYTES   (32u << 20)
+#define VK_EB_REMAP_BYTES    (4u << 20)
+#define VK_EB_IB_BYTES       (16u << 20)
+#define VK_EB_UB_BYTES       (32u << 20)
+#define VK_EB_SB_BYTES       (64u << 20)   /* texture upload staging */
+#define VK_EB_MAX_SETS       1024u
 
 static struct {
     int              on;            /* -1 undecided, 0 off, 1 on */
     u32              max_draws;
-    vk_buffer        vb, ib, ub, sb;
-    VkDeviceSize     vb_head, ib_head, ub_head, sb_head, ub_align;
+    vk_buffer        vb, raw_vb, remap_buf, ib, ub, sb;
+    VkDeviceSize     vb_head, raw_vb_head, remap_head, ib_head, ub_head, sb_head, ub_align;
     VkDescriptorPool pool;
     u32              sets;
     unsigned long long draws, flushes, unbatched, why[8];
 } s_eb = { .on = -1 };
+
+/* Macro Target 2: Vulkan compute pipeline for GPU vertex unpacking */
+static int vk_vtx_unpack_init(void)
+{
+    const char* off = getenv("PS3RECOMP_VK_VTX_UNPACK");
+    if (off && *off == '0') {
+        VK_LOG("gpu vertex unpack: disabled by env\n");
+        return 0;
+    }
+    if (s_vk.vtx_unpack_pipe) return 0;
+
+    if (vk_create_shader(vtx_unpack_comp_spv, sizeof vtx_unpack_comp_spv, &s_vk.vtx_unpack_module)) {
+        VK_LOG("gpu vertex unpack: failed to create compute shader module\n");
+        return -1;
+    }
+
+    VkDescriptorSetLayoutBinding binds[3] = {
+        { 0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL },
+        { 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL },
+        { 2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL },
+    };
+    VkDescriptorSetLayoutCreateInfo dlci = {
+        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+        .bindingCount = 3,
+        .pBindings = binds
+    };
+    if (pvkCreateDescriptorSetLayout(s_vk.device, &dlci, NULL, &s_vk.vtx_unpack_dsl) != VK_SUCCESS)
+        return -1;
+
+    VkPushConstantRange pcr = {
+        .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
+        .offset = 0,
+        .size = 104
+    };
+    VkPipelineLayoutCreateInfo plci = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+        .setLayoutCount = 1,
+        .pSetLayouts = &s_vk.vtx_unpack_dsl,
+        .pushConstantRangeCount = 1,
+        .pPushConstantRanges = &pcr
+    };
+    if (pvkCreatePipelineLayout(s_vk.device, &plci, NULL, &s_vk.vtx_unpack_layout) != VK_SUCCESS)
+        return -1;
+
+    VkComputePipelineCreateInfo cpci = {
+        .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+        .stage = {
+            .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+            .stage = VK_SHADER_STAGE_COMPUTE_BIT,
+            .module = s_vk.vtx_unpack_module,
+            .pName = "main"
+        },
+        .layout = s_vk.vtx_unpack_layout
+    };
+    if (pvkCreateComputePipelines(s_vk.device, VK_NULL_HANDLE, 1, &cpci, NULL, &s_vk.vtx_unpack_pipe) != VK_SUCCESS) {
+        VK_LOG("gpu vertex unpack: failed to create compute pipeline\n");
+        return -1;
+    }
+
+    VkDescriptorPoolSize ps = { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 6 };
+    VkDescriptorPoolCreateInfo dpci = {
+        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+        .maxSets = 2,
+        .poolSizeCount = 1,
+        .pPoolSizes = &ps
+    };
+    if (pvkCreateDescriptorPool(s_vk.device, &dpci, NULL, &s_vk.vtx_unpack_pool) != VK_SUCCESS)
+        return -1;
+
+    VkDescriptorSetLayout lays[2] = { s_vk.vtx_unpack_dsl, s_vk.vtx_unpack_dsl };
+    VkDescriptorSetAllocateInfo dsai = {
+        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+        .descriptorPool = s_vk.vtx_unpack_pool,
+        .descriptorSetCount = 2,
+        .pSetLayouts = lays
+    };
+    if (pvkAllocateDescriptorSets(s_vk.device, &dsai, s_vk.vtx_unpack_ds) != VK_SUCCESS)
+        return -1;
+
+    /* Write set 0 for s_eb */
+    VkDescriptorBufferInfo binfo0[3] = {
+        { s_eb.raw_vb.buf, 0, VK_WHOLE_SIZE },
+        { s_eb.vb.buf,     0, VK_WHOLE_SIZE },
+        { s_eb.remap_buf.buf, 0, VK_WHOLE_SIZE },
+    };
+    VkWriteDescriptorSet w0[3];
+    for (int i = 0; i < 3; i++) {
+        w0[i] = (VkWriteDescriptorSet){
+            .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+            .dstSet = s_vk.vtx_unpack_ds[0],
+            .dstBinding = (uint32_t)i,
+            .descriptorCount = 1,
+            .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+            .pBufferInfo = &binfo0[i]
+        };
+    }
+    pvkUpdateDescriptorSets(s_vk.device, 3, w0, 0, NULL);
+
+    /* Write set 1 for s_ebs[1] if present */
+    if (s_ebs_on) {
+        VkDescriptorBufferInfo binfo1[3] = {
+            { s_ebs[1].raw_vb.buf, 0, VK_WHOLE_SIZE },
+            { s_ebs[1].vb.buf,     0, VK_WHOLE_SIZE },
+            { s_ebs[1].remap_buf.buf, 0, VK_WHOLE_SIZE },
+        };
+        VkWriteDescriptorSet w1[3];
+        for (int i = 0; i < 3; i++) {
+            w1[i] = (VkWriteDescriptorSet){
+                .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                .dstSet = s_vk.vtx_unpack_ds[1],
+                .dstBinding = (uint32_t)i,
+                .descriptorCount = 1,
+                .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                .pBufferInfo = &binfo1[i]
+            };
+        }
+        pvkUpdateDescriptorSets(s_vk.device, 3, w1, 0, NULL);
+    }
+
+    VK_LOG("gpu vertex unpack: compute pipeline ready\n");
+    return 0;
+}
+
+static void vk_vtx_unpack_release(void)
+{
+    if (s_vk.vtx_unpack_pipe) {
+        pvkDestroyPipeline(s_vk.device, s_vk.vtx_unpack_pipe, NULL);
+        s_vk.vtx_unpack_pipe = VK_NULL_HANDLE;
+    }
+    if (s_vk.vtx_unpack_layout) {
+        pvkDestroyPipelineLayout(s_vk.device, s_vk.vtx_unpack_layout, NULL);
+        s_vk.vtx_unpack_layout = VK_NULL_HANDLE;
+    }
+    if (s_vk.vtx_unpack_pool) {
+        pvkDestroyDescriptorPool(s_vk.device, s_vk.vtx_unpack_pool, NULL);
+        s_vk.vtx_unpack_pool = VK_NULL_HANDLE;
+    }
+    if (s_vk.vtx_unpack_dsl) {
+        pvkDestroyDescriptorSetLayout(s_vk.device, s_vk.vtx_unpack_dsl, NULL);
+        s_vk.vtx_unpack_dsl = VK_NULL_HANDLE;
+    }
+    if (s_vk.vtx_unpack_module) {
+        pvkDestroyShaderModule(s_vk.device, s_vk.vtx_unpack_module, NULL);
+        s_vk.vtx_unpack_module = VK_NULL_HANDLE;
+    }
+}
 
 static int vk_eb_on(void)
 {
@@ -3797,7 +3955,9 @@ static int vk_eb_on(void)
     };
     VkDescriptorPoolCreateInfo pci = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
                                        .maxSets = VK_EB_MAX_SETS, .poolSizeCount = 3, .pPoolSizes = ps };
-    if (vk_create_host_buffer(&s_eb.vb, VK_EB_VB_BYTES, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT) || !s_eb.vb.coherent ||
+    if (vk_create_host_buffer(&s_eb.vb, VK_EB_VB_BYTES, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT) || !s_eb.vb.coherent ||
+        vk_create_host_buffer(&s_eb.raw_vb, VK_EB_RAW_VB_BYTES, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT) || !s_eb.raw_vb.coherent ||
+        vk_create_host_buffer(&s_eb.remap_buf, VK_EB_REMAP_BYTES, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT) || !s_eb.remap_buf.coherent ||
         vk_create_host_buffer(&s_eb.ib, VK_EB_IB_BYTES, VK_BUFFER_USAGE_INDEX_BUFFER_BIT) || !s_eb.ib.coherent ||
         vk_create_host_buffer(&s_eb.ub, VK_EB_UB_BYTES, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT) || !s_eb.ub.coherent ||
         vk_create_host_buffer(&s_eb.sb, VK_EB_SB_BYTES, VK_BUFFER_USAGE_TRANSFER_SRC_BIT) || !s_eb.sb.coherent ||
@@ -3816,17 +3976,27 @@ static int vk_eb_on(void)
         VkFenceCreateInfo fci = { .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
         if (pvkAllocateCommandBuffers(s_vk.device, &cai, &o->cmd) == VK_SUCCESS &&
             pvkCreateFence(s_vk.device, &fci, NULL, &o->fence) == VK_SUCCESS &&
-            !vk_create_host_buffer(&o->vb, VK_EB_VB_BYTES, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT) && o->vb.coherent &&
+            !vk_create_host_buffer(&o->vb, VK_EB_VB_BYTES, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT) && o->vb.coherent &&
+            !vk_create_host_buffer(&o->raw_vb, VK_EB_RAW_VB_BYTES, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT) && o->raw_vb.coherent &&
+            !vk_create_host_buffer(&o->remap_buf, VK_EB_REMAP_BYTES, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT) && o->remap_buf.coherent &&
             !vk_create_host_buffer(&o->ib, VK_EB_IB_BYTES, VK_BUFFER_USAGE_INDEX_BUFFER_BIT) && o->ib.coherent &&
             !vk_create_host_buffer(&o->ub, VK_EB_UB_BYTES, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT) && o->ub.coherent &&
             !vk_create_host_buffer(&o->sb, VK_EB_SB_BYTES, VK_BUFFER_USAGE_TRANSFER_SRC_BIT) && o->sb.coherent &&
             pvkCreateDescriptorPool(s_vk.device, &pci, NULL, &o->pool) == VK_SUCCESS) {
+            s_ebs[0].vb = s_eb.vb;
+            s_ebs[0].raw_vb = s_eb.raw_vb;
+            s_ebs[0].remap_buf = s_eb.remap_buf;
+            s_ebs[0].ib = s_eb.ib;
+            s_ebs[0].ub = s_eb.ub;
+            s_ebs[0].sb = s_eb.sb;
+            s_ebs[0].pool = s_eb.pool;
             s_ebs_cur = 0; s_ebs_on = 1;
             VK_LOG("frame pipelining: on (two batch sets)\n");
         } else {
             VK_LOG("frame pipelining: no memory for a second batch set, staying off\n");
         }
     }
+    vk_vtx_unpack_init();
     return 1;
 }
 
@@ -3837,6 +4007,7 @@ static void vk_ebs_swap(void)
     vk_eb_set* c = &s_ebs[s_ebs_cur];
     c->cmd = s_vk.cmd; c->fence = s_vk.fence;
     c->vb = s_eb.vb; c->ib = s_eb.ib; c->ub = s_eb.ub; c->sb = s_eb.sb;
+    c->raw_vb = s_eb.raw_vb; c->remap_buf = s_eb.remap_buf;
     c->pool = s_eb.pool; c->sets = s_eb.sets; c->inflight = 1;
     s_ebs_cur ^= 1;
     vk_eb_set* n = &s_ebs[s_ebs_cur];
@@ -3847,8 +4018,12 @@ static void vk_ebs_swap(void)
         n->inflight = 0;
     }
     s_vk.cmd = n->cmd; s_vk.fence = n->fence;
-    s_eb.vb = n->vb; s_eb.ib = n->ib; s_eb.ub = n->ub; s_eb.sb = n->sb; s_eb.pool = n->pool;
+    s_eb.vb = n->vb; s_eb.ib = n->ib; s_eb.ub = n->ub; s_eb.sb = n->sb;
+    s_eb.raw_vb = n->raw_vb; s_eb.remap_buf = n->remap_buf;
+    s_eb.pool = n->pool;
     s_eb.vb_head = s_eb.ib_head = s_eb.ub_head = s_eb.sb_head = 0;
+    s_eb.raw_vb_head = s_eb.remap_head = 0;
+    s_eb.raw_vb_head = s_eb.remap_head = 0;
     if (n->sets) pvkResetDescriptorPool(s_vk.device, n->pool, 0);
     s_eb.sets = 0;
 }
@@ -3889,14 +4064,18 @@ static void vk_eb_release(void)
         vk_eb_set* o = &s_ebs[s_ebs_cur ^ 1];
         vk_destroy_buffer(&o->vb); vk_destroy_buffer(&o->ib);
         vk_destroy_buffer(&o->ub); vk_destroy_buffer(&o->sb);
+        vk_destroy_buffer(&o->raw_vb); vk_destroy_buffer(&o->remap_buf);
         if (o->pool) pvkDestroyDescriptorPool(s_vk.device, o->pool, NULL);
         if (o->fence) pvkDestroyFence(s_vk.device, o->fence, NULL);
         memset(s_ebs, 0, sizeof s_ebs); s_ebs_on = 0; s_ebs_cur = 0;
     }
+    vk_vtx_unpack_release();
     vk_destroy_buffer(&s_eb.vb);
     vk_destroy_buffer(&s_eb.ib);
     vk_destroy_buffer(&s_eb.ub);
     vk_destroy_buffer(&s_eb.sb);
+    vk_destroy_buffer(&s_eb.raw_vb);
+    vk_destroy_buffer(&s_eb.remap_buf);
     if (s_eb.pool) pvkDestroyDescriptorPool(s_vk.device, s_eb.pool, NULL);
     memset(&s_eb, 0, sizeof s_eb);
     s_eb.on = -1;
@@ -3976,6 +4155,7 @@ static void vk_eng_flush(void)
     vk_submit_and_wait();
     s_wait_tag = 8;
     s_eb.vb_head = s_eb.ib_head = s_eb.ub_head = s_eb.sb_head = 0;
+    s_eb.raw_vb_head = s_eb.remap_head = 0;
     if (s_eb.sets) { pvkResetDescriptorPool(s_vk.device, s_eb.pool, 0); s_eb.sets = 0; }
     if ((++s_eb.flushes & 0x3FFFu) == 0)
         VK_LOG("draw batching: %llu draws in %llu submissions\n", s_eb.draws, s_eb.flushes);
@@ -4089,23 +4269,31 @@ static int vk_eng_draw_from(rsx_topology topology, const void* vertices,
 
     const VkDeviceSize vbytes = (VkDeviceSize)vertex_count * stride;
     const VkDeviceSize ibytes = (indices && index_count) ? (VkDeviceSize)index_count * 4u : 0;
+    const rsx_vtx_gpu_desc* gpu = (const rsx_vtx_gpu_desc*)fill_ctx;
+    int use_gpu_vtx = fill && gpu && gpu->gpu_eligible && s_vk.vtx_unpack_pipe;
+    const VkDeviceSize raw_bytes = (use_gpu_vtx && gpu) ? (VkDeviceSize)gpu->raw_bytes : 0;
+    const VkDeviceSize remap_bytes = (use_gpu_vtx && gpu && (gpu->flags & 1)) ? (VkDeviceSize)vertex_count * 4u : 0;
     VkBuffer vbuf = s_vk.vertices.buf, ibuf = s_e2.indices.buf;
-    VkDeviceSize voff = 0, ioff = 0;
+    VkDeviceSize voff = 0, ioff = 0, raw_off = 0, remap_off = 0;
     VkDescriptorSet set = VK_NULL_HANDLE;
     const u32 vsb = s_e2.vs_bytes ? s_e2.vs_bytes : 16u, psb = s_e2.ps_bytes ? s_e2.ps_bytes : 16u;
-    int batched = vk_eb_on() && vbytes <= VK_EB_VB_BYTES && ibytes <= VK_EB_IB_BYTES;
+    int batched = vk_eb_on() && vbytes <= VK_EB_VB_BYTES && ibytes <= VK_EB_IB_BYTES &&
+                  raw_bytes <= VK_EB_RAW_VB_BYTES && remap_bytes <= VK_EB_REMAP_BYTES;
     if (batched && P->cube_mask && !vk_eng_dummy_cube_view()) return 1;   /* may flush: before any slice */
     if (batched) {
         /* Slices of the rings and a set from the pool; a full one flushes the
          * batch (which empties them all) and the draw takes its slices again. */
         for (int tries = 0; tries < 2; tries++) {
             VkDeviceSize vh = s_eb.vb_head, ih = s_eb.ib_head, uh = s_eb.ub_head;
+            VkDeviceSize rh = s_eb.raw_vb_head, mh = s_eb.remap_head;
             voff = vk_eb_take(&vh, VK_EB_VB_BYTES, vbytes, 16u);
             ioff = ibytes ? vk_eb_take(&ih, VK_EB_IB_BYTES, ibytes, 16u) : 0;
+            raw_off = use_gpu_vtx ? vk_eb_take(&rh, VK_EB_RAW_VB_BYTES, raw_bytes, 16u) : 0;
+            remap_off = (use_gpu_vtx && remap_bytes) ? vk_eb_take(&mh, VK_EB_REMAP_BYTES, remap_bytes, 16u) : 0;
             const VkDeviceSize uvs = vk_eb_take(&uh, VK_EB_UB_BYTES, vsb, s_eb.ub_align);
             const VkDeviceSize ups = uvs == (VkDeviceSize)-1 ? uvs : vk_eb_take(&uh, VK_EB_UB_BYTES, psb, s_eb.ub_align);
             if (voff != (VkDeviceSize)-1 && ioff != (VkDeviceSize)-1 && ups != (VkDeviceSize)-1 &&
-                s_eb.sets < VK_EB_MAX_SETS) {
+                raw_off != (VkDeviceSize)-1 && remap_off != (VkDeviceSize)-1 && s_eb.sets < VK_EB_MAX_SETS) {
                 VkDescriptorSetLayout lay = P->cube_mask ? s_e2.split_layout : s_g.set_layout;
                 VkDescriptorSetAllocateInfo dai = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
                                                     .descriptorPool = s_eb.pool, .descriptorSetCount = 1,
@@ -4113,6 +4301,10 @@ static int vk_eng_draw_from(rsx_topology topology, const void* vertices,
                 if (pvkAllocateDescriptorSets(s_vk.device, &dai, &set) == VK_SUCCESS) {
                     s_eb.sets++;
                     s_eb.vb_head = vh; s_eb.ib_head = ih; s_eb.ub_head = uh;
+                    if (use_gpu_vtx) {
+                        s_eb.raw_vb_head = rh;
+                        if (remap_bytes) s_eb.remap_head = mh;
+                    }
                     vk_eng_put_vs_constants((u8*)s_eb.ub.ptr + uvs, vsb);
                     memcpy((u8*)s_eb.ub.ptr + ups, vk_eng_ucpu() + s_g.ps_off, psb);
                     if (!vk_eng_write_descriptors_to(P, set, s_eb.ub.buf, uvs, ups)) return 1;
@@ -4126,14 +4318,76 @@ static int vk_eng_draw_from(rsx_topology topology, const void* vertices,
         if (batched && !set) batched = 0;
     }
     if (batched) {
-        if (fill) { if (!fill(fill_ctx, (u8*)s_eb.vb.ptr + voff)) return 1; }
-        else memcpy((u8*)s_eb.vb.ptr + voff, vertices, (size_t)vbytes);
+        if (use_gpu_vtx) {
+            memcpy((u8*)s_eb.raw_vb.ptr + raw_off, gpu->raw_data, (size_t)gpu->raw_bytes);
+            if (gpu->flags & 1) {
+                memcpy((u8*)s_eb.remap_buf.ptr + remap_off, gpu->remap_indices, (size_t)remap_bytes);
+            }
+        } else if (fill) {
+            if (!fill(fill_ctx, (u8*)s_eb.vb.ptr + voff)) return 1;
+        } else {
+            memcpy((u8*)s_eb.vb.ptr + voff, vertices, (size_t)vbytes);
+        }
         if (ibytes) memcpy((u8*)s_eb.ib.ptr + ioff, indices, (size_t)ibytes);
         vbuf = s_eb.vb.buf; ibuf = s_eb.ib.buf;
         if (!s_eb_pending && vk_begin()) return 1;
         /* Earlier draws of this batch may have rendered what this one samples
          * or blends over: order it after all of them. */
         vk_cmd_after_everything(s_vk.cmd);
+        if (use_gpu_vtx) {
+            pvkCmdBindPipeline(s_vk.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s_vk.vtx_unpack_pipe);
+            pvkCmdBindDescriptorSets(s_vk.cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                                     s_vk.vtx_unpack_layout, 0, 1,
+                                     &s_vk.vtx_unpack_ds[s_ebs_cur], 0, NULL);
+            struct {
+                uint32_t src_byte_offset;
+                uint32_t dst_float_offset;
+                uint32_t vertex_count;
+                uint32_t src_stride;
+                uint32_t dst_stride;
+                uint32_t layout_mode;
+                uint32_t flags;
+                uint32_t remap_offset;
+                uint32_t num_attrs;
+                uint32_t pad0;
+                rsx_vtx_attr_desc attrs[8];
+            } pc = {
+                .src_byte_offset = (uint32_t)raw_off,
+                .dst_float_offset = (uint32_t)(voff / 4u),
+                .vertex_count = vertex_count,
+                .src_stride = gpu->src_stride,
+                .dst_stride = gpu->dst_stride,
+                .layout_mode = gpu->layout_mode,
+                .flags = gpu->flags,
+                .remap_offset = (uint32_t)(remap_off / 4u),
+                .num_attrs = gpu->num_attrs,
+                .pad0 = 0
+            };
+            memcpy(pc.attrs, gpu->attrs, sizeof(pc.attrs));
+            pvkCmdPushConstants(s_vk.cmd, s_vk.vtx_unpack_layout,
+                                VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
+            pvkCmdDispatch(s_vk.cmd, (vertex_count + 63u) / 64u, 1, 1);
+
+            VkBufferMemoryBarrier vbarrier = {
+                .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
+                .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
+                .dstAccessMask = VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT,
+                .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                .buffer = s_eb.vb.buf,
+                .offset = voff,
+                .size = vbytes
+            };
+            static int s_gpu_vtx_logged = 0;
+            if (!s_gpu_vtx_logged) {
+                s_gpu_vtx_logged = 1;
+                VK_LOG("gpu vertex unpack: offloading draws to Vulkan compute (mode %u)\n", gpu->layout_mode);
+            }
+            pvkCmdPipelineBarrier(s_vk.cmd,
+                                  VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                  VK_PIPELINE_STAGE_VERTEX_INPUT_BIT,
+                                  0, 0, NULL, 1, &vbarrier, 0, NULL);
+        }
     } else {
         if (s_eb_pending) { s_eb_why = 2; vk_eng_flush(); }
         if (vk_ensure_vertex_buffer(vbytes)) return fill ? 0 : 1;
