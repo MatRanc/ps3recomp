@@ -2120,6 +2120,14 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
     if (vi > 0 && fi > 0)
         handle = g.be->pipeline_create(g.be->user, s_vs_hlsl, s_ps_hlsl, rs,
                                        layout, layout->stride, rt_fmt, rt_count);
+    if (handle) {
+        /* Diagnostic: how fast new pipelines (and so glslang translations) are
+         * being created. A steady stream means the key is varying per draw. */
+        static unsigned long long s_new_pipes;
+        if ((++s_new_pipes & 63ull) == 0)
+            fprintf(stderr, "[rsx engine] %llu pipelines created by frame %u\n",
+                    s_new_pipes, g.frames);
+    }
     const u64 fp_hash = fixed ? 0 : eng_fp_debug_hash(fp_uc, fp_size);
     /* RSX_ENGINE_SHADER_DUMP=<existing dir>: each new pipeline's two programs
      * as <dir>/pipe<handle>.vs.hlsl and .ps.hlsl, the handle being the one
