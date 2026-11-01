@@ -271,6 +271,14 @@ flowchart TD
 > to <16.6 ms; the remaining serial stages are close to the whole budget. `vtx_unpack.comp` is downstream of c690,
 > so it cannot reduce c690's cost by itself. Full scoping: `~/Documents/work_notes.md` "Session 5 Update".
 
+> **Session 6 cost table + path to 60 fps (2026-11-01, 36.8 fps binary).** Frame ~27.2–27.8 ms; walker drain
+> 24.65 ms (own CPU ~14–15 ms, ~7–10 ms SPU wait); SPU 25.5 ms wall/worker × 5 (~127 ms CPU); PPU `Gfx_FrameEnd`
+> wait 18.2 ms; present offloaded to a thread; GPU not the limiter. Profile buckets: ~50% per-vertex math,
+> ~34% tree/leaf, ~15% index/ring. Micro-opts are single-digit %. The path to 60 is one structural move: offload
+> the per-vertex math (~12.7 ms) → SPU wall ~13 ms → the walker's ~10 ms SPU-wait collapses → frame ~16–17 ms.
+> If only some of the ~40 format variants are covered or sync serializes, the walker caps it at ~40 fps.
+> See `~/Documents/work_notes.md` "Session 6 Update".
+
 ### Phase 2: Visual Correctness & Render-Target Readback
 1. **Vulkan Render-Target Readback (Write Color Buffers) [COMPLETED]**:
    * Implemented `rsx_draw_engine_flush_dirty_to_guest()` in `libs/video/rsx_draw_engine.c` and integrated into `cellGcmSys.c` at `NV406E_SET_REFERENCE` (0x50), `SEMAPHORE_RELEASE` (0x6C), and flip boundaries.
