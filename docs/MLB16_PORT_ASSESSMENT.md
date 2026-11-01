@@ -130,6 +130,10 @@ figures below were from the 2026-10-28 tree and are kept for history.
   **~32.5 → 36.1–36.7 fps**, interpreted steps **~5 M/s → ~0.1–0.3 M/s**, visual diff 14.2, replay hash verified.
   The AVX2 `0x7C18` kernel re-applied to the new lift measured neutral. This is the cheapest form of Target 4:
   check `SPU_INTERP_STATS` for missing lift entries before hand-vectorizing or offloading anything.
+* **`0x108EC` (tried, reverted):** lifting c690's next pointer target cut interpreted steps ~0.3 → ~0.1 M/s but left
+  pitch fps unchanged (36.06 vs 36.1–36.7) and still hit the interpreter via a residency/SMC path; globally adding
+  it also disassembled data in two other modules. Reverted. The remaining interpreter is the policy module's SMC
+  entry and is no longer a frame-time lever.
 
 ---
 
