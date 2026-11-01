@@ -848,20 +848,24 @@ int rsx_vertex_remap_build(
 
     if (count > UINT_MAX / 2u)
         return 0;
-    u32 slot_capacity = 16u;
+    /* Probe only the smallest power-of-two table that holds this draw, even
+     * when a previous large draw left a bigger allocation behind. The
+     * generation tag makes any stale slot outside this window irrelevant, and
+     * a small window keeps the working set in cache on mixed-size scenes. */
+    u32 logical_capacity = 16u;
     const u32 required_slots = count * 2u;
-    while (slot_capacity < required_slots) {
-        if (slot_capacity > UINT_MAX / 2u)
+    while (logical_capacity < required_slots) {
+        if (logical_capacity > UINT_MAX / 2u)
             return 0;
-        slot_capacity *= 2u;
+        logical_capacity *= 2u;
     }
-    if (slot_capacity > remap->slot_capacity) {
+    if (logical_capacity > remap->slot_capacity) {
         rsx_vertex_remap_slot* slots = (rsx_vertex_remap_slot*)realloc(
-            remap->slots, (size_t)slot_capacity * sizeof(*slots));
+            remap->slots, (size_t)logical_capacity * sizeof(*slots));
         if (!slots)
             return 0;
         remap->slots = slots;
-        remap->slot_capacity = slot_capacity;
+        remap->slot_capacity = logical_capacity;
         memset(remap->slots, 0,
                (size_t)remap->slot_capacity * sizeof(*remap->slots));
         remap->generation = 1u;
@@ -875,7 +879,7 @@ int rsx_vertex_remap_build(
     }
 
     u32 unique = 0;
-    const u32 mask = remap->slot_capacity - 1u;
+    const u32 mask = logical_capacity - 1u;
     for (u32 occurrence = 0; occurrence < count; occurrence++) {
         const rsx_vertex_ref ref = refs[occurrence];
         const u64 key = ((u64)ref.base_index << 32) | ref.vertex_id;
@@ -886,7 +890,10 @@ int rsx_vertex_remap_build(
                 slot->key = key;
                 slot->value = unique;
                 slot->generation = remap->generation;
-                refs[unique] = ref;
+                /* While nothing has been deduped, refs[unique] already holds
+                 * this reference (unique == occurrence). */
+                if (unique != occurrence)
+                    refs[unique] = ref;
                 remap->occurrence_to_unique[occurrence] = unique;
                 unique++;
                 break;
