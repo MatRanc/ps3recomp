@@ -107,7 +107,8 @@
  * headless run never depends on a driver that can present. */
 #define VK_WSI_INSTANCE_FNS(X) \
     X(vkDestroySurfaceKHR) X(vkGetPhysicalDeviceSurfaceSupportKHR) \
-    X(vkGetPhysicalDeviceSurfaceCapabilitiesKHR) X(vkGetPhysicalDeviceSurfaceFormatsKHR)
+    X(vkGetPhysicalDeviceSurfaceCapabilitiesKHR) X(vkGetPhysicalDeviceSurfaceFormatsKHR) \
+    X(vkGetPhysicalDeviceSurfacePresentModesKHR)
 #define VK_WSI_DEVICE_FNS(X) \
     X(vkCreateSwapchainKHR) X(vkDestroySwapchainKHR) X(vkGetSwapchainImagesKHR) \
     X(vkAcquireNextImageKHR) X(vkQueuePresentKHR)
@@ -1887,8 +1888,29 @@ static int vk_create_swapchain(void)
     }
     if (!ext.width || !ext.height) { VK_LOG("window has no drawable area\n"); return -1; }
 
-    u32 count = caps.minImageCount + 1;
+    u32 count = caps.minImageCount < 3 ? 3 : caps.minImageCount;
     if (caps.maxImageCount && count > caps.maxImageCount) count = caps.maxImageCount;
+
+    u32 npm = 0;
+    VkPresentModeKHR present_mode = VK_PRESENT_MODE_FIFO_KHR;
+    if (pvkGetPhysicalDeviceSurfacePresentModesKHR &&
+        pvkGetPhysicalDeviceSurfacePresentModesKHR(s_vk.phys, s_vk.surface, &npm, NULL) == VK_SUCCESS && npm > 0) {
+        if (npm > 16) npm = 16;
+        VkPresentModeKHR pmodes[16];
+        if (pvkGetPhysicalDeviceSurfacePresentModesKHR(s_vk.phys, s_vk.surface, &npm, pmodes) == VK_SUCCESS) {
+            for (u32 i = 0; i < npm; i++) {
+                if (pmodes[i] == VK_PRESENT_MODE_MAILBOX_KHR) {
+                    present_mode = VK_PRESENT_MODE_MAILBOX_KHR;
+                    break;
+                }
+            }
+        }
+    }
+    const char* pm_env = getenv("PS3RECOMP_VK_PRESENT_MODE");
+    if (pm_env) {
+        if (!strcmp(pm_env, "fifo")) present_mode = VK_PRESENT_MODE_FIFO_KHR;
+        else if (!strcmp(pm_env, "mailbox")) present_mode = VK_PRESENT_MODE_MAILBOX_KHR;
+    }
 
     static const VkCompositeAlphaFlagBitsKHR alphas[] = {
         VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR, VK_COMPOSITE_ALPHA_INHERIT_BIT_KHR,
@@ -1907,7 +1929,7 @@ static int vk_create_swapchain(void)
         .imageUsage = VK_IMAGE_USAGE_TRANSFER_DST_BIT,
         .imageSharingMode = VK_SHARING_MODE_EXCLUSIVE,
         .preTransform = caps.currentTransform, .compositeAlpha = alpha,
-        .presentMode = VK_PRESENT_MODE_FIFO_KHR,   /* the one mode every driver has */
+        .presentMode = present_mode,
         .clipped = VK_TRUE, .oldSwapchain = old,
     };
     VkSwapchainKHR sc = VK_NULL_HANDLE;
@@ -1938,7 +1960,9 @@ static int vk_create_swapchain(void)
      * from an infinite-timeout acquire instead of waiting. */
     s_vk.present_slots = n > 1 ? n - 1 : 1;
     if (s_vk.present_slots > VK_PRESENT_SLOTS) s_vk.present_slots = VK_PRESENT_SLOTS;
-    VK_LOG("window swapchain %ux%u, %u images, format %d\n", ext.width, ext.height, n, (int)fmt.format);
+    VK_LOG("window swapchain %ux%u, %u images, format %d, mode %s\n",
+           ext.width, ext.height, n, (int)fmt.format,
+           present_mode == VK_PRESENT_MODE_MAILBOX_KHR ? "MAILBOX" : "FIFO");
     return 0;
 }
 
@@ -2042,16 +2066,17 @@ static void vk_present_thread_barrier(void)
     pthread_mutex_unlock(&s_vk.present_q_mu);
 }
 
-/* Reserve a slot, waiting only when every slot is in flight. */
+/* Reserve a slot in a non-blocking manner. Returns -1 if every slot is busy. */
 static int vk_present_slot_acquire(void)
 {
     int slot = -1;
     pthread_mutex_lock(&s_vk.present_q_mu);
-    for (;;) {
-        for (u32 i = 0; i < s_vk.present_slots; i++)
-            if (!s_vk.window_slot_busy[i]) { slot = (int)i; break; }
-        if (slot >= 0) { s_vk.window_slot_busy[slot] = 1; break; }
-        pthread_cond_wait(&s_vk.present_slot_cv, &s_vk.present_q_mu);
+    for (u32 i = 0; i < s_vk.present_slots; i++) {
+        if (!s_vk.window_slot_busy[i]) {
+            slot = (int)i;
+            s_vk.window_slot_busy[slot] = 1;
+            break;
+        }
     }
     pthread_mutex_unlock(&s_vk.present_q_mu);
     return slot;
@@ -2096,15 +2121,12 @@ static void vk_present_window(void)
     if (slot < 0) return;
 
     u32 idx = 0;
-    VkResult r;
-    do {
-        r = pvkAcquireNextImageKHR(s_vk.device, s_vk.swapchain, UINT64_MAX,
-                                   s_vk.sem_acquire[slot], VK_NULL_HANDLE, &idx);
-        if (r == VK_NOT_READY) {
-            struct timespec pause = { 0, 1000000 };  /* 1 ms, all images held */
-            nanosleep(&pause, NULL);
-        }
-    } while (r == VK_NOT_READY);
+    VkResult r = pvkAcquireNextImageKHR(s_vk.device, s_vk.swapchain, 0,
+                                       s_vk.sem_acquire[slot], VK_NULL_HANDLE, &idx);
+    if (r == VK_NOT_READY || r == VK_TIMEOUT) {
+        vk_present_slot_release(slot);
+        return;
+    }
     if (r == VK_ERROR_OUT_OF_DATE_KHR) {
         vk_present_slot_release(slot);
         vk_present_thread_barrier();

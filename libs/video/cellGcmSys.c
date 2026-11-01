@@ -2228,7 +2228,8 @@ static void gcm_fifo_dump_init(void)
 static inline void gcm_fifo_dump_word(u32 w)
 {
     if (s_fifo_dump_fp && s_fifo_dump_skip <= 0 && s_fifo_dump_frames_left > 0) {
-        fwrite(&w, sizeof(u32), 1, s_fifo_dump_fp);
+        u32 be = __builtin_bswap32(w); // PS3 guest memory is big-endian
+        fwrite(&be, sizeof(u32), 1, s_fifo_dump_fp);
         s_fifo_dump_words++;
     }
 }
@@ -2663,7 +2664,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
                 gcm_fifo_dump_word(w);
                 for (u32 di = 0; di < count; di++) {
                     u32 dea = gcm_io2ea(s_fifo_getoff + 4 + di * 4);
-                    if (dea) gcm_fifo_dump_word(vm_read32(dea));
+                    gcm_fifo_dump_word(dea ? vm_read32(dea) : 0u);
                 }
             }
             /* TCONST_FIFO=1: how the title actually streams vertex constants.
