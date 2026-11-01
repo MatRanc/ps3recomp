@@ -111,6 +111,18 @@ figures below were from the 2026-10-28 tree and are kept for history.
   recomp files are byte-identical to their `.orig` backups.
 * **Real next lever:** reduce walker CPU per draw (remap, texture checks, driver recording) and/or cut the c690 job's
   time so the walker's `put` gaps shrink. Both are macro changes, not micro-tuning.
+* **Walker experiments (2026-11-01 later):**
+  * `VK_DRAWPROF=1` splits the per-draw CPU: descriptor setup 1.4 µs, vertex copy 1.3 µs, GPU vertex dispatch
+    3.1 µs, barriers 0.8 µs, render pass begin 1.9 µs, state sets 0.4 µs, binds+draw 0.6 µs, render pass end
+    0.6 µs — ~10 µs of a ~40 µs/draw walker cost. The other ~30 µs is texture checks (~9), vertex remap (~7) and
+    engine bookkeeping.
+  * Backing the full texture re-hash off for stable textures: **32.5 fps, no change** (reverted; not worth the
+    staleness risk while the frame is not walker-bound).
+  * `PS3RECOMP_ENG_VTX_REMAP=0`: **28.4 fps, worse** — dedup reduces GPU vertex traffic, so keep it on.
+  * Three batch sets instead of two (`VK_FRAME_PIPELINE=1`): **32.96 fps, 1 s-bucket 34.1** vs ~32.5 for two sets.
+    A small, within-noise gain; kept because it removes the set-reuse wait in principle and is opt-in.
+  * **Conclusion:** the walker's own CPU is not the marginal limiter. The frame loses ~10.5 ms/frame waiting for the
+    SPU to publish command buffers, and the remaining GPU waits are latency. The c690 SPU job is the next real lever.
 
 ---
 
