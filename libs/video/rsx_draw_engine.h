@@ -117,6 +117,26 @@ typedef struct rsx_be_render_state {
  * where the boundary is rather than assuming a number. */
 #define RSX_DRAW_ENGINE_TEXTURE_CACHE 1024
 
+typedef struct {
+    uint32_t src_off_dst_slot; /* low 16 bits = src byte offset within vertex, high 16 bits = dst slot index */
+    uint32_t type_count;       /* low 16 bits = format type (1..7), high 16 bits = count of components (1..4) */
+} rsx_vtx_attr_desc;
+
+/* Macro Target 2: descriptor for offloading vertex format unpacking to GPU compute */
+typedef struct rsx_vtx_gpu_desc {
+    u32               vertex_count;       /* must remain first member for *(const u32*)ctx */
+    int               gpu_eligible;       /* 1 if eligible for GPU compute unpack, 0 otherwise */
+    u32               layout_mode;        /* 0 = Fast MLB 3D, 1 = Fast MLB 2D UI, 2 = Fast MLB 2D UI with Color, 3 = Generic Descriptor */
+    u32               flags;              /* bit 0: remap enabled */
+    u32               src_stride;         /* source vertex stride in bytes (e.g. 24, 16, 20, 22, 36) */
+    u32               dst_stride;         /* destination vertex stride in floats */
+    const void*       raw_data;           /* guest pointer to raw vertex attribute bytes */
+    u32               raw_bytes;          /* total bytes of raw vertex data */
+    const u32*        remap_indices;      /* remapped index buffer if flags & 1 */
+    u32               num_attrs;          /* number of active attributes */
+    rsx_vtx_attr_desc attrs[8];           /* attribute descriptors for Mode 3 */
+} rsx_vtx_gpu_desc;
+
 /* ---- the backend interface ---------------------------------------------- */
 
 #define RSX_BE_HAS_COLOR_SNAPSHOT 1

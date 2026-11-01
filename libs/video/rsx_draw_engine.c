@@ -3143,6 +3143,184 @@ static void eng_log_rect_clear(const char* what, const u32 rc[4], u32 w, u32 h)
                 what, rc[0], rc[1], rc[2], rc[3], w, h);
 }
 
+static u64 s_eng_calls = 0;
+static u64 s_eng_eligible_m0 = 0;
+static u64 s_eng_eligible_m1 = 0;
+static u64 s_eng_eligible_m2 = 0;
+static u64 s_eng_eligible_m3 = 0;
+static u64 s_eng_eligible_remap = 0;
+static u64 s_eng_not_deferred = 0;
+static u64 s_eng_not_contiguous = 0;
+static u64 s_eng_other_layout = 0;
+
+static u32 s_gpu_remap_buf[65536];
+
+static void eng_check_gpu_vertex_offload(rsx_vtx_gpu_desc* desc, u32 uploaded)
+{
+    memset(desc, 0, sizeof(*desc));
+    desc->vertex_count = uploaded;
+    s_eng_calls++;
+    if (!uploaded || !dc.fetch_deferred || !dc.refs || uploaded > 65536) {
+        s_eng_not_deferred++;
+        return;
+    }
+
+    const rsx_vertex_layout_plan* l = &dc.layout;
+    const rsx_vertex_fetch_plan* p = &dc.fetch_plan;
+
+    if (l->count == 0 || l->count > 8) {
+        s_eng_other_layout++;
+        return;
+    }
+
+    /* Check that all active attributes have valid stable_base and consistent stride */
+    const rsx_vertex_fetch_attr* a0 = &p->attr[l->attrs[0]];
+    if (!a0->stable_base || !a0->stride) {
+        s_eng_other_layout++;
+        return;
+    }
+
+    const u32 src_stride = a0->stride;
+    const u8* min_base = a0->stable_base;
+    for (u32 i = 1; i < l->count; i++) {
+        const rsx_vertex_fetch_attr* a = &p->attr[l->attrs[i]];
+        if (!a->stable_base || a->stride != src_stride) {
+            s_eng_other_layout++;
+            return;
+        }
+        if (a->stable_base < min_base) {
+            min_base = a->stable_base;
+        }
+    }
+
+    /* All attributes must reside within [min_base, min_base + src_stride) */
+    for (u32 i = 0; i < l->count; i++) {
+        const rsx_vertex_fetch_attr* a = &p->attr[l->attrs[i]];
+        ptrdiff_t diff = a->stable_base - min_base;
+        if (diff < 0 || diff >= (ptrdiff_t)src_stride) {
+            s_eng_other_layout++;
+            return;
+        }
+    }
+
+    u32 mode = 3; /* Generic Descriptor Unpack default */
+
+    /* Mode 0: Fast MLB 3D Mesh (Interleaved Pos3 + UV2 + Color4, Stride 24) */
+    if (l->count == 3 && l->attrs[0] == 0 && l->attrs[1] == 3 && l->attrs[2] == 8 &&
+        src_stride == 24 &&
+        p->attr[0].desc.type == RSX_VTX_TYPE_FLOAT  && p->attr[0].desc.size == 3 &&
+        p->attr[3].desc.type == RSX_VTX_TYPE_UNORM8 && p->attr[3].desc.size == 4 &&
+        p->attr[8].desc.type == RSX_VTX_TYPE_FLOAT  && p->attr[8].desc.size == 2 &&
+        p->attr[0].stable_base == min_base &&
+        p->attr[8].stable_base == min_base + 12 &&
+        p->attr[3].stable_base == min_base + 20) {
+        mode = 0;
+    }
+    /* Mode 2: Fast MLB 2D UI with Color (Interleaved Pos2 + UV2 + Color4, Stride 20) */
+    else if (l->count == 3 && l->attrs[0] == 0 && l->attrs[1] == 3 && l->attrs[2] == 8 &&
+             src_stride == 20 &&
+             p->attr[0].desc.type == RSX_VTX_TYPE_FLOAT  && p->attr[0].desc.size == 2 &&
+             p->attr[8].desc.type == RSX_VTX_TYPE_FLOAT  && p->attr[8].desc.size == 2 &&
+             p->attr[3].desc.type == RSX_VTX_TYPE_UNORM8 && p->attr[3].desc.size == 4 &&
+             p->attr[0].stable_base == min_base &&
+             p->attr[8].stable_base == min_base + 8 &&
+             p->attr[3].stable_base == min_base + 16) {
+        mode = 2;
+    }
+    /* Mode 1: Fast MLB 2D UI (Interleaved Pos2 + UV2, Stride 16) */
+    else if (l->count == 2 && l->attrs[0] == 0 && l->attrs[1] == 1 &&
+             src_stride == 16 &&
+             p->attr[0].desc.type == RSX_VTX_TYPE_FLOAT && p->attr[0].desc.size == 2 &&
+             p->attr[1].desc.type == RSX_VTX_TYPE_FLOAT && p->attr[1].desc.size == 2 &&
+             p->attr[0].stable_base == min_base &&
+             p->attr[1].stable_base == min_base + 8) {
+        mode = 1;
+    }
+
+    /* Populate attribute descriptors for Mode 3 */
+    if (mode == 3) {
+        desc->num_attrs = l->count;
+        for (u32 i = 0; i < l->count; i++) {
+            const u32 attr_id = l->attrs[i];
+            const rsx_vertex_fetch_attr* a = &p->attr[attr_id];
+            u32 slot = (u32)l->slot_by_attr[attr_id];
+            u32 off = (u32)(a->stable_base - min_base);
+            desc->attrs[i].src_off_dst_slot = (slot << 16u) | (off & 0xFFFFu);
+            desc->attrs[i].type_count = ((u32)a->desc.size << 16u) | ((u32)a->desc.type & 0xFFFFu);
+        }
+    }
+
+    /* Destination stride in floats: each slot is 16 bytes = 4 floats */
+    const u32 dst_stride = (mode == 0) ? 12 : (mode == 1) ? 8 : (mode == 2) ? 12 : (l->stride / 4u);
+
+    /* Check contiguous refs */
+    int contiguous = 1;
+    if (uploaded > 1) {
+        const u32 f = dc.refs[0].vertex_id;
+        const u32 b = dc.refs[0].base_index;
+        for (u32 i = 1; i < uploaded; i++) {
+            if (dc.refs[i].vertex_id != f + i || dc.refs[i].base_index != b) {
+                contiguous = 0;
+                break;
+            }
+        }
+    }
+
+    if (contiguous) {
+        desc->gpu_eligible = 1;
+        desc->layout_mode = mode;
+        desc->flags = 0;
+        desc->src_stride = src_stride;
+        desc->dst_stride = dst_stride;
+        desc->raw_data = min_base;
+        desc->raw_bytes = uploaded * src_stride;
+        if (mode == 0) s_eng_eligible_m0++;
+        else if (mode == 1) s_eng_eligible_m1++;
+        else if (mode == 2) s_eng_eligible_m2++;
+        else s_eng_eligible_m3++;
+        return;
+    }
+
+    /* Non-contiguous / indexed vertex remap offload */
+    if (a0->stable_last < a0->stable_first) {
+        s_eng_not_contiguous++;
+        return;
+    }
+
+    const u32 span = a0->stable_last - a0->stable_first + 1;
+    const u32 raw_bytes = span * src_stride;
+    /* Safety bounds: reject if span exceeds 4 MB or is excessively sparse */
+    if (raw_bytes > 4u * 1024u * 1024u || (span > 4096u && span > uploaded * 8u)) {
+        s_eng_not_contiguous++;
+        return;
+    }
+
+    const u32 first = a0->stable_first;
+    const u32 max_elem = span - 1u;
+    for (u32 i = 0; i < uploaded; i++) {
+        const u32 elem = ((dc.refs[i].vertex_id + dc.refs[i].base_index) & 0x000FFFFFu) - first;
+        if (elem > max_elem) {
+            s_eng_not_contiguous++;
+            return;
+        }
+        s_gpu_remap_buf[i] = elem;
+    }
+
+    desc->gpu_eligible = 1;
+    desc->layout_mode = mode;
+    desc->flags = 1; /* remap enabled */
+    desc->src_stride = src_stride;
+    desc->dst_stride = dst_stride;
+    desc->raw_data = min_base;
+    desc->raw_bytes = raw_bytes;
+    desc->remap_indices = s_gpu_remap_buf;
+    s_eng_eligible_remap++;
+    if (mode == 0) s_eng_eligible_m0++;
+    else if (mode == 1) s_eng_eligible_m1++;
+    else if (mode == 2) s_eng_eligible_m2++;
+    else s_eng_eligible_m3++;
+}
+
 static void sink_end(void* user, const rsx_dispatch* r)
 {
     (void)user; (void)r;
@@ -3359,7 +3537,9 @@ static void sink_end(void* user, const rsx_dispatch* r)
     u32 uploaded = indexed ? dc.n_verts : n_draw;
     if (dc.fetch_deferred) {
         s_fill_ok = -1;
-        if (g.be->draw_fill(g.be->user, topology, dc_fill_verts, &uploaded,
+        rsx_vtx_gpu_desc gpu_desc;
+        eng_check_gpu_vertex_offload(&gpu_desc, uploaded);
+        if (g.be->draw_fill(g.be->user, topology, dc_fill_verts, &gpu_desc,
                             uploaded, layout.stride, indexed ? g.indices : NULL,
                             indexed ? n_draw : 0)) {
             /* A conversion that failed drew nothing, as a failed fetch never
@@ -3739,12 +3919,19 @@ void rsx_draw_engine_flush(void)
 
 void rsx_draw_engine_present(void)
 {
-    /* A host that drives the flip itself gets whichever buffer the guest's
-     * own last flip named, and display buffer 0 before there has been one:
-     * a runner that both consumes 0xE944 and calls here would otherwise
-     * re-present a double-buffered title's OTHER scanout. Presenting twice is
-     * harmless either way -- the engine never clears the surface, so a second
-     * present just blits the same image again. */
+    static u32 s_eng_pres_cnt = 0;
+    if (++s_eng_pres_cnt % 120 == 0) {
+        fprintf(stderr, "[vtx offload summary] calls=%llu m0=%llu m1=%llu m2=%llu m3=%llu remap=%llu not_def=%llu not_contig=%llu other=%llu\n",
+                (unsigned long long)s_eng_calls,
+                (unsigned long long)s_eng_eligible_m0,
+                (unsigned long long)s_eng_eligible_m1,
+                (unsigned long long)s_eng_eligible_m2,
+                (unsigned long long)s_eng_eligible_m3,
+                (unsigned long long)s_eng_eligible_remap,
+                (unsigned long long)s_eng_not_deferred,
+                (unsigned long long)s_eng_not_contiguous,
+                (unsigned long long)s_eng_other_layout);
+    }
     eng_present(g.last_flip_buffer);
 }
 

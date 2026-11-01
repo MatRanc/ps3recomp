@@ -1,0 +1,231 @@
+#version 450
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, binding = 0) readonly buffer InputBuffer {
+    uint raw_data[];
+};
+
+layout(std430, binding = 1) writeonly buffer OutputBuffer {
+    float out_verts[];
+};
+
+layout(std430, binding = 2) readonly buffer RemapBuffer {
+    uint remap_indices[];
+};
+
+struct AttrDesc {
+    uint src_off_dst_slot; // low 16 bits = src byte offset within vertex, high 16 bits = dst slot index
+    uint type_count;       // low 16 bits = format type (1..7), high 16 bits = count of components (1..4)
+};
+
+layout(push_constant) uniform PushConstants {
+    uint src_byte_offset;
+    uint dst_float_offset;
+    uint vertex_count;
+    uint src_stride;
+    uint dst_stride;
+    uint layout_mode; // 0 = Fast MLB 3D, 1 = Fast MLB 2D UI, 2 = Fast MLB 2D UI with Color, 3 = Generic Descriptor
+    uint flags;       // bit 0: remap enabled
+    uint remap_offset;
+    uint num_attrs;
+    uint pad0;
+    AttrDesc attrs[8];
+};
+
+uint swap32(uint v) {
+    return ((v >> 24) & 0x000000FFu) |
+           ((v >> 8)  & 0x0000FF00u) |
+           ((v << 8)  & 0x00FF0000u) |
+           ((v << 24) & 0xFF000000u);
+}
+
+uint load_unaligned_be32(uint byte_off) {
+    uint w = byte_off >> 2u;
+    uint rem = byte_off & 3u;
+    uint raw;
+    if (rem == 0u) {
+        raw = raw_data[w];
+    } else {
+        raw = (raw_data[w] >> (rem * 8u)) | (raw_data[w + 1u] << (32u - rem * 8u));
+    }
+    return swap32(raw);
+}
+
+uint load_unaligned_be16(uint byte_off) {
+    uint w = byte_off >> 2u;
+    uint rem = byte_off & 3u;
+    uint raw;
+    if (rem <= 2u) {
+        raw = (raw_data[w] >> (rem * 8u)) & 0xFFFFu;
+    } else {
+        raw = (raw_data[w] >> 24u) | ((raw_data[w + 1u] & 0xFFu) << 8u);
+    }
+    return ((raw & 0xFFu) << 8u) | ((raw >> 8u) & 0xFFu);
+}
+
+uint load_u8(uint byte_off) {
+    uint w = byte_off >> 2u;
+    uint rem = byte_off & 3u;
+    return (raw_data[w] >> (rem * 8u)) & 0xFFu;
+}
+
+float decode_be_f16(uint h) {
+    uint s = (h >> 15u) << 31u;
+    uint exp = (h >> 10u) & 0x1Fu;
+    uint man = h & 0x3FFu;
+    uint out_val;
+    if (exp == 0u) {
+        out_val = s;
+    } else if (exp == 31u) {
+        out_val = s | 0x7F800000u | (man << 13u);
+    } else {
+        out_val = s | ((exp + 112u) << 23u) | (man << 13u);
+    }
+    return uintBitsToFloat(out_val);
+}
+
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    if (gid >= vertex_count) return;
+
+    uint elem = ((flags & 1u) != 0u) ? remap_indices[remap_offset + gid] : gid;
+    uint in_byte = src_byte_offset + elem * src_stride;
+    uint out_f = dst_float_offset + gid * dst_stride;
+
+    if (layout_mode == 0u) {
+        // Fast-path: MLB 16 3D Mesh (Interleaved Pos3 + UV2 + Color4, Stride 24)
+        uint w = in_byte >> 2u;
+        float x = uintBitsToFloat(swap32(raw_data[w + 0u]));
+        float y = uintBitsToFloat(swap32(raw_data[w + 1u]));
+        float z = uintBitsToFloat(swap32(raw_data[w + 2u]));
+
+        float u = uintBitsToFloat(swap32(raw_data[w + 3u]));
+        float v = uintBitsToFloat(swap32(raw_data[w + 4u]));
+
+        uint rc = raw_data[w + 5u];
+        float cr = float(rc & 0xFFu) * (1.0 / 255.0);
+        float cg = float((rc >> 8) & 0xFFu) * (1.0 / 255.0);
+        float cb = float((rc >> 16) & 0xFFu) * (1.0 / 255.0);
+        float ca = float((rc >> 24) & 0xFFu) * (1.0 / 255.0);
+
+        out_verts[out_f + 0u] = x;
+        out_verts[out_f + 1u] = y;
+        out_verts[out_f + 2u] = z;
+        out_verts[out_f + 3u] = 1.0;
+
+        out_verts[out_f + 4u] = cr;
+        out_verts[out_f + 5u] = cg;
+        out_verts[out_f + 6u] = cb;
+        out_verts[out_f + 7u] = ca;
+
+        out_verts[out_f + 8u]  = u;
+        out_verts[out_f + 9u]  = v;
+        out_verts[out_f + 10u] = 0.0;
+        out_verts[out_f + 11u] = 1.0;
+    } else if (layout_mode == 1u) {
+        // Fast-path: MLB 16 2D UI (Interleaved Pos2 + UV2, Stride 16)
+        uint w = in_byte >> 2u;
+        float x = uintBitsToFloat(swap32(raw_data[w + 0u]));
+        float y = uintBitsToFloat(swap32(raw_data[w + 1u]));
+        float u = uintBitsToFloat(swap32(raw_data[w + 2u]));
+        float v = uintBitsToFloat(swap32(raw_data[w + 3u]));
+
+        out_verts[out_f + 0u] = x;
+        out_verts[out_f + 1u] = y;
+        out_verts[out_f + 2u] = 0.0;
+        out_verts[out_f + 3u] = 1.0;
+
+        out_verts[out_f + 4u] = u;
+        out_verts[out_f + 5u] = v;
+        out_verts[out_f + 6u] = 0.0;
+        out_verts[out_f + 7u] = 1.0;
+    } else if (layout_mode == 2u) {
+        // Fast-path: MLB 16 2D UI with Color (Interleaved Pos2 + UV2 + Color4, Stride 20)
+        uint w = in_byte >> 2u;
+        float x = uintBitsToFloat(swap32(raw_data[w + 0u]));
+        float y = uintBitsToFloat(swap32(raw_data[w + 1u]));
+        float u = uintBitsToFloat(swap32(raw_data[w + 2u]));
+        float v = uintBitsToFloat(swap32(raw_data[w + 3u]));
+
+        uint rc = raw_data[w + 4u];
+        float cr = float(rc & 0xFFu) * (1.0 / 255.0);
+        float cg = float((rc >> 8) & 0xFFu) * (1.0 / 255.0);
+        float cb = float((rc >> 16) & 0xFFu) * (1.0 / 255.0);
+        float ca = float((rc >> 24) & 0xFFu) * (1.0 / 255.0);
+
+        out_verts[out_f + 0u] = x;
+        out_verts[out_f + 1u] = y;
+        out_verts[out_f + 2u] = 0.0;
+        out_verts[out_f + 3u] = 1.0;
+
+        out_verts[out_f + 4u] = cr;
+        out_verts[out_f + 5u] = cg;
+        out_verts[out_f + 6u] = cb;
+        out_verts[out_f + 7u] = ca;
+
+        out_verts[out_f + 8u]  = u;
+        out_verts[out_f + 9u]  = v;
+        out_verts[out_f + 10u] = 0.0;
+        out_verts[out_f + 11u] = 1.0;
+    } else {
+        // Mode 3: Generic Descriptor-Driven Unpack (All other layouts: player meshes, stadium passes, depth passes)
+        for (uint a = 0u; a < num_attrs; a++) {
+            AttrDesc ad = attrs[a];
+            uint off = ad.src_off_dst_slot & 0xFFFFu;
+            uint slot = ad.src_off_dst_slot >> 16u;
+            uint type = ad.type_count & 0xFFFFu;
+            uint count = ad.type_count >> 16u;
+
+            uint attr_b = in_byte + off;
+            uint out_s = out_f + slot * 4u;
+            vec4 val = vec4(0.0, 0.0, 0.0, 1.0);
+
+            if (type == 2u) { // FLOAT
+                if (count > 0u) val.x = uintBitsToFloat(load_unaligned_be32(attr_b + 0u));
+                if (count > 1u) val.y = uintBitsToFloat(load_unaligned_be32(attr_b + 4u));
+                if (count > 2u) val.z = uintBitsToFloat(load_unaligned_be32(attr_b + 8u));
+                if (count > 3u) val.w = uintBitsToFloat(load_unaligned_be32(attr_b + 12u));
+            } else if (type == 3u) { // HALF
+                if (count > 0u) val.x = decode_be_f16(load_unaligned_be16(attr_b + 0u));
+                if (count > 1u) val.y = decode_be_f16(load_unaligned_be16(attr_b + 2u));
+                if (count > 2u) val.z = decode_be_f16(load_unaligned_be16(attr_b + 4u));
+                if (count > 3u) val.w = decode_be_f16(load_unaligned_be16(attr_b + 6u));
+            } else if (type == 4u) { // UNORM8
+                if (count > 0u) val.x = float(load_u8(attr_b + 0u)) * (1.0 / 255.0);
+                if (count > 1u) val.y = float(load_u8(attr_b + 1u)) * (1.0 / 255.0);
+                if (count > 2u) val.z = float(load_u8(attr_b + 2u)) * (1.0 / 255.0);
+                if (count > 3u) val.w = float(load_u8(attr_b + 3u)) * (1.0 / 255.0);
+            } else if (type == 1u) { // SNORM16
+                if (count > 0u) { uint u = load_unaligned_be16(attr_b + 0u); int s = (u >= 32768u) ? int(u) - 65536 : int(u); val.x = float(s) * (1.0 / 32767.0); }
+                if (count > 1u) { uint u = load_unaligned_be16(attr_b + 2u); int s = (u >= 32768u) ? int(u) - 65536 : int(u); val.y = float(s) * (1.0 / 32767.0); }
+                if (count > 2u) { uint u = load_unaligned_be16(attr_b + 4u); int s = (u >= 32768u) ? int(u) - 65536 : int(u); val.z = float(s) * (1.0 / 32767.0); }
+                if (count > 3u) { uint u = load_unaligned_be16(attr_b + 6u); int s = (u >= 32768u) ? int(u) - 65536 : int(u); val.w = float(s) * (1.0 / 32767.0); }
+            } else if (type == 6u) { // CMP32 (11-11-10 packed)
+                uint word = load_unaligned_be32(attr_b);
+                int x = int(word & 0x7FFu); if ((x & 0x400) != 0) x -= 0x800;
+                int y = int((word >> 11u) & 0x7FFu); if ((y & 0x400) != 0) y -= 0x800;
+                int z = int((word >> 22u) & 0x3FFu); if ((z & 0x200) != 0) z -= 0x400;
+                val.x = float(x) * (1.0 / 1023.0);
+                val.y = float(y) * (1.0 / 1023.0);
+                val.z = float(z) * (1.0 / 511.0);
+                val.w = 1.0;
+            } else if (type == 7u) { // UINT8
+                if (count > 0u) val.x = float(load_u8(attr_b + 0u));
+                if (count > 1u) val.y = float(load_u8(attr_b + 1u));
+                if (count > 2u) val.z = float(load_u8(attr_b + 2u));
+                if (count > 3u) val.w = float(load_u8(attr_b + 3u));
+            } else if (type == 5u) { // SINT16
+                if (count > 0u) { uint u = load_unaligned_be16(attr_b + 0u); int s = (u >= 32768u) ? int(u) - 65536 : int(u); val.x = float(s); }
+                if (count > 1u) { uint u = load_unaligned_be16(attr_b + 2u); int s = (u >= 32768u) ? int(u) - 65536 : int(u); val.y = float(s); }
+                if (count > 2u) { uint u = load_unaligned_be16(attr_b + 4u); int s = (u >= 32768u) ? int(u) - 65536 : int(u); val.z = float(s); }
+                if (count > 3u) { uint u = load_unaligned_be16(attr_b + 6u); int s = (u >= 32768u) ? int(u) - 65536 : int(u); val.w = float(s); }
+            }
+
+            out_verts[out_s + 0u] = val.x;
+            out_verts[out_s + 1u] = val.y;
+            out_verts[out_s + 2u] = val.z;
+            out_verts[out_s + 3u] = val.w;
+        }
+    }
+}
