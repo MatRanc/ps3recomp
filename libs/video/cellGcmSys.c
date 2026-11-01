@@ -1015,7 +1015,7 @@ static unsigned long long park_since;
  * the boot stopped. The RSX itself would just wait. MLB The Show 16 parks
  * in SPU-built command buffers, and at 50 ms any slower SPU pass (an
  * instrumented build, a busy host) froze the match load the same way. */
-#define GCM_PARK_GRACE_MS 1000ull
+#define GCM_PARK_GRACE_MS 10000ull
 static unsigned long long gcm_park_grace_ms(void)
 {
     static long long ms = -1;

@@ -197,6 +197,8 @@ static void present_guest_frame(void)
     InterlockedIncrement(&g_frames_presented);
 }
 
+extern "C" void cellGcm_fifo_kick_wait(unsigned ms);
+
 static DWORD WINAPI frame_clock(LPVOID)
 {
     const char* title = getenv("PS3_TITLE");
@@ -215,7 +217,7 @@ static DWORD WINAPI frame_clock(LPVOID)
     const DWORD idle_ms = fc_ms && atoi(fc_ms) >= 0 ? (DWORD)atoi(fc_ms) : 4;
 
     for (;;) {
-        Sleep(idle_ms);
+        cellGcm_fifo_kick_wait(idle_ms);
         ULONGLONG now = GetTickCount64();
 
         int fired = 0;

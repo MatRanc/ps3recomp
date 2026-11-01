@@ -3719,7 +3719,7 @@ void rsx_draw_engine_flush_dirty_to_guest(void)
     static int s_wcb = -1;
     if (s_wcb < 0) {
         const char* e = getenv("PS3RECOMP_RSX_WCB");
-        s_wcb = e ? atoi(e) : 1;
+        s_wcb = e ? atoi(e) : 0;
     }
     if (!s_wcb) return;
 
