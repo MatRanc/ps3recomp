@@ -2228,7 +2228,8 @@ static void gcm_fifo_dump_init(void)
 static inline void gcm_fifo_dump_word(u32 w)
 {
     if (s_fifo_dump_fp && s_fifo_dump_skip <= 0 && s_fifo_dump_frames_left > 0) {
-        fwrite(&w, sizeof(u32), 1, s_fifo_dump_fp);
+        u32 be = __builtin_bswap32(w); // PS3 guest memory is big-endian
+        fwrite(&be, sizeof(u32), 1, s_fifo_dump_fp);
         s_fifo_dump_words++;
     }
 }
@@ -2559,7 +2560,6 @@ static void gcm_rsx_process_fifo_unlocked(void)
                 if (s_fifo_flips_reached != s_fifo_flips_queued) s_fifo_flips_reached++;
             } else {
                 cellGcmSetFlipCommand(w & 0xFFu);
-                gcm_fifo_dump_flip(w);
             }
             /* ...unless the FIFO is badly backlogged. One flip per drain is
              * right while `get` is keeping up with `put`; when it is megabytes
@@ -2664,7 +2664,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
                 gcm_fifo_dump_word(w);
                 for (u32 di = 0; di < count; di++) {
                     u32 dea = gcm_io2ea(s_fifo_getoff + 4 + di * 4);
-                    if (dea) gcm_fifo_dump_word(vm_read32(dea));
+                    gcm_fifo_dump_word(dea ? vm_read32(dea) : 0u);
                 }
             }
             /* TCONST_FIFO=1: how the title actually streams vertex constants.
@@ -3397,6 +3397,8 @@ static s32 gcm_flip_request(u32 bufferId, int in_fifo)
     if (!s_display_buffer_set[bufferId])
         return CELL_GCM_ERROR_INVALID_VALUE;
 
+    if (!in_fifo)
+        gcm_fifo_dump_flip(0xFEAD0000u | (bufferId & 7u));
 
     /* in_fifo: the flip sits in the command stream as a GCM_FLIP_MARKER, and
      * the drain does this half when it reaches it (see the 0xFEAD case). */

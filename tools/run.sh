@@ -50,6 +50,7 @@ fi
 
 # Enable WCB by default for accurate render target readback (fixes player faces & crowd textures)
 export PS3RECOMP_RSX_WCB="${PS3RECOMP_RSX_WCB:-1}"
+export __GL_SYNC_TO_VBLANK=0
 
 # Purge corrupted/stale face cache if requested
 if [ "$PURGE_CACHE" = "1" ]; then
