@@ -263,6 +263,14 @@ flowchart TD
 4. **Pipelined Frame Overlap**:
    * Pipeline frame parameters so the PPU starts building Frame $N+1$ rather than sleeping in `Gfx_FrameEnd` waiting for the closing fence of Frame $N$.
 
+> **Session 5 profile update (2026-11-01, 36.8 fps binary).** A reliable gdb stack profile shows the c690 job wall
+> (~25.5 ms/frame across 5 workers) is spread over many format-dispatched kernels: top `0xFDA0` (recursive tree/leaf)
+> ~17%, then `0x7C18`, `0xFCB8`, `0x6D68`, `0xAF98`, `0xC98C`, `0xE0A8`. `0x31B0` is the policy module, not c690.
+> Skinning (`0xD2B8`) is only ~10–20% of the job, so offloading only skinning saves ~2.5–5 ms (→ ~34–38 fps).
+> 60 fps needs the whole per-vertex math pipeline (~35–55% of the job) offloaded **and** the walker (~24.65 ms) cut
+> to <16.6 ms; the remaining serial stages are close to the whole budget. `vtx_unpack.comp` is downstream of c690,
+> so it cannot reduce c690's cost by itself. Full scoping: `~/Documents/work_notes.md` "Session 5 Update".
+
 ### Phase 2: Visual Correctness & Render-Target Readback
 1. **Vulkan Render-Target Readback (Write Color Buffers) [COMPLETED]**:
    * Implemented `rsx_draw_engine_flush_dirty_to_guest()` in `libs/video/rsx_draw_engine.c` and integrated into `cellGcmSys.c` at `NV406E_SET_REFERENCE` (0x50), `SEMAPHORE_RELEASE` (0x6C), and flip boundaries.
