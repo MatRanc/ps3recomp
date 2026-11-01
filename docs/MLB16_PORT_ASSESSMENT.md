@@ -342,3 +342,36 @@ Agents on Linux must utilize the test harnesses built during the Mac session rat
 3. **Step 3: Visual & Correctness Gate**:
    * Run with `PURGE_FACE_CACHE=1` and `PS3RECOMP_RSX_WCB=1` via `tools/run.sh` to ensure WCB flushes dirty render targets to guest memory and eliminates black face textures.
    * Run `bodies.sh` screenshot comparisons only at the end of macro milestones.
+
+---
+
+## 8. Ecosystem Context, Architectural Lineage & Clean-Room Licensing Policy
+
+### 8.1 The PS3 Complexity Hierarchy (The "Nightmare Tier")
+To properly contextualize the engineering challenges in *MLB The Show 16*, the table below illustrates the complexity tiers of the PlayStation 3 library regarding static recompilation and emulation:
+
+| Tier | Representative Titles / Studios | Architectural Characteristics | Recompilation Feasibility |
+| :--- | :--- | :--- | :--- |
+| **Tier 1: The Untouchables (Nightmare)** | *The Last of Us*, *Uncharted 2 & 3* (Naughty Dog), *Killzone 2 & 3* (Guerrilla Games), *Gran Turismo 6* (Polyphony Digital), *MGS4* (Kojima Productions) | Custom SPU software rasterizers, deferred rendering on Cell SPUs, continuous SPU microcode swapping, real-time SPU audio synthesis, pre-SPURS low-level hardware hacks. | Not currently attempted in any public static recomp. |
+| **Tier 1.5: Late-Gen First-Party Titans** | **MLB The Show 16** (Sony San Diego Studio), *LittleBigPlanet 1 & 2* (Media Molecule), *God of War: Ascension* (Santa Monica Studio) | Sony WorldWide Studios (WWS) Job Manager, dynamic SPU code patching (`c0dec0de`), raw SPURS policy modules at `0xA00`, Naughty Dog ICE Team Edge Geometry skinning, 60k poly models, multi-hundred MB stadium caches. | **Active & Booting (`mlb16-recomp` at 24.2 FPS; Targets 3 & 4 leading to 60 FPS)**. |
+| **Tier 2: Early First-Party & Mid-Gen Exclusives** | *inFAMOUS*, *God of War 3*, *Resistance: Fall of Man*, *MotorStorm 1* | Heavy SPURS tasksets, bespoke particle pipelines, early Edge middleware, static SPU ELF images. | Booting / in-progress across community recomp efforts. |
+| **Tier 3: Standard Cross-Platform Titles (90%+ of Library)** | *The Bigs 2*, *Red Dead Redemption*, *Grand Theft Auto IV/V*, *Dead Rising 2*, *Dark Souls*, *Bioshock* | Multi-platform architectures (built symmetrically for Xbox 360 & PS3). Standard Sony SDK APIs (`cellSpursTaskSet`, standard `libfs`, standard GCM command buffers). No self-modifying SPU code, no custom policy modules. | High feasibility; benefits immediately from `ps3recomp` core improvements. |
+
+### 8.2 Architectural Insights from Adjacent Projects
+1. **Naughty Dog's ICE Team Heritage in MLB 16**:
+   - Official SCE GDC archives confirm that the **PlayStation Edge Geometry SDK** was built collaboratively by Sony WWS and Naughty Dog's ICE Team.
+   - The primary 35 ms SPU bottleneck in MLB 16 (`jobmod_c690c2f7b09a`) is explicitly identified as the **ICE mesh program**. Optimizing MLB 16 means optimizing the core technology that powered *Uncharted*.
+2. **RPCS3 SPURS Synchronization & Fence Tracking**:
+   - *elad335's PR #16907*: Solved SPURS workload removal deadlocks by flagging PPU thread wait states (`cpu_flag::wait`), preventing PPU starvation of SPU workers.
+   - *RPCS3 VKGSRender Ring-Slot Pipelining*: RPCS3 never blocks the CPU at frame end; it tracks fences per ring-buffer slot ($N$-buffering) and only waits on a slot when it is about to be overwritten ($N+2$). This serves as the architectural model for Macro Target 3.
+3. **The Core Lesson of Zelda64Recomp (RT64) & UnleashedRecomp**:
+   - *Never emulate on the host CPU what a modern GPU can do natively in microseconds.*
+   - On the PS3, offloading vertex decompression to SPUs was necessary because the RSX was fillrate/vertex-bound. On a modern PC, the CPU is the bottleneck while the RTX 3060 Ti has 4,864 CUDA cores sitting idle. Pushing bone matrix palettes directly to `vtx_unpack.comp` bypasses the CPU entirely.
+
+### 8.3 Clean-Room Engineering & Licensing Policy (MIT vs GPLv2)
+* **The Legal Boundary**: `sp00nznet/ps3recomp` and `mlb16-recomp` are licensed under the permissive **MIT License**. RPCS3 is licensed under the copyleft **GNU General Public License v2 (GPLv2)**.
+* **Strict Prohibition on Code Copying**: Code from RPCS3 (or any GPLv2 project) **CANNOT** be copy-pasted or directly ported into `ps3recomp`. Doing so would violate the GPLv2 license and taint the project, preventing PRs from being merged upstream into `sp00nznet/ps3recomp`.
+* **Clean-Room Implementation Standard**:
+  - Architectural patterns, algorithmic concepts, hardware behaviors, and mathematical equations are non-copyrightable.
+  - Developers and autonomous agents must write **100% original, clean-room C/C++ code** tailored exclusively to `ps3recomp`'s native data structures (`s_vk`, `vk_buffer`, `s_ebs`, `sys_ppu_thread`).
+  - This guarantees that all code produced remains 100% MIT-compliant and upstreamable.
