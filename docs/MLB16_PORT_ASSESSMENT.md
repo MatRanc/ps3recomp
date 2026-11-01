@@ -123,6 +123,13 @@ figures below were from the 2026-10-28 tree and are kept for history.
     A small, within-noise gain; kept because it removes the set-reuse wait in principle and is opt-in.
   * **Conclusion:** the walker's own CPU is not the marginal limiter. The frame loses ~10.5 ms/frame waiting for the
     SPU to publish command buffers, and the remaining GPU waits are latency. The c690 SPU job is the next real lever.
+* **Target 4 first real win (2026-11-01 later):** the tree's `spu_lifted` for c690 was stale and predated the
+  `0xa8a0` entry in `tools/lift_spu.sh`. The game reaches LS `0xA8A0` through a function pointer inside the lifted
+  `0xA818` body, so it fell to the SPU interpreter: ~5 M interpreted steps/s, top entry `img=0xCC ls=0x0A8A0`
+  (~58k calls/s). Re-running the canonical lift splits `0xA818` into `0xA818` + `0xA8A0`. Pitch screen:
+  **~32.5 → 36.1–36.7 fps**, interpreted steps **~5 M/s → ~0.1–0.3 M/s**, visual diff 14.2, replay hash verified.
+  The AVX2 `0x7C18` kernel re-applied to the new lift measured neutral. This is the cheapest form of Target 4:
+  check `SPU_INTERP_STATS` for missing lift entries before hand-vectorizing or offloading anything.
 
 ---
 
