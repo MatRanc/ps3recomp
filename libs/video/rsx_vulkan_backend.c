@@ -157,6 +157,7 @@ typedef struct vk_state {
     VkPhysicalDevice phys;
     VkDevice         device;
     VkQueue          queue;
+    VkQueue          present_queue;
     u32              queue_family;
     VkPhysicalDeviceMemoryProperties memprops;
 
@@ -610,6 +611,9 @@ static VkResult vk_queue_submit(const VkSubmitInfo* si, VkFence fence)
 
 static VkResult vk_queue_present(const VkPresentInfoKHR* pi)
 {
+    if (s_vk.present_queue && s_vk.present_queue != s_vk.queue) {
+        return pvkQueuePresentKHR(s_vk.present_queue, pi);
+    }
     pthread_mutex_lock(&s_vk.queue_mu);
     const VkResult r = pvkQueuePresentKHR(s_vk.queue, pi);
     pthread_mutex_unlock(&s_vk.queue_mu);
@@ -4317,10 +4321,22 @@ static int vk_init_all(u32 width, u32 height, const char* title)
         if (vk_pick_device()) return -1;
     }
 
-    float prio = 1.0f;
+    u32 n_props = 0;
+    pvkGetPhysicalDeviceQueueFamilyProperties(s_vk.phys, &n_props, NULL);
+    u32 queue_count = 1;
+    if (n_props > 0 && n_props <= 64) {
+        VkQueueFamilyProperties props[64];
+        pvkGetPhysicalDeviceQueueFamilyProperties(s_vk.phys, &n_props, props);
+        if (s_vk.queue_family < n_props && props[s_vk.queue_family].queueCount >= 2) {
+            queue_count = 2;
+        }
+    }
+
+    float priorities[2] = { 1.0f, 0.5f };
     VkDeviceQueueCreateInfo qci = { .sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
                                     .queueFamilyIndex = s_vk.queue_family,
-                                    .queueCount = 1, .pQueuePriorities = &prio };
+                                    .queueCount = queue_count,
+                                    .pQueuePriorities = priorities };
     static const char* dev_exts[] = { VK_KHR_SWAPCHAIN_EXTENSION_NAME };
     /* DXT (BC1-3) is how PS3 titles ship most textures; Vulkan gates it
      * behind a feature, enabled only when the device reports it. */
@@ -4350,6 +4366,12 @@ static int vk_init_all(u32 width, u32 height, const char* title)
     if (s_vk.windowed && vk_load_wsi_device_functions())
         vk_window_drop("the driver has no swapchain functions");
     pvkGetDeviceQueue(s_vk.device, s_vk.queue_family, 0, &s_vk.queue);
+    if (queue_count >= 2) {
+        pvkGetDeviceQueue(s_vk.device, s_vk.queue_family, 1, &s_vk.present_queue);
+        VK_LOG("requested 2 queues: queue 0 for walker, queue 1 for presentation\n");
+    } else {
+        s_vk.present_queue = s_vk.queue;
+    }
 
     VkCommandPoolCreateInfo pci = { .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
                                     .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT,
