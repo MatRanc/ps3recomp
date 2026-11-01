@@ -7,7 +7,7 @@
 
 ## 1. Executive Summary
 
-In just a few days of development, **[MatRanc/mlb16-recomp](https://github.com/MatRanc/mlb16-recomp)** progressed from raw PPU/SPU ELF disassembly to an in-engine native PC build running exhibition games at **~26 fps** on Vulkan. *MLB The Show 16* (BCUS01089) represents one of the most demanding titles attempted on `ps3recomp` to date, heavily leveraging Sony's WorldWide Studios (WWS) Job Manager, Edge Geometry pipelines, dynamic SPU code patching, multithreaded command buffers, and complex asynchronous file I/O.
+In just a few days of development, **[MatRanc/mlb16-recomp](https://github.com/MatRanc/mlb16-recomp)** progressed from raw PPU/SPU ELF disassembly to an in-engine native PC build running exhibition games at **~26 fps** on Vulkan, and **~32 fps at the pitch screen** on the current `mlb16-work` tree (2026-11-01 re-measurement, §2.9). *MLB The Show 16* (BCUS01089) represents one of the most demanding titles attempted on `ps3recomp` to date, heavily leveraging Sony's WorldWide Studios (WWS) Job Manager, Edge Geometry pipelines, dynamic SPU code patching, multithreaded command buffers, and complex asynchronous file I/O.
 
 During this pair-programming session, while away from the primary Linux development rig (Ryzen 2600X, RTX 3060 Ti), work shifted toward **eliminating fork debt, diagnosing deep architectural bugs, submitting tested, clean-room PRs upstream to [`sp00nznet/ps3recomp`](https://github.com/sp00nznet/ps3recomp), and implementing the two key architectural components requested: the Deterministic RSX FIFO Replay & Benchmark Harness, and the Vulkan Render-Target Readback (WCB) pipeline with face cache auto-purge**.
 
@@ -40,13 +40,26 @@ A total of **11 atomic, production-grade upstream PRs** were submitted, 100% ver
 ### 2.4 Diagnostic Frame Budget & Bottleneck Breakdown
 Timeline data captured via `PS3RECOMP_TRACE` and ftrace on the Linux testbed (Ryzen 5 2600X, RTX 3060 Ti) revealed the exact breakdown of frame latency:
 
+Re-measured 2026-11-01 on the current `mlb16-work` tree (median frame 33.9 ms, ~32 fps pitch-wait). The earlier
+figures below were from the 2026-10-28 tree and are kept for history.
+
 | Subsystem / Operation | Latency / Overhead | Concurrency & Behavior | Impact on Framerate |
 |:---|:---|:---|:---|
-| **RSX FIFO Walker Drain** | **~31 ms** | Single-threaded bottleneck | **Critical Path**: Dictates total frame time |
-| **CPU Vertex Decode & Remap** | **~26 ms** (~35 µs / draw) | Inside walker thread across ~750 draws | Churns ~55 MB/frame of host-visible memory |
-| **GPU Presentation (`vkQueuePresentKHR`)** | **~9 ms** | Synchronous wait inside walker | Blocks walker from processing next commands |
-| **PPU Idle Wait (`Gfx_FrameEnd`)** | **~30 ms** | PPU main thread | Sleeps waiting for previous frame's closing fence |
-| **SPU Lifted Code Execution** | **~44 ms aggregate** | Concurrently spread across 4–5 cores | Throttled / idling; waiting for GPU mesh ring space |
+| **RSX FIFO Walker Drain** | **~27 ms of a 33.9 ms frame** | Single-threaded | **Critical Path**: dictates frame time |
+| **Walker CPU per draw** | **~40 µs** (38.5–49) across ~438 draws | Inside walker thread | ~17.5 ms/frame |
+| ↳ vertex remap (`rsx_vertex_remap_build`) | ~18% of walker CPU | per-index hash/dedup | ~3 ms/frame |
+| ↳ texture change checks (slot + sparse hash) | ~22% of walker CPU | per texture bind, once/frame | ~4 ms/frame |
+| ↳ Vulkan command recording (driver) | ~29% of walker CPU | `vkCmd*` / descriptors | ~5 ms/frame |
+| **GPU waits (`engine`/`present`/`begin`)** | **~8 ms** | walker blocked on the GPU | latency, not throughput |
+| **Walker waiting for SPU `put`** | **~10.5 ms** of gaps/frame | SPU not publishing buffers fast enough | co-bottleneck |
+| **SPU lifted code** | **~23 ms wall** (~3.25 cores aggregate) | 5–6 SPURS workers | feeds the walker |
+| **PPU idle wait (`Gfx_FrameEnd`)** | **~34 ms** | PPU main thread | waits on the walker's fence, not on the GPU |
+
+> **Important correction to the earlier table:** the headless `replay_rsx` number of 36 ms was the *per-call
+> verification* cost, not draw-engine throughput. Without `--verify` the same 646-draw frame replays in **0.59 ms**
+> (~1,700 fps). The in-game walker is 45× slower per draw because it also fetches/converts guest vertices, checks
+> textures and records Vulkan commands — work the replay harness does not do. Treat `--verify` as a correctness gate
+> only, never as a performance number.
 
 ### 2.5 Deterministic RSX FIFO Replay & Benchmark Harness
 * **Native Standalone Replay (`tools/replay_rsx.cpp`, `tools/replay_rsx_core.c/.h`)**: Built a headless CLI tool that accepts dumped RSX FIFO command streams (`.bin`) and feeds them into the walker and register-file draw engine in a loop.
@@ -79,6 +92,25 @@ Timeline data captured via `PS3RECOMP_TRACE` and ftrace on the Linux testbed (Ry
   1. A/B benchmark isolating `PS3RECOMP_ENG_VTX_DIRECT=0` vs unset.
   2. Geometric integrity audit using `bodies.sh` across 4 high-detail camera angles to guarantee zero polygon stretching, missing geometry, or flickering.
   3. Fast-forwarding `mlb16-work` to `mlb16-next` upon visual approval, followed by PGO retraining on the updated baseline.
+
+### 2.9 2026-11-01 Re-measurement: the Frame Is Walker/Pipeline-Bound
+* **Baseline on the current tree:** pitch-wait **32.2 fps** (1 s buckets 32.1 ± 2.0); `replay_rsx` still verifies
+  `0x85fc2ff5a1655c26`.
+* **`PS3RECOMP_TRACE` timeline (median frame 33.9 ms):** the RSX walker drains for ~27 ms; the PPU main thread is in
+  the `Gfx_FrameEnd` fence spin for ~34 ms; five SPURS workers run the `c690c2f7b09a` job concurrently. The GPU is
+  not the wall.
+* **Sampling profile (per-thread `perf_event_open`, 1 kHz):** walker CPU splits ~29% Vulkan driver, ~18%
+  `rsx_vertex_remap_build`, ~22% texture change checks, ~6% `sink_end`. All SPU workers sit in the c690 job, but in
+  functions `0xD540`, `0x10028`, `0x6D68`, `0xAF98`, `0x8160` — **not** the already-vectorized `0x7C18`.
+* **Consequence for the overnight plan:** Target 4's 0x7C18 AVX2 kernel is active but addresses a small part of the
+  job; the remaining hot functions are local-store-bound (the earlier 8-wide prototype was 1.00× the lift). Target 3
+  (skip the frame fence) was re-attempted correctly — the frame id was left untouched and the `Gfx_FrameEnd` call site
+  waited on the slot about to be reused, `(id + 1) & 3`. It still fails: the run produced **185 flips in 689 s** and
+  never reached the pitch screen, versus ~9,300 flips for the same build without it. The fence also guards guest
+  buffers the walker is still reading, so the PPU cannot run ahead of the drain. The patch was reverted; both PPU
+  recomp files are byte-identical to their `.orig` backups.
+* **Real next lever:** reduce walker CPU per draw (remap, texture checks, driver recording) and/or cut the c690 job's
+  time so the walker's `put` gaps shrink. Both are macro changes, not micro-tuning.
 
 ---
 
