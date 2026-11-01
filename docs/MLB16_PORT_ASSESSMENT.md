@@ -243,56 +243,71 @@ flowchart TD
 > **Directive for Autonomous Agents on Linux (Claude Code & Antigravity):**
 > **CEASE all micro-optimization work.** Do not spend developer time, compute cycles, or API tokens on SPU micro-tweaks, assembly fiddling, register caching, or repeated PGO retraining. Profiling and compiler flags have reached diminishing returns (+1.3 fps). Reaching the **60 fps target (16.6 ms/frame)** requires eliminating the **25 ms of architectural dead weight** identified below.
 
-### 7.1 The Mathematical Reality: Shaving the 25 ms Dead Weight
+### 7.1 The Mathematical Reality & Pipelining Law (Why Triple Buffering Alone Isn't 3x)
 
-$$\text{Current Baseline (24 fps)} = \mathbf{41.6\text{ ms/frame}}$$
+$$\text{Current Baseline (24.2 fps)} = \mathbf{41.3\text{ ms/frame}}$$
 $$\text{Target Performance (60 fps)} = \mathbf{16.6\text{ ms/frame}}$$
-$$\text{Required Frame-Time Reduction} = \mathbf{25.0\text{ ms}}$$
+$$\text{Required Frame-Time Reduction} = \mathbf{24.7\text{ ms}}$$
 
-The diagnostic frame budget reveals that **~35 ms of the 41.6 ms frame** is trapped in two serialized bottlenecks inside the RSX command walker:
+A common misconception is that "triple buffering" divides frame time by 3 (e.g. $41.3\text{ ms} / 3 \approx 13.7\text{ ms}$). **In computing, pipelining never divides execution time by the number of buffers; it overlaps independent stages.** 
 
-```
-Current Frame (41.6 ms)
-├── [26.0 ms] Host CPU Vertex Unpack & Remap (Walker CPU churn across ~750 draws, ~55 MB/frame)
-├── [ 9.0 ms] vkQueuePresentKHR (Walker thread synchronously blocked waiting on swapchain)
-└── [ 6.6 ms] Actual Vulkan command buffer generation & GPU dispatch
-```
+Under pipelined execution, total frame throughput is strictly bounded by the **single slowest stage** in the pipeline:
 
-### 7.2 The Three Macro Redesign Targets (The Path to 60 FPS)
+$$\text{Pipelined Frame Time} = \max\left(\text{Stage 1 [PPU]}, \ \text{Stage 2 [SPU]}, \ \text{Stage 3 [RSX/GPU]}\right)$$
+
+#### Where the Three Stages Stand Today (Post-Target 1 & 2):
+
+| Stage | Subsystem & Workload | Current Time | Ready for 60 FPS ($\le 16.6\text{ ms}$)? |
+| :--- | :--- | :---: | :---: |
+| **Stage 1 (PPU)** | Game logic, animation poses, physics, job submission | **~8.0 ms** |  **YES** (Fast enough for ~125 FPS) |
+| **Stage 3 (RSX / GPU)** | Walker dispatch & RTX 3060 Ti rendering (Targets 1 & 2) | **~3.0 ms** |  **YES** (Fast enough for ~300+ FPS) |
+| **Stage 2 (SPU)** | **Edge Geometry vertex decompression & skinning (`c690c2f7b09a`)** | **~35.0 ms** | ❌ **NO — THE PRIMARY BOTTLENECK** |
+
+#### Why PPU Pipelining (Target 3) Alone Caps at ~28.5 FPS:
+If we overlap the PPU (8 ms) with the SPUs (35 ms) and GPU (3 ms) via triple-buffered command rings:
+$$\text{Frame Time} = \max(8\text{ ms}, \ \mathbf{35\text{ ms}}, \ 3\text{ ms}) = \mathbf{35.0\text{ ms}} \implies \mathbf{28.5\text{ FPS}}$$
+Target 3 will eliminate the ~8 ms PPU wait in `Gfx_FrameEnd`, but **framerate will hit a hard ceiling at 28.5 FPS dictated by the 35 ms SPU skinning loop**.
+
+---
+
+### 7.2 The Macro Redesign Roadmap to 60 FPS
 
 #### Macro Target 1: Decoupled Vulkan Presentation Thread (COMPLETED & VERIFIED)
-* **The Problem**: When the RSX walker encounters a frame flip, it previously called `vkQueuePresentKHR` directly on the walker thread. The entire emulation halted and did zero work for **~9 ms** waiting on display server / swapchain synchronization. Initial background thread attempts locked to 12.00 FPS due to `s_vk.queue_mu` contention with `vkQueueSubmit` and display FIFO sync-coupling.
-* **The Architectural Fix (Implemented in `feat/presentation-thread`, commits `230e494b`, `96b5fbb4`, `277f53b7`)**:
-  1. **Dual Vulkan Queues**: Queried device queue family and allocated 2 distinct `VkQueue` handles (`queueCount = 2`): Queue 0 for RSX walker submissions (`s_vk.queue`) and Queue 1 for the dedicated presentation thread (`s_vk.present_queue`).
-  2. **Zero Mutex Contention**: Presentation calls `pvkQueuePresentKHR(s_vk.present_queue, ...)` directly without locking `s_vk.queue_mu`, completely insulating walker command recording and GPU submission from presentation stalls.
-  3. **Triple-Buffered Mailbox Mode**: Configured `VK_PRESENT_MODE_MAILBOX_KHR` with non-blocking acquire (`timeout = 0`) and exported `__GL_SYNC_TO_VBLANK=0`.
-  4. **Empirical Verification (Kauffman Stadium Pitch Scene)**:
-     - *WCB Performance Diagnostic*: Found that `PS3RECOMP_RSX_WCB=1` forced synchronous `submit_and_wait` + PCIe readbacks on downclocked VRAM (810 MHz P5 state), causing an artificial 11.2 FPS dip.
-     - *Headless Baseline (`WCB=0`)*: Instantly restored full **23.98 fps** baseline (1-sec mean 24.84 fps, peak 34.25 fps).
-     - *Windowed Swapchain (`WINDOW=1`, `WCB=0`)*: Reached **23.34 fps** (instantaneous mean 23.52 fps ±2.17 fps). The 12.00 FPS clamp is **completely eliminated**, with windowed presentation incurring only a ~0.64 FPS (~2.6%) delta from headless.
+* **The Problem**: RSX walker called `vkQueuePresentKHR` directly, halting for ~9 ms at VSync. Background thread attempts locked to 12.00 FPS due to `s_vk.queue_mu` contention.
+* **The Architectural Fix (`feat/presentation-thread`, commits `230e494b`, `96b5fbb4`, `277f53b7`)**:
+  1. **Dual Vulkan Queues**: Allocated 2 distinct `VkQueue` handles: Queue 0 for walker submissions (`s_vk.queue`) and Queue 1 for presentation (`s_vk.present_queue`).
+  2. **Zero Mutex Contention**: Presentation calls `pvkQueuePresentKHR(s_vk.present_queue)` directly without locking `s_vk.queue_mu`.
+  3. **Triple-Buffered Mailbox Mode**: Configured `VK_PRESENT_MODE_MAILBOX_KHR` with non-blocking acquire (`timeout = 0`) and `__GL_SYNC_TO_VBLANK=0`.
+  4. **Empirical Results**: Windowed presentation achieves **23.34 fps** (instantaneous mean 23.52 fps), within 0.64 fps (2.6%) of headless baseline (23.98 fps). The 12.00 FPS clamp is completely eliminated.
 
 #### Macro Target 2: Descriptor-Driven GPU Vertex Offload & Compute Unpack (COMPLETED & VERIFIED)
-* **The Problem**: Host CPU walker spent ~26 ms per frame decoding, byte-swapping, and remapping vertex formats across ~750 draw calls in software (`rsx_vertex_compact.c`). In heavy close-up scenes (mound visits, dugout LOD0 models), this CPU overhead exploded to 45–60 ms, dropping framerates to 15–20 FPS.
-* **The Architectural Fix (Implemented in `feat/gpu-vertex-offload`, commit `1f6dc0cd`)**:
-  1. **Compute Pipeline (`vtx_unpack.comp`)**: Integrated a dedicated compute pipeline into the Vulkan backend (`rsx_vulkan_backend.c`) and draw engine (`rsx_draw_engine.c`).
+* **The Problem**: Host CPU walker spent ~26 ms per frame decoding, byte-swapping, and remapping vertex formats across ~750 draw calls in software (`rsx_vertex_compact.c`).
+* **The Architectural Fix (`feat/gpu-vertex-offload`, commit `1f6dc0cd`)**:
+  1. **Compute Pipeline (`vtx_unpack.comp`)**: Integrated a dedicated compute pipeline into `rsx_vulkan_backend.c` and `rsx_draw_engine.c`.
   2. **Descriptor-Driven Architecture**:
      - *Modes 0, 1, 2*: Fast unrolled paths for 24-byte 3D meshes and 16/20-byte 2D UI quads.
-     - *Mode 3 (Generic Unpack)*: Accepts up to 8 packed `AttrDesc` structs in push constants. Uses bitwise funnel shifts (`load_unaligned_be32`, `load_unaligned_be16`, `load_u8`) to natively unpack 2-byte aligned 22-byte streams (e.g., Short3 Pos + CMP Normal + CMP Tangent + Short2 UV0 + Short2 UV1) without alignment faults. Supports all 7 RSX vertex attribute types.
-     - *Dynamic Index Remapping*: Normalized non-contiguous vertex references (`elem = ((vertex_id + base_index) & 0xFFFFF) - stable_first`), streaming index remap buffers to compute threads to fetch and unpack sequential hardware vertex buffers.
+     - *Mode 3 (Generic Unpack)*: Accepts up to 8 packed `AttrDesc` structs in push constants. Uses bitwise funnel shifts (`load_unaligned_be32`, `load_unaligned_be16`, `load_u8`) to natively unpack 2-byte aligned 22-byte streams without alignment faults. Supports all 7 RSX vertex attribute types.
+     - *Dynamic Index Remapping*: Normalized non-contiguous vertex references (`elem = ((vertex_id + base_index) & 0xFFFFF) - stable_first`), streaming index remap buffers to compute threads.
   3. **Empirical Results (Kauffman Stadium Pitch Scene)**:
-     - **98.28% GPU Offload Rate**: Offloaded 2,239,363 draws out of 2,278,559 evaluated.
-     - **CPU Software Fallbacks Collapsed**: Dropped from 85.0% down to **1.72%** (39,196 draws).
-     - **Live Game Benchmark**: Pitch-wait FPS rose to **24.19 fps** (1-sec mean 24.39 fps, instantaneous mean 24.43 fps ±2.62 fps), with instantaneous peaks reaching **32.15 fps** (+1.55 fps / +6.8% vs prior 22.64 fps run).
-     - **100% Deterministic Replay**: `replay_rsx` verified bit-exact state matching (`0x85fc2ff5a1655c26`).
-     - **Visual Fidelity**: `same.py` pitch-wait match diff 13.4 ($\le 25.0$), end frame diff 2.6 (sub-pixel match across full 1280x720 viewport, zero mesh tears, zero spikes).
-     - **Diagnostic Takeaway**: Headless `replay_rsx` executes the 646-draw Kauffman frame in **0.59 ms (~1,700 fps)**. Target 2 permanently eliminated the walker's 26 ms CPU vertex anchor (making 60 FPS mathematically possible). The live game ~24 FPS floor is now isolated to SPU Edge Geometry skinning (`jobmod_c690c2f7b09a`, ~35 ms) and PPU serialization in `Gfx_FrameEnd`.
+     - **98.28% GPU Offload Rate**: Offloaded 2,239,363 draws out of 2,278,559 evaluated (CPU fallbacks collapsed to 1.72%).
+     - **Live Benchmark**: Pitch-wait FPS rose to **24.19 fps** (mean 24.39 fps), with instantaneous peaks reaching **32.15 fps**.
+     - **Determinism & Visuals**: 100% deterministic replay (`0x85fc2ff5a1655c26`), sub-pixel visual match (`diff 2.6` across full 1280x720 viewport).
+     - **Critical Insight**: Headless `replay_rsx` executes the entire 646-draw Kauffman frame in **0.59 ms (~1,700 fps)**. Target 2 permanently eliminated the walker's 26 ms CPU vertex anchor.
 
-#### Macro Target 3: PPU/RSX Frame $N+1$ Pipelined Overlap (Shaves ~10.0–15.0 ms PPU Sleep) -- IMMEDIATE FOCUS
-* **The Problem**: The main PPU thread finishes building Frame $N$ and then immediately enters a blocking sleep in `Gfx_FrameEnd` waiting on the closing fence of the current frame before it even begins generating Frame $N+1$. CPU and GPU are serialized instead of overlapped.
+#### Macro Target 3: PPU/RSX Frame $N+1$ Pipelined Overlap (Target: Overlap PPU 8 ms)
+* **The Problem**: The main PPU thread finishes building Frame $N$ in ~8 ms and then immediately enters a blocking sleep in `Gfx_FrameEnd` waiting on the closing fence before starting Frame $N+1$.
 * **The Architectural Fix**:
-  1. Pipeline command buffer ring generation so the PPU thread begins constructing Frame $N+1$ while the RSX walker and GPU are actively processing Frame $N$.
-  2. Implement double/triple buffering for frame-level sync fences.
-  3. **Expected Impact**: Eliminates PPU idle sleep, ensuring continuous feeding of the RSX FIFO ring without backpressure bubbles. Target: Solid 60 FPS (16.6 ms).
+  1. Double/triple-buffer command rings and frame-level sync fences so the PPU thread begins constructing Frame $N+1$ while the RSX walker and GPU actively process Frame $N$.
+  2. **Expected Impact**: Completely eliminates the PPU's idle sleep, lifting the baseline toward the ~28.5 FPS SPU ceiling.
+
+#### Macro Target 4: SPU Edge Geometry Skinning Loop Optimization / GPU Compute Skinning Offload (Target: Crush the 35 ms Wall)
+* **The Problem**: SPU module `c690c2f7b09a` represents ~70% of all SPU compute time (~35 ms). It executes software matrix-palette bone skinning and vertex decompression. Because the SPU code is bound by byte swaps and scalar loops in lifted C++, it clamps the entire game to ~24–28.5 FPS.
+* **The Architectural Fix**:
+  - *Option A (Lifted SPU Vectorization)*: Hand-vectorize hot loop `0x7C18` using AVX2 SIMD, keeping matrix palettes in vector registers and eliminating local-store byte-swap roundtrips (similar to RPCS3's LLVM JIT reaching ~43 FPS).
+  - *Option B (GPU Compute Bone Skinning)*: Extend `vtx_unpack.comp` to accept bone matrix palettes via SSBO, performing matrix-palette skinning on the RTX 3060 Ti compute cores in $<1\text{ ms}$.
+* **The Mathematical Climax to 60 FPS**:
+  - Once SPU skinning drops from $35\text{ ms} \rightarrow \le 14\text{ ms}$:
+  $$\text{Pipelined Frame Time} = \max(\text{PPU: } 8\text{ ms}, \ \mathbf{\text{SPU: } 14\text{ ms}}, \ \text{GPU: } 3\text{ ms}) = \mathbf{14.0\text{ ms}} \implies \mathbf{71.4\text{ FPS (Rock-Solid 60 FPS Locked!)}}$$
 
 ### 7.3 Tooling & Verification Protocol for Linux Agents
 
