@@ -2559,7 +2559,6 @@ static void gcm_rsx_process_fifo_unlocked(void)
                 if (s_fifo_flips_reached != s_fifo_flips_queued) s_fifo_flips_reached++;
             } else {
                 cellGcmSetFlipCommand(w & 0xFFu);
-                gcm_fifo_dump_flip(w);
             }
             /* ...unless the FIFO is badly backlogged. One flip per drain is
              * right while `get` is keeping up with `put`; when it is megabytes
@@ -3397,6 +3396,8 @@ static s32 gcm_flip_request(u32 bufferId, int in_fifo)
     if (!s_display_buffer_set[bufferId])
         return CELL_GCM_ERROR_INVALID_VALUE;
 
+    if (!in_fifo)
+        gcm_fifo_dump_flip(0xFEAD0000u | (bufferId & 7u));
 
     /* in_fifo: the flip sits in the command stream as a GCM_FLIP_MARKER, and
      * the drain does this half when it reaches it (see the 0xFEAD case). */

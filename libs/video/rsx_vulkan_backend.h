@@ -42,6 +42,10 @@
  *   PS3RECOMP_VK_FULLSCREEN=1 with a window: borderless full screen.
  *   PS3RECOMP_VK_HOLD=<sec>   with a window: keep the last frame on screen
  *                             this long before shutdown closes it.
+ *   PS3RECOMP_VK_PRESENT_THREAD=0
+ *                             with a window: call vkQueuePresentKHR on the
+ *                             walker thread (the pre-Macro-Target-1 path)
+ *                             instead of the presentation thread.
  *   PS3RECOMP_VK_GUEST_PROGRAMS=1
  *                             run the guest's own vertex/fragment programs
  *                             (needs the translator: glslang at build time),
@@ -90,7 +94,11 @@ void rsx_vulkan_backend_present(void);
  * next frame: the next frame's commands are ordered after the copy, so they
  * never reach the presented image. On the fixed-function path, where the
  * walker draws into the presented image itself, _present_begin() does all of
- * it and _present_finish() has nothing left to do. */
+ * it and _present_finish() has nothing left to do.
+ *
+ * Window presentation is one step further decoupled: vkQueuePresentKHR runs
+ * on a dedicated backend thread fed by a mutex + condvar queue, so its FIFO
+ * stall never holds the RSX walker. */
 void rsx_vulkan_backend_present_begin(void);
 void rsx_vulkan_backend_present_finish(void);
 
