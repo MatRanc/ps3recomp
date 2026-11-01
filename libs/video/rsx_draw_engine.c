@@ -2298,6 +2298,9 @@ static int dc_reserve_indices(u32 count)
  * vertices into dc.verts and hand them to the backend's draw, as before
  * draw_fill, even when the backend has it. */
 static int s_vtx_direct = 1;
+/* PS3RECOMP_ENG_VTX_REMAP=0: do not collapse repeated vertex references.
+ * The GPU draws the duplicates; the CPU skips the per-index hash build. */
+static int s_vtx_remap = 1;
 
 /* draw_fill's callback: the first *(u32*)ctx unique vertices into dst. */
 static int s_fill_ok;   /* the last fill's result; -1 before it is called */
@@ -2388,7 +2391,7 @@ static void dc_fetch(const rsx_vertex_layout_plan* layout, int allow_remap)
     /* Only a topology this engine rebuilds through an index buffer may share
      * repeated references. A line strip or a point list is drawn in the order
      * it arrived, so collapsing duplicates would reorder it. */
-    if (allow_remap && dc.n_refs > 1) {
+    if (s_vtx_remap && allow_remap && dc.n_refs > 1) {
         u32 unique = dc.n_refs;
         if (rsx_vertex_remap_build(&dc.ref_remap, dc.refs, dc.n_refs, &unique)) {
             dc.refs_remapped = unique < dc.n_refs;
@@ -3822,6 +3825,8 @@ int rsx_draw_engine_init(u32 width, u32 height)
       s_texmemo_on = !(e && strcmp(e, "0") == 0); }
     { const char* e = getenv("PS3RECOMP_ENG_VTX_DIRECT");
       s_vtx_direct = !(e && strcmp(e, "0") == 0); }
+    { const char* e = getenv("PS3RECOMP_ENG_VTX_REMAP");
+      s_vtx_remap = !(e && strcmp(e, "0") == 0); }
     memset(s_tmemo, 0, sizeof s_tmemo);
     s_tex_gen++;
     g.vp_cb = (u8*)calloc(1, ENG_VP_CB_BYTES);

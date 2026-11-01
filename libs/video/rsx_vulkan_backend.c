@@ -151,6 +151,10 @@ typedef struct vk_image {
  * one less than the swapchain image count (see vk_create_swapchain), so one
  * image is always available to acquire even when every slot is queued. */
 #define VK_PRESENT_SLOTS 8
+/* Batch sets for VK_FRAME_PIPELINE. Three, not two: with two the walker swaps
+ * back into a set the GPU may still be rendering; with three it waits on a set
+ * submitted two frames ago, which is normally complete. */
+#define VK_EB_SETS 3
 
 typedef struct vk_state {
     void*            lib;
@@ -184,7 +188,7 @@ typedef struct vk_state {
     VkPipelineLayout      vtx_unpack_layout;
     VkPipeline            vtx_unpack_pipe;
     VkDescriptorPool      vtx_unpack_pool;
-    VkDescriptorSet       vtx_unpack_ds[2];
+    VkDescriptorSet       vtx_unpack_ds[VK_EB_SETS];
 
     vk_image         dummy;           /* 1x1 magenta: "nothing bound"    */
     vk_image         tex[RSX_MAX_TEXTURES];   /* decoded guest textures  */
@@ -490,12 +494,12 @@ static void vk_present_wait_gpu(void);
  * results flushes them first, so everything else keeps the invariant that
  * all earlier work has completed. */
 static u32 s_eb_pending;
-/* VK_FRAME_PIPELINE=1 (with VK_DRAW_BATCH=1): two sets of what a batch holds. A
- * present submits the frame's batch without waiting and the next frame records
- * into the other set, so the walker records frame N+1 while the GPU renders N.
- * A set is waited on only before it is recorded into again; every other flush
- * still waits for both, so the rest of the backend keeps its invariant that all
- * earlier work has completed. */
+/* VK_FRAME_PIPELINE=1 (with VK_DRAW_BATCH=1): VK_EB_SETS sets of what a batch
+ * holds. A present submits the frame's batch without waiting and the next frame
+ * records into the next set, so the walker records frame N+1 while the GPU
+ * renders N. A set is waited on only before it is recorded into again; every
+ * other flush still waits for all the other sets, so the rest of the backend
+ * keeps its invariant that all earlier work has completed. */
 typedef struct {
     VkCommandBuffer  cmd;
     VkFence          fence;
@@ -505,7 +509,7 @@ typedef struct {
     u32              sets;
     int              inflight;
 } vk_eb_set;
-static vk_eb_set s_ebs[2];
+static vk_eb_set s_ebs[VK_EB_SETS];
 static int s_ebs_cur, s_ebs_on;
 static void vk_ebs_wait_other(void);
 static void vk_eng_flush_async(void);
@@ -3848,64 +3852,51 @@ static int vk_vtx_unpack_init(void)
         return -1;
     }
 
-    VkDescriptorPoolSize ps = { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 6 };
+    VkDescriptorPoolSize ps = { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 3 * VK_EB_SETS };
     VkDescriptorPoolCreateInfo dpci = {
         .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
-        .maxSets = 2,
+        .maxSets = VK_EB_SETS,
         .poolSizeCount = 1,
         .pPoolSizes = &ps
     };
     if (pvkCreateDescriptorPool(s_vk.device, &dpci, NULL, &s_vk.vtx_unpack_pool) != VK_SUCCESS)
         return -1;
 
-    VkDescriptorSetLayout lays[2] = { s_vk.vtx_unpack_dsl, s_vk.vtx_unpack_dsl };
+    VkDescriptorSetLayout lays[VK_EB_SETS];
+    for (int i = 0; i < VK_EB_SETS; i++) lays[i] = s_vk.vtx_unpack_dsl;
     VkDescriptorSetAllocateInfo dsai = {
         .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
         .descriptorPool = s_vk.vtx_unpack_pool,
-        .descriptorSetCount = 2,
+        .descriptorSetCount = VK_EB_SETS,
         .pSetLayouts = lays
     };
     if (pvkAllocateDescriptorSets(s_vk.device, &dsai, s_vk.vtx_unpack_ds) != VK_SUCCESS)
         return -1;
 
-    /* Write set 0 for s_eb */
-    VkDescriptorBufferInfo binfo0[3] = {
-        { s_eb.raw_vb.buf, 0, VK_WHOLE_SIZE },
-        { s_eb.vb.buf,     0, VK_WHOLE_SIZE },
-        { s_eb.remap_buf.buf, 0, VK_WHOLE_SIZE },
-    };
-    VkWriteDescriptorSet w0[3];
-    for (int i = 0; i < 3; i++) {
-        w0[i] = (VkWriteDescriptorSet){
-            .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-            .dstSet = s_vk.vtx_unpack_ds[0],
-            .dstBinding = (uint32_t)i,
-            .descriptorCount = 1,
-            .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-            .pBufferInfo = &binfo0[i]
+    /* One descriptor set per batch set: it names that set's raw, vertex and
+     * remap buffers. Set 0 is s_eb; the rest exist only with frame pipelining. */
+    for (int s = 0; s < VK_EB_SETS; s++) {
+        if (s > 0 && !s_ebs_on) break;
+        const vk_buffer* raw = s ? &s_ebs[s].raw_vb : &s_eb.raw_vb;
+        const vk_buffer* vb  = s ? &s_ebs[s].vb     : &s_eb.vb;
+        const vk_buffer* rm  = s ? &s_ebs[s].remap_buf : &s_eb.remap_buf;
+        VkDescriptorBufferInfo bi[3] = {
+            { raw->buf, 0, VK_WHOLE_SIZE },
+            { vb->buf,  0, VK_WHOLE_SIZE },
+            { rm->buf,  0, VK_WHOLE_SIZE },
         };
-    }
-    pvkUpdateDescriptorSets(s_vk.device, 3, w0, 0, NULL);
-
-    /* Write set 1 for s_ebs[1] if present */
-    if (s_ebs_on) {
-        VkDescriptorBufferInfo binfo1[3] = {
-            { s_ebs[1].raw_vb.buf, 0, VK_WHOLE_SIZE },
-            { s_ebs[1].vb.buf,     0, VK_WHOLE_SIZE },
-            { s_ebs[1].remap_buf.buf, 0, VK_WHOLE_SIZE },
-        };
-        VkWriteDescriptorSet w1[3];
+        VkWriteDescriptorSet w[3];
         for (int i = 0; i < 3; i++) {
-            w1[i] = (VkWriteDescriptorSet){
+            w[i] = (VkWriteDescriptorSet){
                 .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-                .dstSet = s_vk.vtx_unpack_ds[1],
+                .dstSet = s_vk.vtx_unpack_ds[s],
                 .dstBinding = (uint32_t)i,
                 .descriptorCount = 1,
                 .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-                .pBufferInfo = &binfo1[i]
+                .pBufferInfo = &bi[i]
             };
         }
-        pvkUpdateDescriptorSets(s_vk.device, 3, w1, 0, NULL);
+        pvkUpdateDescriptorSets(s_vk.device, 3, w, 0, NULL);
     }
 
     VK_LOG("gpu vertex unpack: compute pipeline ready\n");
@@ -3969,20 +3960,25 @@ static int vk_eb_on(void)
     s_eb.on = 1;
     const char* fp = getenv("VK_FRAME_PIPELINE");
     if (fp && *fp == '1') {
-        vk_eb_set* o = &s_ebs[1];
-        VkCommandBufferAllocateInfo cai = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
-                                            .commandPool = s_vk.pool, .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
-                                            .commandBufferCount = 1 };
-        VkFenceCreateInfo fci = { .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
-        if (pvkAllocateCommandBuffers(s_vk.device, &cai, &o->cmd) == VK_SUCCESS &&
-            pvkCreateFence(s_vk.device, &fci, NULL, &o->fence) == VK_SUCCESS &&
-            !vk_create_host_buffer(&o->vb, VK_EB_VB_BYTES, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT) && o->vb.coherent &&
-            !vk_create_host_buffer(&o->raw_vb, VK_EB_RAW_VB_BYTES, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT) && o->raw_vb.coherent &&
-            !vk_create_host_buffer(&o->remap_buf, VK_EB_REMAP_BYTES, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT) && o->remap_buf.coherent &&
-            !vk_create_host_buffer(&o->ib, VK_EB_IB_BYTES, VK_BUFFER_USAGE_INDEX_BUFFER_BIT) && o->ib.coherent &&
-            !vk_create_host_buffer(&o->ub, VK_EB_UB_BYTES, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT) && o->ub.coherent &&
-            !vk_create_host_buffer(&o->sb, VK_EB_SB_BYTES, VK_BUFFER_USAGE_TRANSFER_SRC_BIT) && o->sb.coherent &&
-            pvkCreateDescriptorPool(s_vk.device, &pci, NULL, &o->pool) == VK_SUCCESS) {
+        int made = 1;
+        for (int i = 1; i < VK_EB_SETS && made; i++) {
+            vk_eb_set* o = &s_ebs[i];
+            VkCommandBufferAllocateInfo cai = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+                                                .commandPool = s_vk.pool, .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+                                                .commandBufferCount = 1 };
+            VkFenceCreateInfo fci = { .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
+            if (pvkAllocateCommandBuffers(s_vk.device, &cai, &o->cmd) != VK_SUCCESS ||
+                pvkCreateFence(s_vk.device, &fci, NULL, &o->fence) != VK_SUCCESS ||
+                vk_create_host_buffer(&o->vb, VK_EB_VB_BYTES, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT) || !o->vb.coherent ||
+                vk_create_host_buffer(&o->raw_vb, VK_EB_RAW_VB_BYTES, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT) || !o->raw_vb.coherent ||
+                vk_create_host_buffer(&o->remap_buf, VK_EB_REMAP_BYTES, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT) || !o->remap_buf.coherent ||
+                vk_create_host_buffer(&o->ib, VK_EB_IB_BYTES, VK_BUFFER_USAGE_INDEX_BUFFER_BIT) || !o->ib.coherent ||
+                vk_create_host_buffer(&o->ub, VK_EB_UB_BYTES, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT) || !o->ub.coherent ||
+                vk_create_host_buffer(&o->sb, VK_EB_SB_BYTES, VK_BUFFER_USAGE_TRANSFER_SRC_BIT) || !o->sb.coherent ||
+                pvkCreateDescriptorPool(s_vk.device, &pci, NULL, &o->pool) != VK_SUCCESS)
+                made = 0;
+        }
+        if (made) {
             s_ebs[0].vb = s_eb.vb;
             s_ebs[0].raw_vb = s_eb.raw_vb;
             s_ebs[0].remap_buf = s_eb.remap_buf;
@@ -3991,9 +3987,21 @@ static int vk_eb_on(void)
             s_ebs[0].sb = s_eb.sb;
             s_ebs[0].pool = s_eb.pool;
             s_ebs_cur = 0; s_ebs_on = 1;
-            VK_LOG("frame pipelining: on (two batch sets)\n");
+            VK_LOG("frame pipelining: on (%d batch sets)\n", VK_EB_SETS);
         } else {
-            VK_LOG("frame pipelining: no memory for a second batch set, staying off\n");
+            for (int i = 1; i < VK_EB_SETS; i++) {
+                vk_eb_set* o = &s_ebs[i];
+                if (o->vb.buf) vk_destroy_buffer(&o->vb);
+                if (o->raw_vb.buf) vk_destroy_buffer(&o->raw_vb);
+                if (o->remap_buf.buf) vk_destroy_buffer(&o->remap_buf);
+                if (o->ib.buf) vk_destroy_buffer(&o->ib);
+                if (o->ub.buf) vk_destroy_buffer(&o->ub);
+                if (o->sb.buf) vk_destroy_buffer(&o->sb);
+                if (o->pool) pvkDestroyDescriptorPool(s_vk.device, o->pool, NULL);
+                if (o->fence) pvkDestroyFence(s_vk.device, o->fence, NULL);
+                memset(o, 0, sizeof *o);
+            }
+            VK_LOG("frame pipelining: no memory for extra batch sets, staying off\n");
         }
     }
     vk_vtx_unpack_init();
@@ -4009,7 +4017,7 @@ static void vk_ebs_swap(void)
     c->vb = s_eb.vb; c->ib = s_eb.ib; c->ub = s_eb.ub; c->sb = s_eb.sb;
     c->raw_vb = s_eb.raw_vb; c->remap_buf = s_eb.remap_buf;
     c->pool = s_eb.pool; c->sets = s_eb.sets; c->inflight = 1;
-    s_ebs_cur ^= 1;
+    s_ebs_cur = (s_ebs_cur + 1) % VK_EB_SETS;
     vk_eb_set* n = &s_ebs[s_ebs_cur];
     if (n->inflight) {
         const unsigned long long w0 = vk_now_us();
@@ -4031,8 +4039,9 @@ static void vk_ebs_swap(void)
 static void vk_ebs_wait_other(void)
 {
     if (!s_ebs_on) return;
-    vk_eb_set* o = &s_ebs[s_ebs_cur ^ 1];
-    if (o->inflight) {
+    for (int i = 0; i < VK_EB_SETS; i++) {
+        vk_eb_set* o = &s_ebs[i];
+        if (i == s_ebs_cur || !o->inflight) continue;
         pvkWaitForFences(s_vk.device, 1, &o->fence, VK_TRUE, UINT64_MAX);
         o->inflight = 0;
     }
@@ -4060,13 +4069,16 @@ static void vk_eb_release(void)
 {
     if (s_eb_pending) vk_eng_flush();
     vk_ebs_wait_other();
-    if (s_ebs_on) {   /* the set not current; the current one is s_eb / s_vk below */
-        vk_eb_set* o = &s_ebs[s_ebs_cur ^ 1];
-        vk_destroy_buffer(&o->vb); vk_destroy_buffer(&o->ib);
-        vk_destroy_buffer(&o->ub); vk_destroy_buffer(&o->sb);
-        vk_destroy_buffer(&o->raw_vb); vk_destroy_buffer(&o->remap_buf);
-        if (o->pool) pvkDestroyDescriptorPool(s_vk.device, o->pool, NULL);
-        if (o->fence) pvkDestroyFence(s_vk.device, o->fence, NULL);
+    if (s_ebs_on) {   /* every set but the current one; the current is s_eb / s_vk below */
+        for (int i = 0; i < VK_EB_SETS; i++) {
+            if (i == s_ebs_cur) continue;
+            vk_eb_set* o = &s_ebs[i];
+            vk_destroy_buffer(&o->vb); vk_destroy_buffer(&o->ib);
+            vk_destroy_buffer(&o->ub); vk_destroy_buffer(&o->sb);
+            vk_destroy_buffer(&o->raw_vb); vk_destroy_buffer(&o->remap_buf);
+            if (o->pool) pvkDestroyDescriptorPool(s_vk.device, o->pool, NULL);
+            if (o->fence) pvkDestroyFence(s_vk.device, o->fence, NULL);
+        }
         memset(s_ebs, 0, sizeof s_ebs); s_ebs_on = 0; s_ebs_cur = 0;
     }
     vk_vtx_unpack_release();
@@ -4233,10 +4245,42 @@ static VkDescriptorSet vk_eng_write_descriptors_to(const vk_eng_pipe* P, VkDescr
  * would have gone, so the rings, the flushes and the frame pipelining are the
  * same either way. Returns 0 only for a fill draw that found no vertex memory
  * and recorded nothing; every other outcome, drawn or dropped, is 1. */
+/* VK_DRAWPROF=1: where the walker's per-draw CPU time goes, as us/draw over
+ * each 2 s window. Diagnostic only. */
+static int s_drawprof = -1;
+static unsigned long long s_dp_ns[8], s_dp_n[9];
+static unsigned long long s_dp_t0;
+static inline unsigned long long vk_dp_ns(void)
+{
+    struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t);
+    return (unsigned long long)t.tv_sec * 1000000000ull + (unsigned long long)t.tv_nsec;
+}
+static void vk_dp_log(void)
+{
+    const unsigned long long now = vk_dp_ns();
+    if (s_dp_t0 && now - s_dp_t0 < 2000000000ull) return;
+    static const char* names[8] = { "desc", "copy", "vtxgpu", "barrier", "rp_begin",
+                                    "state", "bind_draw", "rp_end" };
+    const unsigned long long nd = s_dp_n[8] ? s_dp_n[8] : 1;
+    unsigned long long tot = 0;
+    for (int i = 0; i < 8; i++) tot += s_dp_ns[i];
+    VK_LOG("drawprof 2s: %llu draws, %.1f us/draw measured", s_dp_n[8], (double)tot / nd / 1000.0);
+    for (int i = 0; i < 8; i++)
+        VK_LOG("  %-9s %6.1f us/draw (n=%llu)", names[i], (double)s_dp_ns[i] / nd / 1000.0, s_dp_n[i]);
+    memset(s_dp_ns, 0, sizeof s_dp_ns);
+    memset(s_dp_n, 0, sizeof s_dp_n);
+    s_dp_t0 = now;
+}
+#define DP_T0() do { dp1 = s_drawprof ? vk_dp_ns() : 0; } while (0)
+#define DP_T1(i) do { if (s_drawprof) { s_dp_ns[i] += vk_dp_ns() - dp1; s_dp_n[i]++; } } while (0)
+
 static int vk_eng_draw_from(rsx_topology topology, const void* vertices,
                             int (*fill)(void* ctx, void* dst), void* fill_ctx,
                             u32 vertex_count, u32 stride, const u32* indices, u32 index_count)
 {
+    if (s_drawprof < 0) { const char* e = getenv("VK_DRAWPROF"); s_drawprof = e && *e && strcmp(e, "0") != 0; }
+    unsigned long long dp1 = 0;
+    if (s_drawprof) { s_dp_n[8]++; DP_T0(); }
     if (!s_e2.pipeline || (!vertices && !fill) || !vertex_count || !stride) return 1;
     if (topology < RSX_TOPOLOGY_POINTS || topology > RSX_TOPOLOGY_TRIANGLE_STRIP) return 1;
     vk_eng_pipe* P = &s_epipe[s_e2.pipeline - 1];
@@ -4283,6 +4327,7 @@ static int vk_eng_draw_from(rsx_topology topology, const void* vertices,
     if (batched) {
         /* Slices of the rings and a set from the pool; a full one flushes the
          * batch (which empties them all) and the draw takes its slices again. */
+        DP_T0();
         for (int tries = 0; tries < 2; tries++) {
             VkDeviceSize vh = s_eb.vb_head, ih = s_eb.ib_head, uh = s_eb.ub_head;
             VkDeviceSize rh = s_eb.raw_vb_head, mh = s_eb.remap_head;
@@ -4315,9 +4360,11 @@ static int vk_eng_draw_from(rsx_topology topology, const void* vertices,
             if (tries || !s_eb_pending) { batched = 0; break; }
             s_eb_why = 1; vk_eng_flush();
         }
+        DP_T1(0);
         if (batched && !set) batched = 0;
     }
     if (batched) {
+        DP_T0();
         if (use_gpu_vtx) {
             memcpy((u8*)s_eb.raw_vb.ptr + raw_off, gpu->raw_data, (size_t)gpu->raw_bytes);
             if (gpu->flags & 1) {
@@ -4329,7 +4376,9 @@ static int vk_eng_draw_from(rsx_topology topology, const void* vertices,
             memcpy((u8*)s_eb.vb.ptr + voff, vertices, (size_t)vbytes);
         }
         if (ibytes) memcpy((u8*)s_eb.ib.ptr + ioff, indices, (size_t)ibytes);
+        DP_T1(1);
         vbuf = s_eb.vb.buf; ibuf = s_eb.ib.buf;
+        DP_T0();
         if (!s_eb_pending && vk_begin()) return 1;
         /* Earlier draws of this batch may have rendered what this one samples
          * or blends over: order it after all of them. */
@@ -4388,6 +4437,7 @@ static int vk_eng_draw_from(rsx_topology topology, const void* vertices,
                                   VK_PIPELINE_STAGE_VERTEX_INPUT_BIT,
                                   0, 0, NULL, 1, &vbarrier, 0, NULL);
         }
+        DP_T1(2);
     } else {
         if (s_eb_pending) { s_eb_why = 2; vk_eng_flush(); }
         if (vk_ensure_vertex_buffer(vbytes)) return fill ? 0 : 1;
@@ -4407,13 +4457,18 @@ static int vk_eng_draw_from(rsx_topology topology, const void* vertices,
     }
     /* Everything submitted before is complete (each submission is waited
      * on); this orders memory for the surfaces this draw touches. */
+    DP_T0();
     for (u32 i = 0; i < n; i++)
         vk_barrier_image(s_eobj[s_eng_bound.rt[i]].im.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL);
+    DP_T1(3);
+    DP_T0();
     VkRenderPassBeginInfo rbi = { .sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
                                   .renderPass = rp, .framebuffer = fb,
                                   .renderArea = { { 0, 0 }, { w, h } } };
     pvkCmdBeginRenderPass(s_vk.cmd, &rbi, VK_SUBPASS_CONTENTS_INLINE);
     pvkCmdBindPipeline(s_vk.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
+    DP_T1(4);
+    DP_T0();
     VkViewport vp = { 0.0f, 0.0f, (float)w, (float)h, 0.0f, 1.0f };
     if (s_e2.have_vp && s_e2.vp[2] > 0.0f && s_e2.vp[3] > 0.0f) {
         vp.x = s_e2.vp[0]; vp.y = s_e2.vp[1]; vp.width = s_e2.vp[2]; vp.height = s_e2.vp[3];
@@ -4432,6 +4487,8 @@ static int vk_eng_draw_from(rsx_topology topology, const void* vertices,
     pvkCmdSetStencilReference(s_vk.cmd, VK_STENCIL_FACE_FRONT_AND_BACK, s_e2.stencil_ref & 0xFFu);
     if (s_vk.depth_bounds_ok)
         pvkCmdSetDepthBounds(s_vk.cmd, s_e2.depth_bounds[0], s_e2.depth_bounds[1]);
+    DP_T1(5);
+    DP_T0();
     pvkCmdBindDescriptorSets(s_vk.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
                              P->cube_mask ? s_e2.split_pipe_layout : s_g.pipe_layout,
                              0, 1, &set, 0, NULL);
@@ -4442,7 +4499,11 @@ static int vk_eng_draw_from(rsx_topology topology, const void* vertices,
     } else {
         pvkCmdDraw(s_vk.cmd, vertex_count, 1, 0, 0);
     }
+    DP_T1(6);
+    DP_T0();
     pvkCmdEndRenderPass(s_vk.cmd);
+    DP_T1(7);
+    if (s_drawprof) vk_dp_log();
     if (!batched) { s_eb.unbatched++; vk_submit_and_wait(); return 1; }
     s_eb.draws++;
     if (++s_eb_pending >= s_eb.max_draws) { s_eb_why = 3; vk_eng_flush_async(); }   /* full: no CPU wait needed */
