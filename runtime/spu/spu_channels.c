@@ -1883,8 +1883,58 @@ static void spu_dcache_shadow_stats(void)
                 __atomic_load_n(&s_dcache_misses, __ATOMIC_RELAXED),
                 __atomic_load_n(&s_dcache_shadow_bad, __ATOMIC_RELAXED));
 }
+/* SPU_JOB_LS_DUMP=<prefix>: Stage-0 capture for the c690 offload. The job runs
+ * inside the SPURS policy, not through spu_workload, so hook its entry
+ * (c690 LSA 0x135B8) at dispatch: dump the whole local store, the descriptor
+ * EA (r3) and the first 256 bytes of the guest descriptor. The palette/weight
+ * buffers are runtime values reachable from r3. First 8 dispatches only. */
+int g_c690_jobcap_arm = 0;
+unsigned g_c690_jobcap_n = 0;
+
+static void spu_jobcap_probe(const spu_context* ctx, uint32_t lsa)
+{
+    static int n = 0;
+    const char* pfx = getenv("SPU_JOB_LS_DUMP");
+    if (!pfx || lsa != 0x135B8 || !PS3_LOG_FIRST(n, 8)) return;
+    if (n == 1) { g_c690_jobcap_arm = 1; g_c690_jobcap_n = 0; }
+    char path[512];
+    snprintf(path, sizeof path, "%s_job_%02d_in.bin", pfx, n - 1);
+    FILE* f = fopen(path, "wb");
+    if (f) { fwrite(ctx->ls, 1, SPU_LS_SIZE, f); fclose(f); }
+    const uint32_t dea = ctx->gpr[3]._u32[0];
+    const uint8_t* d = NULL;
+    if (dea && dea < SPU_LS_SIZE) d = ctx->ls + (dea & SPU_LS_MASK);      /* LS descriptor */
+    else if (dea) d = vm_base + (dea & 0x0FFFFFFFu);                     /* guest descriptor */
+    fprintf(stderr, "[jobcap] job lsa=0x%05X image=%d ovl=%d task=%d desc=0x%08X %s\n",
+            lsa, ctx->image_id, ctx->resident_ovl, ctx->resident_task, dea,
+            d ? "ok" : "null");
+    if (!d) { fflush(stderr); return; }
+    fprintf(stderr, "[jobcap] desc:");
+    uint32_t dw[16];
+    for (int k = 0; k < 16; k++) {
+        dw[k] = ((uint32_t)d[k*4]<<24)|((uint32_t)d[k*4+1]<<16)|
+                ((uint32_t)d[k*4+2]<<8)|d[k*4+3];
+        fprintf(stderr, " %08X", dw[k]);
+    }
+    fprintf(stderr, "\n");
+    /* Follow descriptor words that look like guest EAs and dump the block. */
+    int dumped = 0;
+    for (int k = 0; k < 16 && dumped < 4; k++) {
+        const uint32_t w = dw[k];
+        if (w >= 0x10000 && w < 0x20000000 && (w & 3) == 0) {
+            snprintf(path, sizeof path, "%s_job_%02d_ref%02d_%08X.bin",
+                     pfx, n - 1, k, w);
+            f = fopen(path, "wb");
+            if (f) { fwrite(vm_base + (w & 0x0FFFFFFFu), 1, 256, f); fclose(f); dumped++; }
+        }
+    }
+    fflush(stderr);
+}
+
 spu_lifted_fn spu_lifted_lookup(const spu_context* ctx, uint32_t lsa)
 {
+    { static int s_jc = -1; if (s_jc < 0) s_jc = getenv("SPU_JOB_LS_DUMP") ? 1 : 0;
+      if (s_jc && lsa == 0x135B8) spu_jobcap_probe(ctx, lsa); }
     const int mode = spu_dcache_mode();
     if (!mode || !ctx) return spu_lifted_lookup_full(ctx, lsa);
     spu_context* c = (spu_context*)ctx;

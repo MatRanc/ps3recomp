@@ -930,6 +930,47 @@ static void spu_async_run(spu_async_job* j)
                 }
                 #undef RDBE32
             }
+            /* SPU_JOB_LS_DUMP=<prefix>: Stage-0 capture for the c690 offload.
+             * Dump the job's whole local store BEFORE it runs, plus the
+             * descriptor EA/args and the first 256 bytes of the guest
+             * descriptor. The palette/weight buffers are runtime values
+             * reachable from args_ea, so this is what makes them findable.
+             * First 8 dispatches only; files are <prefix>_img<id>_<n>_{in,desc}.bin. */
+            { static int _capn = 0, _logn = 0;
+              const char* pfx = getenv("SPU_JOB_LS_DUMP");
+              if (pfx && j->image_id >= 200) {
+                  if (PS3_LOG_FIRST(_logn, 256))
+                      fprintf(stderr, "[jobcap] dispatch image=%d entry=0x%05X "
+                              "args_ea=0x%08X\n", j->image_id, entry, j->args_ea);
+                  if (PS3_LOG_FIRST(_capn, 8)) {
+                      char path[512];
+                      snprintf(path, sizeof path, "%s_img%d_%02d_in.bin",
+                               pfx, j->image_id, _capn - 1);
+                      FILE* f = fopen(path, "wb");
+                      if (f) { fwrite(ls, 1, SPU_LS_SIZE, f); fclose(f); }
+                      fprintf(stderr, "[jobcap] image=%d entry=0x%05X args_ea=0x%08X "
+                              "have_r3=%d r3=%08X.%08X.%08X.%08X taskset=0x%08X task=%u\n",
+                              j->image_id, entry, j->args_ea, j->have_r3,
+                              j->r3[0], j->r3[1], j->r3[2], j->r3[3],
+                              j->taskset_ea, j->taskid);
+                      if (j->args_ea) {
+                          const uint32_t dea = j->args_ea & 0x0FFFFFFFu;
+                          snprintf(path, sizeof path, "%s_img%d_%02d_desc.bin",
+                                   pfx, j->image_id, _capn - 1);
+                          f = fopen(path, "wb");
+                          if (f) { fwrite(vm_base + dea, 1, 256, f); fclose(f); }
+                          fprintf(stderr, "[jobcap] desc@0x%08X:", j->args_ea);
+                          for (int k = 0; k < 16; k++) {
+                              const uint8_t* p = vm_base + dea + k * 4;
+                              fprintf(stderr, " %02X%02X%02X%02X",
+                                      p[0], p[1], p[2], p[3]);
+                          }
+                          fprintf(stderr, "\n");
+                      }
+                      fflush(stderr);
+                  }
+              }
+            }
             spu_serial_acquire();       /* one SPU task runs at a time (LBP_SPU_SERIAL) */
             int32_t rc = spu_run_lifted_job_abi(j->fn, ls, j->args_ea, j->image_id,
                                                 1, j->have_r3 ? j->r3 : 0, 0);

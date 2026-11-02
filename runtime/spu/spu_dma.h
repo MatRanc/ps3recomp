@@ -415,9 +415,25 @@ static inline int mfc_do_transfer_fast(spu_context* spu, uint32_t lsa, uint64_t 
  * Execute a single DMA transfer between local store and main memory.
  * Returns 0 on success, -1 on error.
  */
+/* SPU_JOB_LS_DUMP: after the c690 entry is captured, log the job's first DMAs
+ * (img/cmd/lsa/ea/size) so the input vertex/palette/weight buffers and the
+ * output ring become visible. Off unless armed by spu_jobcap_probe(). */
+static inline void jobcap_dma(const spu_context* spu, uint32_t cmd, uint32_t lsa,
+                              uint64_t ea, uint32_t size)
+{
+    extern int g_c690_jobcap_arm;
+    extern unsigned g_c690_jobcap_n;
+    if (__builtin_expect(g_c690_jobcap_arm != 0, 0) && g_c690_jobcap_n < 400) {
+        fprintf(stderr, "[jobdma] img%d cmd=0x%02X lsa=0x%05X ea=0x%09llX size=0x%X\n",
+                spu->image_id, cmd, lsa, (unsigned long long)ea, size);
+        g_c690_jobcap_n++;
+    }
+}
+
 static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
                                    uint32_t size, uint32_t cmd)
 {
+    jobcap_dma(spu, cmd, lsa, ea, size);
     if (__builtin_expect(mfc_transfer_fast_ok(cmd), 1))
         return mfc_do_transfer_fast(spu, lsa, ea, size, cmd);
     /* Upper16 command-channel bits carry replacement/transfer class IDs. */
