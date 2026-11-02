@@ -291,6 +291,9 @@ void cellGcmSetVBlankHandler(CellGcmVBlankHandler handler);
  * title-screen state machine from the VBlank handler. */
 void cellGcmTickVBlank(void);
 void cellGcmTickFlip(void);
+/* Flips the title actually requested (not SetPrepareFlip); used by
+ * PS3RECOMP_VK_PRESENT_NEW_ONLY as its "new guest frame" edge. */
+u32 cellGcm_flip_frame_count(void);
 
 /* NID: 0xF9BFCDA3 */
 void cellGcmSetSecondVHandler(CellGcmSecondVHandler handler);

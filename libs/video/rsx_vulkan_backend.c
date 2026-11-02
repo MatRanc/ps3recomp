@@ -50,6 +50,8 @@
 #include "rsx_fp_decompiler.h"
 #include "rsx_shader_spirv.h"
 #include "rsx_draw_engine.h"
+#include "cellGcmSys.h"
+#include "rsx_tex_miss.h"
 #include "ps3emu/thread_name.h"
 #include "vulkan/rsx_vk_fallback_vert.spv.h"
 #include "vulkan/rsx_vk_fallback_frag.spv.h"
@@ -896,6 +898,14 @@ static void vk_tex_off(u32 unit)
     if (unit == 0) vk_write_texture_descriptor();
 }
 
+/* Census hook for the vtable path: the unit is about to sample the dummy. */
+static void vk_tex_miss_vtable(const rsx_texture_state* t, unsigned reason,
+                               u32 w, u32 h, u32 pitch, u32 levels)
+{
+    rsx_tex_miss_note(reason, 0, t->offset, (t->format >> 8) & 0xFFu,
+                      w, h, pitch, levels, 0, 0, 0);
+}
+
 /* Same decode as the headless null backend (rsx_null_backend.c,
  * nullsw_bind_texture), so both backends sample identical texels. */
 static void vk_cb_bind_texture(void* ud, u32 unit, const rsx_texture_state* t)
@@ -906,21 +916,30 @@ static void vk_cb_bind_texture(void* ud, u32 unit, const rsx_texture_state* t)
 
     u32 w = (t->image_rect >> 16) & 0xFFFFu;
     u32 h =  t->image_rect        & 0xFFFFu;
-    if (!w || !h || w > 4096u || h > 4096u) { vk_tex_off(unit); return; }
+    const u32 levels    = (t->format >> 16) & 0xFFFFu;
+    const u32 row_pitch = t->control3 & 0xFFFFFu;
+    if (!w || !h || w > 4096u || h > 4096u) {
+        vk_tex_miss_vtable(t, RSX_TEX_MISS_SIZE, w, h, row_pitch, levels);
+        vk_tex_off(unit); return;
+    }
 
     u32 ea = cellGcmResolveLocated((t->format & 3u) == 1u, t->offset);
-    if (!vm_base || ea == 0xFFFFFFFFu) { vk_tex_off(unit); return; }
+    if (!vm_base || ea == 0xFFFFFFFFu) {
+        vk_tex_miss_vtable(t, RSX_TEX_MISS_ADDRESS, w, h, row_pitch, levels);
+        vk_tex_off(unit); return;
+    }
     const u32 fmt = (t->format >> 8) & 0xFFu;
 
     /* The whole mip chain, as the Metal backend reads it: SET_TEXTURE_FORMAT's
      * level count above bit 15 and SET_TEXTURE_CONTROL3's row pitch, laid out
      * by the shared rsx_texture_mip_chain() (which clamps the count to what
      * the dimensions allow). Cube maps are not handled yet: face 0 only. */
-    const u32 levels    = (t->format >> 16) & 0xFFFFu;
-    const u32 row_pitch = t->control3 & 0xFFFFFu;
     rsx_tex_level lv[RSX_MAX_TEXTURE_LEVELS];
     const u32 nlv = rsx_texture_mip_chain(fmt, w, h, levels, row_pitch, lv);
-    if (!nlv || lv[0].tl.compressed) { vk_tex_off(unit); return; }   /* no BC path yet */
+    if (!nlv || lv[0].tl.compressed) {                                /* no BC path yet */
+        vk_tex_miss_vtable(t, RSX_TEX_MISS_FORMAT, w, h, row_pitch, levels);
+        vk_tex_off(unit); return;
+    }
 
     size_t total = 0, off[RSX_MAX_TEXTURE_LEVELS];
     u32 lw[RSX_MAX_TEXTURE_LEVELS], lh[RSX_MAX_TEXTURE_LEVELS];
@@ -930,13 +949,17 @@ static void vk_cb_bind_texture(void* ud, u32 unit, const rsx_texture_state* t)
         total += (size_t)lv[m].w * lv[m].h * 4u;
     }
     u8* buf = (u8*)malloc(total);
-    if (!buf) { vk_tex_off(unit); return; }
+    if (!buf) { vk_tex_miss_vtable(t, RSX_TEX_MISS_OTHER, w, h, row_pitch, levels);
+                vk_tex_off(unit); return; }
     for (u32 m = 0; m < nlv; m++)
         if (vk_decode_level_rgba8(buf + off[m], vm_base + ea + lv[m].offset,
                                   lv[m].w, lv[m].h, &lv[m].tl)) {
+            vk_tex_miss_vtable(t, RSX_TEX_MISS_OTHER, w, h, row_pitch, levels);
             free(buf); vk_tex_off(unit); return;
         }
     s_vk.tex_ready[unit] = vk_upload_texture_levels(&s_vk.tex[unit], buf, lw, lh, nlv) == 0;
+    if (!s_vk.tex_ready[unit])
+        vk_tex_miss_vtable(t, RSX_TEX_MISS_OTHER, w, h, row_pitch, levels);
     free(buf);
     s_vk.tex_sampler[unit] = s_vk.tex_ready[unit] ? vk_unit_sampler(t) : VK_NULL_HANDLE;
     if (unit == 0) vk_write_texture_descriptor();
@@ -2218,11 +2241,36 @@ static void vk_present_enqueue(u32 slot, u32 idx, VkSemaphore done)
     pthread_mutex_unlock(&s_vk.present_q_mu);
 }
 
+/* PS3RECOMP_VK_PRESENT_NEW_ONLY=1: present the window only when the title
+ * requested a new flip since the last window present. The frame clock's outer
+ * pass also presents when s_flip_request_count changes, and SetPrepareFlip
+ * bumps that count without presenting a frame, so the window was re-presenting
+ * the frame already on screen; MangoHud's row rate (one per vkQueuePresentKHR)
+ * then read above the [flip] rate. Boot presents (no flip yet) stay free so
+ * the window is not black while the title starts. Default off. */
+static int s_present_new_only = -1;
+static u32 s_last_present_frame;
+
+static int vk_present_new_only_on(void)
+{
+    if (s_present_new_only < 0) {
+        const char* e = getenv("PS3RECOMP_VK_PRESENT_NEW_ONLY");
+        s_present_new_only = e && *e && strcmp(e, "0") != 0;
+    }
+    return s_present_new_only;
+}
+
 /* Blit the offscreen target into the next swapchain image and hand the
  * present to the presentation thread. */
 static void vk_present_window(void)
 {
     if (!s_vk.windowed || !s_vk.swapchain) return;
+
+    if (vk_present_new_only_on()) {
+        const u32 frame = cellGcm_flip_frame_count();
+        if (frame && frame == s_last_present_frame) return;
+        s_last_present_frame = frame;
+    }
 
     /* The thread saw the swapchain go stale; drain it before replacing the
      * swapchain out from under queued presents. */
@@ -4430,6 +4478,20 @@ static VkDescriptorSet vk_eng_write_descriptors_to(const vk_eng_pipe* P, VkDescr
         VkImageView v = ((s_e2.tex_mask >> u) & 1u) ? vk_eng_sample_view(s_e2.tex[u], cube)
                                                      : VK_NULL_HANDLE;
         VkSampler smp = v ? vk_eng_sampler(&s_e2.samp[u]) : s_vk.sampler;
+        /* A bound handle whose kind/cube does not match the unit samples the
+         * dummy. Handles that failed to resolve were counted by the engine. */
+        if (!v && s_e2.tex[u] && s_e2.tex[u] < VK_ENG_MAX_OBJ) {
+            const vk_eng_obj* o = &s_eobj[s_e2.tex[u]];
+            /* A surface_view is already counted by the engine with the
+             * texture's guest address; counting it here too would double the
+             * census. Other kinds (or a cube mismatch on a texture) are only
+             * visible from this side. kind in bits 8-15, VkFormat in 0-7. */
+            if (o->kind != VK_ENG_VIEW) {
+                const u32 tag = ((u32)o->kind << 8) | ((u32)o->fmt & 0xFFu);
+                rsx_tex_miss_note(RSX_TEX_MISS_OTHER, 0, s_e2.tex[u], tag,
+                                  o->w, o->h, 0, o->mips, o->cube, 0, 0);
+            }
+        }
         ii[u] = (VkDescriptorImageInfo){ VK_NULL_HANDLE,
                                          v ? v : (cube ? dummy_cube : s_vk.dummy.view),
                                          VK_IMAGE_LAYOUT_GENERAL };

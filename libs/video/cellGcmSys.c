@@ -107,6 +107,28 @@ u32 cellGcm_flip_request_count(void)
 {
     return s_flip_request_count;
 }
+
+/* Flips the title actually requested (SetFlipCommand / a FIFO flip marker),
+ * not SetPrepareFlip (which the title also calls, but presents nothing and
+ * does not count as a [flip]). PS3RECOMP_VK_PRESENT_NEW_ONLY uses this as the
+ * "a new guest frame was produced" edge: it drops the re-present of the frame
+ * already on screen, which the frame clock's outer pass makes when
+ * s_flip_request_count has advanced (SetPrepareFlip increments that one). */
+static volatile u32 s_flip_frame_count = 0;
+
+u32 cellGcm_flip_frame_count(void)
+{
+    return s_flip_frame_count;
+}
+
+static void gcm_flip_requested(void)
+{
+#if defined(_WIN32)
+    InterlockedIncrement((volatile LONG*)&s_flip_frame_count);
+#else
+    __atomic_fetch_add(&s_flip_frame_count, 1u, __ATOMIC_RELAXED);
+#endif
+}
 static u32  s_debug_level = CELL_GCM_DEBUG_LEVEL0;
 
 /* Display buffers */
@@ -3543,6 +3565,7 @@ u32 cellGcm_display_buffer_count(void)
 
 static s32 gcm_flip_request(u32 bufferId, int in_fifo)
 {
+    gcm_flip_requested();
     /* GCM_FLIPCOUNT=1: every flip, with a timestamp. FLIP_DBG caps at 20 lines,
      * which answers "did it ever flip?" and not "is it still flipping, and how
      * fast?" -- the question that matters when a title stops appearing on

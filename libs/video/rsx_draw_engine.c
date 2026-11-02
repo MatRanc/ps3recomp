@@ -22,6 +22,8 @@
  * own translation unit: every build of the engine -- the runtime library and
  * the many fixtures that compile this file directly -- gets it this way. */
 #include "rsx_wcb.c"
+#include "rsx_tex_miss.h"
+#include "rsx_tex_miss.c"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -1937,6 +1939,10 @@ static int eng_staging_reserve(u32 bytes)
     return 1;
 }
 
+/* Why the last eng_texture_slot answer was 0. Set on every failing return so
+ * the census in sink_bind_textures can attribute the dummy fallback. */
+static unsigned s_tex_miss_reason;
+
 /* Decode a guest texture out of guest memory and hand every face and level to
  * the backend. Returns the backend handle, or 0. `into`, when nonzero, is an
  * existing 2D texture of exactly this key to rewrite instead of creating one
@@ -1947,7 +1953,7 @@ static u32 eng_texture_upload(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
 {
     rsx_tex_level lv[RSX_MAX_TEXTURE_LEVELS];
     const u32 nlv = rsx_texture_mip_chain(fmt, w, h, levels, pitch, lv);
-    if (!nlv || !lv[0].tl.face_bytes) return 0;
+    if (!nlv || !lv[0].tl.face_bytes) { s_tex_miss_reason = RSX_TEX_MISS_FORMAT; return 0; }
     /* A volume: every slice of every level decoded and uploaded on its own.
      * inFAMOUS 2's occlusion volumes read an 8x8x8 cone LUT; uploaded as its
      * first slice and sampled in 2D it darkened whole boxes round every prop. */
@@ -1955,10 +1961,10 @@ static u32 eng_texture_upload(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
         !lv[0].tl.compressed && lv[0].tl.bytes_per_texel) {
         const u32 span = eng_texture_span_3d(fmt, w, h, depth, levels, pitch);
         const u8* src = eng_guest_ptr(NULL, location, offset, span);
-        if (!src) return 0;
+        if (!src) { s_tex_miss_reason = RSX_TEX_MISS_ADDRESS; return 0; }
         const u32 handle = g.be->texture_create_3d(g.be->user, eng_texfmt(lv[0].tl.fmt),
                                                    w, h, depth, nlv, remap, fmt);
-        if (!handle) return 0;
+        if (!handle) { s_tex_miss_reason = RSX_TEX_MISS_OTHER; return 0; }
         const u8* level_src = src;
         u32 d = depth;
         for (u32 m = 0; m < nlv; m++) {
@@ -1966,6 +1972,7 @@ static u32 eng_texture_upload(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
             const u32 lin_bytes = tl->swizzled ? tl->row_bytes * tl->rows : 0u;
             if (!eng_staging_reserve(tl->dst_row_bytes * tl->rows + lin_bytes)) {
                 g.be->texture_release(g.be->user, handle);
+                s_tex_miss_reason = RSX_TEX_MISS_OTHER;
                 return 0;
             }
             for (u32 z = 0; z < d; z++) {
@@ -1993,11 +2000,11 @@ static u32 eng_texture_upload(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
         ? rsx_texture_cube_face_stride(fmt, w, h, levels, pitch) : 0u;
     const u32 span = eng_texture_span(fmt, w, h, levels, pitch, cube);
     const u8* src = eng_guest_ptr(NULL, location, offset, span);
-    if (!src) return 0;
+    if (!src) { s_tex_miss_reason = RSX_TEX_MISS_ADDRESS; return 0; }
 
     const u32 handle = into ? into
         : g.be->texture_create(g.be->user, eng_texfmt(lv[0].tl.fmt), w, h, nlv, faces, remap, fmt);
-    if (!handle) return 0;
+    if (!handle) { s_tex_miss_reason = RSX_TEX_MISS_OTHER; return 0; }
 
     for (u32 f = 0; f < faces; f++) {
         const u8* face = src + (size_t)f * face_stride;
@@ -2005,6 +2012,7 @@ static u32 eng_texture_upload(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
             const rsx_tex_layout* tl = &lv[m].tl;
             if (!eng_staging_reserve(tl->dst_row_bytes * tl->rows)) {
                 if (!into) g.be->texture_release(g.be->user, handle);
+                s_tex_miss_reason = RSX_TEX_MISS_OTHER;
                 return 0;
             }
             rsx_texture_decode(g.tex_staging, tl->dst_row_bytes,
@@ -2031,11 +2039,18 @@ static u32 eng_texture_slot(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
                             u32 levels, u32 pitch, int cube, u32 remap, u32 depth)
 {
     s_tslot_last = ENG_INVALID;
-    if (!w || !h || w > ENG_MAX_TEX_DIM || h > ENG_MAX_TEX_DIM) return 0;
+    s_tex_miss_reason = RSX_TEX_MISS_OTHER;
+    if (!w || !h || w > ENG_MAX_TEX_DIM || h > ENG_MAX_TEX_DIM) {
+        s_tex_miss_reason = RSX_TEX_MISS_SIZE;
+        return 0;
+    }
     if (!depth) depth = 1;
     const u32 span = depth > 1 ? eng_texture_span_3d(fmt, w, h, depth, levels, pitch)
                                : eng_texture_span(fmt, w, h, levels, pitch, cube);
-    if (!span) return 0;
+    if (!span) {
+        s_tex_miss_reason = RSX_TEX_MISS_FORMAT;
+        return 0;
+    }
 
     /* A scene binds the same few hundred textures every frame, and a linear
      * scan of the whole cache per bind averaged several hundred entries.
@@ -3914,6 +3929,24 @@ static int eng_target_at(u32 location, u32 offset)
     return 0;
 }
 
+/* The shader/draw the current texture binding belongs to, for the dummy
+ * census. Set just before sink_bind_textures() in the draw path. */
+static u64 s_miss_fp_hash;
+static u32 s_miss_pipeline;
+
+static void eng_tex_miss_note_reason(u32 u, const rsx_dsp_texture* t, unsigned reason)
+{
+    rsx_tex_miss_note(reason, t->location, t->offset, t->format,
+                      t->width, t->height, t->pitch, t->mipmaps, t->cubemap,
+                      s_miss_fp_hash, s_miss_pipeline);
+    (void)u;
+}
+
+static void eng_tex_miss_note_unit(u32 u, const rsx_dsp_texture* t)
+{
+    eng_tex_miss_note_reason(u, t, s_tex_miss_reason);
+}
+
 static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
                               u32 current_zslot, u32 tex_used,
                               u32 textures[RSX_BE_MAX_TEXTURES],
@@ -3992,15 +4025,22 @@ static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
              * anything else goes through guest memory. */
             if (base_fmt == RSX_TEX_FMT_DEPTH24_D8 && current_zslot != (u32)zsrc) {
                 const u32 snap = eng_zdepth_snapshot((u32)zsrc, t.width, t.height);
-                if (snap) { textures[u] = snap; continue; }
+                if (snap) {
+                    if (t.cubemap) eng_tex_miss_note_reason(u, &t, RSX_TEX_MISS_SURFACE);
+                    textures[u] = snap; continue;
+                }
             }
             const u32 conv = eng_zdepth_as_color((u32)zsrc, &t);
-            if (conv) { textures[u] = conv; continue; }
+            if (conv) {
+                if (t.cubemap) eng_tex_miss_note_reason(u, &t, RSX_TEX_MISS_SURFACE);
+                textures[u] = conv; continue;
+            }
             if (eng_zdepth_to_guest((u32)zsrc)) {
                 textures[u] = eng_texture_slot(t.location, t.offset, t.format,
                                                t.width, t.height, t.mipmaps, t.pitch,
                                                (int)t.cubemap, t.remap & 0xFFFFu,
                                        (t.dimension == 3 && !t.cubemap) ? t.depth : 1u);
+                if (!textures[u]) eng_tex_miss_note_unit(u, &t);
                 continue;
             }
         }
@@ -4028,6 +4068,7 @@ static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
             } else {
                 return eng_color_feedback_failure(u, s, &t);
             }
+            if (t.cubemap) eng_tex_miss_note_reason(u, &t, RSX_TEX_MISS_SURFACE);
             continue;
         }
         if (sampled >= 0 && zsrc < 0 &&
@@ -4038,6 +4079,8 @@ static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
                                            t.width, t.height, t.mipmaps, t.pitch,
                                            (int)t.cubemap, t.remap & 0xFFFFu,
                                        (t.dimension == 3 && !t.cubemap) ? t.depth : 1u);
+            if (!textures[u]) eng_tex_miss_note_unit(u, &t);
+            else if (t.cubemap) eng_tex_miss_note_reason(u, &t, RSX_TEX_MISS_SURFACE);
             continue;
         }
         if (sampled >= 0) {
@@ -4046,6 +4089,7 @@ static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
                                      t.remap & 0xFFFFu, t.format)
                 : 0;
             textures[u] = view ? view : g.surfaces[sampled].handle;
+            if (t.cubemap) eng_tex_miss_note_reason(u, &t, RSX_TEX_MISS_SURFACE);
             continue;
         }
         if (base_fmt == RSX_TEX_FMT_DEPTH24_D8) {
@@ -4054,7 +4098,10 @@ static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
                     g.zdepths[i].offset == t.offset && current_zslot != i) {
                     g.zdepths[i].last_use = g.frames;
                     const u32 snap = eng_zdepth_snapshot(i, t.width, t.height);
-                    if (snap) textures[u] = snap;
+                    if (snap) {
+                        if (t.cubemap) eng_tex_miss_note_reason(u, &t, RSX_TEX_MISS_SURFACE);
+                        textures[u] = snap;
+                    }
                     break;
                 }
             if (textures[u]) continue;
@@ -4063,6 +4110,7 @@ static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
                                        t.width, t.height, t.mipmaps, t.pitch,
                                        (int)t.cubemap, t.remap & 0xFFFFu,
                                        (t.dimension == 3 && !t.cubemap) ? t.depth : 1u);
+        if (!textures[u]) eng_tex_miss_note_unit(u, &t);
         if (s_texmemo_on && textures[u] && s_tslot_last != ENG_INVALID &&
             !eng_target_at(t.location, t.offset)) {
             mm->t = t; mm->samp = samplers[u];
@@ -4772,6 +4820,8 @@ static void sink_end_work(void* user, const rsx_dispatch* r)
     memset(vtextures, 0, sizeof vtextures);
     memset(vsamplers, 0, sizeof vsamplers);
     if (wp) wp_t0 = rsx_wprof_now();
+    s_miss_fp_hash = fp_hash;
+    s_miss_pipeline = pipeline;
     const u32 tex_mask = sink_bind_textures(targets, n_targets, zslot, tex_used,
                                             textures, samplers);
     if (wp) wprof_phase(RSX_WPROF_TEX, rsx_wprof_now() - wp_t0);
@@ -5170,6 +5220,7 @@ static void eng_present(u32 buffer_id)
     g.last_present_surface = target;
     g.be->present(g.be->user, g.surfaces[target].handle);
     g.frames++;
+    rsx_tex_miss_frame(stderr, g.frames);
     g.last_guest_draws = g.guest_draws;
     g.guest_draws = 0;
     eng_wcb_frame_tick();
@@ -5297,6 +5348,7 @@ void rsx_draw_engine_shutdown(void)
     }
     if (g.ready && g.be->shutdown) g.be->shutdown(g.be->user);
 
+    rsx_tex_miss_flush(stderr);
     rsx_draw_engine_set_guest_memory(NULL, NULL);
     eng_fast_free_caches();
     free(dc.refs); free(dc.cuts); free(dc.verts); free(dc.immediate);

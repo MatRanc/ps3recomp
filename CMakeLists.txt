@@ -46,6 +46,7 @@ list(FILTER HLE_SOURCES EXCLUDE REGEX "/tests/")
 # Compiled inside rsx_draw_engine.c (#included), so every build of the engine,
 # test fixtures included, gets it without listing it.
 list(FILTER HLE_SOURCES EXCLUDE REGEX "rsx_wcb\\.c$")
+list(FILTER HLE_SOURCES EXCLUDE REGEX "rsx_tex_miss\\.c$")
 
 # The Vulkan RSX backend is opt-in while it grows (stage V0: clear + present).
 # It loads libvulkan at run time, so building needs only the Vulkan headers --

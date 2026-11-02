@@ -56,6 +56,7 @@ FIXTURES = {
     'test_rsx_primitives': ENGINE,
     'test_rsx_texture_gamma': ENGINE,
     'test_rsx_texture_offset': ENGINE,
+    'test_rsx_tex_miss': [V + 'rsx_tex_miss.c'],
     'test_rsx_transform_constants': ENGINE,
     'test_rsx_vp_run': ENGINE,
     'test_shadow_engine': ENGINE,
