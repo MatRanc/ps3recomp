@@ -106,6 +106,7 @@ enum ps3_tr_ev {
     /* instants */
     PS3_TR_GCM_FLIP,           /* the RSX reached a flip: a = buffer                */
     PS3_TR_GCM_FLIP_REQ,       /* the guest queued a flip: a = buffer, b = 1 if through the FIFO */
+    PS3_TR_GCM_FLIP_VB,        /* a flip was queued: a = request count, b = vblank count at that moment */
     PS3_TR_GCM_FLIP_DONE,      /* the vblank tick completed the outstanding flip: a = request number */
     /* c690 / SPURS producer side (walker-wait attribution) */
     PS3_TR_SPU_OVERLAY_LOAD,   /* a streamed job module became resident: a = content EA, b = image id */
@@ -162,6 +163,7 @@ static inline const ps3_tr_desc* ps3_tr_desc_of(uint32_t ev)
         { "ppu.usleep",         "ppu",   PS3_TR_PH_SPAN,    0, "usec", "lr" },
         { "gcm.flip",           "gcm",   PS3_TR_PH_INSTANT, 0, "buffer", 0 },
         { "gcm.flip_request",   "gcm",   PS3_TR_PH_INSTANT, 0, "buffer", "fifo" },
+        { "gcm.flip_vb",        "gcm",   PS3_TR_PH_INSTANT, 0, "flip", "vblank" },
         { "gcm.flip_done",      "gcm",   PS3_TR_PH_INSTANT, 0, "request", 0 },
         { "spu.overlay_load",   "spu",   PS3_TR_PH_INSTANT, 1, "ea", "image" },
         { "spurs.kick",         "spurs", PS3_TR_PH_INSTANT, 0, "wid", "lane_ready" },

@@ -3558,7 +3558,8 @@ static s32 gcm_flip_request(u32 bufferId, int in_fifo)
           if (!t0) t0 = now;
           ++n;
           if (n <= 400ull || (n % 10ull) == 0)
-              fprintf(stderr, "[flip] %llu at %llu ms%c", n, now - t0, 10);
+              fprintf(stderr, "[flip] %llu at %llu ms vc=%u%c", n, now - t0,
+                      s_vblank_count, 10);
       } }
 
     /* GCM_FLIP_BT=<n>: dump the flipping thread's guest stack for the flips
@@ -3621,6 +3622,11 @@ static s32 gcm_flip_request(u32 bufferId, int in_fifo)
     if (PS3_FT_ON()) { const uint64_t t = ps3_ft_now();
                        ps3_ft_span(PS3_FT_FLIP_REQ, 0, bufferId, (uint32_t)in_fifo, t, t); }
     ps3_trace_instant(PS3_TR_GCM_FLIP_REQ, bufferId, (uint32_t)in_fifo);
+    /* The [flip] lines carry the vblank counter and the trace carries
+     * (request, vblank) on every flip: the tick count per flip is what
+     * separates a guest frame that is simply longer than a tick from one the
+     * title deliberately paces to two vblanks. */
+    ps3_trace_instant(PS3_TR_GCM_FLIP_VB, s_flip_request_count, s_vblank_count);
 
     /* Invoke via OPD resolution, not a raw call into guest code.
      *
