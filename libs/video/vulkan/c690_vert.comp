@@ -1,0 +1,123 @@
+#version 450
+
+// c690 (SPU 0x6D68) position unpack / dequantize.
+//
+// Reads an MSB-first packed bitstream out of the local-store image and writes
+// interleaved 16-byte AoS vertex slots (x, y, z, w_const).
+//
+// Per component the SPU trick is:
+//     a     = uintBitsToFloat(0x3F800000u + B + 4*F)
+//     value = fma(a, A, C)
+// with F the unsigned packed field.  The SPU single-precision fast path
+// (SPU_FAST_FLOAT) flushes any operand/result whose biased exponent is zero to
+// +0, so every float road in and out goes through ftz().  A, B and C are the
+// captured coefficient GPRs (sr11, sr10, sr12) and lane 3 has no field: it is
+// the constant produced by the unused lane-3 coefficient (F = 0), which must
+// be replicated rather than zeroed.
+//
+// The default captured format is 12/12/11 over 192 vertices.  Widths, bit
+// stride, in/out byte bases and the coefficient vectors are push constants so
+// later formats can reuse the same kernel.
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, binding = 0) readonly buffer InputBuffer {
+    uint raw[];
+};
+
+layout(std430, binding = 1) buffer OutputBuffer {
+    uint out_words[];
+};
+
+layout(push_constant) uniform PushConstants {
+    uint in_base;       // byte offset of the packed stream in InputBuffer
+    uint out_base;      // byte offset of the first AoS slot in OutputBuffer
+    uint vertex_count;  // number of vertices (192 here)
+    uint stride_bits;   // bits between vertices (35 = 12+12+11)
+    uint bits_x;        // 12
+    uint bits_y;        // 12
+    uint bits_z;        // 11
+    uint pad0;
+    uvec4 A;            // sr11 coefficient (per lane)
+    uvec4 B;            // sr10 bias / exponent payload (per lane)
+    uvec4 C;            // sr12 offset (per lane)
+} pc;
+
+uint byte_at(uint b)
+{
+    return (raw[b >> 2u] >> ((b & 3u) * 8u)) & 0xFFu;
+}
+
+// Four consecutive stream bytes as one MSB-first 32-bit word.
+uint be32_at_byte(uint b)
+{
+    return (byte_at(b) << 24u) |
+           (byte_at(b + 1u) << 16u) |
+           (byte_at(b + 2u) << 8u) |
+           byte_at(b + 3u);
+}
+
+// MSB-first extraction of n <= 32 bits starting at global bit position p.
+// A 64-bit window is formed from two big-endian words so a field may cross a
+// 32-bit boundary; this keeps the kernel valid for wider future formats.
+uint read_bits(uint p, uint n)
+{
+    uint sh = p & 7u;
+    uint b = p >> 3u;
+    uint w0 = be32_at_byte(b);
+    uint w1 = be32_at_byte(b + 4u);
+    uint win = (w0 << sh) | ((sh == 0u) ? 0u : (w1 >> (32u - sh)));
+    return win >> (32u - n);
+}
+
+// SPU_FAST_FLOAT: a lane with a zero biased exponent becomes +0.
+uint ftz(uint v)
+{
+    return ((v & 0x7F800000u) == 0u) ? 0u : v;
+}
+
+uint bswap32(uint v)
+{
+    return (v >> 24u) |
+           ((v >> 8u) & 0x0000FF00u) |
+           ((v << 8u) & 0x00FF0000u) |
+           (v << 24u);
+}
+
+void main()
+{
+    uint vid = gl_GlobalInvocationID.x;
+    if (vid >= pc.vertex_count)
+        return;
+
+    uint bitpos = pc.in_base * 8u + vid * pc.stride_bits;
+
+    uint fx = read_bits(bitpos, pc.bits_x);
+    uint fy = read_bits(bitpos + pc.bits_x, pc.bits_y);
+    uint fz = read_bits(bitpos + pc.bits_x + pc.bits_y, pc.bits_z);
+
+    // 0x3F800000 + B + 4*F, with lane 3 having no field (F = 0).
+    uvec4 abits;
+    abits.x = 0x3F800000u + pc.B.x + (fx << 2u);
+    abits.y = 0x3F800000u + pc.B.y + (fy << 2u);
+    abits.z = 0x3F800000u + pc.B.z + (fz << 2u);
+    abits.w = 0x3F800000u + pc.B.w;
+
+    uvec4 a = uvec4(ftz(abits.x), ftz(abits.y), ftz(abits.z), ftz(abits.w));
+    uvec4 ca = uvec4(ftz(pc.A.x), ftz(pc.A.y), ftz(pc.A.z), ftz(pc.A.w));
+    uvec4 cc = uvec4(ftz(pc.C.x), ftz(pc.C.y), ftz(pc.C.z), ftz(pc.C.w));
+
+    vec4 r = fma(uintBitsToFloat(a), uintBitsToFloat(ca), uintBitsToFloat(cc));
+
+    uvec4 rb = uvec4(ftz(floatBitsToUint(r.x)),
+                     ftz(floatBitsToUint(r.y)),
+                     ftz(floatBitsToUint(r.z)),
+                     ftz(floatBitsToUint(r.w)));
+
+    // Local-store writes are big-endian per 32-bit lane.
+    uint o = pc.out_base + vid * 16u;
+    out_words[(o + 0u) >> 2u]  = bswap32(rb.x);
+    out_words[(o + 4u) >> 2u]  = bswap32(rb.y);
+    out_words[(o + 8u) >> 2u]  = bswap32(rb.z);
+    out_words[(o + 12u) >> 2u] = bswap32(rb.w);
+}
