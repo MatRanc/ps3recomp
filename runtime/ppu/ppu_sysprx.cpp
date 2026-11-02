@@ -28,6 +28,10 @@ extern "C" uint64_t host_monotonic_ns(void);
 #endif
 #include "ps3emu/log_first.h"
 #include "ps3emu/ps3_trace.h"   /* PS3RECOMP_TRACE: lwmutex / lwcond waits */
+#include "ps3_live_ctl.h"       /* EXP_FAST_WAKE: live lwcond recheck switch */
+#ifndef _WIN32
+#include <sched.h>
+#endif
 
 extern "C" uint8_t* vm_base;
 extern "C" void ps3_hle_register_ctx(uint32_t nid, const char* name, void (*fn)(ppu_context*));
@@ -508,7 +512,18 @@ static void sys_lwcond_wait(ppu_context* ctx)
         vm_write32(lwmutex + LWM_OWNER, 0);
         ppu_thread_note_block(ctx->thread_id);
         lwm_release(sl);
-        Sleep(1);
+        /* EXP_FAST_WAKE: the 1 ms recheck is the cadence every guest cond
+         * wait (including the GCM ref wait) wakes at. Yielding instead of
+         * sleeping is a ceiling test for wake latency, not a fix. */
+        if (ps3_live_ctl_get && ps3_live_ctl_get(PS3_LIVE_EXP_FAST_WAKE)) {
+#ifdef _WIN32
+            Sleep(0);
+#else
+            sched_yield();
+#endif
+        } else {
+            Sleep(1);
+        }
         lwm_acquire(sl, 0);
         vm_write32(lwmutex + LWM_OWNER, own);
         vm_write32(lwmutex + LWM_RECUR, rc ? rc : 1);

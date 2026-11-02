@@ -43,6 +43,10 @@ u32 cellGcmResolveIO(u32 offset);
 /* The guest VM's OOB guard: the size a host backed, or 0 for "the whole 32-bit
  * space is backed and no check is needed" (runtime/memory/vm.h). */
 extern u32 ppu_vm_size;
+/* cellGcmSys.c: monotonic ms, same epoch as the [flip] lines. Weak so the
+ * offline engine fixtures (which compile this file alone) still link; the
+ * `at=` field is then 0 and simply unused. */
+extern unsigned long long ps3_ms_now(void) __attribute__((weak));
 
 /* ------------------------------------------------------------------------- */
 
@@ -279,6 +283,10 @@ typedef struct {
 } eng_pipe_memo;
 
 static int s_walker_fast;
+/* EXP_NO_DRAW: live throwaway switch. When on, sink_end returns before any
+ * fetch, pipeline, texture or Vulkan recording; the method stream (and so
+ * fences, labels and flips) still dispatches exactly as before. */
+static int s_no_draw;
 static u32 s_fast_epoch = 1;
 static unsigned long long s_fetch_hits, s_fetch_misses;
 static unsigned long long s_pipe_hits, s_pipe_misses;
@@ -308,6 +316,25 @@ static void eng_fast_free_caches(void)
     memset(s_fmemo, 0, sizeof s_fmemo);
     memset(s_pmemo, 0, sizeof s_pmemo);
     s_fmemo_next = s_pmemo_next = 0;
+}
+
+/* Live switch setters. cellGcmSys.c owns the PS3RECOMP_CTL dependency (a
+ * standalone engine fixture compiles this file without the control module),
+ * and calls these once per drain pass. A walker-fast change flushes both
+ * memos so the arm measures the path it names from its first draw. */
+void rsx_draw_engine_set_walker_fast(int on)
+{
+    if (on != s_walker_fast) {
+        s_walker_fast = on;
+        eng_fast_reset_caches();
+        fprintf(stderr, "[live] PS3RECOMP_WALKER_FAST=%d: fetch/pipeline memos flushed\n",
+                on);
+    }
+}
+
+void rsx_draw_engine_set_no_draw(int on)
+{
+    s_no_draw = on;
 }
 
 /* The decompilers' HLSL. The VP decompiler builds bodies up to 192 KB. */
@@ -392,6 +419,20 @@ static unsigned long long s_wp_draws;
 static unsigned long long s_wp_flips;
 static unsigned long long s_wp_frames;
 static int s_wp_flip;
+/* Draw-source split: draws fed from the five SPU mesh rings vs everything
+ * else, and the sink_end time each class cost. EA range is the one in
+ * docs/progress.md (2026-10-27 night): five 2 MB rings at 0x11900000..0x12100000. */
+#define ENG_MESH_EA_LO 0x11900000u
+#define ENG_MESH_EA_HI 0x12300000u
+static unsigned long long s_wp_main_draws, s_wp_mesh_draws;
+static unsigned long long s_wp_main_ns, s_wp_mesh_ns;
+/* Pipeline creation inside the walker (vkCreate*Pipelines), fed by the
+ * Vulkan backend. The `pipe` phase includes it; this separates it. */
+static unsigned long long s_wp_pipe_create_ns, s_wp_pipe_create_n;
+/* Base for the `at=` field, the same clock and near the same epoch as the
+ * guest [flip] lines (first flip). */
+static unsigned long long s_wp_t0_ms;
+static unsigned long long s_wp_last_at_ns;
 
 int rsx_wprof_enabled(void)
 {
@@ -422,7 +463,16 @@ void rsx_wprof_note_dispatch(unsigned long long ns)
 
 void rsx_wprof_note_flip(void)
 {
-    if (s_wprof > 0) { s_wp_flip = 1; s_wp_flips++; }
+    if (s_wprof > 0) {
+        if (!s_wp_t0_ms && ps3_ms_now) s_wp_t0_ms = ps3_ms_now();
+        s_wp_flip = 1;
+        s_wp_flips++;
+    }
+}
+
+void rsx_wprof_note_pipeline_create(unsigned long long ns)
+{
+    if (s_wprof > 0) { s_wp_pipe_create_ns += ns; s_wp_pipe_create_n++; }
 }
 
 static void wprof_phase(int phase, unsigned long long ns)
@@ -443,17 +493,36 @@ void rsx_wprof_drain_end(void)
     for (int i = 0; i < RSX_WPROF_PHASES; i++) sum += (double)s_wp_ns[i] / 1e6 / f;
     const double parse = drain > disp ? drain - disp : 0.0;
     const double other = disp > sum ? disp - sum : 0.0;
+    /* Wall time since the previous report, per frame. The difference from the
+     * walker's own drain time is the wait (idle/park/present), the split the
+     * critical-path doc reports as drain vs put_wait. */
+    const unsigned long long now_ns = rsx_wprof_now();
+    double wait = 0.0;
+    if (s_wp_last_at_ns) {
+        const double wall = (double)(now_ns - s_wp_last_at_ns) / 1e6 / f;
+        wait = wall > drain ? wall - drain : 0.0;
+    }
+    s_wp_last_at_ns = now_ns;
+    const unsigned long long at_ms =
+        (s_wp_t0_ms && ps3_ms_now)
+            ? (unsigned long long)(ps3_ms_now() - s_wp_t0_ms) : 0;
     fprintf(stderr,
-            "[walker-prof] report=%llu flips=%llu draws=%.1f walker=%.3fms "
-            "engine=%.3fms parse=%.3fms fetch=%.3f tex=%.3f pipe=%.3f "
-            "bind=%.3f draw=%.3f other=%.3f | n/fetch=%.1f tex=%.1f "
+            "[walker-prof] at=%llums report=%llu flips=%llu draws=%.1f "
+            "walker=%.3fms wait=%.3fms engine=%.3fms parse=%.3fms "
+            "fetch=%.3f tex=%.3f pipe=%.3f bind=%.3f draw=%.3f other=%.3f "
+            "| src_main=%.1f src_mesh=%.1f mainms=%.3f meshms=%.3f "
+            "pipecrt=%llu pipems=%.3f | n/fetch=%.1f tex=%.1f "
             "pipe=%.1f bind=%.1f draw=%.1f\n",
-            s_wp_frames, s_wp_flips, (double)s_wp_draws / f, drain, disp, parse,
+            at_ms, s_wp_frames, s_wp_flips, (double)s_wp_draws / f,
+            drain, wait, disp, parse,
             (double)s_wp_ns[RSX_WPROF_FETCH] / 1e6 / f,
             (double)s_wp_ns[RSX_WPROF_TEX] / 1e6 / f,
             (double)s_wp_ns[RSX_WPROF_PIPE] / 1e6 / f,
             (double)s_wp_ns[RSX_WPROF_BIND] / 1e6 / f,
             (double)s_wp_ns[RSX_WPROF_DRAW] / 1e6 / f, other,
+            (double)s_wp_main_draws / f, (double)s_wp_mesh_draws / f,
+            (double)s_wp_main_ns / 1e6 / f, (double)s_wp_mesh_ns / 1e6 / f,
+            s_wp_pipe_create_n, (double)s_wp_pipe_create_ns / 1e6 / f,
             (double)s_wp_n[RSX_WPROF_FETCH] / f,
             (double)s_wp_n[RSX_WPROF_TEX] / f,
             (double)s_wp_n[RSX_WPROF_PIPE] / f,
@@ -463,6 +532,9 @@ void rsx_wprof_drain_end(void)
     memset(s_wp_ns, 0, sizeof s_wp_ns);
     memset(s_wp_n, 0, sizeof s_wp_n);
     s_wp_drain_ns = s_wp_dispatch_ns = s_wp_draws = s_wp_flips = 0;
+    s_wp_main_draws = s_wp_mesh_draws = 0;
+    s_wp_main_ns = s_wp_mesh_ns = 0;
+    s_wp_pipe_create_ns = s_wp_pipe_create_n = 0;
     s_wp_flip = 0;
     s_wp_frames++;
 }
@@ -4604,12 +4676,18 @@ static void eng_check_gpu_vertex_offload(rsx_vtx_gpu_desc* desc, u32 uploaded)
     else s_eng_eligible_m3++;
 }
 
-static void sink_end(void* user, const rsx_dispatch* r)
+static void sink_end_work(void* user, const rsx_dispatch* r)
 {
     (void)user; (void)r;
     const int wp = s_wprof > 0;
     unsigned long long wp_t0 = wp ? rsx_wprof_now() : 0;
     if (wp) s_wp_draws++;
+    /* EXP_NO_DRAW ceiling: the draw's own work is gone (fetch plan, texture
+     * decode, pipeline lookup/create, and every backend/Vulkan recording).
+     * Everything that makes a fence visible lives in cellGcmSys/rsx_commands,
+     * not here; the flips keep coming and the image is whatever was last
+     * presented. WCB arms must be off: readback needs the real draws. */
+    if (s_no_draw) return;
     if (!g.ready || !dc.n_packets || !dc.fetch_ok) return;
     /* Mixed geometry sources have no defined concatenation here. Reject the
      * whole group instead of drawing partial/misordered geometry. */
@@ -4873,6 +4951,38 @@ static void sink_end(void* user, const rsx_dispatch* r)
     }
 }
 
+/* Draw source: a group whose active vertex arrays were resolved into one of
+ * the five 2 MB mesh rings is a draw the SPU job filled (the 0x90-byte slots
+ * in the command ring point here); everything else -- the PPU-built ring,
+ * inline/immediate geometry -- is the main source. */
+static int dc_source_is_mesh(void)
+{
+    if (dc.n_immediate || dc.inl || dc.fetch_plan.inline_data) return 0;
+    for (u32 a = 0; a < RSX_DSP_NUM_VERTEX_ATTR; a++) {
+        const u8* b = dc.fetch_plan.attr[a].stable_base;
+        if (!b) continue;
+        const uintptr_t ea = (uintptr_t)b - (uintptr_t)vm_base;
+        if (ea >= ENG_MESH_EA_LO && ea < ENG_MESH_EA_HI) return 1;
+    }
+    return 0;
+}
+
+static void sink_end(void* user, const rsx_dispatch* r)
+{
+    if (s_wprof <= 0) { sink_end_work(user, r); return; }
+    const unsigned long long t0 = rsx_wprof_now();
+    sink_end_work(user, r);
+    const unsigned long long ns = rsx_wprof_now() - t0;
+    if (s_no_draw) return;   /* no plan was prepared; the previous one is stale */
+    if (dc_source_is_mesh()) {
+        s_wp_mesh_ns += ns;
+        s_wp_mesh_draws += dc.n_packets;
+    } else {
+        s_wp_main_ns += ns;
+        s_wp_main_draws += dc.n_packets;
+    }
+}
+
 static void sink_clear(void* user, const rsx_dispatch* r, u32 mask)
 {
     (void)user; (void)r;
@@ -5126,6 +5236,8 @@ int rsx_draw_engine_init(u32 width, u32 height)
       s_vtx_remap = !(e && strcmp(e, "0") == 0); }
     { const char* e = getenv("PS3RECOMP_WALKER_FAST");
       s_walker_fast = e && *e && strcmp(e, "0") != 0; }
+    { const char* e = getenv("EXP_NO_DRAW");
+      s_no_draw = e && *e && strcmp(e, "0") != 0; }
     eng_fast_reset_caches();
     memset(s_tmemo, 0, sizeof s_tmemo);
     s_tex_gen++;

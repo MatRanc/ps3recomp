@@ -37,6 +37,7 @@
  * passthrough to <windows.h>; off Windows the toolkit's shim supplies the same
  * names over pthreads and mmap, so the call sites below are written once. */
 #include "win32_compat.h"
+#include "ps3emu/thread_name.h"
 
 #include <stdint.h>
 #include <stdio.h>
@@ -64,6 +65,16 @@
 /* ---------------------------------------------------------------------------
  * What the scaffold gives this file
  * -----------------------------------------------------------------------*/
+/* thread_name.h reaches the pinning helper through a weak symbol so fixtures
+ * that do not link the platform layer still build. Keep the real definition
+ * in this executable's link. */
+extern "C" void ps3_thread_pin_by_name(const char*);
+__attribute__((used)) static void (*s_pin_anchor)(const char*) = ps3_thread_pin_by_name;
+/* Same for PS3RECOMP_CTL: cellGcmSys/ppu_sysprx reference it weakly so the
+ * standalone fixtures link, so this strong reference is what pulls it in. */
+extern "C" int ps3_live_ctl_get(int);
+__attribute__((used)) static int (*s_live_anchor)(int) = ps3_live_ctl_get;
+
 extern "C" {
 uint32_t ppu_load_elf(const char* path);      /* ELF -> guest RAM, returns entry OPD */
 void     ppu_recomp_register(void);           /* generated: lifted table -> address map */
@@ -201,6 +212,9 @@ extern "C" void cellGcm_fifo_kick_wait(unsigned ms);
 
 static DWORD WINAPI frame_clock(LPVOID)
 {
+    /* The RSX walker is this thread (the docs call it that); naming it also
+     * lets PS3RECOMP_PIN give it a physical core of its own. */
+    ps3_thread_name("rsx walker");
     const char* title = getenv("PS3_TITLE");
     if (!title || !*title) title = "ps3recomp";
 

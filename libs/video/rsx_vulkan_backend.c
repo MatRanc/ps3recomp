@@ -50,6 +50,7 @@
 #include "rsx_fp_decompiler.h"
 #include "rsx_shader_spirv.h"
 #include "rsx_draw_engine.h"
+#include "ps3emu/thread_name.h"
 #include "vulkan/rsx_vk_fallback_vert.spv.h"
 #include "vulkan/rsx_vk_fallback_frag.spv.h"
 #include "vulkan/vtx_unpack_comp.spv.h"
@@ -67,6 +68,26 @@
 #include <stdlib.h>
 #include <time.h>
 #include <string.h>
+
+/* Pipeline creation timing: the backend creates every pipeline with a NULL
+ * VkPipelineCache (there is no cache object in this file). These two helpers
+ * feed the walker profile's `pipecrt`/`pipems` and, under
+ * PS3RECOMP_PIPE_TIMING=1, log each creation with its wall time so a
+ * scene-change stutter can be attributed. */
+extern unsigned long long ps3_ms_now(void);
+static void vk_pipe_create_done(const char* what, unsigned long long t0)
+{
+    const unsigned long long ns = rsx_wprof_now() - t0;
+    rsx_wprof_note_pipeline_create(ns);
+    static int on = -1;
+    if (on < 0) {
+        const char* e = getenv("PS3RECOMP_PIPE_TIMING");
+        on = e && *e && strcmp(e, "0") != 0;
+    }
+    if (on)
+        fprintf(stderr, "[pipe-create] %s %.1f us at %llu ms\n",
+                what, (double)ns / 1000.0, ps3_ms_now());
+}
 
 /* ---------------------------------------------------------------------------
  * Run-time loaded entry points (Vulkan 1.0 core only)
@@ -1117,7 +1138,9 @@ static VkPipeline vk_get_pipeline(int ztest, int zwrite, u32 cmp)
         .pDynamicState = &dy, .layout = s_vk.pipe_layout, .renderPass = s_vk.render_pass,
         .subpass = 0 };
     VkPipeline p = VK_NULL_HANDLE;
+    const unsigned long long _pt = rsx_wprof_now();
     VkResult r = pvkCreateGraphicsPipelines(s_vk.device, VK_NULL_HANDLE, 1, &gci, NULL, &p);
+    vk_pipe_create_done("fixed", _pt);
     if (r != VK_SUCCESS) { VK_LOG("vkCreateGraphicsPipelines failed (%d)\n", (int)r); return VK_NULL_HANDLE; }
     s_vk.pipelines[slot] = p;
     return p;
@@ -1458,7 +1481,9 @@ static VkPipeline vk_guest_pipeline(int vs, int fs, int ztest, int zwrite, u32 c
         .pDynamicState = &dy, .layout = s_g.pipe_layout, .renderPass = s_vk.render_pass,
         .subpass = 0 };
     VkPipeline p = VK_NULL_HANDLE;
+    const unsigned long long _pt = rsx_wprof_now();
     VkResult r = pvkCreateGraphicsPipelines(s_vk.device, VK_NULL_HANDLE, 1, &gci, NULL, &p);
+    vk_pipe_create_done("guest", _pt);
     if (r != VK_SUCCESS) {
         VK_LOG("guest pipeline: vkCreateGraphicsPipelines failed (%d)\n", (int)r);
         return VK_NULL_HANDLE;
@@ -2073,6 +2098,7 @@ static uint64_t vk_acquire_timeout_ns(void)
 static void* vk_present_thread_main(void* arg)
 {
     (void)arg;
+    ps3_thread_name("present");
     for (;;) {
         u32 slot, idx;
         VkSemaphore done;
@@ -3696,8 +3722,11 @@ static VkPipeline vk_eng_variant(vk_eng_pipe* P, u32 topo_idx)
         .pViewportState = &vps, .pRasterizationState = &ras, .pMultisampleState = &ms,
         .pDepthStencilState = &ds, .pColorBlendState = &cb, .pDynamicState = &dy,
         .layout = layout, .renderPass = rp, .subpass = 0 };
-    if (pvkCreateGraphicsPipelines(s_vk.device, VK_NULL_HANDLE, 1, &gci, NULL,
-                                   &P->variant[topo_idx]) != VK_SUCCESS) {
+    const unsigned long long _pt = rsx_wprof_now();
+    const VkResult _pr = pvkCreateGraphicsPipelines(s_vk.device, VK_NULL_HANDLE, 1, &gci, NULL,
+                                                    &P->variant[topo_idx]);
+    vk_pipe_create_done("engine", _pt);
+    if (_pr != VK_SUCCESS) {
         VK_LOG("engine: vkCreateGraphicsPipelines failed\n");
         P->variant[topo_idx] = VK_NULL_HANDLE;
     }
@@ -4032,7 +4061,11 @@ static int vk_vtx_unpack_init(void)
         },
         .layout = s_vk.vtx_unpack_layout
     };
-    if (pvkCreateComputePipelines(s_vk.device, VK_NULL_HANDLE, 1, &cpci, NULL, &s_vk.vtx_unpack_pipe) != VK_SUCCESS) {
+    const unsigned long long _pt = rsx_wprof_now();
+    const VkResult _pr = pvkCreateComputePipelines(s_vk.device, VK_NULL_HANDLE, 1, &cpci, NULL,
+                                                   &s_vk.vtx_unpack_pipe);
+    vk_pipe_create_done("compute", _pt);
+    if (_pr != VK_SUCCESS) {
         VK_LOG("gpu vertex unpack: failed to create compute pipeline\n");
         return -1;
     }

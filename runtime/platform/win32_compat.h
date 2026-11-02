@@ -810,6 +810,9 @@ DWORD  GetFileAttributesA(const char* path);
 BOOL   SetThreadPriority(HANDLE h, int priority);
 int    GetThreadPriority(HANDLE h);
 DWORD_PTR SetThreadAffinityMask(HANDLE h, DWORD_PTR mask);
+/* Pin the CALLING thread. Used by the opt-in PS3RECOMP_PIN role mapping
+ * (runtime/platform/thread_affinity.c); the mask is a bit per logical CPU. */
+void   ps3_thread_apply_affinity_self(uint64_t mask);
 DWORD  SetThreadIdealProcessor(HANDLE h, DWORD ideal);
 LONG   SetThreadDescription(HANDLE h, PCWSTR description);   /* HRESULT */
 BOOL   SetPriorityClass(HANDLE process, DWORD cls);

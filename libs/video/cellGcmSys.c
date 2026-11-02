@@ -10,6 +10,7 @@
 
 #include "rsx_live_draw.h"
 #include "rsx_draw_engine.h"
+#include "ps3_live_ctl.h"
 #include "cellGcmSys.h"
 #include "../../runtime/platform/win32_compat.h"
 #include "../../runtime/ppu/ppu_memory.h"   /* vm_write32 (translate + byte-swap, OOB-safe) */
@@ -34,6 +35,7 @@ static u32 s_gcm_context_ea = 0;
 #include <windows.h>
 #else
 #include <time.h>
+#include <sched.h>
 #endif
 
 /* ---------------------------------------------------------------------------
@@ -1899,14 +1901,19 @@ static void gcm_walker_kick(void)
     if (s_gcm_kick_ev) SetEvent(s_gcm_kick_ev);
 }
 
+/* Live switch value, with the environment as the fallback for a fixture that
+ * compiled this file without ps3_live_ctl.c. */
+static int gcm_live_get(int key, const char* env)
+{
+    if (ps3_live_ctl_get) return ps3_live_ctl_get(key);
+    const char* e = getenv(env);
+    return e && *e && strcmp(e, "0") != 0 ? 1 : 0;
+}
+
 static int gcm_walker_wake_on(void)
 {
-    static int on = -1;
-    if (on < 0) {
-        const char* e = getenv("PS3RECOMP_WALKER_WAKE");
-        on = (e && *e && *e != '0') ? 1 : 0;
-    }
-    return on;
+    /* Live: PS3RECOMP_CTL can flip this mid-run (the A/B arms do). */
+    return gcm_live_get(PS3_LIVE_WALKER_WAKE, "PS3RECOMP_WALKER_WAKE");
 }
 static void gcm_walker_wake_for_put(u32 io, u32 size)
 {
@@ -1927,7 +1934,18 @@ void cellGcm_fifo_kick_wait(unsigned ms)
     static int on = -1;
     if (on < 0) { const char* e = getenv("GCM_FIFO_KICK"); on = (e && *e == '0') ? 0 : 1; }
     HANDLE ev = on ? (HANDLE)cellGcm_fifo_kick_event() : NULL;
-    if (ev) WaitForSingleObject(ev, ms);
+    /* EXP_FAST_WAKE: a throwaway ceiling test. Instead of parking the walker
+     * for up to `ms`, re-check the kick event and yield. With PS3RECOMP_PIN=1
+     * the walker has its own core, so the busy poll cannot steal the PPU's;
+     * the question is only whether the idle wait itself is on the frame. */
+    if (gcm_live_get(PS3_LIVE_EXP_FAST_WAKE, "EXP_FAST_WAKE")) {
+        if (ev) WaitForSingleObject(ev, 0);
+#ifdef _WIN32
+        else Sleep(0);
+#else
+        else sched_yield();
+#endif
+    } else if (ev) WaitForSingleObject(ev, ms);
     else    Sleep(ms);
     /* A guest thread blocked on a render target's bytes (on-demand WCB) kicks
      * this wait; copy them before anything else. */
@@ -2363,6 +2381,13 @@ static void gcm_rsx_process_fifo_unlocked(void)
     if (!s_inited) { rsx_state_init(&s_state); s_inited = 1; }
     const int wprof = rsx_wprof_enabled();
     const unsigned long long wprof_t0 = wprof ? rsx_wprof_now() : 0;
+    /* PS3RECOMP_CTL: the walker thread is the one that notices a changed
+     * control file, at most once per drain pass (>= once per flip). The
+     * draw engine then refreshes its own cached switch values from it. */
+    if (ps3_live_ctl_poll) ps3_live_ctl_poll(cellGcm_flip_request_count());
+    rsx_draw_engine_set_walker_fast(gcm_live_get(PS3_LIVE_WALKER_FAST,
+                                                "PS3RECOMP_WALKER_FAST"));
+    rsx_draw_engine_set_no_draw(gcm_live_get(PS3_LIVE_EXP_NO_DRAW, "EXP_NO_DRAW"));
     const int wcap = rsx_wcap_begin_if_triggered();
     const int wdiag = gcm_word_diag(), wmirror = gcm_word_mirror_only();
     /* NOP runs are skipped unless a switch looks at each NOP word: the

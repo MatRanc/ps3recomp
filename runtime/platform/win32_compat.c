@@ -464,6 +464,17 @@ static void apply_affinity(pthread_t pt, DWORD_PTR mask)
 #endif
 }
 
+/* Opt-in role pinning (PS3RECOMP_PIN=1) calls this from the thread it names.
+ * Reusing apply_affinity keeps one Linux implementation of the mask. */
+void ps3_thread_apply_affinity_self(uint64_t mask)
+{
+#ifdef _WIN32
+    SetThreadAffinityMask(GetCurrentThread(), (DWORD_PTR)mask);
+#else
+    apply_affinity(pthread_self(), (DWORD_PTR)mask);
+#endif
+}
+
 static void thread_finish(ps3_obj* t, DWORD code)
 {
     pthread_mutex_lock(&s_lock);

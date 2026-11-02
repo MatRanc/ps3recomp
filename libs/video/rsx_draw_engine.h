@@ -455,8 +455,16 @@ void rsx_wprof_note_drain(unsigned long long ns);
 void rsx_wprof_note_dispatch(unsigned long long ns);
 /* A FIFO flip word: the pass that contains it completes a frame. */
 void rsx_wprof_note_flip(void);
+/* vkCreate*Pipelines time, reported as `pipecrt`/`pipems` in the next report. */
+void rsx_wprof_note_pipeline_create(unsigned long long ns);
 /* Log and reset the frame counters if a flip was seen in this pass. */
 void rsx_wprof_drain_end(void);
+
+/* Live switches from PS3RECOMP_CTL (cellGcmSys polls the file and calls these
+ * on the walker thread). Changing WALKER_FAST flushes the fetch/pipeline
+ * memos so the new arm starts cold. */
+void rsx_draw_engine_set_walker_fast(int on);
+void rsx_draw_engine_set_no_draw(int on);
 
 /* Captured dispatcher state: enough to start a replay at the frame boundary
  * the capture began on. The sink and the coverage counters are not part of
