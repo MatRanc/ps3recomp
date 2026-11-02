@@ -215,6 +215,15 @@ static DWORD WINAPI frame_clock(LPVOID)
      * title whose frame is many such parks waits it out many times a frame. */
     const char* fc_ms = getenv("PS3_FRAME_CLOCK_MS");
     const DWORD idle_ms = fc_ms && atoi(fc_ms) >= 0 ? (DWORD)atoi(fc_ms) : 4;
+    /* PS3RECOMP_PUMP_MS=<n>: also pump window events inside the catch-up loop
+     * below, at most every n ms. Without it the pump runs once per outer pass,
+     * and a pass behind the clock runs up to 240 ticks (each a drain, some a
+     * present) before it gets there -- seconds with no SDL_PollEvent when the
+     * drain is slower than the 16 ms tick. Must stay on this thread: it is the
+     * one rsx_backend_init created the window on. Unset = the old behaviour. */
+    const char* pump_env = getenv("PS3RECOMP_PUMP_MS");
+    const int   pump_ms  = pump_env && atoi(pump_env) > 0 ? atoi(pump_env) : 0;
+    ULONGLONG   last_pump = 0;
 
     for (;;) {
         cellGcm_fifo_kick_wait(idle_ms);
@@ -239,6 +248,17 @@ static DWORD WINAPI frame_clock(LPVOID)
             if (rsx_ok) cellGcm_rsx_process_fifo();
             next_tick += 16;             /* ~60 Hz */
             fired++;
+            if (pump_ms && rsx_ok) {
+                const ULONGLONG t = GetTickCount64();
+                if (t - last_pump >= (ULONGLONG)pump_ms) {
+                    last_pump = t;
+                    if (rsx_backend_pump() != 0) {
+                        rsx_ok = 0;
+                        ps3_host_quit("window closed");
+                        break;
+                    }
+                }
+            }
         }
         if (fired >= 240) next_tick = now;   /* fell too far behind -- resync */
 
@@ -253,6 +273,7 @@ static DWORD WINAPI frame_clock(LPVOID)
             }
             cellGcm_rsx_process_fifo();
 
+            last_pump = GetTickCount64();
             if (rsx_backend_pump() != 0) {
                 rsx_ok = 0;              /* window closed */
                 /* ...so quit, as the console's Quit Game does, instead of
