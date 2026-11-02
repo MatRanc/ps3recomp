@@ -1602,9 +1602,18 @@ void gcm_forget_spu_blocks(void)
 void gcm_note_spu_put(u32 ea, u32 size)
 {
     if (!size || size > 0x40000u) return;
+    /* PS3RECOMP_TRACE: a job's publish writes the ring slot (mapped IO) and
+     * releases its ring label. Record both so a walker wait can be attributed
+     * to the job and the worker that produced it. */
+    if (ps3_trace_on()) {
+        if (ea >= GCM_LABEL_GUEST_BASE && ea < GCM_LABEL_GUEST_BASE + 0x1000u)
+            ps3_trace_instant(PS3_TR_GCM_LABEL_REL, ea - GCM_LABEL_GUEST_BASE,
+                              vm_read32(ea));
+    }
     u32 room = 0;
     u32 io = gcm_ea2io_range(ea, &room);
     if (io == 0xFFFFFFFFu || size > room) return;   /* not in RSX-visible memory */
+    if (ps3_trace_on()) ps3_trace_instant(PS3_TR_GCM_SPU_PUT, io, size);
 
     /* Coalesce with the previous block when an SPU emits one buffer in several
      * transfers -- otherwise only the last fragment is remembered and the
@@ -2632,6 +2641,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
                   why = "parked";
                   s_park_pass = 1;
                   s_tr_parked = 1;
+                  ps3_trace_instant(PS3_TR_RSX_PARK, s_fifo_getoff, put);
                   break;
               }
               if (tgt < s_fifo_getoff) s_fifo_back_jumps++;

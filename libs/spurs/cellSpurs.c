@@ -1884,6 +1884,11 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
                 spu_lockline_lock();
                 vm_base[ea + SPURS_WKL_CURCONT + wid] = si->active[wid];
                 ef_line_end(ea);
+                /* PS3RECOMP_TRACE: the scheduler's view of the PPU's push --
+                 * which workload was admitted, on which physical lane, and
+                 * with what ready count. */
+                ps3_trace_instant(PS3_TR_SPURS_KICK, wid,
+                                  (uint32_t)sn | ((ready & 0xFFu) << 8));
                 slot->busy = 1;
                 WakeAllConditionVariable(&si->wake);
                 break;
@@ -1912,6 +1917,9 @@ static s32 spurs_scheduler_start(struct SpursInst* si)
     }
     si->coordinator = CreateThread(NULL, 1u << 20, spurs_kernel_thread, si, 0, NULL);
     if (!si->coordinator) goto failed;
+    /* PS3RECOMP_TRACE: how many physical lanes this instance can use, so an
+     * analysis can tell "all lanes busy" from "a lane never appeared". */
+    ps3_trace_instant(PS3_TR_SPURS_INIT, si->nspus, si->ea);
     return CELL_OK;
 failed:
     AcquireSRWLockExclusive(&si->lock);

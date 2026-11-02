@@ -106,6 +106,14 @@ enum ps3_tr_ev {
     PS3_TR_GCM_FLIP,           /* the RSX reached a flip: a = buffer                */
     PS3_TR_GCM_FLIP_REQ,       /* the guest queued a flip: a = buffer, b = 1 if through the FIFO */
     PS3_TR_GCM_FLIP_DONE,      /* the vblank tick completed the outstanding flip: a = request number */
+    /* c690 / SPURS producer side (walker-wait attribution) */
+    PS3_TR_SPU_OVERLAY_LOAD,   /* a streamed job module became resident: a = content EA, b = image id */
+    PS3_TR_SPURS_KICK,         /* the SPURS scheduler admitted a workload run: a = wid, b = lane | ready << 8 */
+    PS3_TR_SPURS_INIT,         /* a SPURS instance started: a = physical lanes, b = instance EA */
+    PS3_TR_C690_JOB,           /* one c690 job (LS 0x135B8..0x12AB8): a = descriptor EA, b = spu id */
+    PS3_TR_GCM_SPU_PUT,        /* an SPU DMA PUT landed in RSX-visible memory: a = IO offset, b = size */
+    PS3_TR_GCM_LABEL_REL,      /* an SPU DMA PUT landed in the GCM label window: a = label offset, b = value */
+    PS3_TR_RSX_PARK,           /* the walker stopped on a self-JUMP park: a = get, b = put */
     PS3_TR_EV_COUNT
 };
 
@@ -151,6 +159,13 @@ static inline const ps3_tr_desc* ps3_tr_desc_of(uint32_t ev)
         { "gcm.flip",           "gcm",   PS3_TR_PH_INSTANT, 0, "buffer", 0 },
         { "gcm.flip_request",   "gcm",   PS3_TR_PH_INSTANT, 0, "buffer", "fifo" },
         { "gcm.flip_done",      "gcm",   PS3_TR_PH_INSTANT, 0, "request", 0 },
+        { "spu.overlay_load",   "spu",   PS3_TR_PH_INSTANT, 1, "ea", "image" },
+        { "spurs.kick",         "spurs", PS3_TR_PH_INSTANT, 0, "wid", "lane_ready" },
+        { "spurs.init",         "spurs", PS3_TR_PH_INSTANT, 2, "lanes", "ea" },
+        { "c690.job",           "spu",   PS3_TR_PH_SPAN,    1, "desc", "spu" },
+        { "gcm.spu_put",        "gcm",   PS3_TR_PH_INSTANT, 1, "io", "size" },
+        { "gcm.label_rel",      "gcm",   PS3_TR_PH_INSTANT, 1, "offset", "value" },
+        { "rsx.park",           "rsx",   PS3_TR_PH_INSTANT, 3, "get", "put" },
     };
     return &d[ev < (uint32_t)PS3_TR_EV_COUNT ? ev : 0];
 }
@@ -205,6 +220,13 @@ typedef struct {
     int first;                  /* no event written yet (comma placement) */
     uint32_t nrings, next_tid;
     uint64_t ring_recs, flush_recs, min_ns, base, written;
+    /* PS3RECOMP_TRACE_TRIGGER=<path> + PS3RECOMP_TRACE_SECS=<n>: record only
+     * after the file appears, for n seconds. Before the trigger every event is
+     * dropped; at the end the flusher writes the file out and closes it, so a
+     * run killed with SIGKILL still has the whole window. */
+    int win_armed;              /* a trigger path was configured */
+    uint64_t win_start, win_end, win_secs;
+    char trigger[1024];
     FILE* f;
 #ifdef _WIN32
     DWORD tls;
@@ -382,6 +404,8 @@ static inline int ps3_tr_flush_due(void)
     return total >= s->flush_recs;
 }
 
+static inline void ps3_trace_shutdown(void);
+
 #ifdef _WIN32
 static inline DWORD WINAPI ps3_tr_flusher(LPVOID unused)
 #else
@@ -392,6 +416,26 @@ static inline void* ps3_tr_flusher(void* unused)
     for (;;) {
         ps3_tr_sleep_ms(PS3_TR_POLL_MS);
         if (__atomic_load_n(&g_ps3_tr.on, __ATOMIC_ACQUIRE) != 2) break;
+        if (g_ps3_tr.win_armed) {
+            const uint64_t ws = __atomic_load_n(&g_ps3_tr.win_start, __ATOMIC_ACQUIRE);
+            if (!ws) {
+                FILE* tf = fopen(g_ps3_tr.trigger, "rb");
+                if (tf) {
+                    fclose(tf);
+                    remove(g_ps3_tr.trigger);
+                    const uint64_t now = ps3_trace_now();
+                    __atomic_store_n(&g_ps3_tr.win_end, now + g_ps3_tr.win_secs,
+                                     __ATOMIC_RELEASE);
+                    __atomic_store_n(&g_ps3_tr.win_start, now, __ATOMIC_RELEASE);
+                    fprintf(stderr, "[trace] trigger %s: window open for %.1f s\n",
+                            g_ps3_tr.trigger, (double)g_ps3_tr.win_secs / 1e9);
+                }
+            } else if (ps3_trace_now() > __atomic_load_n(&g_ps3_tr.win_end, __ATOMIC_ACQUIRE)) {
+                fprintf(stderr, "[trace] window closed\n");
+                ps3_trace_shutdown();      /* drains, writes the footer, closes */
+                break;
+            }
+        }
         if (!ps3_tr_trylock()) continue;
         if (__atomic_load_n(&g_ps3_tr.on, __ATOMIC_ACQUIRE) == 2 && ps3_tr_flush_due())
             ps3_tr_drain();
@@ -461,6 +505,14 @@ static inline int ps3_tr_init(void)
         s->flush_recs = (uint64_t)(ps3_tr_env_num("PS3RECOMP_TRACE_FLUSH_MB", 4.0) * 1048576.0) / sizeof(ps3_tr_rec);
         if (!s->flush_recs) s->flush_recs = 1;
         s->min_ns = (uint64_t)(ps3_tr_env_num("PS3RECOMP_TRACE_MIN_US", 0.0) * 1000.0);
+        {
+            const char* trig = getenv("PS3RECOMP_TRACE_TRIGGER");
+            if (trig && *trig) {
+                snprintf(s->trigger, sizeof s->trigger, "%s", trig);
+                s->win_armed = 1;
+                s->win_secs = (uint64_t)(ps3_tr_env_num("PS3RECOMP_TRACE_SECS", 10.0) * 1e9);
+            }
+        }
         s->f = fopen(s->path, "wb");
 #ifdef _WIN32
         s->tls = TlsAlloc();
@@ -488,10 +540,14 @@ static inline int ps3_tr_init(void)
             const int started = pthread_create(&th, NULL, ps3_tr_flusher, NULL) == 0;
             if (started) pthread_detach(th);
 #endif
-            fprintf(stderr, "[trace] recording to %s (%llu KB per thread, flush every %.2f MB)%s\n",
+            fprintf(stderr, "[trace] recording to %s (%llu KB per thread, flush every %.2f MB)%s%s\n",
                     s->path, (unsigned long long)(recs * sizeof(ps3_tr_rec) / 1024u),
                     (double)(s->flush_recs * sizeof(ps3_tr_rec)) / 1048576.0,
+                    s->win_armed ? " -- armed, waiting for trigger" : "",
                     started ? "" : " -- no flusher thread, written at exit only");
+            if (s->win_armed)
+                fprintf(stderr, "[trace] trigger %s starts a %.1f s window\n",
+                        s->trigger, (double)s->win_secs / 1e9);
         }
     }
     __atomic_store_n(&s->on, on, __ATOMIC_RELEASE);
@@ -547,6 +603,12 @@ static inline ps3_tr_ring* ps3_tr_ring_self(void)
 static inline void ps3_tr_put(ps3_tr_ring* r, uint32_t ev, uint64_t t0, uint64_t t1,
                               uint32_t a, uint32_t b)
 {
+    if (__atomic_load_n(&g_ps3_tr.win_armed, __ATOMIC_RELAXED)) {
+        const uint64_t ws = __atomic_load_n(&g_ps3_tr.win_start, __ATOMIC_ACQUIRE);
+        if (!ws) return;                                   /* before the trigger */
+        const uint64_t we = __atomic_load_n(&g_ps3_tr.win_end, __ATOMIC_ACQUIRE);
+        if (we && (t1 < ws || t0 > we)) return;            /* outside the window */
+    }
     if (PS3_TR_UNLIKELY(!r->buf)) {
         if (r->alloc_failed) { __atomic_fetch_add(&r->dropped, 1, __ATOMIC_RELAXED); return; }
         r->buf = (ps3_tr_rec*)malloc((size_t)(r->mask + 1) * sizeof(ps3_tr_rec));

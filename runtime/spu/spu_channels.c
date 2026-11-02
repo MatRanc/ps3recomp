@@ -2375,6 +2375,7 @@ void spu_overlay_note_get(spu_context* ctx, uint32_t ea, const uint8_t* ls, uint
                     ctx->resident_code[slot].verify_state = o->code ? SPU_OVERLAY_PENDING : 0;
                     ctx->resident_code[slot].source_index = i;
                     spu_dcache_residency_changed(ctx);
+                    ps3_trace_instant(PS3_TR_SPU_OVERLAY_LOAD, ea, (uint32_t)o->image_id);
                     return;
                 }
                 fprintf(stderr, "[spu-ovl] no free resident code span for image %d\n", o->image_id);

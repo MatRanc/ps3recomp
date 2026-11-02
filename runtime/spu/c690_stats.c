@@ -48,6 +48,7 @@
  */
 #include "c690_stats.h"
 #include "spu_context.h"
+#include "ps3emu/ps3_trace.h"   /* PS3RECOMP_TRACE: one c690.job span per job */
 
 #include <stdint.h>
 #include <stdio.h>
@@ -155,6 +156,8 @@ static SPU_THREAD_LOCAL struct {
     uint64_t job_start_ns;
     uint64_t last_ns;
     uint32_t current_lsa;
+    uint64_t tr_t0;          /* PS3RECOMP_TRACE: open c690.job span, 0 when untraced */
+    uint32_t tr_desc_ea;     /* the job descriptor the jm2 ABI passed in r3 */
 } t_run;
 
 static uint64_t c690_now_ns(void)
@@ -228,6 +231,9 @@ void c690_stats_on_lookup(const struct spu_context* ctx, uint32_t lsa)
             if (t_run.current_lsa) c690_charge(s, t_run.current_lsa, now - t_run.last_ns);
             c690_opcode_inc(s, 0x00u);       /* the end command itself */
             c690_record_job(s, now - t_run.job_start_ns);
+            ps3_trace_end(t_run.tr_t0, PS3_TR_C690_JOB, t_run.tr_desc_ea,
+                          (uint32_t)ctx->spu_id);
+            t_run.tr_t0 = 0;
             t_run.job_active = 0;
             t_run.current_lsa = 0;
             __atomic_fetch_sub(&s_active_jobs, 1u, __ATOMIC_RELAXED);
@@ -248,6 +254,8 @@ void c690_stats_on_lookup(const struct spu_context* ctx, uint32_t lsa)
         t_run.job_start_ns = now;
         t_run.last_ns = now;
         t_run.current_lsa = lsa;
+        t_run.tr_desc_ea = ctx->gpr[3]._u32[0];
+        t_run.tr_t0 = ps3_trace_begin();
         __atomic_fetch_add(&s_active_jobs, 1u, __ATOMIC_RELAXED);
         if (s->spu_id == 0xFFFFFFFFu) s->spu_id = ctx->spu_id;
         c690_maybe_periodic(now);
