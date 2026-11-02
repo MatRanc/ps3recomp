@@ -1931,8 +1931,43 @@ static void spu_jobcap_probe(const spu_context* ctx, uint32_t lsa)
     fflush(stderr);
 }
 
+/* SPU_FN_CAPTURE=<lsa>[:<dir>]: dump the full LS + all 128 GPRs + pc the first
+ * time the given function is dispatched. This is the input half of the offline
+ * per-function replay harness (see tests/test_job_c690_replay.c). */
+void spu_fncap_capture(const spu_context* ctx, uint32_t lsa)
+{
+    static int inited = 0, on = 0, done = 0;
+    static uint32_t want = 0;
+    static const char* dir = ".";
+    if (!inited) {
+        inited = 1;
+        const char* e = getenv("SPU_FN_CAPTURE");
+        if (e && *e) {
+            char* end = NULL;
+            want = (uint32_t)strtoul(e, &end, 0);
+            if (end && *end == ':') dir = end + 1;
+            on = 1;
+        }
+    }
+    if (!on || done || lsa != want) return;
+    done = 1;
+    char path[512];
+    snprintf(path, sizeof path, "%s/ls.bin", dir);
+    FILE* f = fopen(path, "wb");
+    if (f) { fwrite(ctx->ls, 1, SPU_LS_SIZE, f); fclose(f); }
+    snprintf(path, sizeof path, "%s/gpr.bin", dir);
+    f = fopen(path, "wb");
+    if (f) { fwrite(ctx->gpr, 1, sizeof(ctx->gpr), f); fclose(f); }
+    snprintf(path, sizeof path, "%s/pc.txt", dir);
+    f = fopen(path, "w");
+    if (f) { fprintf(f, "lsa=0x%05X pc=0x%05X image=%d\n", lsa, ctx->pc, ctx->image_id); fclose(f); }
+    fprintf(stderr, "[fncap] captured lsa=0x%05X -> %s\n", lsa, dir);
+}
+
 spu_lifted_fn spu_lifted_lookup(const spu_context* ctx, uint32_t lsa)
 {
+    { static int s_fc = -1; if (s_fc < 0) s_fc = getenv("SPU_FN_CAPTURE") ? 1 : 0;
+      if (s_fc) spu_fncap_capture(ctx, lsa); }
     { static int s_jc = -1; if (s_jc < 0) s_jc = getenv("SPU_JOB_LS_DUMP") ? 1 : 0;
       if (s_jc && lsa == 0x135B8) spu_jobcap_probe(ctx, lsa); }
     const int mode = spu_dcache_mode();
