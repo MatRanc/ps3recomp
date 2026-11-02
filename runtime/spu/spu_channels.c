@@ -21,6 +21,7 @@
 #include "ps3emu/ps3_ftrace.h"
 #include "ps3emu/ps3_trace.h"   /* PS3RECOMP_TRACE: runs, channel waits, lock-line retries */
 #include "spu_overlay_residency.h"
+#include "c690_stats.h"   /* PS3RECOMP_C690_STATS: measurement-only counters */
 #include <stdint.h>
 #include <stdatomic.h>
 #include <stdio.h>
@@ -1993,6 +1994,10 @@ spu_lifted_fn spu_lifted_lookup(const spu_context* ctx, uint32_t lsa)
       if (s_fc) spu_fncap_capture(ctx, lsa); }
     { static int s_jc = -1; if (s_jc < 0) s_jc = getenv("SPU_JOB_LS_DUMP") ? 1 : 0;
       if (s_jc && lsa == 0x135B8) spu_jobcap_probe(ctx, lsa); }
+    /* PS3RECOMP_C690_STATS: job entry/end, opcode histogram and exclusive
+     * entry accounting, all at the one place indirect dispatch is resolved.
+     * Predicted-not-taken and out of line when off. */
+    if (__builtin_expect(g_c690_stats, 0)) c690_stats_on_lookup(ctx, lsa);
     const int mode = spu_dcache_mode();
     if (!mode || !ctx) return spu_lifted_lookup_full(ctx, lsa);
     spu_context* c = (spu_context*)ctx;

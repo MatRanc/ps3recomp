@@ -13,7 +13,7 @@ root = Path(__file__).resolve().parents[1]
 spu = root / "runtime/spu"
 common = ["spu_drain.c", "spu_lockstep.c", "spu_coherency.c", "spu_workload.c",
           "spurs_policy.c", "spurs_job.c", "spu_tsp_weak.c", "spu_vm_pagemap.c",
-          "spurs_policy_blob_weak.c", "spu_interp.c"]
+          "spurs_policy_blob_weak.c", "spu_interp.c", "c690_stats.c"]
 env = {k: v for k, v in os.environ.items()
        if not k.startswith(("SPU_", "SPURS_", "YDKJ_", "LBP_", "GH3_"))}
 with tempfile.TemporaryDirectory(prefix="spu-sdcrz-") as tmp:

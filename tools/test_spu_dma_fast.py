@@ -51,9 +51,14 @@ def build(tree, out, inline, old=False):
     ops = out.with_suffix(".ops.o")
     subprocess.run([cc, *flags, *(["-DSPU_WRCH_INLINE"] if inline else []), "-c",
                     str(tests / "test_spu_dma_fast_ops.c"), "-o", str(ops)], check=True)
+    # c690_stats.c is newer than the runtime this fixture can compare against;
+    # add it only when the tree being built has it.
+    runtime_srcs = [str(spu / name) for name in common]
+    if (spu / "c690_stats.c").exists():
+        runtime_srcs.append(str(spu / "c690_stats.c"))
     subprocess.run([cc, *flags, *(["-DFIXTURE_OLD_RUNTIME"] if old else []),
                     str(ops), str(tests / "test_spu_dma_fast_rt.c"),
-                    *[str(spu / name) for name in common],
+                    *runtime_srcs,
                     str(tree / "runtime/platform/win32_compat.c"), "-lm", "-o", str(out)],
                    check=True)
 

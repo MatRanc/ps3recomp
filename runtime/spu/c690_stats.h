@@ -1,0 +1,46 @@
+/*
+ * ps3recomp - measurement-only counters for the c690 SPU job module.
+ *
+ * PS3RECOMP_C690_STATS=1 enables them. They are off by default and change no
+ * dispatch decision: every call site is a single
+ * `if (__builtin_expect(g_c690_stats, 0))` around an out-of-line hook.
+ *
+ * Hooks (see c690_stats.c for the model and the exclusions):
+ *   c690_stats_on_lookup()  spu_lifted_lookup(), for indirect dispatch, the
+ *                           c690 job entry/end command, and handler opcodes.
+ *   c690_stats_on_direct()  SPU_DIRECT (spu_context.h), for direct lifted
+ *                           function entries that never reach the resolver.
+ *
+ * Only contexts with image_id == 6 (the c690 job image) are counted.
+ */
+#ifndef SPU_C690_STATS_H
+#define SPU_C690_STATS_H
+
+#include <stdint.h>
+
+/* spu_context is defined by spu_context.h; the hooks only read image_id/spu_id. */
+struct spu_context;
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/* Set once at startup from PS3RECOMP_C690_STATS=1. Read-only afterwards. */
+extern int g_c690_stats;
+
+/* A lifted target is about to be entered through spu_lifted_lookup(). `lsa`
+ * is the LS target; NULL ctx and other images are ignored. */
+void c690_stats_on_lookup(const struct spu_context* ctx, uint32_t lsa);
+
+/* A lifted target is about to be entered through SPU_DIRECT(). */
+void c690_stats_on_direct(const struct spu_context* ctx, uint32_t lsa);
+
+/* Print the accumulated report. Registered with atexit() when enabled; also
+ * safe to call explicitly (it does nothing when the counters are off). */
+void c690_stats_report(void);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif /* SPU_C690_STATS_H */

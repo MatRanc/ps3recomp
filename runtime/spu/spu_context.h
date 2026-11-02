@@ -12,6 +12,7 @@
 
 #include "../../include/ps3emu/ps3types.h"
 #include "../../include/ps3emu/log_first.h"
+#include "c690_stats.h"   /* PS3RECOMP_C690_STATS on_direct hook (off by default) */
 #include <stdint.h>
 #include <string.h>
 #include <stdio.h>
@@ -1056,6 +1057,8 @@ void spu_direct_init(void);
 #define SPU_DIRECT(ctx, PC, FN) do {                                          \
         const uint32_t _dpc = (uint32_t)(PC);                                 \
         (ctx)->pc = _dpc;                                                     \
+        if (__builtin_expect(g_c690_stats, 0))                                \
+            c690_stats_on_direct(ctx, _dpc);                                  \
         if (__builtin_expect(g_spu_direct > 0, 1) && (_dpc & SPU_LS_MASK) &&  \
             (ctx)->steps && !g_spu_stack_reset_hint[(_dpc >> 2) & 1023u] &&    \
             !((ctx)->int_enable && ((ctx)->event_status & (ctx)->event_mask))) \
@@ -1066,6 +1069,8 @@ void spu_direct_init(void);
 #else
 #define SPU_DIRECT(ctx, PC, FN) do {                                          \
         (ctx)->pc = (PC);                                                     \
+        if (__builtin_expect(g_c690_stats, 0))                                \
+            c690_stats_on_direct(ctx, (uint32_t)(PC));                        \
         g_spu_trampoline_fn = FN;                                             \
         return;                                                               \
     } while (0)

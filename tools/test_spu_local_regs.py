@@ -338,7 +338,7 @@ void spurs_pm_build_context(spu_context* c, uint32_t a, uint32_t b, uint32_t d) 
 }
 uint32_t g_spu_image_src_ea, g_spu_image_ls_start, g_spu_image_span;
 """
-RUNTIME = ['spu_channels.c', 'spu_drain.c', 'spu_lockstep.c', 'spu_coherency.c',
+RUNTIME = ['spu_channels.c', 'c690_stats.c', 'spu_drain.c', 'spu_lockstep.c', 'spu_coherency.c',
            'spu_workload.c', 'spurs_policy.c', 'spurs_job.c', 'spu_tsp_weak.c',
            'spu_vm_pagemap.c', 'spurs_policy_blob_weak.c', 'spu_interp.c']
 FLAG_SETS = ([], ['--merge-chunks'], ['--const-bi'], ['--merge-chunks', '--const-bi'],
