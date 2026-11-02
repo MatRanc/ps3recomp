@@ -1931,37 +1931,60 @@ static void spu_jobcap_probe(const spu_context* ctx, uint32_t lsa)
     fflush(stderr);
 }
 
-/* SPU_FN_CAPTURE=<lsa>[:<dir>]: dump the full LS + all 128 GPRs + pc the first
- * time the given function is dispatched. This is the input half of the offline
- * per-function replay harness (see tests/test_job_c690_replay.c). */
+/* SPU_FN_CAPTURE=<lsa>[,<lsa>...][:<dir>]: dump the full LS + all 128 GPRs +
+ * pc the first time each listed function is dispatched. This is the input half
+ * of the offline per-function replay harness (see tests/test_job_c690_replay.c).
+ * A single LSA keeps the old layout, <dir>/ls.bin; a comma-separated list
+ * writes <dir>/0x<lsa>/{ls.bin,gpr.bin,pc.txt}. The directory defaults to ".". */
+#define SPU_FNCAP_MAX 16
 void spu_fncap_capture(const spu_context* ctx, uint32_t lsa)
 {
-    static int inited = 0, on = 0, done = 0;
-    static uint32_t want = 0;
+    static int inited = 0, on = 0, multi = 0, nlsas = 0;
+    static uint32_t lsas[SPU_FNCAP_MAX];
+    static int done[SPU_FNCAP_MAX];
     static const char* dir = ".";
     if (!inited) {
         inited = 1;
         const char* e = getenv("SPU_FN_CAPTURE");
         if (e && *e) {
-            char* end = NULL;
-            want = (uint32_t)strtoul(e, &end, 0);
-            if (end && *end == ':') dir = end + 1;
-            on = 1;
+            const char* p = e;
+            while (*p && nlsas < SPU_FNCAP_MAX) {
+                char* end = NULL;
+                const unsigned long v = strtoul(p, &end, 0);
+                if (end == p) break;
+                lsas[nlsas++] = (uint32_t)v;
+                p = end;
+                if (*p != ',') break;
+                multi = 1;
+                p++;
+            }
+            if (*p == ':') dir = p + 1;
+            on = nlsas > 0;
         }
     }
-    if (!on || done || lsa != want) return;
-    done = 1;
-    char path[512];
-    snprintf(path, sizeof path, "%s/ls.bin", dir);
+    if (!on) return;
+    int idx = -1;
+    for (int i = 0; i < nlsas; i++)
+        if (!done[i] && lsas[i] == lsa) { idx = i; break; }
+    if (idx < 0) return;
+    done[idx] = 1;
+    char path[512], fdir[512];
+    if (multi) {
+        snprintf(fdir, sizeof fdir, "%s/0x%05X", dir, lsa);
+        CreateDirectoryA(fdir, NULL);
+    } else {
+        snprintf(fdir, sizeof fdir, "%s", dir);
+    }
+    snprintf(path, sizeof path, "%s/ls.bin", fdir);
     FILE* f = fopen(path, "wb");
     if (f) { fwrite(ctx->ls, 1, SPU_LS_SIZE, f); fclose(f); }
-    snprintf(path, sizeof path, "%s/gpr.bin", dir);
+    snprintf(path, sizeof path, "%s/gpr.bin", fdir);
     f = fopen(path, "wb");
     if (f) { fwrite(ctx->gpr, 1, sizeof(ctx->gpr), f); fclose(f); }
-    snprintf(path, sizeof path, "%s/pc.txt", dir);
+    snprintf(path, sizeof path, "%s/pc.txt", fdir);
     f = fopen(path, "w");
     if (f) { fprintf(f, "lsa=0x%05X pc=0x%05X image=%d\n", lsa, ctx->pc, ctx->image_id); fclose(f); }
-    fprintf(stderr, "[fncap] captured lsa=0x%05X -> %s\n", lsa, dir);
+    fprintf(stderr, "[fncap] captured lsa=0x%05X -> %s\n", lsa, fdir);
 }
 
 spu_lifted_fn spu_lifted_lookup(const spu_context* ctx, uint32_t lsa)
