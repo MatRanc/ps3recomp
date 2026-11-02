@@ -1650,6 +1650,57 @@ static u32 gcm_spu_block_for_put(u32 put)
     return best;
 }
 
+/* PS3RECOMP_WALKER_RESYNC_FIX=1: do not teleport `get` to `put` for a park the
+ * title abandoned. Move it to the first command the RSX has not executed
+ * (the last ring offset below `put`, or `get` itself when that is below `put`)
+ * and let the normal walk execute everything up to `put`.
+ *
+ * The jump-park resync exists because a self-JUMP park can stand forever when
+ * the title has moved `put` to another segment and will never patch that park.
+ * Following `put` keeps the FIFO alive, but `gcm_fifo_resync_why` can only
+ * rescue fences and label writes: every draw, clear and flip marker in the
+ * skipped range is lost (the team-select 3D logo). Those commands are below
+ * `put`, so they are complete; the only obstacle is that `get` was left on the
+ * park, possibly in another buffer. Rewinding it to the unread offset below
+ * `put` drains exactly that range through the same code the walker always
+ * runs -- state, fences, flips and the draw sink included.
+ *
+ * A park *below* `put` is stepped over (one JUMP word); the title did not
+ * patch it, and the RSX would execute it as a no-op at that point.
+ *
+ * Returns 1 when `*getoff` now points at a command the drain should walk (the
+ * caller continues/returns and lets it); 0 to fall back to the resync. */
+static int gcm_fifo_resync_walk(u32* getoff, u32 put)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char* e = getenv("PS3RECOMP_WALKER_RESYNC_FIX");
+        on = (e && *e && strcmp(e, "0") != 0) ? 1 : 0;
+    }
+    if (!on) return 0;
+
+    u32 from = (*getoff <= put) ? *getoff : s_last_ring_off;
+    if (from < put) {
+        /* An abandoned self-JUMP at `from` is the only word to step over. */
+        u32 ea = gcm_io2ea(from);
+        if (ea) {
+            const u32 w = vm_read32(ea);
+            if ((w & 0xE0000003u) == 0x20000000u || (w & 3u) == 1u) {
+                const u32 tgt = ((w & 3u) == 1u) ? (w & ~3u) : (w & 0x1FFFFFFCu);
+                if (tgt == from) from += 4;
+            }
+        }
+    }
+    if (from >= put) { *getoff = put; park_off = 0; return 1; }
+    { static int n = 0;
+      if (PS3_LOG_FIRST(n, 8))
+          fprintf(stderr, "[cellGcmSys] resync-fix: walking 0x%08X..0x%08X "
+                  "instead of skipping to put 0x%08X\n", from, put, put); }
+    *getoff = from;
+    park_off = 0;
+    return 1;
+}
+
 /* A resync jumps `get` straight to `put`, which is what keeps the FIFO alive
  * when the walker cannot make progress -- but everything in between is
  * dropped, and if a SET_REFERENCE is in there the cellGcmFinish waiting on it
@@ -2733,6 +2784,10 @@ static void gcm_rsx_process_fifo_unlocked(void)
                                  vm_read32(gcm_io2ea(s_fifo_getoff)) == w) {
                           park_off = 0;
                           gcm_fifo_dump_around(s_fifo_getoff);
+                          /* Walk the range below `put` instead of dropping
+                           * it (PS3RECOMP_WALKER_RESYNC_FIX). */
+                          if (gcm_fifo_resync_walk(&s_fifo_getoff, put))
+                              continue;
                           gcm_fifo_resync_why("jump-park", &s_fifo_getoff, put);
                       }
                   }
@@ -3197,7 +3252,9 @@ static void gcm_rsx_process_fifo_unlocked(void)
           stuck = 0; last = s_fifo_getoff; s_sema_blocked_pass = 0; s_park_pass = 0; }
       else if (s_fifo_getoff == last && s_fifo_getoff != put) {
           if (++stuck >= 8) { gcm_fifo_dump_around(s_fifo_getoff);
-                             gcm_fifo_resync_why("stuck-get", &s_fifo_getoff, put); stuck = 0; }
+                             if (!gcm_fifo_resync_walk(&s_fifo_getoff, put))
+                                 gcm_fifo_resync_why("stuck-get", &s_fifo_getoff, put);
+                             stuck = 0; }
       } else { stuck = 0; last = s_fifo_getoff; } }
 
     /* Publish progress: get chases put; ref advances at most ONE queued fence

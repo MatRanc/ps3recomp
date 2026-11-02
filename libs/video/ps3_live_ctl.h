@@ -35,6 +35,7 @@ enum {
     PS3_LIVE_WALKER_WAKE,
     PS3_LIVE_EXP_NO_DRAW,
     PS3_LIVE_EXP_FAST_WAKE,
+    PS3_LIVE_EXP_TICK_US,       /* numeric: display tick period in us */
     PS3_LIVE_COUNT
 };
 
@@ -53,6 +54,13 @@ int ps3_live_ctl_enabled(void) PS3_LIVE_CTL_WEAK;
 void ps3_live_ctl_poll(uint32_t flip) PS3_LIVE_CTL_WEAK;
 
 const char* ps3_live_ctl_name(int key) PS3_LIVE_CTL_WEAK;
+
+/* EXP_TICK_US as an effective value (default 16000), NOT weak: the runner
+ * calls this and that call is what makes the linker pull this translation
+ * unit into the executable. Every other entry point is weak so a fixture that
+ * compiles the walker alone still links; a weak reference does not extract an
+ * archive member, so the runner's call must be strong. */
+int ps3_live_ctl_tick_us(void);
 
 #ifdef __cplusplus
 }

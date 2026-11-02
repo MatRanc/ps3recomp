@@ -34,6 +34,7 @@ static const char* const K_NAME[PS3_LIVE_COUNT] = {
     "PS3RECOMP_WALKER_WAKE",
     "EXP_NO_DRAW",
     "EXP_FAST_WAKE",
+    "EXP_TICK_US",
 };
 
 static _Atomic int s_val[PS3_LIVE_COUNT];
@@ -177,4 +178,10 @@ void ps3_live_ctl_poll(uint32_t flip)
 const char* ps3_live_ctl_name(int key)
 {
     return (key >= 0 && key < PS3_LIVE_COUNT) ? K_NAME[key] : "?";
+}
+
+int ps3_live_ctl_tick_us(void)
+{
+    const int us = ps3_live_ctl_get(PS3_LIVE_EXP_TICK_US);
+    return us > 0 ? us : 16000;      /* 16 ms: the historical tick */
 }

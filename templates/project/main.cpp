@@ -38,6 +38,7 @@
  * names over pthreads and mmap, so the call sites below are written once. */
 #include "win32_compat.h"
 #include "ps3emu/thread_name.h"
+#include "ps3_live_ctl.h"   /* EXP_TICK_US: the live display-tick period */
 
 #include <stdint.h>
 #include <stdio.h>
@@ -223,7 +224,21 @@ static DWORD WINAPI frame_clock(LPVOID)
             rsx_ok ? "OK -- window open" : "FAILED");
 
     unsigned  last_flip = 0;
-    ULONGLONG next_tick = GetTickCount64();
+    /* EXP_TICK_US: period of the display tick that completes flips and
+     * advances the vblank count. Throwaway experiment: default 16000 (16 ms,
+     * what `next_tick += 16` on the millisecond clock did), read live from
+     * PS3RECOMP_CTL so one run can A/B 16 ms against 8 ms. QPC is used so a
+     * sub-millisecond period is possible; on Linux it is the monotonic ns
+     * clock, on Windows the 10 MHz performance counter. */
+    LARGE_INTEGER qpf_li, qpc_li;
+    QueryPerformanceFrequency(&qpf_li);
+    QueryPerformanceCounter(&qpc_li);
+    const LONGLONG qpf = qpf_li.QuadPart > 0 ? qpf_li.QuadPart : 1000000;
+    ULONGLONG next_tick = (ULONGLONG)qpc_li.QuadPart;
+    auto tick_period_qpc = [qpf]() -> ULONGLONG {
+        const int us = ps3_live_ctl_tick_us();
+        return (ULONGLONG)((qpf * (LONGLONG)us + 500000) / 1000000);
+    };
     /* PS3_FRAME_CLOCK_MS: the idle wait between drains. A walker parked on a
      * buffer an SPU job is still filling only looks again after it, so a
      * title whose frame is many such parks waits it out many times a frame. */
@@ -241,7 +256,9 @@ static DWORD WINAPI frame_clock(LPVOID)
 
     for (;;) {
         cellGcm_fifo_kick_wait(idle_ms);
-        ULONGLONG now = GetTickCount64();
+        LARGE_INTEGER now_q;
+        QueryPerformanceCounter(&now_q);
+        ULONGLONG now = (ULONGLONG)now_q.QuadPart;
 
         int fired = 0;
         while ((long long)(now - next_tick) >= 0 && fired < 240) {
@@ -260,7 +277,7 @@ static DWORD WINAPI frame_clock(LPVOID)
              * labels the game's per-frame logic blocks on, so it has to keep
              * advancing at 60 Hz even while present() throttles. */
             if (rsx_ok) cellGcm_rsx_process_fifo();
-            next_tick += 16;             /* ~60 Hz */
+            next_tick += tick_period_qpc();   /* default 16 ms; EXP_TICK_US */
             fired++;
             if (pump_ms && rsx_ok) {
                 const ULONGLONG t = GetTickCount64();
