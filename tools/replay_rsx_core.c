@@ -192,6 +192,19 @@ void rsx_draw_engine_guest_wrote(u32 l, u32 o, u32 p, u32 w, u32 h) { (void)l; (
 void rsx_draw_engine_flush_dirty_to_guest(void) {}
 void rsx_draw_engine_set_display_query(int (*fn)(u32 offset)) { (void)fn; }
 void rsx_draw_engine_set_display_buffer(u32 id, u32 loc, u32 off, u32 w, u32 h, u32 p) { (void)id; (void)loc; (void)off; (void)w; (void)h; (void)p; }
+/* Profiler/capture are real-engine features; this verification replay does
+ * not use them. */
+int  rsx_wprof_enabled(void) { return 0; }
+unsigned long long rsx_wprof_now(void) { return 0; }
+void rsx_wprof_note_drain(unsigned long long ns) { (void)ns; }
+void rsx_wprof_note_dispatch(unsigned long long ns) { (void)ns; }
+void rsx_wprof_note_flip(void) {}
+void rsx_wprof_drain_end(void) {}
+int  rsx_wcap_begin_if_triggered(void) { return 0; }
+void rsx_wcap_word(u32 w) { (void)w; }
+void rsx_wcap_flip(u32 w) { (void)w; }
+void rsx_wcap_drain_end(void) {}
+void rsx_wcap_note_texture(u32 l, u32 o, u32 n) { (void)l; (void)o; (void)n; }
 void rsx_live_draw_set_display_buffer(u32 id, u32 loc, u32 off, u32 w, u32 h, u32 p) { (void)id; (void)loc; (void)off; (void)w; (void)h; (void)p; }
 int  rsx_live_draw_enabled(void) { return 0; }
 void rsx_live_draw_method(u32 method, u32 arg) { (void)method; (void)arg; }

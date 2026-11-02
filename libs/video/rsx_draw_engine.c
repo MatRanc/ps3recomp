@@ -21,8 +21,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdatomic.h>
 #include <time.h>
 #include "ps3emu/log_first.h"
+#include "../../runtime/memory/vm.h"   /* vm_commit: the capture images pages */
 
 /* Guest memory and the RSX offset resolvers, declared the way every backend
  * that reads guest data declares them (rsx_vertex_fetch.h). */
@@ -278,16 +280,438 @@ void rsx_draw_engine_set_guest_memory(rsx_vertex_guest_ptr_fn reader, void* user
     s_guest_user = user;
 }
 
+
+/* ==========================================================================
+ * Walker profiler (PS3RECOMP_WALKER_PROF) and one-frame capture
+ * (PS3RECOMP_WALKER_CAPTURE). Both are dormant unless their environment
+ * variable is set; the off path is a cached integer compare.
+ * ======================================================================== */
+
+static int s_wprof = -1;
+static unsigned long long s_wp_ns[RSX_WPROF_PHASES];
+static unsigned long long s_wp_n[RSX_WPROF_PHASES];
+static unsigned long long s_wp_drain_ns;
+static unsigned long long s_wp_dispatch_ns;
+static unsigned long long s_wp_draws;
+static unsigned long long s_wp_flips;
+static unsigned long long s_wp_frames;
+static int s_wp_flip;
+
+int rsx_wprof_enabled(void)
+{
+    if (s_wprof < 0) {
+        const char* e = getenv("PS3RECOMP_WALKER_PROF");
+        s_wprof = (e && *e && strcmp(e, "0") != 0) ? 1 : 0;
+    }
+    return s_wprof;
+}
+
+unsigned long long rsx_wprof_now(void)
+{
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return (unsigned long long)t.tv_sec * 1000000000ull +
+           (unsigned long long)t.tv_nsec;
+}
+
+void rsx_wprof_note_drain(unsigned long long ns)
+{
+    if (s_wprof > 0) s_wp_drain_ns += ns;
+}
+
+void rsx_wprof_note_dispatch(unsigned long long ns)
+{
+    if (s_wprof > 0) s_wp_dispatch_ns += ns;
+}
+
+void rsx_wprof_note_flip(void)
+{
+    if (s_wprof > 0) { s_wp_flip = 1; s_wp_flips++; }
+}
+
+static void wprof_phase(int phase, unsigned long long ns)
+{
+    if (s_wprof > 0) { s_wp_ns[phase] += ns; s_wp_n[phase]++; }
+}
+
+void rsx_wprof_drain_end(void)
+{
+    if (s_wprof <= 0 || !s_wp_flip) return;
+    /* A flip can land between two drain passes, so one report may cover
+     * several flips. Divide by them: the printed values are per frame, and
+     * the pitch window is many reports wide. */
+    const double f = s_wp_flips ? (double)s_wp_flips : 1.0;
+    const double drain = (double)s_wp_drain_ns / 1e6 / f;
+    const double disp  = (double)s_wp_dispatch_ns / 1e6 / f;
+    double sum = 0.0;
+    for (int i = 0; i < RSX_WPROF_PHASES; i++) sum += (double)s_wp_ns[i] / 1e6 / f;
+    const double parse = drain > disp ? drain - disp : 0.0;
+    const double other = disp > sum ? disp - sum : 0.0;
+    fprintf(stderr,
+            "[walker-prof] report=%llu flips=%llu draws=%.1f walker=%.3fms "
+            "engine=%.3fms parse=%.3fms fetch=%.3f tex=%.3f pipe=%.3f "
+            "bind=%.3f draw=%.3f other=%.3f | n/fetch=%.1f tex=%.1f "
+            "pipe=%.1f bind=%.1f draw=%.1f\n",
+            s_wp_frames, s_wp_flips, (double)s_wp_draws / f, drain, disp, parse,
+            (double)s_wp_ns[RSX_WPROF_FETCH] / 1e6 / f,
+            (double)s_wp_ns[RSX_WPROF_TEX] / 1e6 / f,
+            (double)s_wp_ns[RSX_WPROF_PIPE] / 1e6 / f,
+            (double)s_wp_ns[RSX_WPROF_BIND] / 1e6 / f,
+            (double)s_wp_ns[RSX_WPROF_DRAW] / 1e6 / f, other,
+            (double)s_wp_n[RSX_WPROF_FETCH] / f,
+            (double)s_wp_n[RSX_WPROF_TEX] / f,
+            (double)s_wp_n[RSX_WPROF_PIPE] / f,
+            (double)s_wp_n[RSX_WPROF_BIND] / f,
+            (double)s_wp_n[RSX_WPROF_DRAW] / f);
+    fflush(stderr);
+    memset(s_wp_ns, 0, sizeof s_wp_ns);
+    memset(s_wp_n, 0, sizeof s_wp_n);
+    s_wp_drain_ns = s_wp_dispatch_ns = s_wp_draws = s_wp_flips = 0;
+    s_wp_flip = 0;
+    s_wp_frames++;
+}
+
+/* ---- the capture ------------------------------------------------------- */
+
+/* Guest main memory is the only host-backed window (runtime/memory/vm.h maps
+ * the rest PROT_NONE). A page outside it cannot be imaged and is reported. */
+#define WCAP_PAGE      4096u
+#define WCAP_MAX_BYTES (768u * 1024u * 1024u)
+
+typedef struct wcap_range { u32 location, offset, len, ea; } wcap_range;
+typedef struct wcap_page  { u32 location, page, ea; } wcap_page;
+
+static int  s_wcap = -1;          /* -1 unread, 0 off, 1 waiting, 2 active, 3 done */
+static int  s_wcap_active;
+static int  s_wcap_finish;
+static int  s_wcap_wait_flip;
+static int  s_wcap_start_next;
+static atomic_flag s_wcap_lock = ATOMIC_FLAG_INIT;
+static inline void wcap_lock(void)
+{ while (atomic_flag_test_and_set_explicit(&s_wcap_lock, memory_order_acquire)) {} }
+static inline void wcap_unlock(void)
+{ atomic_flag_clear_explicit(&s_wcap_lock, memory_order_release); }
+static int  s_wcap_polls;
+static char s_wcap_prefix[448];
+static rsx_wcap_state s_wcap_state;
+
+static u32*   s_wcap_words;
+static size_t s_wcap_nwords, s_wcap_cwords;
+static wcap_range* s_wcap_ranges;
+static size_t s_wcap_nranges, s_wcap_cranges;
+static wcap_page*  s_wcap_pages;
+static size_t s_wcap_npages, s_wcap_cpages;
+
+static int wcap_grow(void** p, size_t* cap, size_t need, size_t elem)
+{
+    if (need <= *cap) return 1;
+    size_t n = *cap ? *cap * 2 : 4096;
+    while (n < need) n *= 2;
+    void* q = realloc(*p, n * elem);
+    if (!q) return 0;
+    *p = q; *cap = n;
+    return 1;
+}
+
+static void wcap_add_range(u32 location, u32 offset, u32 len, u32 ea)
+{
+    if (!s_wcap_active || !len) return;
+    if (!wcap_grow((void**)&s_wcap_ranges, &s_wcap_cranges,
+                   s_wcap_nranges + 1, sizeof(wcap_range))) return;
+    wcap_range* r = &s_wcap_ranges[s_wcap_nranges++];
+    r->location = location; r->offset = offset; r->len = len; r->ea = ea;
+}
+
+void rsx_wcap_note_read(u32 location, u32 offset, u32 len, u32 ea)
+{
+    wcap_add_range(location, offset, len, ea);
+}
+
+void rsx_wcap_note_texture(u32 location, u32 offset, u32 len)
+{
+    if (!s_wcap_active || !len) return;
+    const u32 ea = cellGcmResolveLocated(location == RSX_LOCATION_LOCAL, offset);
+    wcap_add_range(location, offset, len, ea);
+}
+
+static int wcap_page_cmp(const void* a, const void* b)
+{
+    const wcap_page* x = (const wcap_page*)a;
+    const wcap_page* y = (const wcap_page*)b;
+    if (x->location != y->location) return x->location < y->location ? -1 : 1;
+    if (x->page != y->page) return x->page < y->page ? -1 : 1;
+    return 0;
+}
+
+/* Main memory is committed at boot; RSX local memory is demand-committed by
+ * the title's own accesses (ppu_loader's fault handler). Every page the frame
+ * read is therefore either already committed or legal to commit now, which is
+ * what makes a local-memory image possible at all. */
+static int wcap_readable(u32 ea)
+{
+    if (!vm_base || (u64)ea + WCAP_PAGE > 0x100000000ull) return 0;
+    return vm_commit(ea, WCAP_PAGE) == 0;
+}
+
+static void wcap_missing(const char* why, u32 location, u32 offset, u32 len, u32 ea)
+{
+    char path[520];
+    snprintf(path, sizeof path, "%s.missing", s_wcap_prefix);
+    FILE* f = fopen(path, "a");
+    if (!f) return;
+    fprintf(f, "%s location=%u offset=0x%08X len=%u ea=0x%08X\n",
+            why, location, offset, len, ea);
+    fclose(f);
+}
+
+static void wcap_write_fifo(void)
+{
+    char path[520];
+    snprintf(path, sizeof path, "%s.fifo", s_wcap_prefix);
+    FILE* f = fopen(path, "wb");
+    if (!f) { fprintf(stderr, "[walker-cap] cannot create %s\n", path); return; }
+    struct {
+        u32 magic, version, io_addr, io_size, frame_count, total_words, flags, extra;
+    } h = { 0x46585352u, 1u, s_wcap_state.io_addr, s_wcap_state.io_size,
+            1u, (u32)s_wcap_nwords, 0u, 0u };
+    fwrite(&h, sizeof h, 1, f);
+    for (size_t i = 0; i < s_wcap_nwords; i++) {
+        u32 be = __builtin_bswap32(s_wcap_words[i]);
+        fwrite(&be, 4, 1, f);
+    }
+    fclose(f);
+}
+
+static void wcap_write_state(void)
+{
+    char path[520];
+    snprintf(path, sizeof path, "%s.state", s_wcap_prefix);
+    FILE* f = fopen(path, "wb");
+    if (!f) { fprintf(stderr, "[walker-cap] cannot create %s\n", path); return; }
+    fwrite(&s_wcap_state, sizeof s_wcap_state, 1, f);
+    fclose(f);
+}
+
+static void wcap_write_mem(void)
+{
+    /* Every range expanded to whole pages, deduplicated by (location, page). */
+    for (size_t i = 0; i < s_wcap_nranges; i++) {
+        const wcap_range* r = &s_wcap_ranges[i];
+        const u32 first = r->offset & ~(WCAP_PAGE - 1u);
+        const u32 last  = (r->offset + r->len + WCAP_PAGE - 1u) & ~(WCAP_PAGE - 1u);
+        for (u32 off = first; off < last; off += WCAP_PAGE) {
+            if (!wcap_grow((void**)&s_wcap_pages, &s_wcap_cpages,
+                           s_wcap_npages + 1, sizeof(wcap_page))) return;
+            wcap_page* p = &s_wcap_pages[s_wcap_npages++];
+            p->location = r->location;
+            p->page = off;
+            p->ea = r->ea ? r->ea - (r->offset - off) : 0;
+        }
+    }
+    qsort(s_wcap_pages, s_wcap_npages, sizeof(wcap_page), wcap_page_cmp);
+
+    /* A page is usable when its EA is in the host-backed window. Keep the
+     * lowest EA for duplicate pages; two different EAs for one RSX offset in
+     * one frame would already be a title bug. */
+    size_t keep = 0;
+    for (size_t i = 0; i < s_wcap_npages; i++) {
+        if (keep && s_wcap_pages[keep - 1].location == s_wcap_pages[i].location &&
+            s_wcap_pages[keep - 1].page == s_wcap_pages[i].page)
+            continue;
+        s_wcap_pages[keep++] = s_wcap_pages[i];
+    }
+    s_wcap_npages = keep;
+
+    size_t good = 0, bytes = 0;
+    for (size_t i = 0; i < s_wcap_npages; i++) {
+        wcap_page* p = &s_wcap_pages[i];
+        if (!wcap_readable(p->ea)) {
+            wcap_missing(vm_base ? "unbacked" : "no-vm", p->location,
+                         p->page, WCAP_PAGE, p->ea);
+            continue;
+        }
+        if (bytes + WCAP_PAGE > WCAP_MAX_BYTES) {
+            wcap_missing("cap", p->location, p->page, WCAP_PAGE, p->ea);
+            continue;
+        }
+        s_wcap_pages[good++] = *p;
+        bytes += WCAP_PAGE;
+    }
+    s_wcap_npages = good;
+
+    char path[520];
+    snprintf(path, sizeof path, "%s.mem", s_wcap_prefix);
+    FILE* f = fopen(path, "wb");
+    if (!f) { fprintf(stderr, "[walker-cap] cannot create %s\n", path); return; }
+    struct { u32 magic, version, count, page_bytes, data_bytes, reserved; } h = {
+        0x50414357u, 1u, (u32)s_wcap_npages, WCAP_PAGE, (u32)bytes, 0u
+    };
+    fwrite(&h, sizeof h, 1, f);
+    for (size_t i = 0; i < s_wcap_npages; i++) {
+        struct { u32 location, page, len, data_off; } e = {
+            s_wcap_pages[i].location, s_wcap_pages[i].page, WCAP_PAGE,
+            (u32)(i * WCAP_PAGE)
+        };
+        fwrite(&e, sizeof e, 1, f);
+    }
+    for (size_t i = 0; i < s_wcap_npages; i++)
+        fwrite(vm_base + s_wcap_pages[i].ea, WCAP_PAGE, 1, f);
+    fclose(f);
+    fprintf(stderr, "[walker-cap] wrote %s (pages=%llu, %.1f MB)\n", path,
+            (unsigned long long)s_wcap_npages, (double)bytes / (1024.0 * 1024.0));
+}
+
+void rsx_wcap_word(u32 w)
+{
+    if (!s_wcap_active || s_wcap_finish) return;
+    wcap_lock();
+    if (s_wcap_active && !s_wcap_finish &&
+        wcap_grow((void**)&s_wcap_words, &s_wcap_cwords,
+                  s_wcap_nwords + 1, sizeof(u32)))
+        s_wcap_words[s_wcap_nwords++] = w;
+    wcap_unlock();
+}
+
+void rsx_wcap_flip(u32 w)
+{
+    /* Armed: the next drain starts a clean frame boundary. */
+    if (s_wcap == 4 && s_wcap_wait_flip) {
+        s_wcap_wait_flip = 0;
+        s_wcap_start_next = 1;
+        return;
+    }
+    if (!s_wcap_active || s_wcap_finish) return;
+    wcap_lock();
+    if (s_wcap_active && !s_wcap_finish) {
+        s_wcap_finish = 1;
+        if (wcap_grow((void**)&s_wcap_words, &s_wcap_cwords,
+                      s_wcap_nwords + 1, sizeof(u32)))
+            s_wcap_words[s_wcap_nwords++] = 0xFEAD0000u | (w & 7u);
+    }
+    wcap_unlock();
+}
+
+int rsx_wcap_begin_if_triggered(void)
+{
+    if (s_wcap < 0) {
+        const char* e = getenv("PS3RECOMP_WALKER_CAPTURE");
+        if (e && *e) {
+            snprintf(s_wcap_prefix, sizeof s_wcap_prefix, "%s", e);
+            s_wcap = 1;
+        } else {
+            s_wcap = 0;
+        }
+    }
+    if (s_wcap == 1) {
+        if ((s_wcap_polls++ & 0x0F) != 0) return s_wcap_active;
+        char trig[520];
+        snprintf(trig, sizeof trig, "%s.trigger", s_wcap_prefix);
+        FILE* f = fopen(trig, "rb");
+        if (!f) return s_wcap_active;
+        fclose(f);
+        remove(trig);
+        s_wcap_wait_flip = 1;
+        s_wcap = 4;
+        fprintf(stderr, "[walker-cap] trigger seen; waiting for a flip boundary\n");
+        fflush(stderr);
+        return 0;
+    }
+    if (s_wcap != 4 || !s_wcap_start_next) return s_wcap_active;
+    s_wcap_start_next = 0;
+
+    memset(&s_wcap_state, 0, sizeof s_wcap_state);
+    if (rsx_draw_engine_state_snapshot(&s_wcap_state) != 0) return s_wcap_active;
+    s_wcap_state.io_addr = 0x00100000u;
+    s_wcap_state.io_size = 0x00400000u;
+    s_wcap_nwords = 0;
+    s_wcap_nranges = 0;
+    s_wcap_npages = 0;
+    s_wcap_finish = 0;
+    s_wcap_active = 1;
+    s_wcap = 2;
+    fprintf(stderr, "[walker-cap] flip boundary reached; capturing this frame\n");
+    fflush(stderr);
+    return 1;
+}
+
+static void wcap_finish_write(void)
+{
+    char missing[520];
+    snprintf(missing, sizeof missing, "%s.missing", s_wcap_prefix);
+    remove(missing);
+    wcap_write_fifo();
+    wcap_write_state();
+    wcap_write_mem();
+    fprintf(stderr, "[walker-cap] frame complete: %llu words, %llu read ranges\n",
+            (unsigned long long)s_wcap_nwords,
+            (unsigned long long)s_wcap_nranges);
+    fflush(stderr);
+    s_wcap_active = 0;
+    s_wcap_finish = 0;
+    s_wcap = 3;
+}
+
+void rsx_wcap_drain_end(void)
+{
+    if (s_wcap_active && s_wcap_finish) wcap_finish_write();
+}
+
+/* ---- snapshot / restore ------------------------------------------------ */
+
+int rsx_draw_engine_state_snapshot(rsx_wcap_state* out)
+{
+    if (!out) return -1;
+    memset(out, 0, sizeof *out);
+    out->magic = RSX_WCAP_MAGIC;
+    out->version = 1;
+    out->width = g.width;
+    out->height = g.height;
+    out->in_begin_end = (u32)g.rsx.in_begin_end;
+    out->current_primitive = g.rsx.current_primitive;
+    out->inline_len = g.rsx.inline_len;
+    out->inline_dropped = g.rsx.inline_dropped;
+    memcpy(out->regs, g.rsx.regs, sizeof out->regs);
+    memcpy(out->vp, g.rsx.vp, sizeof out->vp);
+    memcpy(out->constants, g.rsx.constants, sizeof out->constants);
+    if (g.rsx.inline_len <= RSX_DSP_INLINE_MAX_BYTES)
+        memcpy(out->inline_data, g.rsx.inline_data, g.rsx.inline_len);
+    return 0;
+}
+
+int rsx_draw_engine_state_restore(const rsx_wcap_state* in)
+{
+    if (!in || in->magic != RSX_WCAP_MAGIC || in->version != 1) return -1;
+    rsx_dispatch_sink sink = g.rsx.sink;
+    g.rsx.in_begin_end = (int)in->in_begin_end;
+    g.rsx.current_primitive = in->current_primitive;
+    g.rsx.inline_len = in->inline_len;
+    g.rsx.inline_dropped = in->inline_dropped;
+    memcpy(g.rsx.regs, in->regs, sizeof in->regs);
+    memcpy(g.rsx.vp, in->vp, sizeof in->vp);
+    memcpy(g.rsx.constants, in->constants, sizeof in->constants);
+    if (in->inline_len <= RSX_DSP_INLINE_MAX_BYTES)
+        memcpy(g.rsx.inline_data, in->inline_data, in->inline_len);
+    g.rsx.sink = sink;
+    return 0;
+}
+
 static const u8* eng_guest_ptr(void* user, u32 location, u32 offset,
                                u32 min_bytes)
 {
     (void)user;
     if (!min_bytes || min_bytes > (256u << 20)) return NULL;
-    if (s_guest_reader) return s_guest_reader(s_guest_user, location, offset, min_bytes);
+    if (s_guest_reader) {
+        const u8* p = s_guest_reader(s_guest_user, location, offset, min_bytes);
+        if (p && s_wcap_active)
+            rsx_wcap_note_read(location, offset, min_bytes,
+                               (u32)(uintptr_t)(p - vm_base));
+        return p;
+    }
     if (!vm_base) return NULL;
     const u32 ea = cellGcmResolveLocated(location == RSX_LOCATION_LOCAL, offset);
     if (!ea) return NULL;
     if (ppu_vm_size && (u64)ea + min_bytes > ppu_vm_size) return NULL;
+    if (s_wcap_active) rsx_wcap_note_read(location, offset, min_bytes, ea);
     return vm_base + ea;
 }
 
@@ -2597,6 +3021,14 @@ static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
          * aliased surface a store to guest memory, for nothing. */
         if (!t.enabled || !((tex_used >> u) & 1u)) continue;
         mask |= 1u << u;
+        if (s_wcap_active) {
+            const u32 span = (t.dimension == 3 && !t.cubemap)
+                ? eng_texture_span_3d(t.format, t.width, t.height, t.depth,
+                                      t.mipmaps, t.pitch)
+                : eng_texture_span(t.format, t.width, t.height, t.mipmaps,
+                                   t.pitch, (int)t.cubemap);
+            if (span) rsx_wcap_note_texture(t.location, t.offset, span);
+        }
         eng_tmemo* mm = &s_tmemo[u];
         if (s_texmemo_on && mm->handle && mm->gen == s_tex_gen && mm->frame == g.frames &&
             ((s_tex_wgen_on && mm->wgen == g.rsx.tex_wgen[u]) || !memcmp(&mm->t, &t, sizeof t))) {
@@ -2743,6 +3175,11 @@ static u32 sink_bind_vertex_textures(
         if (!((vtex_mask >> u) & 1u)) continue;
         rsx_dsp_vertex_texture vt;
         rsx_dsp_get_vertex_texture(&g.rsx, u, &vt);
+        if (s_wcap_active) {
+            const u32 span = eng_texture_span(vt.format, vt.width, vt.height,
+                                              vt.mipmaps, vt.pitch, 0);
+            if (span) rsx_wcap_note_texture(vt.location, vt.offset, span);
+        }
         eng_decode_sampler(vt.filter, vt.wrap, vt.control0, &samplers[u]);
         samplers[u].border = eng_border_class(vt.format, vt.border_color);
         /* A vertex unit has no crossbar, so its remap is the identity. */
@@ -3335,6 +3772,9 @@ static void eng_check_gpu_vertex_offload(rsx_vtx_gpu_desc* desc, u32 uploaded)
 static void sink_end(void* user, const rsx_dispatch* r)
 {
     (void)user; (void)r;
+    const int wp = s_wprof > 0;
+    unsigned long long wp_t0 = wp ? rsx_wprof_now() : 0;
+    if (wp) s_wp_draws++;
     if (!g.ready || !dc.n_packets || !dc.fetch_ok) return;
     /* Mixed geometry sources have no defined concatenation here. Reject the
      * whole group instead of drawing partial/misordered geometry. */
@@ -3361,7 +3801,9 @@ static void sink_end(void* user, const rsx_dispatch* r)
 
     rsx_vertex_layout_plan layout;
     eng_vertex_layout(&layout);
+    if (wp) wp_t0 = rsx_wprof_now();
     dc_fetch(&layout, rebuild);
+    if (wp) wprof_phase(RSX_WPROF_FETCH, rsx_wprof_now() - wp_t0);
     if (!dc.n_verts || !dc.fetch_ok) return;
 
     int indexed = 0;
@@ -3397,10 +3839,12 @@ static void sink_end(void* user, const rsx_dispatch* r)
     int pipeline_is_fixed = 1;
     u32 tex_used = 0;
     u64 fp_hash = 0;
+    if (wp) wp_t0 = rsx_wprof_now();
     const u32 pipeline = eng_pipeline_get(&layout, &rs,
                                           eng_surface_format(sf.color_format),
                                           n_targets, &pipeline_is_fixed, &tex_used,
                                           &fp_hash);
+    if (wp) wprof_phase(RSX_WPROF_PIPE, rsx_wprof_now() - wp_t0);
     if (!pipeline) return;
     if (fp_hash && eng_debug_fp(fp_hash, pipeline)) return;
 
@@ -3414,11 +3858,15 @@ static void sink_end(void* user, const rsx_dispatch* r)
     memset(samplers, 0, sizeof samplers);
     memset(vtextures, 0, sizeof vtextures);
     memset(vsamplers, 0, sizeof vsamplers);
+    if (wp) wp_t0 = rsx_wprof_now();
     const u32 tex_mask = sink_bind_textures(targets, n_targets, zslot, tex_used,
                                             textures, samplers);
+    if (wp) wprof_phase(RSX_WPROF_TEX, rsx_wprof_now() - wp_t0);
     if (tex_mask == ENG_INVALID) return;
+    if (wp) wp_t0 = rsx_wprof_now();
     const u32 vtex_mask = sink_bind_vertex_textures(eng_vtex_mask(), vtextures,
                                                     vsamplers);
+    if (wp) wprof_phase(RSX_WPROF_TEX, rsx_wprof_now() - wp_t0);
 
     if (indexed) {
         if (!dc_reserve_indices(n_draw)) return;
@@ -3481,6 +3929,7 @@ static void sink_end(void* user, const rsx_dispatch* r)
 
     pd_note(targets, n_targets, zslot, &rs, pipeline, tex_mask);
 
+    if (wp) wp_t0 = rsx_wprof_now();
     /* The depth attachment is cleared the first time it is bound, so a title
      * that never clears its shadow zeta still tests against something. */
     const u32 depth_handle = (zslot != ENG_INVALID) ? g.zdepths[zslot].handle : 0;
@@ -3544,7 +3993,9 @@ static void sink_end(void* user, const rsx_dispatch* r)
                              /* SURFACE_FORMAT depth: 1 Z16, 2 Z24S8 */
                              sf.depth_format == 1u ? 16u : 24u);
     }
+    if (wp) wprof_phase(RSX_WPROF_BIND, rsx_wprof_now() - wp_t0);
 
+    if (wp) wp_t0 = rsx_wprof_now();
     u32 uploaded = indexed ? dc.n_verts : n_draw;
     if (dc.fetch_deferred) {
         s_fill_ok = -1;
@@ -3564,7 +4015,9 @@ static void sink_end(void* user, const rsx_dispatch* r)
         } else {
             /* The backend had no room for them: convert here and hand them
              * over the old way. */
+            unsigned long long conv_t0 = wp ? rsx_wprof_now() : 0;
             if (!dc_convert_verts()) return;
+            if (wp) wprof_phase(RSX_WPROF_FETCH, rsx_wprof_now() - conv_t0);
             g.be->draw(g.be->user, topology, dc.verts, uploaded, layout.stride,
                        indexed ? g.indices : NULL, indexed ? n_draw : 0);
         }
@@ -3572,6 +4025,7 @@ static void sink_end(void* user, const rsx_dispatch* r)
         g.be->draw(g.be->user, topology, dc.verts, uploaded, layout.stride,
                    indexed ? g.indices : NULL, indexed ? n_draw : 0);
     }
+    if (wp) wprof_phase(RSX_WPROF_DRAW, rsx_wprof_now() - wp_t0);
     /* Counted only when the draw ran the guest's OWN programs, which is what
      * the test hook means: a draw through the built-in pair is a draw, not
      * evidence that the decompile-translate-compile path worked. */
@@ -3818,6 +4272,7 @@ int rsx_draw_engine_enabled(void)
 int rsx_draw_engine_init(u32 width, u32 height)
 {
     if (!g.be) return -1;
+    (void)rsx_wprof_enabled();
     g.width  = width  ? width  : 1280;
     g.height = height ? height : 720;
     { const char* e = getenv("PS3RECOMP_ENG_TEXHASH_FULL");

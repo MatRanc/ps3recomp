@@ -438,6 +438,35 @@ if(PS3RECOMP_BUILD_TESTS)
         target_link_libraries(replay_rsx PRIVATE Threads::Threads)
     endif()
 
+    # The same captured frame through the REAL register-file draw engine with
+    # a null backend: drain minus Vulkan recording, A/B-able offline.
+    add_executable(replay_rsx_engine
+        tools/replay_rsx_engine.cpp
+        tools/replay_rsx_engine_core.c
+        tools/replay_null_draw_backend.c
+        libs/video/rsx_draw_engine.c
+        libs/video/rsx_dispatch.c
+        libs/video/rsx_vertex_fetch.c
+        libs/video/rsx_vertex_compact.c
+        libs/video/rsx_texture_layout.c
+        libs/video/rsx_vp_decompiler.c
+        libs/video/rsx_fp_decompiler.c
+    )
+    target_include_directories(replay_rsx_engine PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/include"
+        "${CMAKE_CURRENT_SOURCE_DIR}/libs/video"
+        "${CMAKE_CURRENT_SOURCE_DIR}/runtime/ppu"
+        "${CMAKE_CURRENT_SOURCE_DIR}/runtime/spu"
+        "${CMAKE_CURRENT_SOURCE_DIR}/runtime/memory"
+        "${CMAKE_CURRENT_SOURCE_DIR}/runtime/platform"
+        "${CMAKE_CURRENT_SOURCE_DIR}/runtime/syscalls"
+        "${CMAKE_CURRENT_SOURCE_DIR}/tools"
+    )
+    set_target_properties(replay_rsx_engine PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON)
+    if(TARGET Threads::Threads)
+        target_link_libraries(replay_rsx_engine PRIVATE Threads::Threads)
+    endif()
+
     if(NOT WIN32)
         # The vector single-precision ops against the exact per-lane references.
         add_executable(test_spu_float_exact

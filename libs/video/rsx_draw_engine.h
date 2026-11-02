@@ -418,6 +418,65 @@ void rsx_draw_engine_guest_wrote(u32 location, u32 offset, u32 pitch, u32 w, u32
  * valid rendered texels instead of uninitialized RAM. */
 void rsx_draw_engine_flush_dirty_to_guest(void);
 
+/* ---- walker profiler and frame capture (PS3RECOMP_WALKER_PROF/CAPTURE) -- */
+
+/* The phases the profiler splits a draw group into. WALKER and DISPATCH are
+ * filled by cellGcmSys.c; the rest by sink_end in this file. `OTHER` is
+ * derived at report time as dispatch minus the five measured phases, so an
+ * early-returning group (a dropped draw) is accounted for rather than lost. */
+enum {
+    RSX_WPROF_FETCH = 0,
+    RSX_WPROF_TEX,
+    RSX_WPROF_PIPE,
+    RSX_WPROF_BIND,
+    RSX_WPROF_DRAW,
+    RSX_WPROF_PHASES
+};
+
+/* Cached PS3RECOMP_WALKER_PROF. Cheap (one static compare) when off. */
+int  rsx_wprof_enabled(void);
+unsigned long long rsx_wprof_now(void);
+/* cellGcmSys.c: one drain pass, and the part of it spent inside the engine. */
+void rsx_wprof_note_drain(unsigned long long ns);
+void rsx_wprof_note_dispatch(unsigned long long ns);
+/* A FIFO flip word: the pass that contains it completes a frame. */
+void rsx_wprof_note_flip(void);
+/* Log and reset the frame counters if a flip was seen in this pass. */
+void rsx_wprof_drain_end(void);
+
+/* Captured dispatcher state: enough to start a replay at the frame boundary
+ * the capture began on. The sink and the coverage counters are not part of
+ * it; regs/vp/constants and the BEGIN_END accumulator are. */
+#define RSX_WCAP_MAGIC 0x50414357u /* "WCAP" */
+typedef struct rsx_wcap_state {
+    u32 magic;
+    u32 version;
+    u32 width, height;
+    u32 io_addr, io_size;
+    u32 in_begin_end;
+    u32 current_primitive;
+    u32 inline_len;
+    u32 inline_dropped;
+    u32 regs[RSX_DSP_NUM_REGS];
+    u32 vp[RSX_DSP_VP_WORDS];
+    u32 constants[RSX_DSP_NUM_CONSTANTS][4];
+    u8  inline_data[RSX_DSP_INLINE_MAX_BYTES];
+} rsx_wcap_state;
+
+/* PS3RECOMP_WALKER_CAPTURE=<prefix>: capture one pitch frame, triggered by
+ * the existence of <prefix>.trigger, into <prefix>.fifo (the frame's method
+ * stream), <prefix>.state (rsx_wcap_state) and <prefix>.mem (the guest pages
+ * the draws read). Called by cellGcmSys.c at a drain boundary. */
+int  rsx_wcap_begin_if_triggered(void);
+void rsx_wcap_word(u32 w);
+void rsx_wcap_note_texture(u32 location, u32 offset, u32 len);
+void rsx_wcap_flip(u32 w);
+void rsx_wcap_drain_end(void);
+
+/* Snapshot / restore the dispatcher state used by a capture. */
+int rsx_draw_engine_state_snapshot(rsx_wcap_state* out);
+int rsx_draw_engine_state_restore(const rsx_wcap_state* in);
+
 /* --- test hooks ---------------------------------------------------------- */
 
 /* Draws that ran the guest's OWN programs in the last presented frame. A draw
