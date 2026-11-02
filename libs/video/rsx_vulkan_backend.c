@@ -1991,6 +1991,73 @@ static void vk_swapchain_lost(void)
 }
 
 /* ---------------------------------------------------------------------------
+ * Window diagnostics (PS3RECOMP_VK_PRESENT_STATS=1) and the acquire timeout
+ * (PS3RECOMP_VK_ACQUIRE_TIMEOUT_MS=<n>, default 0 = the old non-blocking try).
+ *
+ * vk_present_window drops a frame without a word when no present slot is free
+ * or the acquire comes back VK_NOT_READY / VK_TIMEOUT, while s_vk.presented
+ * still counts it. The window can then stand still with every counter moving.
+ * These say which of the three it is: the pump not running (max_gap), the
+ * present thread stuck in vkQueuePresentKHR (noslot, q_max), or the WSI
+ * holding every image (notready). Read and written with relaxed atomics from
+ * the frame-clock and present threads; one line a second from the pump.
+ * -------------------------------------------------------------------------*/
+static struct {
+    unsigned long long last_pump_us, last_print_us, max_gap_us, q_max_us;
+    unsigned pumps, enq, shown, noslot, notready;
+} s_vkw;
+
+static int vk_window_stats_on(void)
+{
+    static int on = -1;
+    if (on < 0) { const char* e = getenv("PS3RECOMP_VK_PRESENT_STATS"); on = e && *e == '1'; }
+    return on;
+}
+
+#define VKW_ADD(f) do { if (vk_window_stats_on()) __atomic_fetch_add(&s_vkw.f, 1u, __ATOMIC_RELAXED); } while (0)
+
+static void vk_window_stats_max(unsigned long long* slot, unsigned long long v)
+{
+    unsigned long long cur = __atomic_load_n(slot, __ATOMIC_RELAXED);
+    while (v > cur && !__atomic_compare_exchange_n(slot, &cur, v, 0, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {}
+}
+
+/* Pump thread only. */
+static void vk_window_stats_pump(void)
+{
+    if (!vk_window_stats_on()) return;
+    const unsigned long long now = vk_now_us();
+    if (s_vkw.last_pump_us) vk_window_stats_max(&s_vkw.max_gap_us, now - s_vkw.last_pump_us);
+    s_vkw.last_pump_us = now;
+    s_vkw.pumps++;
+    if (!s_vkw.last_print_us) { s_vkw.last_print_us = now; return; }
+    if (now - s_vkw.last_print_us < 1000000ull) return;
+    VK_LOG("window: %u pumps, max pump gap %llu ms | blits %u, shown %u, "
+           "dropped %u no-slot + %u not-ready, longest vkQueuePresentKHR %llu ms\n",
+           s_vkw.pumps, s_vkw.max_gap_us / 1000ull,
+           __atomic_exchange_n(&s_vkw.enq, 0u, __ATOMIC_RELAXED),
+           __atomic_exchange_n(&s_vkw.shown, 0u, __ATOMIC_RELAXED),
+           __atomic_exchange_n(&s_vkw.noslot, 0u, __ATOMIC_RELAXED),
+           __atomic_exchange_n(&s_vkw.notready, 0u, __ATOMIC_RELAXED),
+           __atomic_exchange_n(&s_vkw.q_max_us, 0ull, __ATOMIC_RELAXED) / 1000ull);
+    s_vkw.pumps = 0;
+    s_vkw.max_gap_us = 0;
+    s_vkw.last_print_us = now;
+}
+
+static uint64_t vk_acquire_timeout_ns(void)
+{
+    static long long ms = -1;
+    if (ms < 0) {
+        const char* e = getenv("PS3RECOMP_VK_ACQUIRE_TIMEOUT_MS");
+        ms = e && atoll(e) > 0 ? atoll(e) : 0;
+        if (ms > 1000) ms = 1000;
+        if (ms) VK_LOG("window: vkAcquireNextImageKHR waits up to %lld ms\n", ms);
+    }
+    return (uint64_t)ms * 1000000ull;
+}
+
+/* ---------------------------------------------------------------------------
  * Presentation thread (Macro Target 1)
  *
  * The walker still records and submits the swapchain blit, because that blit
@@ -2029,7 +2096,9 @@ static void* vk_present_thread_main(void* arg)
             .swapchainCount = 1, .pSwapchains = &s_vk.swapchain,
             .pImageIndices = &idx,
         };
+        const unsigned long long q0 = vk_window_stats_on() ? vk_now_us() : 0;
         VkResult r = vk_queue_present(&pi);
+        if (q0) { vk_window_stats_max(&s_vkw.q_max_us, vk_now_us() - q0); VKW_ADD(shown); }
         if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR)
             __atomic_store_n(&s_vk.present_lost, 1, __ATOMIC_RELEASE);
         else if (r != VK_SUCCESS)
@@ -2136,12 +2205,13 @@ static void vk_present_window(void)
     }
 
     const int slot = vk_present_slot_acquire();
-    if (slot < 0) return;
+    if (slot < 0) { VKW_ADD(noslot); return; }
 
     u32 idx = 0;
-    VkResult r = pvkAcquireNextImageKHR(s_vk.device, s_vk.swapchain, 0,
+    VkResult r = pvkAcquireNextImageKHR(s_vk.device, s_vk.swapchain, vk_acquire_timeout_ns(),
                                        s_vk.sem_acquire[slot], VK_NULL_HANDLE, &idx);
     if (r == VK_NOT_READY || r == VK_TIMEOUT) {
+        VKW_ADD(notready);
         vk_present_slot_release(slot);
         return;
     }
@@ -2217,6 +2287,7 @@ static void vk_present_window(void)
         return;
     }
 
+    VKW_ADD(enq);
     if (s_vk.present_thread_on) {
         vk_present_enqueue((u32)slot, idx, s_vk.sc_done[idx]);
         return;
@@ -2229,7 +2300,9 @@ static void vk_present_window(void)
         .waitSemaphoreCount = 1, .pWaitSemaphores = &s_vk.sc_done[idx],
         .swapchainCount = 1, .pSwapchains = &s_vk.swapchain, .pImageIndices = &idx,
     };
+    const unsigned long long q0 = vk_window_stats_on() ? vk_now_us() : 0;
     r = vk_queue_present(&pi);
+    if (q0) { vk_window_stats_max(&s_vkw.q_max_us, vk_now_us() - q0); VKW_ADD(shown); }
     if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR) vk_swapchain_lost();
     else if (r != VK_SUCCESS) VK_LOG("vkQueuePresentKHR failed (VkResult %d)\n", (int)r);
     vk_present_slot_release(slot);
@@ -4847,6 +4920,7 @@ void rsx_vulkan_backend_shutdown(void)
 int rsx_vulkan_backend_pump_messages(void)
 {
     if (!s_vk.windowed) return 0;
+    vk_window_stats_pump();
     int quit = 0;
     SDL_Event e;
     while (SDL_PollEvent(&e)) {
