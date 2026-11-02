@@ -1,0 +1,127 @@
+#version 450
+
+// c690 pitch vertex pipeline (SPU job jobmod_c690c2f7b09a, image 6).
+//
+// Extends c690_vert.comp (position unpack, SPU 0x6D68) with the rest of the
+// per-vertex pitch pipeline captured from the game:
+//
+//   A. 12/12/11 MSB-first position unpack + dequant   (0x6D68)  [bit-exact]
+//   B. 3x4 affine transform                           (0xA798)
+//   C. normalize (SPU frsqest + FI, emulated)         (0xAF98)
+//   D. snorm16 / snorm8 pack                          (0x7C18 / 0x8160)
+//
+// Stage A is the same arithmetic as c690_vert.comp and is known bit-exact
+// against the lifted SPU, the native AVX2 kernel, and the captured LS.
+// Stage B uses the captured matrix rows (LS 0x29540).  Stage C follows the
+// SPU FSQRT-ESTIMATE + FI sequence rather than inversesqrt(): GLSL is
+// implementation-defined here, so this shader does not claim bit-exactness
+// for C unless the driver's fi/frsqest emulation is used.
+//
+// The pitch output stream is 16-byte AoS slots; for snorm16 the two 16-bit
+// components of each pair are packed with the same shufb/rotmi ordering the
+// SPU uses (low half of the pair first, big-endian within the 32-bit word).
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, binding = 0) readonly buffer InputBuffer  { uint raw[];  };
+layout(std430, binding = 1) buffer OutputBuffer { uint out_words[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint in_base;        // packed position bitstream byte base (0x17350)
+    uint out_base;       // first AoS slot byte base (0x1F7C0)
+    uint vertex_count;   // 192
+    uint stride_bits;    // 35 = 12+12+11
+    uint bits_x;
+    uint bits_y;
+    uint bits_z;
+    uint flags;          // bit0: snorm8 output, bit1: normalize
+    uvec4 A;             // dequant scale   (sr11)
+    uvec4 B;             // dequant exponent payload (sr10)
+    uvec4 C;             // dequant offset  (sr12)
+    vec4  m0;            // transform row 0  (xyzw = xyz | translation)
+    vec4  m1;            // transform row 1
+    vec4  m2;            // transform row 2
+    vec4  pack_scale;    // snorm scale   (32767 or 127 for unit attrs)
+    vec4  pack_offset;   // snorm offset  (0)
+} pc;
+
+uint byte_at(uint b)
+{
+    return (raw[b >> 2u] >> ((b & 3u) * 8u)) & 0xFFu;
+}
+
+uint be32_at(uint b)
+{
+    return (byte_at(b) << 24u) | (byte_at(b + 1u) << 16u) |
+           (byte_at(b + 2u) << 8u) | byte_at(b + 3u);
+}
+
+uint read_bits(uint p, uint n)
+{
+    uint sh = p & 7u, b = p >> 3u;
+    uint w0 = be32_at(b), w1 = be32_at(b + 4u);
+    uint win = (w0 << sh) | ((sh == 0u) ? 0u : (w1 >> (32u - sh)));
+    return win >> (32u - n);
+}
+
+uint ftz(uint v) { return ((v & 0x7F800000u) == 0u) ? 0u : v; }
+uint bswap32(uint v)
+{
+    return (v >> 24u) | ((v >> 8u) & 0x0000FF00u) |
+           ((v << 8u) & 0x00FF0000u) | (v << 24u);
+}
+
+void main()
+{
+    uint vid = gl_GlobalInvocationID.x;
+    if (vid >= pc.vertex_count) return;
+
+    // ---- A. position unpack / dequant (bit-exact vs SPU 0x6D68) ----------
+    uint bp = pc.in_base * 8u + vid * pc.stride_bits;
+    uint fx = read_bits(bp, pc.bits_x);
+    uint fy = read_bits(bp + pc.bits_x, pc.bits_y);
+    uint fz = read_bits(bp + pc.bits_x + pc.bits_y, pc.bits_z);
+
+    uvec4 F = uvec4(fx, fy, fz, 0u);
+    vec4 p;
+    for (int i = 0; i < 4; i++) {
+        uint a = ftz(0x3F800000u + pc.B[i] + (F[i] << 2u));
+        p[i] = uintBitsToFloat(ftz(floatBitsToUint(
+                   fma(uintBitsToFloat(a), uintBitsToFloat(ftz(pc.A[i])),
+                       uintBitsToFloat(ftz(pc.C[i]))))));
+    }
+
+    // ---- B. 3x4 affine transform ----------------------------------------
+    vec3 t;
+    t.x = dot(vec3(pc.m0), p.xyz) + pc.m0.w;
+    t.y = dot(vec3(pc.m1), p.xyz) + pc.m1.w;
+    t.z = dot(vec3(pc.m2), p.xyz) + pc.m2.w;
+
+    // ---- C. normalize ---------------------------------------------------
+    if ((pc.flags & 2u) != 0u) {
+        float l2 = dot(t, t);
+        // Approximates SPU frsqest + FI. Replace with the exact fixed-point
+        // FI step if bit-exact normals are required.
+        t *= inversesqrt(l2);
+    }
+
+    // ---- D. pack + store ------------------------------------------------
+    uint o = pc.out_base + vid * 16u;
+    if ((pc.flags & 1u) == 0u) {
+        // snorm16: two int16 per 32-bit word, big-endian within the word.
+        for (int i = 0; i < 4; i += 2) {
+            int q0 = int(clamp(t[i]   * pc.pack_scale[i]   + pc.pack_offset[i],   -32768.0, 32767.0));
+            int q1 = int(clamp(t[i+1] * pc.pack_scale[i+1] + pc.pack_offset[i+1], -32768.0, 32767.0));
+            uint w = ((uint(q0) & 0xFFFFu) << 16u) | (uint(q1) & 0xFFFFu);
+            out_words[(o >> 2u) + uint(i / 2)] = bswap32(w);
+        }
+    } else {
+        // snorm8: four int8 in one word.
+        uint w = 0u;
+        for (int i = 0; i < 4; i++) {
+            int q = int(clamp(t[i] * pc.pack_scale[i] + pc.pack_offset[i], -128.0, 127.0));
+            w |= (uint(q) & 0xFFu) << (24u - 8u * uint(i));
+        }
+        out_words[o >> 2u] = w;
+    }
+}
