@@ -243,6 +243,11 @@ int64_t sys_timer_usleep(ppu_context* ctx)
         extern void ppu_log_host_chain(const char*);
         ppu_log_host_chain("usleep1ms"); } }
 
+    /* PS3RECOMP_TRACE: a short sleep is a guest poll (the engine's spin loops
+     * poll at 200 us, a few at 30 us). One span per sleep, tagged with the
+     * guest return address, so the analyser can name the wait site. */
+    const uint64_t tr_t0 = (usec > 0 && usec <= 500) ? ps3_trace_begin() : 0;
+
 #ifdef _WIN32
     /* Use high-resolution sleep via waitable timer for better precision */
     if (usec >= 1000) {
@@ -283,6 +288,7 @@ int64_t sys_timer_usleep(ppu_context* ctx)
         nanosleep(&ts, NULL);
     }
 #endif
+    ps3_trace_end(tr_t0, PS3_TR_PPU_USLEEP, (uint32_t)usec, (uint32_t)ctx->lr);
 
     return CELL_OK;
 }

@@ -135,6 +135,10 @@ static int prio_start_enabled(void)
 
 void ppu_thread_note_block(uint64_t tid)
 {
+    /* PS3RECOMP_TRACE: a ref-register spin (ps3_trace_poll GCM_FINISH) ends when
+     * the thread blocks on something else; close that run here so the fence
+     * span is not left open across the next wait. */
+    ps3_trace_poll_end(PS3_TR_PPU_GCM_FINISH);
     if (tid == 0 || tid > PPU_THREAD_MAX) return;
     int* blocked = &g_ppu_threads[tid - 1].blocked;
     /* Load first: the wait syscalls call this on every wait, and most threads blocked long ago. */

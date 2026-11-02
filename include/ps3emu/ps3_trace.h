@@ -102,6 +102,7 @@ enum ps3_tr_ev {
     PS3_TR_PPU_GCM_WAIT_FLIP,  /* cellGcmSetWaitFlip on a flip still waiting        */
     PS3_TR_PPU_GCM_FLIP_POLL,  /* cellGcmGetFlipStatus answered WAITING, run: b = polls */
     PS3_TR_PPU_GCM_FINISH,     /* spin-reads of the ref register, run: a = last ref, b = polls */
+    PS3_TR_PPU_USLEEP,         /* one short sys_timer_usleep (<= 500 us): a = usec, b = guest LR */
     /* instants */
     PS3_TR_GCM_FLIP,           /* the RSX reached a flip: a = buffer                */
     PS3_TR_GCM_FLIP_REQ,       /* the guest queued a flip: a = buffer, b = 1 if through the FIFO */
@@ -156,6 +157,7 @@ static inline const ps3_tr_desc* ps3_tr_desc_of(uint32_t ev)
         { "ppu.gcm_wait_flip",  "ppu",   PS3_TR_PH_SPAN,    0, 0, 0 },
         { "ppu.gcm_flip_poll",  "ppu",   PS3_TR_PH_SPAN,    0, 0, "polls" },
         { "ppu.gcm_finish",     "ppu",   PS3_TR_PH_SPAN,    1, "ref", "polls" },
+        { "ppu.usleep",         "ppu",   PS3_TR_PH_SPAN,    0, "usec", "lr" },
         { "gcm.flip",           "gcm",   PS3_TR_PH_INSTANT, 0, "buffer", 0 },
         { "gcm.flip_request",   "gcm",   PS3_TR_PH_INSTANT, 0, "buffer", "fifo" },
         { "gcm.flip_done",      "gcm",   PS3_TR_PH_INSTANT, 0, "request", 0 },
