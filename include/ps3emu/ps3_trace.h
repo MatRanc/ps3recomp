@@ -115,6 +115,8 @@ enum ps3_tr_ev {
     PS3_TR_GCM_SPU_PUT,        /* an SPU DMA PUT landed in RSX-visible memory: a = IO offset, b = size */
     PS3_TR_GCM_LABEL_REL,      /* an SPU DMA PUT landed in the GCM label window: a = label offset, b = value */
     PS3_TR_RSX_PARK,           /* the walker stopped on a self-JUMP park: a = get, b = put */
+    PS3_TR_GCM_REF_SET,        /* a NV406E_SET_REFERENCE was reached: a = get, b = value */
+    PS3_TR_GCM_REF_PUB,        /* the ref register was made guest-visible: a = value, b = source (0=drain tail, 1=poll) */
     PS3_TR_EV_COUNT
 };
 
@@ -168,6 +170,8 @@ static inline const ps3_tr_desc* ps3_tr_desc_of(uint32_t ev)
         { "gcm.spu_put",        "gcm",   PS3_TR_PH_INSTANT, 1, "io", "size" },
         { "gcm.label_rel",      "gcm",   PS3_TR_PH_INSTANT, 1, "offset", "value" },
         { "rsx.park",           "rsx",   PS3_TR_PH_INSTANT, 3, "get", "put" },
+        { "gcm.ref_set",        "gcm",   PS3_TR_PH_INSTANT, 1, "get", "value" },
+        { "gcm.ref_pub",        "gcm",   PS3_TR_PH_INSTANT, 0, "value", "source" },
     };
     return &d[ev < (uint32_t)PS3_TR_EV_COUNT ? ev : 0];
 }

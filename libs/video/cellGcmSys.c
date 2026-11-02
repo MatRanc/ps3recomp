@@ -1796,6 +1796,7 @@ static void gcm_ref_push_at(u32 v, u32 getoff)
 {
     { static int _d = -1; if (_d < 0) _d = getenv("GCM_REFLOG") ? 1 : 0;
       if (_d) fprintf(stderr, "[refq] drained fence 0x%X at getoff=%08X\n", v, getoff); }
+    if (ps3_trace_on()) ps3_trace_instant(PS3_TR_GCM_REF_SET, getoff, v);
     u32 t = s_ref_qtail;
     if (t - s_ref_qhead >= GCM_REF_QLEN) {   /* overflow: drop oldest (keeps liveness) */
         s_ref_qhead++;
@@ -1821,11 +1822,13 @@ unsigned long long ps3_qpc_us(void)
     return (unsigned long long)(n.QuadPart / (f.QuadPart / 1000000));
 }
 
-static void gcm_ref_publish_one(void)
+static void gcm_ref_publish_one(int src)
 {
     u32 h = s_ref_qhead;
     if (h == s_ref_qtail) return;
-    vm_write32(GCM_CONTROL_GUEST_ADDR + 8, s_ref_q[h % GCM_REF_QLEN]);
+    const u32 val = s_ref_q[h % GCM_REF_QLEN];
+    vm_write32(GCM_CONTROL_GUEST_ADDR + 8, val);
+    if (ps3_trace_on()) ps3_trace_instant(PS3_TR_GCM_REF_PUB, val, (u32)src);
     /* stderr, deliberately: [DRAIN] uses printf and stdout is block-buffered
      * when redirected, so its interleaving with an stderr probe is not a
      * timeline. Same stream = same ordering. */
@@ -1903,7 +1906,7 @@ void cellGcm_ref_on_poll(void)
     LONGLONG min_gap = s_freq.QuadPart / 5000;          /* ~200us */
     int dry = 0;
     if (now.QuadPart - s_last_pub >= min_gap) {
-        gcm_ref_publish_one();
+        gcm_ref_publish_one(1);
         s_last_pub = now.QuadPart;
         dry = (s_ref_qhead == s_ref_qtail);
     }
@@ -3188,7 +3191,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
     vm_write32(GCM_CONTROL_GUEST_ADDR + 4, gcm_get_eq_put() ? put : s_fifo_getoff);
 
     AcquireSRWLockExclusive(&s_ref_pub_lock);                           /* ref */
-    gcm_ref_publish_one();
+    gcm_ref_publish_one(0);
     ReleaseSRWLockExclusive(&s_ref_pub_lock);
 }
 
