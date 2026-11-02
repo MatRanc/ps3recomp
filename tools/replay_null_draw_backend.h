@@ -10,6 +10,8 @@
 const rsx_draw_backend* replay_null_backend(void);
 unsigned long long replay_null_draws(void);
 unsigned long long replay_null_draw_vertices(void);
+/* Digest of everything the backend received since the last reset. */
+unsigned long long replay_null_hash(void);
 void replay_null_reset(void);
 
 #endif

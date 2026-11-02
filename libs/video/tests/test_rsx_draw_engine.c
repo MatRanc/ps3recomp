@@ -2543,6 +2543,175 @@ static void test_draw_fill(void)
     engine_down();
 }
 
+/* ---- 26. PS3RECOMP_WALKER_FAST: cut 1 and cut 3 ----------------------- */
+
+static void walker_fast_env(int on)
+{
+    if (on) setenv("PS3RECOMP_WALKER_FAST", "1", 1);
+    else unsetenv("PS3RECOMP_WALKER_FAST");
+}
+
+static rsx_walker_fast_stats walker_fast_stats(void)
+{
+    rsx_walker_fast_stats st = {0};
+    rsx_draw_engine_walker_fast_stats(&st);
+    return st;
+}
+
+/* An 8-vertex array in main memory and a 16-bit index array at IDX_OFFSET.
+ * The index bytes, not a register, are the reference set's source: changing
+ * them changes what the draw reads without touching NV4097 state. */
+static void fast_write_vertices(float base)
+{
+    for (u32 i = 0; i < 8; i++) {
+        const float f[4] = { base + (float)i, 0.0f, 0.0f, 1.0f };
+        for (u32 c = 0; c < 4; c++) {
+            u32 w; memcpy(&w, &f[c], 4);
+            put_be(vm_base + VTX_OFFSET + i * 16 + c * 4, w, 4);
+        }
+    }
+}
+
+static void fast_draw_indexed(const u16* idx, u32 n)
+{
+    for (u32 i = 0; i < n; i++) put_be(vm_base + IDX_OFFSET + i * 2, idx[i], 2);
+    m(0x181C, IDX_OFFSET);                 /* index array offset */
+    m(0x1820, 1u | (1u << 4));             /* main memory, 16-bit */
+    m(M_BEGIN_END, RSX_PRIMITIVE_TRIANGLES);
+    m(0x1824, 0u | ((n - 1u) << 24));      /* first 0, count n */
+    m(M_BEGIN_END, 0u);
+}
+
+static void test_walker_fast_fetch(void)
+{
+    printf("-- walker fast: fetch/remap cache\n");
+
+    walker_fast_env(0);
+    engine_up();
+    draw_triangle();
+    const float off_x = stub.draw_first_vertex[0];
+    engine_down();
+
+    walker_fast_env(1);
+    engine_up();
+    fast_write_vertices(1.0f);
+    draw_triangle();
+    rsx_walker_fast_stats st = walker_fast_stats();
+    CHECK(st.fetch_hits == 0 && st.fetch_misses == 1,
+          "the first group prepares the plan and remap (%llu hit / %llu miss)",
+          st.fetch_hits, st.fetch_misses);
+    draw_triangle();
+    st = walker_fast_stats();
+    CHECK(st.fetch_hits == 1 && st.fetch_misses == 1,
+          "an identical group reuses both (%llu hit / %llu miss)",
+          st.fetch_hits, st.fetch_misses);
+    CHECK(stub.draw_first_vertex[0] == 1.0f,
+          "the cached plan still fetched the current vertices (%g)",
+          stub.draw_first_vertex[0]);
+
+    /* The cache stores no guest bytes: a vertex payload write is observed
+     * even on a hit, and does not need to invalidate the plan. */
+    fast_write_vertices(7.0f);
+    draw_triangle();
+    st = walker_fast_stats();
+    CHECK(st.fetch_hits == 2 &&
+          stub.draw_first_vertex[0] == 7.0f,
+          "a vertex write between draws is fetched fresh (hit %llu, x %g)",
+          st.fetch_hits, stub.draw_first_vertex[0]);
+
+    /* The reference set's source is an input to the key. Changing the index
+     * bytes (what a new frame reads) changes the references, so the plan and
+     * remap must miss. */
+    static const u16 idx_a[] = { 0, 1, 2, 0, 1, 2 };
+    static const u16 idx_b[] = { 3, 4, 5, 3, 4, 5 };
+    fast_draw_indexed(idx_a, 6);
+    const u64 hits = walker_fast_stats().fetch_hits;
+    const u64 misses = walker_fast_stats().fetch_misses;
+    fast_draw_indexed(idx_a, 6);
+    CHECK(walker_fast_stats().fetch_hits == hits + 1,
+          "the same index source reuses the cached reference set");
+    fast_draw_indexed(idx_b, 6);
+    CHECK(walker_fast_stats().fetch_misses == misses + 1,
+          "different index bytes are a different reference set and miss (%llu)",
+          walker_fast_stats().fetch_misses);
+
+    /* State that changes the plan: a different VTXFMT stride/offset is not
+     * the same layout even though the input mask is unchanged. */
+    const u64 m2 = walker_fast_stats().fetch_misses;
+    m(M_VTXFMT, 2u | (4u << 4) | (32u << 8));   /* stride 16 -> 32 */
+    draw_triangle();
+    CHECK(walker_fast_stats().fetch_misses == m2 + 1,
+          "a VTXFMT change misses (%llu)", walker_fast_stats().fetch_misses);
+
+    engine_down();
+    walker_fast_env(0);
+}
+
+static void test_walker_fast_pipeline(void)
+{
+    printf("-- walker fast: pipeline memo\n");
+    walker_fast_env(1);
+    engine_up();
+    draw_triangle();
+    draw_triangle();
+    rsx_walker_fast_stats st = walker_fast_stats();
+    CHECK(st.pipeline_hits == 1 && st.pipeline_misses == 1,
+          "an identical group reuses the pipeline answer (%llu hit / %llu miss)",
+          st.pipeline_hits, st.pipeline_misses);
+
+    /* A pipeline-relevant render state change is a new fingerprint. */
+    m(M_DEPTH_BOUNDS_ENABLE, 1u);
+    const int before = stub.n_pipeline_create;
+    draw_triangle();
+    st = walker_fast_stats();
+    CHECK(st.pipeline_misses == 2 && stub.n_pipeline_create == before + 1,
+          "enabling depth bounds misses and builds the new pipeline (%llu miss, %d new)",
+          st.pipeline_misses, stub.n_pipeline_create - before);
+    m(M_DEPTH_BOUNDS_ENABLE, 0u);
+    draw_triangle();
+    CHECK(stub.bound_pipeline != 0,
+          "the old state's pipeline is reused from the memo");
+
+    /* A guest program's own bytes are part of the identity. Install a pair,
+     * draw it twice (the second is a memo hit), then rewrite the fragment
+     * program in guest memory between frames: it must miss and build a new
+     * pipeline, not serve the old one. */
+    u8 vp[16];
+    rsx_test_vp_mov_out(vp, 0, RSX_TEST_VP_SWZ_IDENT, 0, 1);
+    m(0x1E9C, 0);
+    for (u32 i = 0; i < 4; i++) { u32 w; memcpy(&w, vp + i * 4, 4); m(0xB80 + i * 4, w); }
+    m(0x1EA0, 0);                               /* VP start */
+    rsx_test_fp_instr(vm_base + WPOS_FP_OFFSET,
+                      RSX_TEST_FP_OPC(RSX_TEST_FP_OP_MOV) | RSX_TEST_FP_MASK_XYZW |
+                      RSX_TEST_FP_INSRC(0) | RSX_TEST_FP_END,
+                      RSX_TEST_FP_SRC_INPUT | RSX_TEST_FP_SWZ_IDENT);
+    m(0x08E4, WPOS_FP_OFFSET | 2u);             /* SHADER_PROGRAM, main */
+    m(0x1D60, 0x40u);
+    draw_triangle();
+    draw_triangle();
+    const int pipes = stub.n_pipeline_create;
+    const u32 old_pipe = stub.bound_pipeline;
+    st = walker_fast_stats();
+    const u64 ph = st.pipeline_hits, pm = st.pipeline_misses;
+
+    rsx_test_fp_instr(vm_base + WPOS_FP_OFFSET,
+                      RSX_TEST_FP_OPC(RSX_TEST_FP_OP_MOV) | RSX_TEST_FP_MASK_XYZW |
+                      RSX_TEST_FP_INSRC(1) | RSX_TEST_FP_END,
+                      RSX_TEST_FP_SRC_INPUT | RSX_TEST_FP_SWZ_IDENT);
+    draw_triangle();
+    st = walker_fast_stats();
+    CHECK(st.pipeline_misses == pm + 1 && stub.n_pipeline_create == pipes + 1 &&
+          stub.bound_pipeline != old_pipe,
+          "changed fragment-program bytes miss and build another pipeline "
+          "(%llu miss, %d new)", st.pipeline_misses, stub.n_pipeline_create - pipes);
+    CHECK(st.pipeline_hits == ph,
+          "and the memo did not answer from the old program");
+    m(0x08E4, 0u);
+
+    engine_down();
+    walker_fast_env(0);
+}
+
 int main(void)
 {
     vm_base = (u8*)calloc(1, GUEST_BYTES);
@@ -2589,6 +2758,8 @@ int main(void)
     test_immediate_packed_zero_and_inline();
     test_clear_rect();
     test_draw_fill();
+    test_walker_fast_fetch();
+    test_walker_fast_pipeline();
 
     free(vm_base);
     printf(g_failures ? "\n%d check(s) FAILED\n" : "\nall checks passed\n",

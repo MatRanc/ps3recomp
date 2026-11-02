@@ -16,6 +16,7 @@ typedef struct {
     uint64_t read_hits;
     uint64_t read_misses;
     uint32_t words;
+    uint64_t frame_hash;   /* output gate: everything the backend received */
 } rsx_engine_replay_stats;
 
 rsx_engine_replay* rsx_engine_replay_create(const char* prefix, char* err, size_t errlen);

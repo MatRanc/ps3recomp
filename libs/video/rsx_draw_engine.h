@@ -477,6 +477,20 @@ void rsx_wcap_drain_end(void);
 int rsx_draw_engine_state_snapshot(rsx_wcap_state* out);
 int rsx_draw_engine_state_restore(const rsx_wcap_state* in);
 
+/* PS3RECOMP_WALKER_FAST=1 (read at engine init, default off): cut 1's
+ * fetch/remap plan cache and cut 3's pipeline input memo. A memo survives a
+ * frame boundary; it is invalidated by a change in its key (layout, the
+ * reference set, program bytes or pipeline-relevant state) and, for the fetch
+ * plan, by a new guest-memory resolver. The fetch memo holds no guest payload:
+ * vertex bytes are always re-read. The counters are for the unit tests and
+ * the offline A/B; they are cumulative until the next init. */
+int  rsx_draw_engine_walker_fast_enabled(void);
+typedef struct rsx_walker_fast_stats {
+    unsigned long long fetch_hits, fetch_misses;
+    unsigned long long pipeline_hits, pipeline_misses;
+} rsx_walker_fast_stats;
+void rsx_draw_engine_walker_fast_stats(rsx_walker_fast_stats* out);
+
 /* --- test hooks ---------------------------------------------------------- */
 
 /* Draws that ran the guest's OWN programs in the last presented frame. A draw

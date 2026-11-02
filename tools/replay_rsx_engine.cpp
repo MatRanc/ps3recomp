@@ -8,6 +8,7 @@
  * PS3RECOMP_WALKER_PROF (enabled here unless it is explicitly set to 0).
  */
 #include "replay_rsx_engine_core.h"
+#include "rsx_draw_engine.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -53,6 +54,7 @@ int main(int argc, char** argv)
     std::vector<double> us;
     us.reserve(frames);
     uint64_t draws = 0, verts = 0, hits = 0, misses = 0;
+    uint64_t gate = 1469598103934665603ull, last_hash = 0;
     for (int i = 0; i < frames; i++) {
         auto t0 = std::chrono::high_resolution_clock::now();
         int rc = rsx_engine_replay_run_frame(r, &st);
@@ -61,10 +63,13 @@ int main(int argc, char** argv)
         us.push_back(std::chrono::duration<double, std::micro>(t1 - t0).count());
         draws += st.draws; verts += st.vertices;
         hits += st.read_hits; misses += st.read_misses;
+        last_hash = st.frame_hash;
+        gate = (gate ^ st.frame_hash) * 1099511628211ull;
         if (verbose)
-            std::printf("frame %3d: %.2f us, %llu draws, %llu read misses\n", i,
+            std::printf("frame %3d: %.2f us, %llu draws, %llu read misses, hash %016llx\n", i,
                         us.back(), (unsigned long long)st.draws,
-                        (unsigned long long)st.read_misses);
+                        (unsigned long long)st.read_misses,
+                        (unsigned long long)st.frame_hash);
     }
 
     std::vector<double> sorted = us;
@@ -76,10 +81,11 @@ int main(int argc, char** argv)
     const double avg_draws = (double)draws / frames;
 
     if (csv) {
-        std::printf("capture,words,frames,median_us,mean_us,p95_us,avg_draws,read_hits,read_misses\n");
-        std::printf("%s,%u,%d,%.2f,%.2f,%.2f,%.1f,%llu,%llu\n", prefix, st.words, frames,
-                    med, mean, p95, avg_draws,
-                    (unsigned long long)hits, (unsigned long long)misses);
+        std::printf("capture,words,frames,median_us,mean_us,p95_us,avg_draws,read_hits,read_misses,last_hash,gate\n");
+        std::printf("%s,%u,%d,%.2f,%.2f,%.2f,%.1f,%llu,%llu,%016llx,%016llx\n",
+                    prefix, st.words, frames, med, mean, p95, avg_draws,
+                    (unsigned long long)hits, (unsigned long long)misses,
+                    (unsigned long long)last_hash, (unsigned long long)gate);
     } else {
         std::printf("capture:      %s\n", prefix);
         std::printf("frames:       %d (+%d warmup), %u words\n", frames, warmup, st.words);
@@ -87,6 +93,16 @@ int main(int argc, char** argv)
         std::printf("draws/frame:  %.1f\n", avg_draws);
         std::printf("guest reads:  %llu hit, %llu miss\n",
                     (unsigned long long)hits, (unsigned long long)misses);
+        std::printf("output hash:  %016llx (last measured frame)\n",
+                    (unsigned long long)last_hash);
+        std::printf("output gate:  %016llx (%d measured frames)\n",
+                    (unsigned long long)gate, frames);
+    }
+    if (rsx_draw_engine_walker_fast_enabled()) {
+        rsx_walker_fast_stats fs = {0};
+        rsx_draw_engine_walker_fast_stats(&fs);
+        std::printf("fast path:    fetch %llu hit / %llu miss, pipeline %llu hit / %llu miss\n",
+                    fs.fetch_hits, fs.fetch_misses, fs.pipeline_hits, fs.pipeline_misses);
     }
 
     rsx_engine_replay_destroy(r);

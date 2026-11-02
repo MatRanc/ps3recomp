@@ -286,6 +286,7 @@ int rsx_engine_replay_run_frame(rsx_engine_replay* r, rsx_engine_replay_stats* o
         out->read_hits = r->hits;
         out->read_misses = r->misses;
         out->words = r->words;
+        out->frame_hash = replay_null_hash();
     }
     return (s_fifo_getoff == r->stream_end) ? 0 : -2;
 }
