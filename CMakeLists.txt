@@ -43,6 +43,9 @@ file(GLOB_RECURSE HLE_SOURCES
 )
 # Exclude test harnesses (e.g. libs/video/tests/*): they define their own main().
 list(FILTER HLE_SOURCES EXCLUDE REGEX "/tests/")
+# Compiled inside rsx_draw_engine.c (#included), so every build of the engine,
+# test fixtures included, gets it without listing it.
+list(FILTER HLE_SOURCES EXCLUDE REGEX "rsx_wcb\\.c$")
 
 # The Vulkan RSX backend is opt-in while it grows (stage V0: clear + present).
 # It loads libvulkan at run time, so building needs only the Vulkan headers --
@@ -491,6 +494,8 @@ if(PS3RECOMP_BUILD_TESTS)
         "${CMAKE_CURRENT_SOURCE_DIR}/libs/video")
     add_test(NAME rsx_present_policy COMMAND test_rsx_present_policy)
 
+    # POSIX only: the test maps guest memory with mmap and drives real faults.
+    if(NOT WIN32)
     add_executable(test_color_readback_guest
         libs/video/tests/test_color_readback_guest.c
         libs/video/rsx_dispatch.c
@@ -504,7 +509,14 @@ if(PS3RECOMP_BUILD_TESTS)
         "${CMAKE_CURRENT_SOURCE_DIR}/libs/video"
         "${CMAKE_CURRENT_SOURCE_DIR}/libs/video/tests"
     )
+    target_link_libraries(test_color_readback_guest PRIVATE Threads::Threads)
     add_test(NAME color_readback_guest COMMAND test_color_readback_guest)
+    # The same, with the copy written after reopening the pages (the path
+    # hosts without /proc/self/mem take).
+    add_test(NAME color_readback_guest_reopen COMMAND test_color_readback_guest)
+    set_tests_properties(color_readback_guest_reopen PROPERTIES
+        ENVIRONMENT "PS3RECOMP_RSX_WCB_FORCED=0")
+    endif()
 
     add_test(NAME replay_rsx_sample_fifo COMMAND replay_rsx "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/sample_fifo.bin" --frames 5)
 

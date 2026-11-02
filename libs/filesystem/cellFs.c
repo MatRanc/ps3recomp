@@ -15,6 +15,7 @@
 #include <errno.h>
 #include "../../runtime/ppu/ppu_memory.h"   /* GUEST_PTR, vm_write*: guest EA -> host */
 #include "ps3emu/log_first.h"
+#include "ps3emu/guest_access.h"    /* rendered bytes the kernel is about to read */
 
 /* glibc's <sys/stat.h> exposes st_atime/st_mtime/st_ctime as macros that expand
  * to st_atim.tv_sec etc.  They collide with the identically named members of the
@@ -564,6 +565,11 @@ s32 cellFsWrite(CellFsFd fd, const void* buf, u64 nbytes, u64* nwrite)
     u64 bytes_written = 0;
 
     if (s_files[fd].host_fp) {
+        /* fwrite can hand a large buffer straight to write(2), which fails
+         * with EFAULT on a page armed for render-target readback instead of
+         * faulting: make it coherent first (MLB 16 writes its generated
+         * faces to HeadFaceCacheFile). */
+        ps3_guest_access(gptr((void*)buf), (size_t)nbytes);
         bytes_written = (u64)fwrite(gptr((void*)buf), 1, (size_t)nbytes, s_files[fd].host_fp);
         fflush(s_files[fd].host_fp);
     }

@@ -13,6 +13,7 @@
 static uint8_t memory[0x40000];
 uint8_t* vm_base = memory;
 uint8_t g_vm_page_bitmap[65536 / 8];
+void (*volatile g_ps3_guest_access_hook)(const void*, size_t);   /* ps3emu/guest_access.h */
 int g_cri_video_dma;
 uint32_t g_spu_image_src_ea, g_spu_image_ls_start, g_spu_image_span;
 uint32_t g_barrier_sync_watch;

@@ -17,6 +17,11 @@
 #include "rsx_restart_cuts.h"
 #include "rsx_vertex_formats.h"
 #include "rsx_vp_decompiler.h"
+#include "rsx_wcb.h"
+/* The page-protection half of on-demand readback is its own file but not its
+ * own translation unit: every build of the engine -- the runtime library and
+ * the many fixtures that compile this file directly -- gets it this way. */
+#include "rsx_wcb.c"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -111,6 +116,12 @@ typedef struct {
     u64 color_serial;       /* g.write_serial of the last colour write, or 0 */
     int guest_dirty;        /* rendered since guest memory last got a copy   */
     u32 last_use;           /* g.frames when last bound, sampled or presented */
+    /* PS3RECOMP_RSX_WCB ondemand/async (docs/wcb-async.md). */
+    int wcb_pending;        /* guest pages protected, guest bytes stale       */
+    u32 wcb_ticket;         /* queued async copy, or 0                        */
+    u64 wcb_ticket_serial;  /* color_serial the ticket's copy captured        */
+    u32 wcb_reads;          /* guest reads that needed a copy                 */
+    u32 wcb_last_read;      /* g.frames of the last one                       */
 } eng_surface;
 
 typedef struct {
@@ -132,6 +143,7 @@ typedef struct {
     u32 last_use;          /* g.frames when last bound or sampled             */
     u32 ext_w, ext_h;      /* the largest clip it was bound with: past it,
                             * nothing was drawn or cleared (eng_clear_rect) */
+    int wcb_pending;       /* guest pages protected (docs/wcb-async.md)       */
 
 } eng_zdepth;
 
@@ -784,10 +796,10 @@ int rsx_draw_engine_state_restore(const rsx_wcap_state* in)
     return 0;
 }
 
-static const u8* eng_guest_ptr(void* user, u32 location, u32 offset,
-                               u32 min_bytes)
+/* The host address of guest bytes, with no coherence step: what a copy INTO
+ * guest memory for on-demand readback writes through (rsx_wcb_store). */
+static const u8* eng_guest_ptr_raw(u32 location, u32 offset, u32 min_bytes)
 {
-    (void)user;
     if (!min_bytes || min_bytes > (256u << 20)) return NULL;
     if (s_guest_reader) {
         const u8* p = s_guest_reader(s_guest_user, location, offset, min_bytes);
@@ -802,6 +814,45 @@ static const u8* eng_guest_ptr(void* user, u32 location, u32 offset,
     if (ppu_vm_size && (u64)ea + min_bytes > ppu_vm_size) return NULL;
     if (s_wcap_active) rsx_wcap_note_read(location, offset, min_bytes, ea);
     return vm_base + ea;
+}
+
+/* Nonzero while ondemand/async readback has targets armed: every engine read
+ * of guest memory first resolves an armed target whose pages it touches, in
+ * command-stream order, rather than faulting on them. */
+static int s_wcb_live;
+
+static const u8* eng_guest_ptr(void* user, u32 location, u32 offset,
+                               u32 min_bytes)
+{
+    (void)user;
+    const u8* p = eng_guest_ptr_raw(location, offset, min_bytes);
+    if (p && s_wcb_live) rsx_wcb_access(p, min_bytes);
+    return p;
+}
+
+/* WCB mode, settings and counters (docs/wcb-async.md). `st` is cumulative;
+ * `win` is the window PS3RECOMP_RSX_WCB_STATS prints and resets. */
+static struct {
+    int mode;                 /* -1 until read from the environment        */
+    int armed_module;         /* rsx_wcb_init done                         */
+    u32 hot_frames;           /* a read this recent makes a target "hot"   */
+    u32 stats_every;          /* print window in frames, 0 = never         */
+    u32 win_frames;
+    void (*wake)(void);
+    rsx_draw_engine_wcb_stats st, win;
+    rsx_wcb_counters mod_mark;  /* module counters at the window start      */
+} s_wcb = { .mode = -1 };
+
+#define WCB_COUNT(field, v) do { s_wcb.st.field += (v); s_wcb.win.field += (v); } while (0)
+
+static void eng_wcb_retire_surface(u32 slot);
+static void eng_wcb_retire_zdepth(u32 slot);
+
+static unsigned long long eng_wcb_now_ns(void)
+{
+    struct timespec ts;
+    timespec_get(&ts, TIME_UTC);
+    return (unsigned long long)ts.tv_sec * 1000000000ull + (unsigned long long)ts.tv_nsec;
 }
 
 static u64 eng_fnv1a(const void* data, u32 n, u64 hash)
@@ -1243,6 +1294,7 @@ static u32 eng_surface_get(u32 location, u32 offset, u32 want_w, u32 want_h,
         return (!evicted && slot < g.n_surfaces && g.surfaces[slot].handle) ? slot : ENG_INVALID;
 
     eng_surface* s = &g.surfaces[slot];
+    eng_wcb_retire_surface(slot);
     if (s->feedback) { g.be->texture_release(g.be->user, s->feedback); s->feedback = 0; }
     if (s->handle) g.be->color_target_release(g.be->user, s->handle);
     s->location = location; s->offset = offset;
@@ -1402,6 +1454,47 @@ static void eng_row_convert(u8* dst, const u8* src, u32 w, int rgba, int to_gues
     }
 }
 
+/* Rows read back from a colour surface (`n` surface pixels of `bpp` bytes
+ * each per row, R,G,B,A order, contiguous), converted in place to the bytes
+ * RSX leaves in memory and stored at `pitch`, `bytes` per row starting `skip`
+ * bytes into each. `forced`: the destination may still be protected for
+ * on-demand readback, so write through rsx_wcb_store, as one write when the
+ * rows are already laid out exactly as guest memory is. */
+static void eng_color_rows_store(u32 bpp, u32 location, u32 offset, u32 pitch, u8* rows,
+                                 u32 n, u32 h, u32 skip, u32 bytes, int forced)
+{
+    const int rgba = rsx_texture_argb_is_rgba();
+    const size_t stride = (size_t)n * bpp;
+    for (u32 r = 0; r < h; r++) {
+        u8* src = rows + (size_t)r * stride;
+        if (bpp == 8u) {
+            /* R,G,B,A halves, each stored big-endian: the layout
+             * rsx_texture_decode reads W16_Z16_Y16_X16_FLOAT from. */
+            for (u32 c = 0; c < n * 4u; c++) {
+                const u8 t = src[2 * c]; src[2 * c] = src[2 * c + 1]; src[2 * c + 1] = t;
+            }
+        } else if (!rgba) {
+            eng_row_convert(src, src, n, 0, 1);   /* in place: one pixel per load/store */
+        }
+    }
+    if (forced && !skip && bytes == stride && bytes == pitch && h) {
+        u8* dst = (u8*)eng_guest_ptr_raw(location, offset, pitch * h);
+        if (dst) { rsx_wcb_store(dst, rows, (size_t)pitch * h); return; }
+    }
+    for (u32 r = 0; r < h; r++) {
+        const u8* src = rows + (size_t)r * stride + skip;
+        if (forced) {
+            u8* dst = (u8*)eng_guest_ptr_raw(location, offset + r * pitch, bytes);
+            if (!dst) return;
+            rsx_wcb_store(dst, src, bytes);
+        } else {
+            u8* dst = (u8*)eng_guest_ptr(NULL, location, offset + r * pitch, bytes);
+            if (!dst) return;
+            memcpy(dst, src, bytes);
+        }
+    }
+}
+
 void rsx_draw_engine_guest_read(u32 location, u32 offset, u32 pitch, u32 w, u32 h)
 {
     if (!g.ready || !g.be->readback || !pitch || !w || !h) return;
@@ -1413,6 +1506,10 @@ void rsx_draw_engine_guest_read(u32 location, u32 offset, u32 pitch, u32 w, u32 
                     location, offset, w, h);
         return;
     }
+    /* Armed for on-demand readback: one full copy, in stream order, covers
+     * this rectangle and reopens the pages. */
+    if (g.surfaces[slot].wcb_pending && rsx_wcb_resolve_cookie(slot, RSX_WCB_REASON_EXPLICIT))
+        return;
     const eng_surface* s = &g.surfaces[slot];
     const u32 bpp = eng_transfer_bpp(s->fmt);
     /* The transfer counts 32-bit pixels, so w * 4 bytes per row; an FP16
@@ -1431,22 +1528,7 @@ void rsx_draw_engine_guest_read(u32 location, u32 offset, u32 pitch, u32 w, u32 
         fprintf(stderr, "[rsx engine] guest_read %u:0x%08X %ux%u <- surface 0x%08X (%u bpp) at %u,%u:"
                         " %u non-zero pixels\n", location, offset, w, h, s->offset, bpp, x, y,
                 eng_nonzero_pixels(rows, n * h, bpp));
-    const int rgba = rsx_texture_argb_is_rgba();
-    for (u32 r = 0; r < h; r++) {
-        u8* dst = (u8*)eng_guest_ptr(NULL, location, offset + r * pitch, bytes);
-        if (!dst) return;
-        u8* src = rows + (size_t)r * n * bpp;
-        if (bpp == 8u) {
-            /* R,G,B,A halves, each stored big-endian: the layout
-             * rsx_texture_decode reads W16_Z16_Y16_X16_FLOAT from. */
-            for (u32 c = 0; c < n * 4u; c++) {
-                const u8 t = src[2 * c]; src[2 * c] = src[2 * c + 1]; src[2 * c + 1] = t;
-            }
-        } else if (!rgba) {
-            eng_row_convert(src, src, n, 0, 1);   /* in place: one pixel per load/store */
-        }
-        memcpy(dst, src + skip, bytes);
-    }
+    eng_color_rows_store(bpp, location, offset, pitch, rows, n, h, skip, bytes, 0);
 }
 
 void rsx_draw_engine_guest_wrote(u32 location, u32 offset, u32 pitch, u32 w, u32 h)
@@ -1541,6 +1623,7 @@ static u32 eng_zdepth_get(u32 location, u32 offset, u32 rt_w, u32 rt_h)
         return (!evicted && slot < g.n_zdepths && g.zdepths[slot].handle) ? slot : ENG_INVALID;
 
     eng_zdepth* z = &g.zdepths[slot];
+    eng_wcb_retire_zdepth(slot);
     /* The old size's snapshot goes with it: it can never be valid again. */
     if (z->snapshot && g.be->texture_release) g.be->texture_release(g.be->user, z->snapshot);
     if (z->handle) g.be->depth_target_release(g.be->user, z->handle);
@@ -2035,13 +2118,19 @@ static int eng_format_reinterprets_rgba8(u32 base_fmt)
 static int eng_surface_to_guest(u32 slot)
 {
     eng_surface* s = &g.surfaces[slot];
+    /* Armed for on-demand readback: the resolve copies it, in stream order. */
+    if (s->wcb_pending && rsx_wcb_resolve_cookie(slot, RSX_WCB_REASON_EXPLICIT)) return 1;
     if (!s->guest_dirty) return 1;
     const u32 bpp = eng_transfer_bpp(s->fmt);
     if (!bpp || s->pitch < s->w * bpp || !g.be->readback)
         return 0;
+    const unsigned long long t0 = eng_wcb_now_ns();
     rsx_draw_engine_guest_read(s->location, s->offset, s->pitch, s->w, s->h);
     s->guest_dirty = 0;
     eng_textures_touch(s->location, s->offset, s->pitch * s->h);
+    WCB_COUNT(copied, 1);
+    WCB_COUNT(bytes, (unsigned long long)s->pitch * s->h);
+    WCB_COUNT(copy_ns, eng_wcb_now_ns() - t0);
     return 1;
 }
 
@@ -2084,15 +2173,26 @@ static void eng_depth_row_to_guest(u8* dst, const float* src, u32 w, u32 bpp)
  * Z16 as one big-endian 16-bit value, Z24S8 as a big-endian word with the
  * depth in the top 24 bits. The stencil byte is written as 0: the host depth
  * target keeps no stencil to copy. Returns 0 when it cannot. */
-static int eng_zdepth_to_guest(u32 slot)
+static u8* s_depth_bytes;
+static size_t s_depth_bytes_cap;
+
+/* The guest-memory span a depth target's copy covers: used clip, zeta pitch. */
+static int eng_zdepth_span(const eng_zdepth* z, u32* w, u32* h, u32* bpp)
+{
+    *bpp = (z->zfmt == 1u) ? 2u : 4u;               /* SURFACE_FORMAT Z16 = 1 */
+    *w = z->used_w < z->w ? z->used_w : z->w;
+    *h = z->used_h < z->h ? z->used_h : z->h;
+    return *w && *h && z->pitch >= *w * *bpp;
+}
+
+/* `forced`: an on-demand resolve, whose destination is still protected. */
+static int eng_zdepth_store(u32 slot, int forced)
 {
     eng_zdepth* z = &g.zdepths[slot];
-    if (!z->guest_dirty) return 1;
     if (!g.be->depth_readback || !z->handle) return 0;
-    const u32 bpp = (z->zfmt == 1u) ? 2u : 4u;      /* SURFACE_FORMAT Z16 = 1 */
-    const u32 w = z->used_w < z->w ? z->used_w : z->w;
-    const u32 h = z->used_h < z->h ? z->used_h : z->h;
-    if (!w || !h || z->pitch < w * bpp) return 0;
+    u32 w, h, bpp;
+    if (!eng_zdepth_span(z, &w, &h, &bpp)) return 0;
+    const unsigned long long t0 = eng_wcb_now_ns();
     if (s_depth_cap < w * h) {
         float* n = (float*)realloc(s_depth_rows, (size_t)w * h * sizeof(float));
         if (!n) return 0;
@@ -2103,17 +2203,52 @@ static int eng_zdepth_to_guest(u32 slot)
     if (g.be->depth_readback(g.be->user, z->handle, 0, 0, w, h, s_depth_rows,
                              w * (u32)sizeof(float)) != 0)
         return 0;
-    for (u32 r = 0; r < h; r++) {
-        u8* dst = (u8*)eng_guest_ptr(NULL, z->location, z->offset + r * z->pitch, w * bpp);
-        if (!dst) return 0;
-        eng_depth_row_to_guest(dst, s_depth_rows + (size_t)r * w, w, bpp);
+    if (forced) {
+        /* Converted whole, then written through the protection: one write
+         * when the rows are packed at the zeta pitch, else one per row. */
+        const size_t row = (size_t)w * bpp, need = row * h;
+        if (s_depth_bytes_cap < need) {
+            u8* n = (u8*)realloc(s_depth_bytes, need);
+            if (!n) return 0;
+            s_depth_bytes = n;
+            s_depth_bytes_cap = need;
+        }
+        for (u32 r = 0; r < h; r++)
+            eng_depth_row_to_guest(s_depth_bytes + r * row, s_depth_rows + (size_t)r * w, w, bpp);
+        u8* all = row == z->pitch ? (u8*)eng_guest_ptr_raw(z->location, z->offset, (u32)need) : NULL;
+        if (all) {
+            rsx_wcb_store(all, s_depth_bytes, need);
+        } else {
+            for (u32 r = 0; r < h; r++) {
+                u8* dst = (u8*)eng_guest_ptr_raw(z->location, z->offset + r * z->pitch, (u32)row);
+                if (!dst) return 0;
+                rsx_wcb_store(dst, s_depth_bytes + r * row, row);
+            }
+        }
+    } else {
+        for (u32 r = 0; r < h; r++) {
+            u8* dst = (u8*)eng_guest_ptr(NULL, z->location, z->offset + r * z->pitch, w * bpp);
+            if (!dst) return 0;
+            eng_depth_row_to_guest(dst, s_depth_rows + (size_t)r * w, w, bpp);
+        }
     }
     z->guest_dirty = 0;
+    WCB_COUNT(copied, 1);
+    WCB_COUNT(bytes, (unsigned long long)z->pitch * h);
+    WCB_COUNT(copy_ns, eng_wcb_now_ns() - t0);
     eng_textures_touch(z->location, z->offset, z->pitch * h);
     if (eng_coherence_log())
         fprintf(stderr, "[rsx engine] depth 0x%08X (%s, pitch %u) %ux%u stored to guest memory\n",
                 z->offset, bpp == 2u ? "Z16" : "Z24S8", z->pitch, w, h);
     return 1;
+}
+
+static int eng_zdepth_to_guest(u32 slot)
+{
+    eng_zdepth* z = &g.zdepths[slot];
+    if (z->wcb_pending && rsx_wcb_resolve_cookie(0x10000u | slot, RSX_WCB_REASON_EXPLICIT)) return 1;
+    if (!z->guest_dirty) return 1;
+    return eng_zdepth_store(slot, 0);
 }
 
 /* A depth write or clear through the current zeta, recorded with what the
@@ -2122,6 +2257,7 @@ static void eng_zdepth_wrote(u32 slot, const rsx_dsp_surface* sf)
 {
     eng_zdepth* z = &g.zdepths[slot];
     z->depth_serial = ++g.write_serial;
+    if (!z->guest_dirty) WCB_COUNT(marked_dirty, 1);
     z->guest_dirty = 1;
     z->zfmt = sf->depth_format;
     z->pitch = sf->zeta_pitch;
@@ -2134,8 +2270,286 @@ static void eng_surfaces_wrote(const u32* targets, u32 n_targets)
     const u64 serial = ++g.write_serial;
     for (u32 i = 0; i < n_targets; i++) {
         g.surfaces[targets[i]].color_serial = serial;
+        if (!g.surfaces[targets[i]].guest_dirty) WCB_COUNT(marked_dirty, 1);
         g.surfaces[targets[i]].guest_dirty = 1;
     }
+}
+
+/* ---- write colour buffers: on-demand readback ---------------------------
+ *
+ * docs/wcb-async.md has the design. In short: at a sync point a dirty target
+ * is not copied; its guest pages are protected (rsx_wcb_protect). The first
+ * guest touch of those pages faults, and eng_wcb_resolve -- always on this,
+ * the engine's, thread -- copies the target and reopens them. In async mode a
+ * target the guest read recently also gets a GPU copy queued at the sync
+ * point, which the read then only collects. */
+
+#define WCB_COOKIE_DEPTH 0x10000u
+
+static int eng_wcb_parse_mode(const char* e)
+{
+    if (!e || !*e) return RSX_WCB_OFF;
+    if (!strcmp(e, "off"))      return RSX_WCB_OFF;
+    if (!strcmp(e, "sync"))     return RSX_WCB_SYNC;
+    if (!strcmp(e, "ondemand")) return RSX_WCB_ONDEMAND;
+    if (!strcmp(e, "async"))    return RSX_WCB_ASYNC;
+    const int v = atoi(e);
+    return v < RSX_WCB_OFF ? RSX_WCB_OFF : (v > RSX_WCB_ASYNC ? RSX_WCB_SYNC : v);
+}
+
+int rsx_draw_engine_wcb_mode(void)
+{
+    if (s_wcb.mode < 0) {
+        s_wcb.mode = eng_wcb_parse_mode(getenv("PS3RECOMP_RSX_WCB"));
+        const char* h = getenv("PS3RECOMP_RSX_WCB_HOT_FRAMES");
+        s_wcb.hot_frames = h && atoi(h) > 0 ? (u32)atoi(h) : 8u;
+        const char* st = getenv("PS3RECOMP_RSX_WCB_STATS");
+        const int every = st ? atoi(st) : 0;
+        s_wcb.stats_every = every <= 0 ? 0u : (every > 1000 ? 1000u : (u32)every);
+        if (s_wcb.mode)
+            fprintf(stderr, "[rsx wcb] mode %s%s\n",
+                    s_wcb.mode == RSX_WCB_SYNC ? "sync (copy every dirty target at every sync point)" :
+                    s_wcb.mode == RSX_WCB_ONDEMAND ? "ondemand (copy on first guest access)" :
+                    "async (ondemand; queue copies of recently read targets at sync points)",
+                    s_wcb.stats_every ? ", stats on" : "");
+    }
+    return s_wcb.mode;
+}
+
+void rsx_draw_engine_wcb_set_mode(int mode)
+{
+    rsx_draw_engine_wcb_mode();     /* settle the other knobs from the environment */
+    s_wcb.mode = mode < RSX_WCB_OFF ? RSX_WCB_OFF : (mode > RSX_WCB_ASYNC ? RSX_WCB_ASYNC : mode);
+}
+
+static void eng_wcb_resolve(void* user, u32 cookie, int reason);
+
+void rsx_draw_engine_wcb_set_wake(void (*wake)(void))
+{
+    s_wcb.wake = wake;
+    if (s_wcb.armed_module) rsx_wcb_init(eng_wcb_resolve, NULL, wake);
+}
+
+static int eng_wcb_hot(const eng_surface* s)
+{
+    return s->wcb_reads && g.frames - s->wcb_last_read <= s_wcb.hot_frames;
+}
+
+static void eng_wcb_drop_ticket(eng_surface* s)
+{
+    if (!s->wcb_ticket) return;
+    if (g.be->readback_async_release) g.be->readback_async_release(g.be->user, s->wcb_ticket);
+    s->wcb_ticket = 0;
+    WCB_COUNT(async_discarded, 1);
+}
+
+/* Copy colour surface `slot` whole into guest memory through the protection.
+ * `ticket`: take the bytes from the async copy queued at the sync point
+ * instead of reading the surface as it is now. */
+static int eng_wcb_copy_surface(u32 slot, int use_ticket)
+{
+    eng_surface* s = &g.surfaces[slot];
+    const u32 bpp = eng_transfer_bpp(s->fmt);
+    if (!bpp || !s->handle || s->pitch < s->w * bpp || !s->w || !s->h) return 0;
+    const unsigned long long t0 = eng_wcb_now_ns();
+    u8* rows = eng_coherence_buffer(s->w * bpp * s->h);
+    if (!rows) return 0;
+    int from_ticket = 0;
+    if (use_ticket && s->wcb_ticket && g.be->readback_async_fetch) {
+        const u32 t = s->wcb_ticket;
+        s->wcb_ticket = 0;
+        if (g.be->readback_async_fetch(g.be->user, t, rows, s->w * bpp) == 0) {
+            from_ticket = 1;
+        } else {
+            WCB_COUNT(async_discarded, 1);  /* fetch frees the ticket either way */
+        }
+    }
+    if (!from_ticket) {
+        eng_wcb_drop_ticket(s);
+        if (!g.be->readback) return 0;
+        g.be->submit_and_wait(g.be->user, RSX_BE_FLUSH_GUEST_REFERENCE);
+        g.be->readback(g.be->user, s->handle, 0, 0, s->w, s->h, rows, s->w * bpp);
+    }
+    eng_color_rows_store(bpp, s->location, s->offset, s->pitch, rows, s->w, s->h, 0, s->w * bpp, 1);
+    /* Drawn again since the queued copy: guest memory holds the sync point's
+     * bytes, and the next sync point arms it again for the newer ones. */
+    s->guest_dirty = from_ticket && s->color_serial != s->wcb_ticket_serial;
+    eng_textures_touch(s->location, s->offset, s->pitch * s->h);
+    WCB_COUNT(copied, 1);
+    WCB_COUNT(bytes, (unsigned long long)s->pitch * s->h);
+    if (from_ticket) WCB_COUNT(async_fetched, 1);
+    WCB_COUNT(copy_ns, eng_wcb_now_ns() - t0);
+    return 1;
+}
+
+/* rsx_wcb_resolve_fn: the guest (or the engine itself) is about to touch an
+ * armed target's pages. Engine thread only. The module reopens the pages when
+ * this returns. */
+static void eng_wcb_resolve(void* user, u32 cookie, int reason)
+{
+    (void)user;
+    /* A read in command-stream order -- the walker's own transfers, a texture
+     * upload, an eviction -- wants the target as it is now. A guest thread
+     * that saw the sync point's label wants it as of that label: the queued
+     * copy, when there is one. */
+    const int guest_read = reason == RSX_WCB_REASON_REQUEST;
+    const int is_read = reason != RSX_WCB_REASON_FLUSH;
+    if (cookie & WCB_COOKIE_DEPTH) {
+        const u32 slot = cookie & 0xFFFFu;
+        if (slot >= g.n_zdepths || !g.zdepths[slot].wcb_pending) return;
+        g.zdepths[slot].wcb_pending = 0;
+        if (g.zdepths[slot].guest_dirty && eng_zdepth_store(slot, 1) && is_read)
+            WCB_COUNT(demand_copies, 1);
+        return;
+    }
+    if (cookie >= g.n_surfaces || !g.surfaces[cookie].wcb_pending) return;
+    eng_surface* s = &g.surfaces[cookie];
+    s->wcb_pending = 0;
+    if (!eng_wcb_copy_surface(cookie, guest_read)) return;
+    if (is_read) {
+        WCB_COUNT(demand_copies, 1);
+        s->wcb_reads++;
+        s->wcb_last_read = g.frames;
+    }
+}
+
+static void eng_wcb_module_up(void)
+{
+    if (!s_wcb.armed_module) {
+        rsx_wcb_init(eng_wcb_resolve, NULL, s_wcb.wake);
+        rsx_wcb_counters_get(&s_wcb.mod_mark);
+        s_wcb.armed_module = 1;
+    }
+    s_wcb_live = 1;
+    rsx_wcb_set_owner_thread();
+}
+
+/* A slot is about to hold another target, or the engine is going down: guest
+ * memory gets what the old one rendered, and its ticket is freed. */
+static void eng_wcb_retire_surface(u32 slot)
+{
+    if (slot >= ENG_MAX_SURFACES) return;
+    eng_surface* s = &g.surfaces[slot];
+    if (s->wcb_pending) rsx_wcb_resolve_cookie(slot, RSX_WCB_REASON_FLUSH);
+    if (s->wcb_pending) { rsx_wcb_release(slot); s->wcb_pending = 0; }
+    eng_wcb_drop_ticket(s);
+    s->wcb_reads = 0;
+    s->wcb_last_read = 0;
+    s->wcb_ticket_serial = 0;
+}
+
+static void eng_wcb_retire_zdepth(u32 slot)
+{
+    if (slot >= ENG_MAX_ZDEPTHS) return;
+    eng_zdepth* z = &g.zdepths[slot];
+    if (z->wcb_pending) rsx_wcb_resolve_cookie(WCB_COOKIE_DEPTH | slot, RSX_WCB_REASON_FLUSH);
+    if (z->wcb_pending) { rsx_wcb_release(WCB_COOKIE_DEPTH | slot); z->wcb_pending = 0; }
+}
+
+static int eng_is_display_offset(u32 location, u32 offset);
+
+/* ondemand / async at a sync point: arm every dirty target, queue copies of
+ * the hot ones. Nothing here waits for the GPU. */
+static void eng_wcb_sync_point(int mode)
+{
+    eng_wcb_module_up();
+    for (u32 i = 0; i < g.n_surfaces; i++) {
+        eng_surface* s = &g.surfaces[i];
+        /* A wait that timed out had the module open the pages without a
+         * copy: arm the target again. */
+        if (s->wcb_pending && !rsx_wcb_is_pending(i)) s->wcb_pending = 0;
+        if (!s->handle || !s->guest_dirty) continue;
+        if (eng_is_display_offset(s->location, s->offset)) continue;
+        if (!s->wcb_pending) {
+            const u32 bpp = eng_transfer_bpp(s->fmt);
+            if (!bpp || s->pitch < s->w * bpp || !s->w || !s->h || !g.be->readback) continue;
+            const u32 span = s->pitch * (s->h - 1u) + s->w * bpp;
+            void* host = (void*)eng_guest_ptr_raw(s->location, s->offset, span);
+            if (host && rsx_wcb_protect(i, host, span) == 0) {
+                s->wcb_pending = 1;
+                WCB_COUNT(armed, 1);
+            } else {
+                /* The host would not protect the pages: copy now, as sync
+                 * mode does, rather than let the guest read stale bytes. */
+                if (eng_surface_to_guest(i)) WCB_COUNT(sync_copies, 1);
+                continue;
+            }
+        }
+        if (mode == RSX_WCB_ASYNC && g.be->readback_async && eng_wcb_hot(s) &&
+            (!s->wcb_ticket || s->wcb_ticket_serial != s->color_serial)) {
+            eng_wcb_drop_ticket(s);
+            const u32 t = g.be->readback_async(g.be->user, s->handle, 0, 0, s->w, s->h);
+            if (t) {
+                s->wcb_ticket = t;
+                s->wcb_ticket_serial = s->color_serial;
+                WCB_COUNT(async_issued, 1);
+            }
+        }
+    }
+    if (!g.be->depth_readback) return;
+    for (u32 i = 0; i < g.n_zdepths; i++) {
+        eng_zdepth* z = &g.zdepths[i];
+        if (z->wcb_pending && !rsx_wcb_is_pending(WCB_COOKIE_DEPTH | i)) z->wcb_pending = 0;
+        if (!z->handle || !z->guest_dirty || z->wcb_pending) continue;
+        u32 w, h, bpp;
+        if (!eng_zdepth_span(z, &w, &h, &bpp)) continue;
+        const u32 span = z->pitch * (h - 1u) + w * bpp;
+        void* host = (void*)eng_guest_ptr_raw(z->location, z->offset, span);
+        if (host && rsx_wcb_protect(WCB_COOKIE_DEPTH | i, host, span) == 0) {
+            z->wcb_pending = 1;
+            WCB_COUNT(armed, 1);
+        } else if (eng_zdepth_to_guest(i)) {
+            WCB_COUNT(sync_copies, 1);
+        }
+    }
+}
+
+void rsx_draw_engine_wcb_service(void)
+{
+    if (!s_wcb_live || !g.ready) return;
+    rsx_wcb_set_owner_thread();
+    rsx_wcb_service();
+}
+
+void rsx_draw_engine_wcb_stats_get(rsx_draw_engine_wcb_stats* out)
+{
+    if (!out) return;
+    *out = s_wcb.st;
+    if (!s_wcb.armed_module) return;
+    rsx_wcb_counters c;
+    rsx_wcb_counters_get(&c);
+    out->faults = c.faults;
+    out->waits = c.waits;
+    out->wait_ns = c.wait_ns;
+    out->wait_max_ns = c.wait_max_ns;
+    out->timeouts = c.timeouts;
+}
+
+/* PS3RECOMP_RSX_WCB_STATS: one line per window, per-frame averages. */
+static void eng_wcb_frame_tick(void)
+{
+    if (!s_wcb.stats_every || !s_wcb.mode) return;
+    if (++s_wcb.win_frames < s_wcb.stats_every) return;
+    const double f = (double)s_wcb.win_frames;
+    const rsx_draw_engine_wcb_stats* w = &s_wcb.win;
+    rsx_wcb_counters c;
+    memset(&c, 0, sizeof c);
+    if (s_wcb.armed_module) rsx_wcb_counters_get(&c);
+    const rsx_wcb_counters* m = &s_wcb.mod_mark;
+    const unsigned long long waits = c.waits - m->waits, wait_ns = c.wait_ns - m->wait_ns;
+    fprintf(stderr, "[rsx wcb] %u frames, per frame: dirty %.1f armed %.1f copied %.1f (%.0f KB:"
+                    " sync %.1f demand %.1f) async issued %.1f fetched %.1f discarded %.1f;"
+                    " faults %.1f waits %.1f (avg %.0f us, max %.0f us) copy %.2f ms; timeouts %llu"
+                    " pending %u\n",
+            s_wcb.win_frames, w->marked_dirty / f, w->armed / f, w->copied / f,
+            w->bytes / f / 1024.0, w->sync_copies / f, w->demand_copies / f,
+            w->async_issued / f, w->async_fetched / f, w->async_discarded / f,
+            (c.faults - m->faults) / f, waits / f, waits ? wait_ns / 1e3 / waits : 0.0,
+            c.wait_max_ns / 1e3, w->copy_ns / f / 1e6, (unsigned long long)(c.timeouts - m->timeouts),
+            rsx_wcb_pending_count());
+    memset(&s_wcb.win, 0, sizeof s_wcb.win);
+    s_wcb.mod_mark = c;
+    s_wcb.win_frames = 0;
 }
 
 /* SET_TEXTURE_FILTER's min field is [18:16] (1 NEAREST, 2 LINEAR, then 3..6,
@@ -4602,27 +5016,25 @@ static int eng_is_display_offset(u32 location, u32 offset)
 void rsx_draw_engine_flush_dirty_to_guest(void)
 {
     if (!g.ready || !g.be) return;
-    static int s_wcb = -1;
-    if (s_wcb < 0) {
-        const char* e = getenv("PS3RECOMP_RSX_WCB");
-        s_wcb = e ? atoi(e) : 0;
-    }
-    if (!s_wcb) return;
+    const int mode = rsx_draw_engine_wcb_mode();
+    if (!mode) return;
+    if (mode >= RSX_WCB_ONDEMAND) { eng_wcb_sync_point(mode); return; }
 
+    /* sync: every dirty target, now, each behind a full GPU wait. */
     if (g.be->readback) {
         for (u32 i = 0; i < g.n_surfaces; i++) {
             eng_surface* s = &g.surfaces[i];
             if (s->guest_dirty) {
                 if (eng_is_display_offset(s->location, s->offset))
                     continue;
-                eng_surface_to_guest(i);
+                if (eng_surface_to_guest(i) && !s->guest_dirty) WCB_COUNT(sync_copies, 1);
             }
         }
     }
     if (g.be->depth_readback) {
         for (u32 i = 0; i < g.n_zdepths; i++) {
             if (g.zdepths[i].guest_dirty) {
-                eng_zdepth_to_guest(i);
+                if (eng_zdepth_to_guest(i) && !g.zdepths[i].guest_dirty) WCB_COUNT(sync_copies, 1);
             }
         }
     }
@@ -4650,6 +5062,7 @@ static void eng_present(u32 buffer_id)
     g.frames++;
     g.last_guest_draws = g.guest_draws;
     g.guest_draws = 0;
+    eng_wcb_frame_tick();
 }
 
 static void sink_flip(void* user, const rsx_dispatch* r, u32 arg)
@@ -4734,6 +5147,10 @@ int rsx_draw_engine_init(u32 width, u32 height)
     sink.flip             = sink_flip;
     rsx_dispatch_init(&g.rsx, &sink);
     g.ready = 1;
+    memset(&s_wcb.st, 0, sizeof s_wcb.st);
+    memset(&s_wcb.win, 0, sizeof s_wcb.win);
+    s_wcb.win_frames = 0;
+    if (rsx_draw_engine_wcb_mode() >= RSX_WCB_ONDEMAND) eng_wcb_module_up();
     /* Display buffers the title registered before the backend came up. */
     cellGcm_replay_display_buffers_to_engine();
     fprintf(stderr, "[rsx engine] register-file draw engine up (%ux%u)\n",
@@ -4744,6 +5161,14 @@ int rsx_draw_engine_init(u32 width, u32 height)
 void rsx_draw_engine_shutdown(void)
 {
     if (!g.be) return;
+    if (g.ready && s_wcb_live) {
+        /* Armed targets go to guest memory and their pages reopen: the guest
+         * may outlive the engine (a backend switch, a window close). */
+        for (u32 i = 0; i < g.n_surfaces; i++) eng_wcb_retire_surface(i);
+        for (u32 i = 0; i < g.n_zdepths; i++) eng_wcb_retire_zdepth(i);
+        rsx_wcb_shutdown();
+        s_wcb_live = 0;
+    }
     if (g.ready && g.be->submit_and_wait)
         g.be->submit_and_wait(g.be->user, RSX_BE_FLUSH_SHUTDOWN);
     for (u32 i = 0; i < g.n_textures; i++)
@@ -4781,12 +5206,15 @@ void rsx_draw_engine_method(u32 method, u32 arg)
      * (0xE9xx, 0xEBxx) encode the subchannel bits as part of the address;
      * preserve them with the wider mask. */
     u32 m = (method >= 0xE000u) ? (method & 0xFFFCu) : (method & 0x1FFCu);
+    /* A guest thread waiting on an armed target's bytes. */
+    if (s_wcb_live && rsx_wcb_requests_pending()) rsx_draw_engine_wcb_service();
     rsx_dispatch_method(&g.rsx, m, arg);
 }
 
 void rsx_draw_engine_methods(u32 method, u32 step, const u8* src, u32 count)
 {
     if (!g.ready) return;
+    if (s_wcb_live && rsx_wcb_requests_pending()) rsx_draw_engine_wcb_service();
     rsx_dispatch_method_run(&g.rsx, method, step, src, count);
 }
 
