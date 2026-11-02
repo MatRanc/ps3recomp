@@ -1599,6 +1599,8 @@ void gcm_forget_spu_blocks(void)
     s_spu_blk_w = 0;
 }
 
+static void gcm_walker_wake_for_put(u32 io, u32 size);
+
 void gcm_note_spu_put(u32 ea, u32 size)
 {
     if (!size || size > 0x40000u) return;
@@ -1614,6 +1616,7 @@ void gcm_note_spu_put(u32 ea, u32 size)
     u32 io = gcm_ea2io_range(ea, &room);
     if (io == 0xFFFFFFFFu || size > room) return;   /* not in RSX-visible memory */
     if (ps3_trace_on()) ps3_trace_instant(PS3_TR_GCM_SPU_PUT, io, size);
+    gcm_walker_wake_for_put(io, size);
 
     /* Coalesce with the previous block when an SPU emits one buffer in several
      * transfers -- otherwise only the last fragment is remembered and the
@@ -1860,11 +1863,55 @@ static void gcm_rsx_process_fifo_unlocked(void);
  * 16 ms tick per fence was ~0.75 s/frame (the 2 FPS intro). The walker (and
  * the D3D12 backend it feeds) stays on the present thread -- running it from
  * the polling game thread killed the process silently. */
+static void (*s_walker_kick_fn)(void);
+static void gcm_walker_kick(void);
 static HANDLE s_gcm_kick_ev = NULL;
 void* cellGcm_fifo_kick_event(void)
 {
     if (!s_gcm_kick_ev) s_gcm_kick_ev = CreateEventA(NULL, FALSE, FALSE, NULL);
+    s_walker_kick_fn = gcm_walker_kick;
     return (void*)s_gcm_kick_ev;
+}
+
+/* PS3RECOMP_WALKER_WAKE=1: the idle wait below ends on its 4 ms timeout (or a
+ * fence poll's kick), so an SPU job that fills the very word the walker parked
+ * on can sit visible for up to that whole timeout before the walker runs again
+ * (measured p50 0.53 ms, p90 2.15 ms). Remember the parked `get` and let that
+ * DMA PUT wake the wait directly. Only a PUT whose range contains the parked
+ * word signals: a write elsewhere cannot make the park executable, and the
+ * auto-reset event coalesces a burst of them, so this cannot spin the walker.
+ *
+ * Off by default: waking per slot turns one 4 ms-batched pass into a pass per
+ * c690 job (6.2 -> 35.4 waits/frame in the pitch trace), and the wait it
+ * removes from "PUT visible" reappears as "job not pushed" -- the walker is
+ * caught up with the SPU producer either way. Measured at the pitch it cost
+ * ~7.5 % fps (33.29 -> 30.67 traced) and did not raise the frame rate. */
+static volatile u32 s_walker_park_get = 0xFFFFFFFFu;
+
+/* Installed by cellGcm_fifo_kick_event, so a title whose tests build this
+ * file without the host event layer does not gain a new undefined symbol:
+ * a PUT only wakes a wait that the event path has already armed. */
+static void gcm_walker_kick(void)
+{
+    if (s_gcm_kick_ev) SetEvent(s_gcm_kick_ev);
+}
+
+static int gcm_walker_wake_on(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char* e = getenv("PS3RECOMP_WALKER_WAKE");
+        on = (e && *e && *e != '0') ? 1 : 0;
+    }
+    return on;
+}
+static void gcm_walker_wake_for_put(u32 io, u32 size)
+{
+    if (!gcm_walker_wake_on()) return;
+    const u32 get = s_walker_park_get;
+    if (get == 0xFFFFFFFFu || get < io || get - io >= size) return;
+    void (*kick)(void) = s_walker_kick_fn;
+    if (kick) kick();
 }
 
 /* The present thread's idle wait. It used to be a flat Sleep(4), which meant
@@ -2266,6 +2313,9 @@ static void gcm_fifo_dump_flip(u32 w)
 static void gcm_rsx_process_fifo_unlocked(void)
 {
     gcm_fifo_dump_init();
+    /* A pass that parks publishes the word it is waiting on; the next pass
+     * clears it before touching `get`, so a PUT wakes only a live park. */
+    s_walker_park_get = 0xFFFFFFFFu;
     { static unsigned _n = 0; static unsigned long long _t0 = 0;
       extern unsigned long long ps3_ms_now(void);
       _n++;
@@ -2641,6 +2691,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
                   why = "parked";
                   s_park_pass = 1;
                   s_tr_parked = 1;
+                  s_walker_park_get = s_fifo_getoff;
                   ps3_trace_instant(PS3_TR_RSX_PARK, s_fifo_getoff, put);
                   break;
               }
