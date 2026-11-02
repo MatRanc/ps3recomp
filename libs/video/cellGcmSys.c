@@ -1870,6 +1870,20 @@ void cellGcm_fifo_kick_wait(unsigned ms)
     HANDLE ev = on ? (HANDLE)cellGcm_fifo_kick_event() : NULL;
     if (ev) WaitForSingleObject(ev, ms);
     else    Sleep(ms);
+    /* A guest thread blocked on a render target's bytes (on-demand WCB) kicks
+     * this wait; copy them before anything else. */
+    if (rsx_draw_engine_enabled()) {
+        AcquireSRWLockExclusive(&s_gcm_fifo_lock);
+        rsx_draw_engine_wcb_service();
+        ReleaseSRWLockExclusive(&s_gcm_fifo_lock);
+    }
+}
+
+/* rsx_draw_engine_wcb_set_wake: a faulting guest thread's nudge. */
+static void gcm_wcb_wake(void)
+{
+    HANDLE ev = (HANDLE)cellGcm_fifo_kick_event();
+    if (ev) SetEvent(ev);
 }
 
 
@@ -2052,8 +2066,11 @@ void cellGcm_rsx_process_fifo(void)
 {
     wprof_note_walker();
     g_gcm_drain_tid = GetCurrentThreadId();
+    { static int wake_set;
+      if (!wake_set) { wake_set = 1; rsx_draw_engine_wcb_set_wake(gcm_wcb_wake); } }
     const uint64_t ft_t0 = PS3_FT_ON() ? ps3_ft_now() : 0;
     AcquireSRWLockExclusive(&s_gcm_fifo_lock);
+    if (rsx_draw_engine_enabled()) rsx_draw_engine_wcb_service();
     const uint64_t tr_t0 = ps3_trace_begin();
     if (tr_t0) {
         ps3_trace_thread_name_default("rsx walker");

@@ -494,6 +494,9 @@ static void vk_present_wait_gpu(void);
  * results flushes them first, so everything else keeps the invariant that
  * all earlier work has completed. */
 static u32 s_eb_pending;
+/* Bumped each time the open batch is submitted: an async readback ticket
+ * recorded into batch N is still unsubmitted while this equals N. */
+static unsigned long long s_eb_batch_id;
 /* VK_FRAME_PIPELINE=1 (with VK_DRAW_BATCH=1): VK_EB_SETS sets of what a batch
  * holds. A present submits the frame's batch without waiting and the next frame
  * records into the next set, so the walker records frame N+1 while the GPU
@@ -2594,6 +2597,7 @@ static void vk_eng_release(void* user, u32 handle)
 }
 
 static void vk_eng_snapshot_pool_drain(void);
+static void vk_eng_readback_tickets_drain(void);
 
 static void vk_eng_shutdown(void* user)
 {
@@ -2601,6 +2605,7 @@ static void vk_eng_shutdown(void* user)
     for (u32 i = 1; i < VK_ENG_MAX_OBJ; i++) vk_eng_release(user, i);
     vk_eng_snapshot_pool_drain();
     vk_eb_release();
+    vk_eng_readback_tickets_drain();
     vk_destroy_buffer(&s_rb_stage);
     vk_destroy_buffer(&s_up_stage);
 }
@@ -2793,6 +2798,113 @@ static void vk_eng_readback(void* user, u32 surface, u32 x, u32 y, u32 w, u32 h,
             for (u32 row = 0; row < h; row++)
                 memcpy((u8*)out + (size_t)row * out_pitch, (const u8*)st->ptr + (size_t)row * tight, tight);
         }
+    }
+}
+
+/* ---- asynchronous readback (on-demand WCB, docs/wcb-async.md) -------------
+ * A copy of a colour target into a host buffer of its own, recorded into the
+ * open draw batch when batching is on, so queueing it costs no GPU wait: it
+ * runs when the batch is submitted, ordered after every draw before it by the
+ * full barrier in front of it and before every draw after it by the one
+ * behind. Fetching waits for that batch alone if it is still open or in
+ * flight. With batching off the copy is one synchronous submission, as every
+ * other operation here is, and the ticket only carries the bytes. Buffers are
+ * kept per ticket slot and grow; a released slot is reused, and the barrier
+ * in front of the next copy orders it after any copy still in flight there. */
+#define VK_RB_TICKETS 64
+typedef struct {
+    int                used, done;
+    vk_buffer          buf;
+    u32                w, h, bpp;
+    unsigned long long batch;
+} vk_rb_ticket;
+static vk_rb_ticket s_rbt[VK_RB_TICKETS];
+
+static u32 vk_eng_readback_async(void* user, u32 surface, u32 x, u32 y, u32 w, u32 h)
+{
+    (void)user;
+    vk_eng_obj* o = vk_eng_get(surface, VK_ENG_COLOR);
+    if (!o || !w || !h || x + w > o->w || y + h > o->h) return 0;
+    u32 i = 0;
+    while (i < VK_RB_TICKETS && s_rbt[i].used) i++;
+    if (i == VK_RB_TICKETS) return 0;
+    const VkDeviceSize bytes = (VkDeviceSize)w * h * o->bpp;
+    if (s_rbt[i].buf.buf && s_rbt[i].buf.size < bytes) vk_destroy_buffer(&s_rbt[i].buf);
+    if (!s_rbt[i].buf.buf) {
+        VkDeviceSize cap = (VkDeviceSize)1 << 20;
+        while (cap < bytes) cap *= 2u;
+        if (vk_create_host_buffer(&s_rbt[i].buf, cap, VK_BUFFER_USAGE_TRANSFER_DST_BIT)) {
+            vk_destroy_buffer(&s_rbt[i].buf);
+            return 0;
+        }
+    }
+    const int batched = vk_eb_active();
+    if (batched ? (!s_eb_pending && vk_begin()) : vk_begin()) return 0;
+    vk_cmd_after_everything(s_vk.cmd);
+    vk_barrier_image(o->im.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL);
+    VkBufferImageCopy region = {
+        .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
+        .imageOffset = { (int32_t)x, (int32_t)y, 0 }, .imageExtent = { w, h, 1 },
+    };
+    pvkCmdCopyImageToBuffer(s_vk.cmd, o->im.img, VK_IMAGE_LAYOUT_GENERAL, s_rbt[i].buf.buf, 1, &region);
+    VkBufferMemoryBarrier hb = {
+        .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
+        .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT, .dstAccessMask = VK_ACCESS_HOST_READ_BIT,
+        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .buffer = s_rbt[i].buf.buf, .offset = 0, .size = VK_WHOLE_SIZE,
+    };
+    pvkCmdPipelineBarrier(s_vk.cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT,
+                          0, 0, NULL, 1, &hb, 0, NULL);
+    /* Later draws into the target wait for the copy to have read it. */
+    vk_barrier_image(o->im.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL);
+    s_rbt[i].used = 1;
+    s_rbt[i].w = w; s_rbt[i].h = h; s_rbt[i].bpp = o->bpp;
+    s_rbt[i].batch = s_eb_batch_id;
+    if (batched) {
+        s_rbt[i].done = 0;
+        vk_eb_recorded();            /* may submit the batch: the ticket's batch id is already set */
+    } else {
+        s_rbt[i].done = vk_submit_and_wait() == 0;
+        if (!s_rbt[i].done) { s_rbt[i].used = 0; return 0; }
+    }
+    return i + 1u;
+}
+
+static int vk_eng_readback_fetch(void* user, u32 ticket, void* out, u32 out_pitch)
+{
+    (void)user;
+    if (!ticket || ticket > VK_RB_TICKETS || !s_rbt[ticket - 1u].used) return -1;
+    vk_rb_ticket* t = &s_rbt[ticket - 1u];
+    if (!t->done) {
+        const unsigned long long w0 = vk_now_us();
+        if (t->batch == s_eb_batch_id && s_eb_pending) { s_eb_why = 4; vk_eng_flush(); }
+        vk_ebs_wait_other();         /* a pipelined batch set may still hold it */
+        s_eb_wait_us[8] += vk_now_us() - w0;
+        t->done = 1;
+    }
+    int rc = -1;
+    if (out && out_pitch) {
+        vk_invalidate(&t->buf);
+        const size_t tight = (size_t)t->w * t->bpp;
+        for (u32 row = 0; row < t->h; row++)
+            memcpy((u8*)out + (size_t)row * out_pitch, (const u8*)t->buf.ptr + (size_t)row * tight, tight);
+        rc = 0;
+    }
+    t->used = 0;
+    return rc;
+}
+
+static void vk_eng_readback_release(void* user, u32 ticket)
+{
+    (void)user;
+    if (ticket && ticket <= VK_RB_TICKETS) s_rbt[ticket - 1u].used = 0;
+}
+
+static void vk_eng_readback_tickets_drain(void)
+{
+    for (u32 i = 0; i < VK_RB_TICKETS; i++) {
+        if (s_rbt[i].buf.buf) vk_destroy_buffer(&s_rbt[i].buf);
+        memset(&s_rbt[i], 0, sizeof s_rbt[i]);
     }
 }
 
@@ -4059,6 +4171,7 @@ static void vk_eng_flush_async(void)
                         .commandBufferCount = 1, .pCommandBuffers = &s_vk.cmd };
     pvkResetFences(s_vk.device, 1, &s_vk.fence);
     if (vk_queue_submit(&si, s_vk.fence) != VK_SUCCESS) { VK_LOG("vkQueueSubmit (pipelined) failed\n"); return; }
+    s_eb_batch_id++;
     s_eb.flushes++;
     vk_ebs_swap();
 }
@@ -4165,6 +4278,7 @@ static void vk_eng_flush(void)
         s_eb_why = 0; }
     s_eb_pending = 0;               /* first: the submit below must not re-enter */
     vk_submit_and_wait();
+    s_eb_batch_id++;
     s_wait_tag = 8;
     s_eb.vb_head = s_eb.ib_head = s_eb.ub_head = s_eb.sb_head = 0;
     s_eb.raw_vb_head = s_eb.remap_head = 0;
@@ -4562,6 +4676,9 @@ static const rsx_draw_backend s_vk_engine_backend = {
     .clear_depth_stencil  = vk_eng_clear_depth_stencil,
     .present              = vk_eng_present,
     .readback             = vk_eng_readback,
+    .readback_async       = vk_eng_readback_async,
+    .readback_async_fetch = vk_eng_readback_fetch,
+    .readback_async_release = vk_eng_readback_release,
     .depth_readback       = vk_eng_depth_readback,
     .color_target_write   = vk_eng_color_target_write,
     /* Every draw and every upload submits and waits, so an upload runs after

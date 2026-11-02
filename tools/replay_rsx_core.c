@@ -190,6 +190,8 @@ void rsx_draw_engine_note_flip(u32 buffer_id)
 void rsx_draw_engine_guest_read(u32 l, u32 o, u32 p, u32 w, u32 h) { (void)l; (void)o; (void)p; (void)w; (void)h; }
 void rsx_draw_engine_guest_wrote(u32 l, u32 o, u32 p, u32 w, u32 h) { (void)l; (void)o; (void)p; (void)w; (void)h; }
 void rsx_draw_engine_flush_dirty_to_guest(void) {}
+void rsx_draw_engine_wcb_service(void) {}
+void rsx_draw_engine_wcb_set_wake(void (*wake)(void)) { (void)wake; }
 void rsx_draw_engine_set_display_query(int (*fn)(u32 offset)) { (void)fn; }
 void rsx_draw_engine_set_display_buffer(u32 id, u32 loc, u32 off, u32 w, u32 h, u32 p) { (void)id; (void)loc; (void)off; (void)w; (void)h; (void)p; }
 void rsx_live_draw_set_display_buffer(u32 id, u32 loc, u32 off, u32 w, u32 h, u32 p) { (void)id; (void)loc; (void)off; (void)w; (void)h; (void)p; }

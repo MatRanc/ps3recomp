@@ -342,6 +342,20 @@ typedef struct rsx_draw_backend {
                       u32 vertex_count, u32 stride, const u32* indices,
                       u32 index_count);
 
+    /* Optional asynchronous colour readback, for on-demand render-target
+     * readback (PS3RECOMP_RSX_WCB=async, docs/wcb-async.md). readback_async
+     * queues a copy of the rectangle -- ordered after every draw recorded so
+     * far and before every later one -- into backend-owned memory, and returns
+     * at once with a nonzero ticket (0: cannot, and the engine reads back
+     * synchronously when the guest needs the bytes). readback_async_fetch
+     * waits for that copy alone if it has not finished, writes the rows in
+     * the format readback would, and frees the ticket; 0 on success.
+     * readback_async_release frees a ticket nobody fetched. All three are
+     * called on the engine's thread. */
+    u32  (*readback_async)(void* user, u32 surface, u32 x, u32 y, u32 w, u32 h);
+    int  (*readback_async_fetch)(void* user, u32 ticket, void* out, u32 out_pitch);
+    void (*readback_async_release)(void* user, u32 ticket);
+
 } rsx_draw_backend;
 
 /* ---- the engine --------------------------------------------------------- */
@@ -417,6 +431,60 @@ void rsx_draw_engine_guest_wrote(u32 location, u32 offset, u32 pitch, u32 w, u32
  * memory (e.g. MLB The Show 16 dynamic player faces and crowd textures) observe
  * valid rendered texels instead of uninitialized RAM. */
 void rsx_draw_engine_flush_dirty_to_guest(void);
+
+/* ---- write colour buffers (WCB): render targets the guest reads ---------
+ *
+ * PS3RECOMP_RSX_WCB selects how rendered targets reach guest memory. See
+ * docs/wcb-async.md for the design and when each mode is safe.
+ *
+ *   0, off       never (default)
+ *   1, sync      every dirty target copied at every sync point, each a full
+ *                GPU stall (the original behaviour)
+ *   2, ondemand  at a sync point a dirty target's guest pages are protected;
+ *                it is copied only when the CPU or an SPU first touches them
+ *   3, async     ondemand, plus: a target the guest has read recently gets
+ *                its copy queued on the GPU at the sync point, so the read
+ *                only waits for that copy (and gets the bytes as of the sync
+ *                point, as sync mode would)
+ *
+ * PS3RECOMP_RSX_WCB_STATS=N prints the counters every N frames (1 = every
+ * frame; any other nonzero value up to 1000 is the window). */
+#define RSX_WCB_OFF      0
+#define RSX_WCB_SYNC     1
+#define RSX_WCB_ONDEMAND 2
+#define RSX_WCB_ASYNC    3
+
+int  rsx_draw_engine_wcb_mode(void);
+/* Override the environment (tests, or a port that knows its title). */
+void rsx_draw_engine_wcb_set_mode(int mode);
+/* Owner thread: copy the targets other threads are waiting for. The FIFO
+ * walker calls it between methods; the idle wait calls it too. Cheap when
+ * nothing is waiting. */
+void rsx_draw_engine_wcb_service(void);
+/* How a faulting thread wakes the owner thread out of its idle wait. */
+void rsx_draw_engine_wcb_set_wake(void (*wake)(void));
+
+typedef struct rsx_draw_engine_wcb_stats {
+    unsigned long long marked_dirty;    /* targets that became dirty after a copy  */
+    unsigned long long armed;           /* targets whose pages were protected       */
+    unsigned long long copied;          /* targets copied to guest memory, any path */
+    unsigned long long bytes;           /* bytes those copies wrote                 */
+    unsigned long long sync_copies;     /*   ... at a sync point (sync mode, or a
+                                         *   target whose pages could not be armed) */
+    unsigned long long demand_copies;   /*   ... because the guest touched them     */
+    unsigned long long async_issued;    /* copies queued on the GPU                 */
+    unsigned long long async_fetched;   /*   ... whose bytes the guest got          */
+    unsigned long long async_discarded; /*   ... superseded or dropped unread       */
+    unsigned long long faults;          /* guest faults on armed pages              */
+    unsigned long long waits;           /* guest-thread waits for a copy            */
+    unsigned long long wait_ns;         /*   ... total                              */
+    unsigned long long wait_max_ns;     /*   ... longest                            */
+    unsigned long long timeouts;        /* waits given up on (stale bytes read)     */
+    unsigned long long copy_ns;         /* engine-thread time spent copying         */
+} rsx_draw_engine_wcb_stats;
+
+/* Cumulative since the engine came up. */
+void rsx_draw_engine_wcb_stats_get(rsx_draw_engine_wcb_stats* out);
 
 /* --- test hooks ---------------------------------------------------------- */
 

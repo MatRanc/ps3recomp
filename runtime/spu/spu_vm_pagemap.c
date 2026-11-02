@@ -12,3 +12,10 @@
  * never seeds it is correct, just slower on first touch per page. */
 
 unsigned char g_vm_page_bitmap[65536 / 8];
+
+/* ps3emu/guest_access.h: NULL until the RSX draw engine arms on-demand
+ * render-target readback (libs/video/rsx_wcb.c). Lives here, beside the page
+ * bitmap, because the SPU DMA guard that consults it is inlined into whichever
+ * TU handles MFC. */
+#include <stddef.h>
+void (*volatile g_ps3_guest_access_hook)(const void* host, size_t len);

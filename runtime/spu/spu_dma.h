@@ -19,6 +19,7 @@
 #include "../../include/ps3emu/log_first.h"
 #include "../../include/ps3emu/ps3_trace.h"   /* PS3RECOMP_TRACE: tag-status waits */
 #include "spu_coherency.h"
+#include "../../include/ps3emu/guest_access.h"   /* render-target pages armed for readback */
 #include <stdint.h>
 #include <string.h>
 #include <stdlib.h>
@@ -64,6 +65,12 @@ static inline int mfc_ea_range_committed(uint64_t ea, uint32_t size)
           if ((g_vm_page_bitmap[pg[i] >> 3] >> (pg[i] & 7)) & 1) continue;
           MEMORY_BASIC_INFORMATION mbi;
           uint8_t* p = vm_base + ((uintptr_t)pg[i] << 16);
+          /* A render-target page armed for on-demand readback is PROT_NONE
+           * until the rendered bytes are copied in, which the POSIX shim
+           * reports as an uncommitted reservation -- and the commit below
+           * would then reopen it read-write over stale bytes. Make the block
+           * coherent before asking (a bitmap miss only: first touch). */
+          ps3_guest_access(p, 0x10000);
           if (VirtualQuery(p, &mbi, sizeof mbi) == 0) return 0;
           if (mbi.State != MEM_COMMIT) {
               if (!VirtualAlloc(p, 0x10000, MEM_COMMIT, PAGE_READWRITE)) return 0;
