@@ -2987,8 +2987,10 @@ static int eng_wcb_copy_surface(u32 slot, int use_ticket)
     else if (s_wcb.partial_slot == (int)slot) s_wcb.partial_slot = -1;
     eng_guest_valid_set(s, rx, ry, rw, rh);
     eng_textures_touch(s->location, s->offset, s->pitch * s->h);
-    eng_light_probe_log(slot, s, rx, ry, rw, rh, full ? "sync" : "rect", rows,
-                        rw, probe_stored, probe_covers, probe_ticket);
+    eng_light_probe_log(slot, s, rx, ry, rw, rh,
+                        full ? (from_ticket ? "ticket" :
+                                use_ticket ? "guestreq" : "copy") : "rect",
+                        rows, rw, probe_stored, probe_covers, probe_ticket);
     WCB_COUNT(copied, 1);
     WCB_COUNT(bytes, (unsigned long long)s->pitch * rh);
     if (from_ticket) WCB_COUNT(async_fetched, 1);
