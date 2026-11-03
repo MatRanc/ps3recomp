@@ -909,6 +909,30 @@ static const u8* eng_guest_ptr(void* user, u32 location, u32 offset,
     return p;
 }
 
+/* PS3RECOMP_RSX_WCB_ATTR=1: why each readback ran. Every copy is counted
+ * against its target and against the path that asked for it, so the log says
+ * whether the walker's texture binds or the guest PPU/SPU reads cost the
+ * readback time. Default off; the note path is one flag test when off. */
+enum {
+    ENG_WCB_TRIG_TEXBIND = 0,   /* the walker's texture bind wants guest bytes */
+    ENG_WCB_TRIG_GUEST,         /* a PPU/SPU load/store faulted on the target  */
+    ENG_WCB_TRIG_OTHER,         /* transfer, sync-point fallback, eviction      */
+    ENG_WCB_TRIG_COUNT
+};
+
+/* The trigger of the copy currently on the stack. Only the draw engine sets
+ * it, and every copy ends inside the call that set it. */
+static int s_wcb_trigger = ENG_WCB_TRIG_OTHER;
+
+typedef struct {
+    int used, depth;
+    u32 location, offset, fmt, w, h, pitch;
+    u64 reads[ENG_WCB_TRIG_COUNT];
+    u64 bytes[ENG_WCB_TRIG_COUNT];
+    u64 copy_ns[ENG_WCB_TRIG_COUNT];
+    u64 wait_ns;                /* guest-thread wait, taken at the flush     */
+} eng_wcb_attr_row;
+
 /* WCB mode, settings and counters (docs/wcb-async.md). `st` is cumulative;
  * `win` is the window PS3RECOMP_RSX_WCB_STATS prints and resets. */
 static struct {
@@ -917,6 +941,9 @@ static struct {
     u32 hot_frames;           /* a read this recent makes a target "hot"   */
     u32 stats_every;          /* print window in frames, 0 = never         */
     u32 win_frames;
+    int attr_on;              /* PS3RECOMP_RSX_WCB_ATTR                    */
+    u32 attr_every, attr_frames;
+    eng_wcb_attr_row attr[ENG_MAX_SURFACES + ENG_MAX_ZDEPTHS];
     void (*wake)(void);
     rsx_draw_engine_wcb_stats st, win;
     rsx_wcb_counters mod_mark;  /* module counters at the window start      */
@@ -932,6 +959,31 @@ static unsigned long long eng_wcb_now_ns(void)
     struct timespec ts;
     timespec_get(&ts, TIME_UTC);
     return (unsigned long long)ts.tv_sec * 1000000000ull + (unsigned long long)ts.tv_nsec;
+}
+
+/* One copy finished: count it against its target and trigger. */
+static void eng_wcb_attr_note(int depth, u32 slot, u64 bytes, u64 ns)
+{
+    if (!s_wcb.attr_on) return;
+    const u32 idx = depth ? ENG_MAX_SURFACES + slot : slot;
+    if (idx >= ENG_MAX_SURFACES + ENG_MAX_ZDEPTHS) return;
+    eng_wcb_attr_row* r = &s_wcb.attr[idx];
+    if (!r->used) { r->used = 1; r->depth = depth; }
+    if (depth) {
+        const eng_zdepth* z = &g.zdepths[slot];
+        r->location = z->location; r->offset = z->offset; r->fmt = z->zfmt;
+        r->w = z->used_w < z->w ? z->used_w : z->w;
+        r->h = z->used_h < z->h ? z->used_h : z->h;
+        r->pitch = z->pitch;
+    } else {
+        const eng_surface* s = &g.surfaces[slot];
+        r->location = s->location; r->offset = s->offset; r->fmt = (u32)s->fmt;
+        r->w = s->w; r->h = s->h; r->pitch = s->pitch;
+    }
+    const int t = s_wcb_trigger;
+    r->reads[t]++;
+    r->bytes[t] += bytes;
+    r->copy_ns[t] += ns;
 }
 
 static u64 eng_fnv1a(const void* data, u32 n, u64 hash)
@@ -2388,7 +2440,11 @@ static int eng_surface_to_guest(u32 slot)
     eng_textures_touch(s->location, s->offset, s->pitch * s->h);
     WCB_COUNT(copied, 1);
     WCB_COUNT(bytes, (unsigned long long)s->pitch * s->h);
-    WCB_COUNT(copy_ns, eng_wcb_now_ns() - t0);
+    {
+        const unsigned long long done = eng_wcb_now_ns();
+        WCB_COUNT(copy_ns, done - t0);
+        eng_wcb_attr_note(0, slot, (u64)s->pitch * s->h, done - t0);
+    }
     return 1;
 }
 
@@ -2493,7 +2549,11 @@ static int eng_zdepth_store(u32 slot, int forced)
     z->guest_dirty = 0;
     WCB_COUNT(copied, 1);
     WCB_COUNT(bytes, (unsigned long long)z->pitch * h);
-    WCB_COUNT(copy_ns, eng_wcb_now_ns() - t0);
+    {
+        const unsigned long long done = eng_wcb_now_ns();
+        WCB_COUNT(copy_ns, done - t0);
+        eng_wcb_attr_note(1, slot, (u64)z->pitch * h, done - t0);
+    }
     eng_textures_touch(z->location, z->offset, z->pitch * h);
     if (eng_coherence_log())
         fprintf(stderr, "[rsx engine] depth 0x%08X (%s, pitch %u) %ux%u stored to guest memory\n",
@@ -2564,6 +2624,14 @@ int rsx_draw_engine_wcb_mode(void)
         const char* st = getenv("PS3RECOMP_RSX_WCB_STATS");
         const int every = st ? atoi(st) : 0;
         s_wcb.stats_every = every <= 0 ? 0u : (every > 1000 ? 1000u : (u32)every);
+        const char* at = getenv("PS3RECOMP_RSX_WCB_ATTR");
+        s_wcb.attr_on = at && *at && strcmp(at, "0") != 0;
+        s_wcb.attr_every = s_wcb.stats_every ? s_wcb.stats_every : 60u;
+        if (s_wcb.attr_on) {
+            rsx_wcb_attr_set(1);
+            fprintf(stderr, "[rsx wcb] readback attribution on, %u-frame windows\n",
+                    s_wcb.attr_every);
+        }
         if (s_wcb.mode)
             fprintf(stderr, "[rsx wcb] mode %s%s\n",
                     s_wcb.mode == RSX_WCB_SYNC ? "sync (copy every dirty target at every sync point)" :
@@ -2636,7 +2704,11 @@ static int eng_wcb_copy_surface(u32 slot, int use_ticket)
     WCB_COUNT(copied, 1);
     WCB_COUNT(bytes, (unsigned long long)s->pitch * s->h);
     if (from_ticket) WCB_COUNT(async_fetched, 1);
-    WCB_COUNT(copy_ns, eng_wcb_now_ns() - t0);
+    {
+        const unsigned long long done = eng_wcb_now_ns();
+        WCB_COUNT(copy_ns, done - t0);
+        eng_wcb_attr_note(0, slot, (u64)s->pitch * s->h, done - t0);
+    }
     return 1;
 }
 
@@ -2652,23 +2724,29 @@ static void eng_wcb_resolve(void* user, u32 cookie, int reason)
      * copy, when there is one. */
     const int guest_read = reason == RSX_WCB_REASON_REQUEST;
     const int is_read = reason != RSX_WCB_REASON_FLUSH;
+    const int saved_trig = s_wcb_trigger;
+    s_wcb_trigger = (reason == RSX_WCB_REASON_REQUEST || reason == RSX_WCB_REASON_FAULT)
+                    ? ENG_WCB_TRIG_GUEST
+                    : reason == RSX_WCB_REASON_EXPLICIT ? saved_trig : ENG_WCB_TRIG_OTHER;
     if (cookie & WCB_COOKIE_DEPTH) {
         const u32 slot = cookie & 0xFFFFu;
-        if (slot >= g.n_zdepths || !g.zdepths[slot].wcb_pending) return;
+        if (slot >= g.n_zdepths || !g.zdepths[slot].wcb_pending) { s_wcb_trigger = saved_trig; return; }
         g.zdepths[slot].wcb_pending = 0;
         if (g.zdepths[slot].guest_dirty && eng_zdepth_store(slot, 1) && is_read)
             WCB_COUNT(demand_copies, 1);
+        s_wcb_trigger = saved_trig;
         return;
     }
-    if (cookie >= g.n_surfaces || !g.surfaces[cookie].wcb_pending) return;
+    if (cookie >= g.n_surfaces || !g.surfaces[cookie].wcb_pending) { s_wcb_trigger = saved_trig; return; }
     eng_surface* s = &g.surfaces[cookie];
     s->wcb_pending = 0;
-    if (!eng_wcb_copy_surface(cookie, guest_read)) return;
+    if (!eng_wcb_copy_surface(cookie, guest_read)) { s_wcb_trigger = saved_trig; return; }
     if (is_read) {
         WCB_COUNT(demand_copies, 1);
         s->wcb_reads++;
         s->wcb_last_read = g.frames;
     }
+    s_wcb_trigger = saved_trig;
 }
 
 static void eng_wcb_module_up(void)
@@ -2808,6 +2886,56 @@ static void eng_wcb_frame_tick(void)
     memset(&s_wcb.win, 0, sizeof s_wcb.win);
     s_wcb.mod_mark = c;
     s_wcb.win_frames = 0;
+}
+
+/* PS3RECOMP_RSX_WCB_ATTR: one line per copied target per window, with the
+ * trigger split. Runs even when the stats line is off, so the attribution
+ * window follows PS3RECOMP_RSX_WCB_STATS when that is set and 60 frames
+ * otherwise. */
+static void eng_wcb_attr_flush(void)
+{
+    if (!s_wcb.attr_on) return;
+    if (++s_wcb.attr_frames < s_wcb.attr_every) return;
+    const double f = (double)s_wcb.attr_frames;
+    double tot_reads = 0.0, tot_copy = 0.0, tot_wait = 0.0;
+    unsigned rows = 0;
+    for (u32 idx = 0; idx < ENG_MAX_SURFACES + ENG_MAX_ZDEPTHS; idx++) {
+        eng_wcb_attr_row* r = &s_wcb.attr[idx];
+        if (!r->used) continue;
+        const u32 slot = r->depth ? idx - ENG_MAX_SURFACES : idx;
+        uint64_t wns = 0; uint32_t wn = 0;
+        rsx_wcb_attr_take_wait(r->depth ? (WCB_COOKIE_DEPTH | slot) : slot, &wns, &wn);
+        r->wait_ns += wns;
+        double reads = 0.0, copy = 0.0, bytes = 0.0;
+        for (int t = 0; t < ENG_WCB_TRIG_COUNT; t++) {
+            reads += (double)r->reads[t];
+            copy += (double)r->copy_ns[t] / 1e6;
+            bytes += (double)r->bytes[t];
+        }
+        tot_reads += reads; tot_copy += copy; tot_wait += (double)r->wait_ns / 1e6;
+        fprintf(stderr,
+                "[rsx wcb attr] loc=%u addr=0x%08X fmt=0x%02X %ux%u pitch=%u %s:"
+                " reads %.2f/f [texbind %.2f guest %.2f other %.2f]"
+                " copy %.3f ms/f [texbind %.3f guest %.3f other %.3f]"
+                " wait %.3f ms/f bytes %.0f KB/f\n",
+                r->location, r->offset, r->fmt, r->w, r->h, r->pitch,
+                r->depth ? "depth" : "color",
+                reads / f,
+                (double)r->reads[ENG_WCB_TRIG_TEXBIND] / f,
+                (double)r->reads[ENG_WCB_TRIG_GUEST] / f,
+                (double)r->reads[ENG_WCB_TRIG_OTHER] / f,
+                copy / f,
+                (double)r->copy_ns[ENG_WCB_TRIG_TEXBIND] / 1e6 / f,
+                (double)r->copy_ns[ENG_WCB_TRIG_GUEST] / 1e6 / f,
+                (double)r->copy_ns[ENG_WCB_TRIG_OTHER] / 1e6 / f,
+                (double)r->wait_ns / 1e6 / f, bytes / f / 1024.0);
+        rows++;
+    }
+    fprintf(stderr, "[rsx wcb attr] %u frames: copies %.2f/f, copy %.3f ms/f,"
+                    " wait %.3f ms/f, %u surfaces\n",
+            s_wcb.attr_frames, tot_reads / f, tot_copy / f, tot_wait / f, rows);
+    memset(s_wcb.attr, 0, sizeof s_wcb.attr);
+    s_wcb.attr_frames = 0;
 }
 
 /* SET_TEXTURE_FILTER's min field is [18:16] (1 NEAREST, 2 LINEAR, then 3..6,
@@ -4230,7 +4358,26 @@ static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
                 if (t.cubemap) eng_tex_miss_note_reason(u, &t, RSX_TEX_MISS_SURFACE);
                 textures[u] = conv; continue;
             }
-            if (eng_zdepth_to_guest((u32)zsrc)) {
+            int copied;
+            {
+                const int saved = s_wcb_trigger;
+                s_wcb_trigger = ENG_WCB_TRIG_TEXBIND;
+                copied = eng_zdepth_to_guest((u32)zsrc);
+                s_wcb_trigger = saved;
+            }
+            if (copied) {
+                static int logs;
+                if (s_wcb.attr_on && logs++ < 32) {
+                    const eng_zdepth* z = &g.zdepths[zsrc];
+                    fprintf(stderr, "[rsx wcb attr] texbind-depth loc=%u addr=0x%08X"
+                            " zfmt=%u pitch=%u used=%ux%u <- tex fmt=0x%02X base=0x%02X"
+                            " %ux%u pitch=%u mips=%u dim=%u cube=%u linear=%u remap=0x%04X"
+                            " current=%u\n",
+                            z->location, z->offset, z->zfmt, z->pitch, z->used_w, z->used_h,
+                            t.format, base_fmt, t.width, t.height, t.pitch, t.mipmaps,
+                            t.dimension, t.cubemap, (t.format & RSX_TEX_FMT_LINEAR) ? 1u : 0u,
+                            t.remap & 0xFFFFu, current_zslot == (u32)zsrc);
+                }
                 textures[u] = eng_texture_slot(t.location, t.offset, t.format,
                                                t.width, t.height, t.mipmaps, t.pitch,
                                                (int)t.cubemap, t.remap & 0xFFFFu,
@@ -4266,10 +4413,26 @@ static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
             if (t.cubemap) eng_tex_miss_note_reason(u, &t, RSX_TEX_MISS_SURFACE);
             continue;
         }
+        int reinterpreted = 0;
         if (sampled >= 0 && zsrc < 0 &&
             g.surfaces[sampled].fmt == RSX_BE_FMT_R8G8B8A8 &&
-            eng_format_reinterprets_rgba8(base_fmt) &&
-            eng_surface_to_guest((u32)sampled)) {
+            eng_format_reinterprets_rgba8(base_fmt)) {
+            const int saved = s_wcb_trigger;
+            s_wcb_trigger = ENG_WCB_TRIG_TEXBIND;
+            reinterpreted = eng_surface_to_guest((u32)sampled);
+            s_wcb_trigger = saved;
+        }
+        if (reinterpreted) {
+            static int logs;
+            if (s_wcb.attr_on && logs++ < 32) {
+                const eng_surface* s = &g.surfaces[sampled];
+                fprintf(stderr, "[rsx wcb attr] texbind-reinterpret loc=%u addr=0x%08X"
+                        " fmt=%d pitch=%u %ux%u <- tex fmt=0x%02X base=0x%02X %ux%u"
+                        " pitch=%u mips=%u dim=%u cube=%u remap=0x%04X\n",
+                        s->location, s->offset, (int)s->fmt, s->pitch, s->w, s->h,
+                        t.format, base_fmt, t.width, t.height, t.pitch, t.mipmaps,
+                        t.dimension, t.cubemap, t.remap & 0xFFFFu);
+            }
             textures[u] = eng_texture_slot(t.location, t.offset, t.format,
                                            t.width, t.height, t.mipmaps, t.pitch,
                                            (int)t.cubemap, t.remap & 0xFFFFu,
@@ -5428,6 +5591,7 @@ static void eng_present(u32 buffer_id)
     g.last_guest_draws = g.guest_draws;
     g.guest_draws = 0;
     eng_wcb_frame_tick();
+    eng_wcb_attr_flush();
 }
 
 static void sink_flip(void* user, const rsx_dispatch* r, u32 arg)

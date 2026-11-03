@@ -149,6 +149,10 @@ static struct {
     int        mem_fd;
 #endif
     rsx_wcb_counters c;
+    /* Per-cookie guest wait totals for the attribution table. Only updated
+     * when `attr` is on. */
+    int        attr;
+    struct { uint32_t cookie, n; uint64_t ns; } attr_wait[RSX_WCB_MAX_REGIONS];
 } s_wcbm;
 
 /* The owner is one thread at a time: whichever last called
@@ -411,6 +415,7 @@ static int wcb_request_span(uintptr_t lo, uintptr_t hi)
 {
     int slots[RSX_WCB_MAX_REGIONS];
     uint32_t gens[RSX_WCB_MAX_REGIONS];
+    uint32_t cookies[RSX_WCB_MAX_REGIONS];
     int n = 0;
     wcb_lock();
     for (uint32_t i = 0; i < s_wcbm.n; i++) {
@@ -419,6 +424,7 @@ static int wcb_request_span(uintptr_t lo, uintptr_t hi)
             if (r->state == WCB_PENDING) { r->state = WCB_REQUESTED; s_wcbm.requested++; }
             slots[n] = (int)i;
             gens[n] = r->gen;
+            cookies[n] = r->cookie;
             n++;
         }
     }
@@ -463,6 +469,22 @@ static int wcb_request_span(uintptr_t lo, uintptr_t hi)
     WCB_ADD64(&s_wcbm.c.waits, 1);
     WCB_ADD64(&s_wcbm.c.wait_ns, dt);
     wcb_count_max(&s_wcbm.c.wait_max_ns, dt);
+    if (s_wcbm.attr && n) {
+        wcb_lock();
+        for (int k = 0; k < n; k++) {
+            int e = -1;
+            for (uint32_t j = 0; j < RSX_WCB_MAX_REGIONS; j++)
+                if (s_wcbm.attr_wait[j].n && s_wcbm.attr_wait[j].cookie == cookies[k]) { e = (int)j; break; }
+            if (e < 0)
+                for (uint32_t j = 0; j < RSX_WCB_MAX_REGIONS; j++)
+                    if (!s_wcbm.attr_wait[j].n) { e = (int)j; s_wcbm.attr_wait[j].cookie = cookies[k]; break; }
+            if (e >= 0) {
+                s_wcbm.attr_wait[e].ns += dt / (uint64_t)n;
+                s_wcbm.attr_wait[e].n += 1;
+            }
+        }
+        wcb_unlock();
+    }
     return n;
 }
 
@@ -691,4 +713,31 @@ void rsx_wcb_counters_get(rsx_wcb_counters* out)
     wcb_lock();
     *out = s_wcbm.c;
     wcb_unlock();
+}
+
+void rsx_wcb_attr_set(int on)
+{
+    wcb_lock();
+    s_wcbm.attr = on ? 1 : 0;
+    memset(s_wcbm.attr_wait, 0, sizeof s_wcbm.attr_wait);
+    wcb_unlock();
+}
+
+int rsx_wcb_attr_take_wait(uint32_t cookie, uint64_t* ns, uint32_t* n)
+{
+    int found = 0;
+    if (ns) *ns = 0;
+    if (n) *n = 0;
+    wcb_lock();
+    for (uint32_t j = 0; j < RSX_WCB_MAX_REGIONS; j++)
+        if (s_wcbm.attr_wait[j].n && s_wcbm.attr_wait[j].cookie == cookie) {
+            if (ns) *ns = s_wcbm.attr_wait[j].ns;
+            if (n) *n = s_wcbm.attr_wait[j].n;
+            s_wcbm.attr_wait[j].ns = 0;
+            s_wcbm.attr_wait[j].n = 0;
+            found = 1;
+            break;
+        }
+    wcb_unlock();
+    return found;
 }

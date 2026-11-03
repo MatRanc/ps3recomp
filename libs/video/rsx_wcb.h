@@ -127,6 +127,13 @@ int  rsx_wcb_on_fault(uintptr_t addr);
 
 void rsx_wcb_counters_get(rsx_wcb_counters* out);
 
+/* Readback attribution (PS3RECOMP_RSX_WCB_ATTR): collect, per region, how
+ * long guest threads waited for a copy. Off by default. */
+void rsx_wcb_attr_set(int on);
+/* Take the wait accumulated for `cookie` since the last call. Returns 1 when
+ * there was any. */
+int  rsx_wcb_attr_take_wait(uint32_t cookie, uint64_t* ns, uint32_t* n);
+
 #ifdef __cplusplus
 }
 #endif
