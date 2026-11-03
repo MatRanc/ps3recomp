@@ -139,6 +139,18 @@ enum ps3_tr_ev {
     PS3_TR_GCM_FLIP_REQ_SEQ,   /* a flip request: a = frame (flip count), b = request seq          */
     PS3_TR_GCM_FLIP_HANDLER,   /* the guest flip handler ran: a = request seq it completed         */
     PS3_TR_FLIP_WAIT_EXIT,     /* flip-done lwcond exit: a = kind (0 signal,1 timeout,2 fallback,3 poll), b = elapsed us */
+    /* Hitch census (PS3RECOMP_TIMELINE_HITCH_US): a frame longer than the
+     * threshold, with the work that ran inside it. */
+    PS3_TR_HITCH,              /* a = frame length us, b = 0                             */
+    PS3_TR_PIPE_CREATE,        /* a = kind (0 fixed,1 guest,2 engine,3 compute), b = us   */
+    PS3_TR_SHADER_COMPILE,     /* span: a = stage (0 vertex,1 fragment), b = source bytes */
+    PS3_TR_TEX_UPLOAD,         /* span: a = KiB decoded+uploaded, b = mip levels          */
+    PS3_TR_SURFACE_CREATE,     /* span: a = w | h << 16, b = backend format               */
+    PS3_TR_FS_READ,            /* span: a = fd, b = bytes read                            */
+    PS3_TR_SPURS_ADD_WL,       /* a = wid, b = policy-module size                         */
+    PS3_TR_SPURS_REMOVE_WL,    /* a = wid, b = result                                     */
+    PS3_TR_SPU_OVERLAY_VERIFY, /* span: a = image id, b = slot                            */
+    PS3_TR_GCM_RESYNC,         /* a = get before, b = put                                 */
     PS3_TR_EV_COUNT
 };
 
@@ -212,6 +224,16 @@ static inline const ps3_tr_desc* ps3_tr_desc_of(uint32_t ev)
         { "gcm.flip_req_seq",   "gcm",   PS3_TR_PH_INSTANT, 0, "frame", "req_seq" },
         { "gcm.flip_handler",   "gcm",   PS3_TR_PH_INSTANT, 0, "req_seq", "req_now" },
         { "flip.wait_exit",     "gcm",   PS3_TR_PH_INSTANT, 0, "kind", "elapsed_us" },
+        { "hitch",              "hitch", PS3_TR_PH_INSTANT, 0, "us", 0 },
+        { "pipe.create",        "rsx",   PS3_TR_PH_INSTANT, 0, "kind", "us" },
+        { "shader.compile",     "rsx",   PS3_TR_PH_SPAN,    0, "stage", "bytes" },
+        { "tex.upload",         "rsx",   PS3_TR_PH_SPAN,    0, "kib", "levels" },
+        { "surface.create",     "rsx",   PS3_TR_PH_SPAN,    0, "size", "format" },
+        { "fs.read",            "fs",    PS3_TR_PH_SPAN,    0, "fd", "bytes" },
+        { "spurs.add_wl",       "spurs", PS3_TR_PH_INSTANT, 0, "wid", "pm_size" },
+        { "spurs.remove_wl",    "spurs", PS3_TR_PH_INSTANT, 0, "wid", "rc" },
+        { "spu.overlay_verify", "spu",   PS3_TR_PH_SPAN,    0, "image", "slot" },
+        { "gcm.resync",         "gcm",   PS3_TR_PH_INSTANT, 0, "get", "put" },
     };
     return &d[ev < (uint32_t)PS3_TR_EV_COUNT ? ev : 0];
 }
@@ -287,6 +309,15 @@ typedef struct {
 #endif
     char path[1024];
     ps3_tr_ring* rings[PS3_TR_MAX_RINGS];
+    /* PS3RECOMP_TIMELINE_HITCH_US: a frame-time census. Between hitches the
+     * rings are trimmed to the newest frame; when a guest frame exceeds the
+     * threshold its window is queued and the flusher writes only the records
+     * that fall inside it. This keeps a whole boot/menu/load/cinematic run to
+     * a few MB instead of the ~5 MB/s the unfiltered timeline writes. */
+    uint64_t hitch_ns;          /* 0: ordinary continuous recording */
+    uint64_t last_frame_ns;     /* previous ps3_trace_frame_boundary() */
+    uint32_t hitch_n;
+    uint64_t hitch_w0[64], hitch_w1[64];
 } ps3_tr_state;
 
 #ifdef __cplusplus
@@ -476,13 +507,105 @@ static inline void ps3_tr_drain_bin(void)
     }
 }
 
+/* Records that overlap any queued hitch window. Records are appended in time
+ * order per thread, so the tail advances to the first record that starts
+ * after the last window: the next frame's records survive for its own hitch. */
+static inline int ps3_tr_in_hitch(uint64_t t0, uint64_t t1)
+{
+    ps3_tr_state* s = &g_ps3_tr;
+    for (uint32_t i = 0; i < s->hitch_n; i++)
+        if (t1 >= s->hitch_w0[i] && t0 <= s->hitch_w1[i]) return 1;
+    return 0;
+}
+
+static inline void ps3_tr_drain_bin_hitch(void)
+{
+    ps3_tr_state* s = &g_ps3_tr;
+    FILE* f = s->f;
+    const uint64_t last_end = s->hitch_n ? s->hitch_w1[s->hitch_n - 1] : 0;
+    const uint32_t n = __atomic_load_n(&s->nrings, __ATOMIC_ACQUIRE);
+    for (uint32_t i = 0; i < n && i < PS3_TR_MAX_RINGS; i++) {
+        ps3_tr_ring* r = __atomic_load_n(&s->rings[i], __ATOMIC_ACQUIRE);
+        if (!r) continue;
+        ps3_tr_write_name_bin(f, r);
+        const uint64_t h = __atomic_load_n(&r->head, __ATOMIC_ACQUIRE);
+        const uint64_t t = r->tail;
+        if (h == t) continue;
+        uint32_t count = 0;
+        for (uint64_t p = t; p != h; p++) {
+            const ps3_tr_rec* x = &r->buf[p & r->mask];
+            if (ps3_tr_in_hitch(x->t0, x->t1)) count++;
+        }
+        if (count) {
+            uint32_t kind = PS3_TL_CHUNK_EVENTS, tid = r->tid;
+            ps3_tr_write_u32(f, kind);
+            ps3_tr_write_u32(f, tid);
+            ps3_tr_write_u32(f, count);
+            for (uint64_t p = t; p != h; p++) {
+                const ps3_tr_rec* x = &r->buf[p & r->mask];
+                if (ps3_tr_in_hitch(x->t0, x->t1))
+                    fwrite(x, sizeof *x, 1, f);
+            }
+            s->written += count;
+        }
+        uint64_t nt = t;
+        for (uint64_t p = t; p != h; p++) {
+            const ps3_tr_rec* x = &r->buf[p & r->mask];
+            if (x->t0 <= last_end) nt = p + 1;
+            else break;
+        }
+        __atomic_store_n(&r->tail, nt, __ATOMIC_RELEASE);
+    }
+}
+
+/* Drop records older than `cutoff` from every ring. The caller only does this
+ * while the current guest frame is short, so the frame in progress is kept. */
+static inline void ps3_tr_drop_before(uint64_t cutoff)
+{
+    ps3_tr_state* s = &g_ps3_tr;
+    const uint32_t n = __atomic_load_n(&s->nrings, __ATOMIC_ACQUIRE);
+    for (uint32_t i = 0; i < n && i < PS3_TR_MAX_RINGS; i++) {
+        ps3_tr_ring* r = __atomic_load_n(&s->rings[i], __ATOMIC_ACQUIRE);
+        if (!r) continue;
+        const uint64_t h = __atomic_load_n(&r->head, __ATOMIC_ACQUIRE);
+        uint64_t t = r->tail, nt = t;
+        for (uint64_t p = t; p != h; p++) {
+            const ps3_tr_rec* x = &r->buf[p & r->mask];
+            if (x->t0 < cutoff) nt = p + 1;
+            else break;
+        }
+        if (nt != t) __atomic_store_n(&r->tail, nt, __ATOMIC_RELEASE);
+    }
+}
+
+static inline uint64_t ps3_tr_pending(void)
+{
+    ps3_tr_state* s = &g_ps3_tr;
+    const uint32_t n = __atomic_load_n(&s->nrings, __ATOMIC_ACQUIRE);
+    uint64_t total = 0;
+    for (uint32_t i = 0; i < n && i < PS3_TR_MAX_RINGS; i++) {
+        ps3_tr_ring* r = __atomic_load_n(&s->rings[i], __ATOMIC_ACQUIRE);
+        if (r) total += __atomic_load_n(&r->head, __ATOMIC_ACQUIRE) - r->tail;
+    }
+    return total;
+}
+
 /* Write every pending record of every ring. */
 static inline void ps3_tr_drain(void)
 {
     ps3_tr_state* s = &g_ps3_tr;
     FILE* f = s->f;
     if (!f) return;
-    if (s->binary) { ps3_tr_drain_bin(); fflush(f); return; }
+    if (s->binary) {
+        if (s->hitch_ns) {
+            if (s->hitch_n) ps3_tr_drain_bin_hitch();
+            else ps3_tr_drop_before(UINT64_MAX);
+        } else {
+            ps3_tr_drain_bin();
+        }
+        fflush(f);
+        return;
+    }
     const uint32_t n = __atomic_load_n(&s->nrings, __ATOMIC_ACQUIRE);
     for (uint32_t i = 0; i < n && i < PS3_TR_MAX_RINGS; i++) {
         ps3_tr_ring* r = __atomic_load_n(&s->rings[i], __ATOMIC_ACQUIRE);
@@ -546,8 +669,27 @@ static inline void* ps3_tr_flusher(void* unused)
             }
         }
         if (!ps3_tr_trylock()) continue;
-        if (__atomic_load_n(&g_ps3_tr.on, __ATOMIC_ACQUIRE) == 2 && ps3_tr_flush_due())
-            ps3_tr_drain();
+        if (__atomic_load_n(&g_ps3_tr.on, __ATOMIC_ACQUIRE) == 2) {
+            if (g_ps3_tr.hitch_ns) {
+                if (g_ps3_tr.hitch_n) {
+                    ps3_tr_drain_bin_hitch();
+                    g_ps3_tr.hitch_n = 0;
+                    fflush(g_ps3_tr.f);
+                } else {
+                    const uint64_t last = __atomic_load_n(&g_ps3_tr.last_frame_ns,
+                                                          __ATOMIC_ACQUIRE);
+                    const uint64_t now = ps3_trace_now();
+                    /* Do not trim a frame that is already over the threshold:
+                     * its start is the evidence we want. Between hitches,
+                     * everything before the current frame is dead weight. */
+                    if (last && (now < last || now - last < g_ps3_tr.hitch_ns) &&
+                        ps3_tr_pending() >= g_ps3_tr.flush_recs)
+                        ps3_tr_drop_before(last);
+                }
+            } else if (ps3_tr_flush_due()) {
+                ps3_tr_drain();
+            }
+        }
         ps3_tr_unlock();
     }
     return 0;
@@ -633,10 +775,17 @@ static inline int ps3_tr_init(void)
         if (!s->flush_recs) s->flush_recs = 1;
         snprintf(knob, sizeof knob, "%sMIN_US", pfx);
         s->min_ns = (uint64_t)(ps3_tr_env_num(knob, 0.0) * 1000.0);
+        if (binary) {
+            snprintf(knob, sizeof knob, "%sHITCH_US", pfx);
+            const double hitch_us = ps3_tr_env_num(knob, 0.0);
+            s->hitch_ns = (uint64_t)(hitch_us * 1000.0);
+            if (s->hitch_ns && s->flush_recs > 2097152ull / sizeof(ps3_tr_rec))
+                s->flush_recs = 2097152ull / sizeof(ps3_tr_rec);   /* trim between hitches */
+        }
         {
             snprintf(knob, sizeof knob, "%sTRIGGER", pfx);
             const char* trig = getenv(knob);
-            if (trig && *trig) {
+            if (trig && *trig && !s->hitch_ns) {
                 snprintf(s->trigger, sizeof s->trigger, "%s", trig);
                 s->win_armed = 1;
                 snprintf(knob, sizeof knob, "%sSECS", pfx);
@@ -790,6 +939,37 @@ static inline void ps3_trace_instant(int ev, uint32_t a, uint32_t b)
     const uint64_t t = ps3_trace_now();
     ps3_tr_ring* r = ps3_tr_ring_self();
     if (r) ps3_tr_put(r, (uint32_t)ev, t, t, a, b);
+}
+
+/* Called at every guest frame boundary (the flip request). In hitch mode a
+ * frame longer than PS3RECOMP_TIMELINE_HITCH_US queues its window and leaves a
+ * "hitch" marker; the flusher writes the records inside the window. */
+static inline void ps3_trace_frame_boundary(uint64_t now)
+{
+    ps3_tr_state* s = &g_ps3_tr;
+    if (PS3_TR_LIKELY(!s->hitch_ns)) return;
+    if (__atomic_load_n(&s->on, __ATOMIC_ACQUIRE) != 2) return;
+    const uint64_t last = __atomic_exchange_n(&s->last_frame_ns, now, __ATOMIC_ACQ_REL);
+    if (!last || now <= last || now - last < s->hitch_ns) return;
+    const uint64_t dur = now - last;
+    ps3_tr_lock();
+    {
+        uint32_t n = s->hitch_n;
+        if (n >= (uint32_t)(sizeof s->hitch_w0 / sizeof s->hitch_w0[0])) {
+            memmove(s->hitch_w0, s->hitch_w0 + 1,
+                    (n - 1) * sizeof s->hitch_w0[0]);
+            memmove(s->hitch_w1, s->hitch_w1 + 1,
+                    (n - 1) * sizeof s->hitch_w1[0]);
+            n--;
+        }
+        s->hitch_w0[n] = last;
+        s->hitch_w1[n] = now;
+        s->hitch_n = n + 1;
+    }
+    ps3_tr_unlock();
+    uint32_t us = dur / 1000u > 0xFFFFFFFFu ? 0xFFFFFFFFu : (uint32_t)(dur / 1000u);
+    ps3_tr_ring* r = ps3_tr_ring_self();
+    if (r) ps3_tr_put(r, PS3_TR_HITCH, now, now, us, 0);
 }
 
 /* ---- causal-event notes (wake-up lag) ---------------------------------

@@ -1471,6 +1471,7 @@ s32 cellSpursAddWorkload(CellSpurs* spurs, CellSpursWorkloadId* wid,
             vm_write32((u32)(uintptr_t)wid, i);
             printf("[cellSpurs] AddWorkload(wid=%u, pm=%p, size=%u)\n",
                    i, pm, sizePm);
+            ps3_trace_instant(PS3_TR_SPURS_ADD_WL, i, sizePm);
             spurs_api_unlock(si);
             return CELL_OK;
         }
@@ -1692,6 +1693,7 @@ s32 cellSpursRemoveWorkload(CellSpurs* spurs, CellSpursWorkloadId wid)
                vm_read32(si->ea + SPURS_WKL_ENABLED) & ~(0x80000000u >> wid));
     spurs_scheduler_forget(wid);
     printf("[cellSpurs] RemoveWorkload(wid=%u)\n", wid);
+    ps3_trace_instant(PS3_TR_SPURS_REMOVE_WL, wid, CELL_OK);
     spurs_api_unlock(si);
     return CELL_OK;
 }

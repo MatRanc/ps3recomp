@@ -73,16 +73,26 @@
 #include <time.h>
 #include <string.h>
 
-/* Pipeline creation timing: the backend creates every pipeline with a NULL
- * VkPipelineCache (there is no cache object in this file). These two helpers
+/* Pipeline creation timing: creation uses s_pipe_cache, which is
+ * VK_NULL_HANDLE unless PS3RECOMP_VK_PIPELINE_CACHE is set. These helpers
  * feed the walker profile's `pipecrt`/`pipems` and, under
  * PS3RECOMP_PIPE_TIMING=1, log each creation with its wall time so a
  * scene-change stutter can be attributed. */
 extern unsigned long long ps3_ms_now(void);
+static void vk_pipe_cache_tick(void);
 static void vk_pipe_create_done(const char* what, unsigned long long t0)
 {
     const unsigned long long ns = rsx_wprof_now() - t0;
     rsx_wprof_note_pipeline_create(ns);
+    {
+        uint32_t kind = 4;
+        if (what && strcmp(what, "fixed") == 0) kind = 0;
+        else if (what && strcmp(what, "guest") == 0) kind = 1;
+        else if (what && strcmp(what, "engine") == 0) kind = 2;
+        else if (what && strcmp(what, "compute") == 0) kind = 3;
+        ps3_trace_instant(PS3_TR_PIPE_CREATE, kind,
+                          (uint32_t)(ns / 1000ull > 0xFFFFFFFFull ? 0xFFFFFFFFull : ns / 1000ull));
+    }
     static int on = -1;
     if (on < 0) {
         const char* e = getenv("PS3RECOMP_PIPE_TIMING");
@@ -91,6 +101,7 @@ static void vk_pipe_create_done(const char* what, unsigned long long t0)
     if (on)
         fprintf(stderr, "[pipe-create] %s %.1f us at %llu ms\n",
                 what, (double)ns / 1000.0, ps3_ms_now());
+    vk_pipe_cache_tick();
 }
 
 /* ---------------------------------------------------------------------------
@@ -120,6 +131,7 @@ static void vk_pipe_create_done(const char* what, unsigned long long t0)
     X(vkAllocateDescriptorSets) X(vkUpdateDescriptorSets) X(vkResetDescriptorPool) \
     X(vkCreatePipelineLayout) X(vkDestroyPipelineLayout) \
     X(vkCreateGraphicsPipelines) X(vkCreateComputePipelines) X(vkDestroyPipeline) \
+    X(vkCreatePipelineCache) X(vkDestroyPipelineCache) X(vkGetPipelineCacheData) \
     X(vkCreateSampler) X(vkDestroySampler) \
     X(vkCmdPipelineBarrier) X(vkCmdClearColorImage) X(vkCmdClearDepthStencilImage) \
     X(vkCmdCopyImageToBuffer) X(vkCmdCopyBufferToImage) X(vkCmdCopyImage) \
@@ -316,6 +328,15 @@ typedef struct vk_state {
 
 static vk_state s_vk;
 
+/* Optional persistent VkPipelineCache (PS3RECOMP_VK_PIPELINE_CACHE=1 or a
+ * path). Off by default: every creation passes VK_NULL_HANDLE, exactly as
+ * before. Keyed by the physical device's pipelineCacheUUID and driver
+ * version, so a driver update starts a new file instead of feeding stale
+ * blobs to the compiler. */
+static VkPipelineCache s_pipe_cache = VK_NULL_HANDLE;
+static char s_pipe_cache_path[1024];
+static unsigned long long s_pipe_cache_saved;
+
 #define VK_LOG(...)  fprintf(stderr, "[RSX vulkan] " __VA_ARGS__)
 #define VK_CHECK(call, what)                                               \
     do { VkResult r_ = (call);                                             \
@@ -373,6 +394,110 @@ static int vk_load_wsi_device_functions(void)
 {
     VK_WSI_DEVICE_FNS(LOAD_D)
     return 0;
+}
+
+/* ---- persistent pipeline cache (NHL #128 analogue) --------------------- */
+static int vk_pipe_cache_on(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char* e = getenv("PS3RECOMP_VK_PIPELINE_CACHE");
+        on = e && *e && strcmp(e, "0") != 0;
+    }
+    return on;
+}
+
+static void vk_pipe_cache_save(void)
+{
+    if (!s_pipe_cache || !s_pipe_cache_path[0] || !pvkGetPipelineCacheData) return;
+    size_t sz = 0;
+    if (pvkGetPipelineCacheData(s_vk.device, s_pipe_cache, &sz, NULL) != VK_SUCCESS || !sz) return;
+    void* data = malloc(sz);
+    if (!data) return;
+    if (pvkGetPipelineCacheData(s_vk.device, s_pipe_cache, &sz, data) != VK_SUCCESS) {
+        free(data); return;
+    }
+    char tmp[sizeof s_pipe_cache_path + 8];
+    snprintf(tmp, sizeof tmp, "%s.tmp", s_pipe_cache_path);
+    FILE* f = fopen(tmp, "wb");
+    if (f) {
+        const size_t w = fwrite(data, 1, sz, f);
+        fclose(f);
+        if (w == sz) rename(tmp, s_pipe_cache_path);
+        else remove(tmp);
+    }
+    free(data);
+}
+
+/* Called after a pipeline was compiled; writing the cache takes a few ms, so
+ * rate-limit it. This also covers a run that is killed instead of shut down. */
+static void vk_pipe_cache_tick(void)
+{
+    if (!s_pipe_cache) return;
+    const unsigned long long now = ps3_trace_now();
+    if (!s_pipe_cache_saved || now - s_pipe_cache_saved > 2000000000ull) {
+        s_pipe_cache_saved = now;
+        vk_pipe_cache_save();
+    }
+}
+
+static void vk_pipe_cache_init(void)
+{
+    if (!vk_pipe_cache_on() || !s_vk.device || !pvkCreatePipelineCache) return;
+    const char* e = getenv("PS3RECOMP_VK_PIPELINE_CACHE");
+    if (e && strchr(e, '/')) {
+        snprintf(s_pipe_cache_path, sizeof s_pipe_cache_path, "%s", e);
+    } else {
+        const char* dir = getenv("PS3RECOMP_VK_PIPELINE_CACHE_DIR");
+        if (!dir || !*dir) dir = getenv("PS3_GAMEDATA_ROOT");
+        if (!dir || !*dir) dir = ".";
+        VkPhysicalDeviceProperties p;
+        memset(&p, 0, sizeof p);
+        pvkGetPhysicalDeviceProperties(s_vk.phys, &p);
+        char dev[48];
+        unsigned d = 0;
+        for (const char* s = p.deviceName; *s && d + 1 < sizeof dev; s++)
+            dev[d++] = (char)(((*s >= 'A' && *s <= 'Z') || (*s >= 'a' && *s <= 'z') ||
+                               (*s >= '0' && *s <= '9')) ? *s : '_');
+        dev[d] = 0;
+        unsigned long long h = 1469598103934665603ull;
+        for (unsigned i = 0; i < VK_UUID_SIZE; i++) {
+            h ^= p.pipelineCacheUUID[i];
+            h *= 1099511628211ull;
+        }
+        snprintf(s_pipe_cache_path, sizeof s_pipe_cache_path,
+                 "%s/vk_pipe_cache_%s_%08x_%016llx.bin", dir, dev,
+                 (unsigned)p.driverVersion, h);
+    }
+    void* data = NULL;
+    size_t sz = 0;
+    FILE* f = fopen(s_pipe_cache_path, "rb");
+    if (f) {
+        if (fseek(f, 0, SEEK_END) == 0) {
+            const long n = ftell(f);
+            if (n > 0 && (unsigned long)n < (256u << 20)) {
+                sz = (size_t)n;
+                data = malloc(sz);
+                if (data) {
+                    rewind(f);
+                    if (fread(data, 1, sz, f) != sz) { free(data); data = NULL; sz = 0; }
+                }
+            }
+        }
+        fclose(f);
+    }
+    VkPipelineCacheCreateInfo ci = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO,
+        .initialDataSize = sz, .pInitialData = data };
+    VkResult r = pvkCreatePipelineCache(s_vk.device, &ci, NULL, &s_pipe_cache);
+    free(data);
+    if (r != VK_SUCCESS) {
+        s_pipe_cache = VK_NULL_HANDLE;
+        VK_LOG("pipeline cache %s could not be created (%d); creating without one\n",
+               s_pipe_cache_path, (int)r);
+    } else {
+        VK_LOG("pipeline cache %s: %zu bytes loaded\n", s_pipe_cache_path, sz);
+    }
 }
 
 /* ---------------------------------------------------------------------------
@@ -1174,7 +1299,7 @@ static VkPipeline vk_get_pipeline(int ztest, int zwrite, u32 cmp)
         .subpass = 0 };
     VkPipeline p = VK_NULL_HANDLE;
     const unsigned long long _pt = rsx_wprof_now();
-    VkResult r = pvkCreateGraphicsPipelines(s_vk.device, VK_NULL_HANDLE, 1, &gci, NULL, &p);
+    VkResult r = pvkCreateGraphicsPipelines(s_vk.device, s_pipe_cache, 1, &gci, NULL, &p);
     vk_pipe_create_done("fixed", _pt);
     if (r != VK_SUCCESS) { VK_LOG("vkCreateGraphicsPipelines failed (%d)\n", (int)r); return VK_NULL_HANDLE; }
     s_vk.pipelines[slot] = p;
@@ -1517,7 +1642,7 @@ static VkPipeline vk_guest_pipeline(int vs, int fs, int ztest, int zwrite, u32 c
         .subpass = 0 };
     VkPipeline p = VK_NULL_HANDLE;
     const unsigned long long _pt = rsx_wprof_now();
-    VkResult r = pvkCreateGraphicsPipelines(s_vk.device, VK_NULL_HANDLE, 1, &gci, NULL, &p);
+    VkResult r = pvkCreateGraphicsPipelines(s_vk.device, s_pipe_cache, 1, &gci, NULL, &p);
     vk_pipe_create_done("guest", _pt);
     if (r != VK_SUCCESS) {
         VK_LOG("guest pipeline: vkCreateGraphicsPipelines failed (%d)\n", (int)r);
@@ -3946,9 +4071,21 @@ static u32 vk_eng_pipeline_create(void* user, const char* vs_hlsl, const char* p
     }
     vk_eng_pipe* P = &s_epipe[slot];
     memset(P, 0, sizeof *P);
-    if (vk_eng_translate(vs_hlsl, RSX_SHADER_STAGE_VERTEX, &P->vs)) return 0;
-    if (vk_eng_translate(ps_hlsl, RSX_SHADER_STAGE_FRAGMENT, &P->fs)) {
-        pvkDestroyShaderModule(s_vk.device, P->vs, NULL); memset(P, 0, sizeof *P); return 0;
+    {
+        const uint64_t _t = ps3_trace_begin();
+        const int _rc = vk_eng_translate(vs_hlsl, RSX_SHADER_STAGE_VERTEX, &P->vs);
+        if (_t) ps3_trace_end(_t, PS3_TR_SHADER_COMPILE, 0,
+                              (uint32_t)strlen(vs_hlsl));
+        if (_rc) return 0;
+    }
+    {
+        const uint64_t _t = ps3_trace_begin();
+        const int _rc = vk_eng_translate(ps_hlsl, RSX_SHADER_STAGE_FRAGMENT, &P->fs);
+        if (_t) ps3_trace_end(_t, PS3_TR_SHADER_COMPILE, 1,
+                              (uint32_t)strlen(ps_hlsl));
+        if (_rc) {
+            pvkDestroyShaderModule(s_vk.device, P->vs, NULL); memset(P, 0, sizeof *P); return 0;
+        }
     }
     P->rs = *rs;
     P->nslots = layout->count;
@@ -4101,7 +4238,7 @@ static VkPipeline vk_eng_variant(vk_eng_pipe* P, u32 topo_idx)
         .pDepthStencilState = &ds, .pColorBlendState = &cb, .pDynamicState = &dy,
         .layout = layout, .renderPass = rp, .subpass = 0 };
     const unsigned long long _pt = rsx_wprof_now();
-    const VkResult _pr = pvkCreateGraphicsPipelines(s_vk.device, VK_NULL_HANDLE, 1, &gci, NULL,
+    const VkResult _pr = pvkCreateGraphicsPipelines(s_vk.device, s_pipe_cache, 1, &gci, NULL,
                                                     &P->variant[topo_idx]);
     vk_pipe_create_done("engine", _pt);
     if (_pr != VK_SUCCESS) {
@@ -4440,7 +4577,7 @@ static int vk_vtx_unpack_init(void)
         .layout = s_vk.vtx_unpack_layout
     };
     const unsigned long long _pt = rsx_wprof_now();
-    const VkResult _pr = pvkCreateComputePipelines(s_vk.device, VK_NULL_HANDLE, 1, &cpci, NULL,
+    const VkResult _pr = pvkCreateComputePipelines(s_vk.device, s_pipe_cache, 1, &cpci, NULL,
                                                    &s_vk.vtx_unpack_pipe);
     vk_pipe_create_done("compute", _pt);
     if (_pr != VK_SUCCESS) {
@@ -5306,6 +5443,7 @@ static int vk_init_all(u32 width, u32 height, const char* title)
     } else {
         s_vk.present_queue = s_vk.queue;
     }
+    vk_pipe_cache_init();
 
     VkCommandPoolCreateInfo pci = { .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
                                     .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT,
@@ -5425,6 +5563,11 @@ void rsx_vulkan_backend_shutdown(void)
     if (s_vk.windowed || s_vk.window) vk_window_drop(NULL);
     if (s_vk.device) {
         vk_device_idle();
+        if (s_pipe_cache) {
+            vk_pipe_cache_save();
+            pvkDestroyPipelineCache(s_vk.device, s_pipe_cache, NULL);
+            s_pipe_cache = VK_NULL_HANDLE;
+        }
         vk_guest_shutdown();
         for (int i = 0; i < VK_PIPELINE_SLOTS; i++)
             if (s_vk.pipelines[i]) pvkDestroyPipeline(s_vk.device, s_vk.pipelines[i], NULL);

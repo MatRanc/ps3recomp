@@ -1965,6 +1965,7 @@ static int gcm_fifo_resync_walk(u32* getoff, u32 put)
  * is not, it deadlocks the title. Sweep the skipped range first. */
 static void gcm_fifo_resync_why(const char* why, u32* getoff, u32 put)
 {
+    ps3_trace_instant(PS3_TR_GCM_RESYNC, *getoff, put);
     static int n = 0;
     if (PS3_LOG_FIRST(n, 8))
         fprintf(stderr, "[cellGcmSys] FIFO resync (%s) 0x%08X -> put 0x%08X\n",
@@ -3897,6 +3898,10 @@ u32 cellGcm_display_buffer_count(void)
 static s32 gcm_flip_request(u32 bufferId, int in_fifo)
 {
     const u32 flip_seq = gcm_flip_requested();
+    /* Hitch census: this is a guest frame boundary even when the per-flip log
+     * is off. Cheap (one env read folded into a static) when no timeline is
+     * recording. */
+    ps3_trace_frame_boundary(ps3_trace_now());
     /* The seq this request has in the per-flip log (PS3RECOMP_FLIP_LOG). For
      * an in-FIFO flip this is the instant the marker was written; the walker
      * stamps `fin` when it reaches it. */

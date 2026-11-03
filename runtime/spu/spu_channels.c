@@ -2337,6 +2337,7 @@ static int spu_overlay_resident_verified(spu_context* ctx, unsigned slot)
 {
     int* state = &ctx->resident_code[slot].verify_state;
     if (*state == SPU_OVERLAY_PENDING) {
+        const uint64_t _tr = ps3_trace_begin();
         const spu_ovl_src* o = &s_ovl_src[ctx->resident_code[slot].source_index];
         const uint32_t src_ea = ctx->resident_code[slot].source_ea;
         const uint32_t span = ctx->resident_code[slot].size;
@@ -2367,6 +2368,8 @@ static int spu_overlay_resident_verified(spu_context* ctx, unsigned slot)
         *state = match ? SPU_OVERLAY_VERIFIED : SPU_OVERLAY_REJECTED;
         { extern int g_c690_gap; extern void c690_gap_on_overlay(int,int);
           if (__builtin_expect(g_c690_gap, 0)) c690_gap_on_overlay(1, match); }
+        if (_tr) ps3_trace_end(_tr, PS3_TR_SPU_OVERLAY_VERIFY,
+                               (uint32_t)ctx->image_id, slot);
     }
     return *state == SPU_OVERLAY_VERIFIED;
 }

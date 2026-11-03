@@ -1653,10 +1653,13 @@ static u32 eng_surface_get(u32 location, u32 offset, u32 want_w, u32 want_h,
     }
 
     u32 seed_row = 0;
+    const uint64_t _tr = ps3_trace_begin();
     const void* seed = eng_surface_seed(location, offset, want_w, want_h,
                                         want_fmt, &seed_row);
     const u32 handle = g.be->color_target_create(g.be->user, want_fmt,
                                                  want_w, want_h, seed, seed_row);
+    if (_tr) ps3_trace_end(_tr, PS3_TR_SURFACE_CREATE,
+                           (want_w & 0xFFFFu) | (want_h << 16), (uint32_t)want_fmt);
     if (!handle)
         return (!evicted && slot < g.n_surfaces && g.surfaces[slot].handle) ? slot : ENG_INVALID;
 
@@ -2735,8 +2738,14 @@ static u32 eng_texture_upload(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
                               u32 into)
 {
     const unsigned long long wp2 = wp2_t0();
+    const uint64_t _tr = ps3_trace_begin();
     const u32 handle = eng_texture_upload_work(location, offset, fmt, w, h, levels,
                                                pitch, cube, remap, depth, into);
+    if (_tr) {
+        uint64_t bytes = (uint64_t)w * h * 4u * (cube ? 6u : 1u) * (depth ? depth : 1u);
+        ps3_trace_end(_tr, PS3_TR_TEX_UPLOAD, (uint32_t)(bytes >> 10),
+                      levels ? levels : 1u);
+    }
     if (wp2) { wp2_add(WPROF2_TEX_UPLOAD, wp2); s_wp2_tex_uploads++; }
     return handle;
 }

@@ -20,6 +20,7 @@
 #include "ps3emu/guest_call.h" /* ps3_invoke_guest: AIO completion is a guest OPD */
 #include "ps3emu/guest_access.h"
 #include "ps3emu/fs_write_check.h"   /* shared short-write predicate */
+#include "ps3emu/ps3_trace.h"        /* PS3RECOMP_TIMELINE: reads on the frame path */
 #include "../../libs/video/ps3_live_ctl.h"   /* PS3RECOMP_FS_WRITE_CHECK */
 #include "sdata_decrypt.h"   /* SDATA/EDAT (NPD) decryption for cellFsSdataOpen */
 #include <stdint.h>
@@ -491,7 +492,12 @@ static void cellFsRead(ppu_context* ctx)
     fs_prefault(buf, nbytes);
     fs_set_dir(fd, f, 1);
     ps3_guest_write(vm_base + buf, (size_t)nbytes);
+    const uint64_t _tr = ps3_trace_begin();
     size_t n = fread(vm_base + buf, 1, (size_t)nbytes, f);   /* raw bytes, no swap */
+    if (_tr) {
+        const uint64_t rb = n > 0xFFFFFFFFull ? 0xFFFFFFFFull : (uint64_t)n;
+        ps3_trace_end(_tr, PS3_TR_FS_READ, (uint32_t)fd, (uint32_t)rb);
+    }
     /* PS3_FSLOG_EOF=<fd>,<bytes>: report end-of-file past <bytes> on one descriptor.
      * The intro cinematic is 28 seconds and this port renders it at a few frames
      * a second, so it cannot be watched to its end -- truncating the stream makes
