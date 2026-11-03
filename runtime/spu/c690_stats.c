@@ -47,6 +47,7 @@
  * the two hook points the counters are allowed to use.
  */
 #include "c690_stats.h"
+#include "c690_corpus.h"
 #include "spu_context.h"
 #include "ps3emu/ps3_trace.h"   /* PS3RECOMP_TRACE: one c690.job span per job */
 
@@ -322,6 +323,7 @@ void c690_stats_on_lookup(const struct spu_context* ctx, uint32_t lsa)
         if (lsa == C690_JOB_END_LS) {
             if (t_run.current_lsa) c690_charge(s, t_run.current_lsa, now - t_run.last_ns);
             c690_opcode_inc(s, 0x00u);       /* the end command itself */
+            if (__builtin_expect(g_c690_corpus_on, 0)) c690_corpus_job_end(ctx);
             c690_record_job(s, now - t_run.job_start_ns);
             if (t_run.hash_active) {
                 /* The assembled vertex buffer lives at LS 0x2F870; fold the
@@ -351,7 +353,11 @@ void c690_stats_on_lookup(const struct spu_context* ctx, uint32_t lsa)
         t_run.current_lsa = lsa;
         t_run.last_ns = now;
         const int op = c690_opcode_for_lsa(lsa);
-        if (op >= 0) c690_opcode_inc(s, (unsigned)op);
+        if (op >= 0) {
+            c690_opcode_inc(s, (unsigned)op);
+            if (__builtin_expect(g_c690_corpus_on, 0))
+                c690_corpus_note_op(ctx, (unsigned)op);
+        }
         c690_maybe_periodic(now);
         return;
     }
@@ -389,6 +395,8 @@ void c690_stats_on_lookup(const struct spu_context* ctx, uint32_t lsa)
         t_run.last_ns = c690_now_ns();
         t_run.current_lsa = lsa;
         t_run.tr_desc_ea = ctx->gpr[3]._u32[0];
+        if (__builtin_expect(g_c690_corpus_on, 0))
+            c690_corpus_job_begin(ctx, t_run.tr_desc_ea, c690_frame_flips());
         t_run.tr_t0 = ps3_trace_begin();
         __atomic_fetch_add(&s_active_jobs, 1u, __ATOMIC_RELAXED);
         if (s->spu_id == 0xFFFFFFFFu) s->spu_id = ctx->spu_id;
@@ -648,9 +656,11 @@ static void c690_stats_startup(void)
     if (__atomic_exchange_n(&s_started, 1, __ATOMIC_RELAXED)) return;
     const char* e = getenv("PS3RECOMP_C690_STATS");
     const char* h = getenv("PS3RECOMP_C690_HASH");
+    const char* c = getenv("PS3RECOMP_C690_CORPUS");
     const int hash_stride = (h && *h) ? atoi(h) : 0;
-    if ((!e || strcmp(e, "1") != 0) && hash_stride <= 0) return;
-    g_c690_stats = 1;                     /* job tracking also feeds the hash */
+    const int corpus_on = c && *c;
+    if ((!e || strcmp(e, "1") != 0) && hash_stride <= 0 && !corpus_on) return;
+    g_c690_stats = 1;                     /* job tracking also feeds the hash/corpus */
     g_c690_hash_on = hash_stride > 0 ? hash_stride : 0;
     s_t0_ns = c690_now_ns();
     s_last_report_ns = s_t0_ns;
