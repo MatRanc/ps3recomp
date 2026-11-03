@@ -265,6 +265,7 @@ static struct {
 
 #define ENG_FETCH_MEMO 1024
 #define ENG_PIPE_MEMO  512
+#define ENG_REMAP_MEMO 1024
 
 /* One prepared fetch plan and its remap, keyed by the attribute layout, the
  * decoded VTXFMT/default state and the reference set. No guest bytes are
@@ -303,7 +304,32 @@ typedef struct {
     u32 const_cap;
 } eng_pipe_memo;
 
+/* One deduplicated reference answer, keyed by the source reference list. It
+ * stores only the collapse result (unique prefix and occurrence map), never
+ * guest bytes, so a hit is exactly what rsx_vertex_remap_build would return
+ * for the same references. It is independent of the fetch plan: a draw whose
+ * transform/buffer registers changed but whose references did not still hits. */
+typedef struct {
+    int used;
+    u32 epoch;
+    u64 key;
+    u32 n_source, n_unique;
+    int remapped;
+    rsx_vertex_ref* refs;
+    u32 refs_cap;
+    u32* occ;
+    u32 occ_cap;
+} eng_remap_memo;
+
 static int s_walker_fast;
+/* The two halves of WALKER_FAST as independent switches: the fetch
+ * plan/remap memo (plan item 4) and the pipeline answer memo (plan item 5).
+ * WALKER_FAST=1 still turns both on; an explicit per-item value wins. */
+static int s_fetch_memo;
+static int s_pipe_memo;
+/* PS3RECOMP_REMAP_CACHE: memoize rsx_vertex_remap_build by the reference
+ * list, independent of the fetch plan (plan item 1/4). */
+static int s_remap_cache;
 /* EXP_NO_DRAW: live throwaway switch. When on, sink_end returns before any
  * fetch, pipeline, texture or Vulkan recording; the method stream (and so
  * fences, labels and flips) still dispatches exactly as before. */
@@ -311,19 +337,24 @@ static int s_no_draw;
 static u32 s_fast_epoch = 1;
 static unsigned long long s_fetch_hits, s_fetch_misses;
 static unsigned long long s_pipe_hits, s_pipe_misses;
+static unsigned long long s_remap_hits, s_remap_misses;
 static eng_fetch_memo s_fmemo[ENG_FETCH_MEMO];
 static u32 s_fmemo_next;
 static eng_pipe_memo s_pmemo[ENG_PIPE_MEMO];
 static u32 s_pmemo_next;
+static eng_remap_memo s_rmemo[ENG_REMAP_MEMO];
+static u32 s_rmemo_next;
 
 static void eng_fast_reset_caches(void)
 {
     for (u32 i = 0; i < ENG_FETCH_MEMO; i++) s_fmemo[i].used = 0;
     for (u32 i = 0; i < ENG_PIPE_MEMO; i++) s_pmemo[i].used = 0;
-    s_fmemo_next = s_pmemo_next = 0;
+    for (u32 i = 0; i < ENG_REMAP_MEMO; i++) s_rmemo[i].used = 0;
+    s_fmemo_next = s_pmemo_next = s_rmemo_next = 0;
     s_fast_epoch = 1;
     s_fetch_hits = s_fetch_misses = 0;
     s_pipe_hits = s_pipe_misses = 0;
+    s_remap_hits = s_remap_misses = 0;
 }
 
 static void eng_fast_free_caches(void)
@@ -334,22 +365,56 @@ static void eng_fast_free_caches(void)
     }
     for (u32 i = 0; i < ENG_PIPE_MEMO; i++)
         free(s_pmemo[i].const_values);
+    for (u32 i = 0; i < ENG_REMAP_MEMO; i++) {
+        free(s_rmemo[i].refs);
+        free(s_rmemo[i].occ);
+    }
     memset(s_fmemo, 0, sizeof s_fmemo);
     memset(s_pmemo, 0, sizeof s_pmemo);
-    s_fmemo_next = s_pmemo_next = 0;
+    memset(s_rmemo, 0, sizeof s_rmemo);
+    s_fmemo_next = s_pmemo_next = s_rmemo_next = 0;
 }
 
 /* Live switch setters. cellGcmSys.c owns the PS3RECOMP_CTL dependency (a
  * standalone engine fixture compiles this file without the control module),
- * and calls these once per drain pass. A walker-fast change flushes both
- * memos so the arm measures the path it names from its first draw. */
+ * and calls these once per drain pass. A switch change flushes the memos it
+ * governs so the arm measures the path it names from its first draw. */
 void rsx_draw_engine_set_walker_fast(int on)
 {
     if (on != s_walker_fast) {
         s_walker_fast = on;
+        s_fetch_memo = on;
+        s_pipe_memo = on;
         eng_fast_reset_caches();
         fprintf(stderr, "[live] PS3RECOMP_WALKER_FAST=%d: fetch/pipeline memos flushed\n",
                 on);
+    }
+}
+
+void rsx_draw_engine_set_fetch_memo(int on)
+{
+    if (on != s_fetch_memo) {
+        s_fetch_memo = on;
+        eng_fast_reset_caches();
+        fprintf(stderr, "[live] PS3RECOMP_FETCH_MEMO=%d: fetch memo flushed\n", on);
+    }
+}
+
+void rsx_draw_engine_set_pipe_memo(int on)
+{
+    if (on != s_pipe_memo) {
+        s_pipe_memo = on;
+        eng_fast_reset_caches();
+        fprintf(stderr, "[live] PS3RECOMP_PIPE_MEMO=%d: pipeline memo flushed\n", on);
+    }
+}
+
+void rsx_draw_engine_set_remap_cache(int on)
+{
+    if (on != s_remap_cache) {
+        s_remap_cache = on;
+        eng_fast_reset_caches();
+        fprintf(stderr, "[live] PS3RECOMP_REMAP_CACHE=%d: remap memo flushed\n", on);
     }
 }
 
@@ -492,6 +557,7 @@ static unsigned long long s_wp2_conv_verts, s_wp2_conv_bytes;
 static unsigned long long s_wp2_pipe_hits, s_wp2_pipe_gets, s_wp2_pipe_created;
 static unsigned long long s_wp2_tex_slots, s_wp2_tex_uploads;
 static unsigned long long s_wp2_fetch_hit, s_wp2_fetch_miss;
+static unsigned long long s_wp2_remap_hit, s_wp2_remap_miss;
 
 static int rsx_wprof2_enabled(void)
 {
@@ -622,7 +688,8 @@ void rsx_wprof_drain_end(void)
                 "tex_upload=%.3f tex_bind=%.3f vtex=%.3f const=%.3f "
                 "index=%.3f bind_be=%.3f surftrack=%.3f draw_be=%.3f "
                 "| pipe_hit=%.1f pipe_get=%.1f pipe_new=%.1f "
-                "fetch_hit=%.0f fetch_miss=%.0f tex_binds=%.1f tex_loads=%.1f\n",
+                "fetch_hit=%.0f fetch_miss=%.0f remap_hit=%.0f remap_miss=%.0f "
+                "tex_binds=%.1f tex_loads=%.1f\n",
                 at_ms, (double)s_wp2_draws / f, (double)s_wp2_verts / f,
                 (double)s_wp2_conv_verts / f,
                 (double)s_wp2_conv_bytes / 1024.0 / f,
@@ -651,6 +718,7 @@ void rsx_wprof_drain_end(void)
                 (double)s_wp2_pipe_hits / f, (double)s_wp2_pipe_gets / f,
                 (double)s_wp2_pipe_created / f,
                 (double)s_wp2_fetch_hit / f, (double)s_wp2_fetch_miss / f,
+                (double)s_wp2_remap_hit / f, (double)s_wp2_remap_miss / f,
                 (double)s_wp2_tex_slots / f, (double)s_wp2_tex_uploads / f);
         fflush(stderr);
         memset(s_wp2_ns, 0, sizeof s_wp2_ns);
@@ -660,6 +728,7 @@ void rsx_wprof_drain_end(void)
         s_wp2_pipe_hits = s_wp2_pipe_gets = s_wp2_pipe_created = 0;
         s_wp2_tex_slots = s_wp2_tex_uploads = 0;
         s_wp2_fetch_hit = s_wp2_fetch_miss = 0;
+        s_wp2_remap_hit = s_wp2_remap_miss = 0;
     }
     fflush(stderr);
     memset(s_wp_ns, 0, sizeof s_wp_ns);
@@ -4271,7 +4340,7 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
      * (including the buffered fragment constants the caller needs) without
      * walking either program again. */
     u64 pipe_fp = 0;
-    if (s_walker_fast) {
+    if (s_pipe_memo) {
         pipe_fp = eng_pipe_fingerprint(vp_uc, fixed ? 0 : vp_instrs * 16u,
                                        fp_uc, fixed ? 0 : fp_size, fixed,
                                        layout, rs, rt_fmt, rt_count);
@@ -4404,7 +4473,7 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
             *out_tex_used = p->tex_used;
             *out_fp_hash = p->fp_hash;
             s_vpc.lo = p->vpc_lo; s_vpc.n = p->vpc_n; s_vpc.full = p->vpc_full;
-            if (s_walker_fast)
+            if (s_pipe_memo)
                 eng_pipe_memo_save(pipe_fp, p->handle, p->fixed, p->tex_used,
                                    p->fp_hash);
             wp2_add(WPROF2_PIPE_DIR, wp2_dir);
@@ -4529,7 +4598,7 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
     g.pipeline_index[slot] = (u16)(g.n_pipelines + 1u);
     g.n_pipelines++;
     *out_fixed = fixed;
-    if (s_walker_fast)
+    if (s_pipe_memo)
         eng_pipe_memo_save(pipe_fp, handle, fixed, *out_tex_used, fp_hash);
     return handle;
 }
@@ -4695,7 +4764,7 @@ static int dc_convert_verts(void)
  * FIFO, so it bypasses the cache. */
 static u64 eng_fetch_key(const rsx_vertex_fetch_plan* p,
                          const rsx_vertex_layout_plan* layout,
-                         const rsx_vertex_ref* refs, u32 n, int allow_remap)
+                         u64 refs_hash, u32 n, int allow_remap)
 {
     u64 h = 1469598103934665603ull;
     h = eng_fnv1a(layout, sizeof *layout, h);
@@ -4710,8 +4779,69 @@ static u64 eng_fetch_key(const rsx_vertex_fetch_plan* p,
     const u32 flags = (allow_remap ? 1u : 0u) | (s_vtx_remap ? 2u : 0u) |
                       (p->inline_data ? 4u : 0u);
     h = eng_fnv1a(&flags, sizeof flags, h);
-    if (n) h = eng_fnv1a_words(refs, n * (u32)sizeof(*refs), h);
+    h = eng_fnv1a(&refs_hash, sizeof refs_hash, h);
+    h = eng_fnv1a(&n, sizeof n, h);
     return h;
+}
+
+/* Identity of a draw's source reference list, hashed once and shared by the
+ * fetch and remap memos (the fetch key used to hash the same words again). */
+static u64 eng_refs_key(const rsx_vertex_ref* refs, u32 n)
+{
+    u64 h = 1469598103934665603ull;
+    if (n && n <= 0xFFFFFFFFu / (u32)sizeof(*refs))
+        h = eng_fnv1a_words(refs, n * (u32)sizeof(*refs), h);
+    h = eng_fnv1a(&n, sizeof n, h);
+    return h;
+}
+
+static eng_remap_memo* eng_remap_memo_find(u64 key)
+{
+    for (u32 i = 0; i < ENG_REMAP_MEMO; i++)
+        if (s_rmemo[i].used && s_rmemo[i].epoch == s_fast_epoch &&
+            s_rmemo[i].key == key)
+            return &s_rmemo[i];
+    return NULL;
+}
+
+static eng_remap_memo* eng_remap_memo_alloc(void)
+{
+    u32 i;
+    for (i = 0; i < ENG_REMAP_MEMO; i++)
+        if (!s_rmemo[i].used || s_rmemo[i].epoch != s_fast_epoch) break;
+    if (i == ENG_REMAP_MEMO) i = s_rmemo_next++ % ENG_REMAP_MEMO;
+    eng_remap_memo* m = &s_rmemo[i];
+    m->used = 1;
+    m->epoch = s_fast_epoch;
+    return m;
+}
+
+static void eng_remap_memo_save(u64 key, const rsx_vertex_ref* refs,
+                                u32 n_unique, const u32* occ, u32 n_source,
+                                int remapped)
+{
+    eng_remap_memo* m = eng_remap_memo_alloc();
+    m->key = key;
+    m->n_source = n_source;
+    m->n_unique = n_unique;
+    m->remapped = remapped;
+    if (remapped) {
+        if (n_unique > m->refs_cap) {
+            rsx_vertex_ref* p = (rsx_vertex_ref*)realloc(
+                m->refs, (size_t)n_unique * sizeof(*p));
+            if (!p) { m->used = 0; return; }
+            m->refs = p;
+            m->refs_cap = n_unique;
+        }
+        if (n_source > m->occ_cap) {
+            u32* p = (u32*)realloc(m->occ, (size_t)n_source * sizeof(*p));
+            if (!p) { m->used = 0; return; }
+            m->occ = p;
+            m->occ_cap = n_source;
+        }
+        if (n_unique) memcpy(m->refs, refs, (size_t)n_unique * sizeof(*refs));
+        if (n_source) memcpy(m->occ, occ, (size_t)n_source * sizeof(*occ));
+    }
 }
 
 static eng_fetch_memo* eng_fetch_memo_find(u64 key)
@@ -4784,6 +4914,30 @@ static int dc_ensure_occ(u32 n)
     if (!p) return 0;
     dc.ref_remap.occurrence_to_unique = p;
     dc.ref_remap.occurrence_capacity = n;
+    return 1;
+}
+
+/* Restore a memoized collapse into the current accumulator. The source refs
+ * already built for this draw are dropped only when the answer collapsed
+ * them; an uncollapsed hit leaves them in place (it is the same list). The
+ * caller falls back to rsx_vertex_remap_build if this cannot allocate. */
+static int dc_remap_memo_restore(const eng_remap_memo* m)
+{
+    if (!m->remapped) {
+        dc.n_refs = m->n_unique;
+        dc.refs_remapped = 0;
+        return 1;
+    }
+    if (!dc_ensure_refs(m->n_unique) || !dc_ensure_occ(m->n_source))
+        return 0;
+    if (m->n_unique)
+        memcpy(dc.refs, m->refs, (size_t)m->n_unique * sizeof(*dc.refs));
+    if (m->n_source)
+        memcpy(dc.ref_remap.occurrence_to_unique, m->occ,
+               (size_t)m->n_source * sizeof(*m->occ));
+    dc.ref_remap.occurrence_capacity = m->n_source;
+    dc.n_refs = m->n_unique;
+    dc.refs_remapped = 1;
     return 1;
 }
 
@@ -4864,14 +5018,21 @@ static void dc_fetch(const rsx_vertex_layout_plan* layout, int allow_remap)
      * never reaches here, so both keep the old path. The plan is initialized
      * before the key because the key is over the plan's decoded inputs; a
      * hit then skips the remap hash and the per-attribute span resolution. */
-    const int fast_cacheable = s_walker_fast && !dc.inl;
+    const int fast_cacheable = s_fetch_memo && !dc.inl;
+    const int remap_cacheable = s_remap_cache && s_vtx_remap && allow_remap &&
+                                dc.n_refs > 1;
+    /* One pass over the source references feeds both memos; the fetch key
+     * used to hash the same words a second time. */
+    u64 refs_key = 0;
+    if (fast_cacheable || remap_cacheable)
+        refs_key = eng_refs_key(dc.refs, dc.n_source_refs);
     rsx_vertex_fetch_plan next_plan;
     u64 fetch_key = 0;
     eng_fetch_memo* fetch_hit = NULL;
     if (fast_cacheable) {
         rsx_vertex_fetch_plan_init(&next_plan, &g.rsx, layout,
                                    eng_guest_ptr, NULL);
-        fetch_key = eng_fetch_key(&next_plan, layout, dc.refs,
+        fetch_key = eng_fetch_key(&next_plan, layout, refs_key,
                                   dc.n_source_refs, allow_remap);
         fetch_hit = eng_fetch_memo_find(fetch_key);
     }
@@ -4903,15 +5064,36 @@ static void dc_fetch(const rsx_vertex_layout_plan* layout, int allow_remap)
         }
         dc.fetch_plan = fetch_hit->plan;
     } else {
-        if (s_walker_fast) { s_fetch_misses++; s_wp2_fetch_miss++; }
+        if (fast_cacheable) { s_fetch_misses++; s_wp2_fetch_miss++; }
         /* Only a topology this engine rebuilds through an index buffer may
          * share repeated references. A line strip or a point list is drawn in
          * the order it arrived, so collapsing duplicates would reorder it. */
         if (s_vtx_remap && allow_remap && dc.n_refs > 1) {
-            u32 unique = dc.n_refs;
-            if (rsx_vertex_remap_build(&dc.ref_remap, dc.refs, dc.n_refs, &unique)) {
-                dc.refs_remapped = unique < dc.n_refs;
-                dc.n_refs = unique;
+            int restored = 0;
+            if (remap_cacheable) {
+                eng_remap_memo* rm = eng_remap_memo_find(refs_key);
+                if (rm && dc_remap_memo_restore(rm)) {
+                    s_remap_hits++;
+                    s_wp2_remap_hit++;
+                    restored = 1;
+                }
+            }
+            if (!restored) {
+                const u32 n_source = dc.n_refs;
+                u32 unique = dc.n_refs;
+                if (remap_cacheable) {
+                    s_remap_misses++;
+                    s_wp2_remap_miss++;
+                }
+                if (rsx_vertex_remap_build(&dc.ref_remap, dc.refs, dc.n_refs,
+                                           &unique)) {
+                    dc.refs_remapped = unique < dc.n_refs;
+                    dc.n_refs = unique;
+                    if (remap_cacheable)
+                        eng_remap_memo_save(refs_key, dc.refs, unique,
+                                            dc.ref_remap.occurrence_to_unique,
+                                            n_source, dc.refs_remapped);
+                }
             }
         }
         if (fast_cacheable) {
@@ -6680,6 +6862,16 @@ int rsx_draw_engine_init(u32 width, u32 height)
       s_vtx_remap = !(e && strcmp(e, "0") == 0); }
     { const char* e = getenv("PS3RECOMP_WALKER_FAST");
       s_walker_fast = e && *e && strcmp(e, "0") != 0; }
+    /* The umbrella sets both halves, but an explicit per-item value wins so
+     * the two can be measured on their own (or with WALKER_FAST=0). */
+    s_fetch_memo = s_walker_fast;
+    s_pipe_memo = s_walker_fast;
+    { const char* e = getenv("PS3RECOMP_FETCH_MEMO");
+      if (e && *e) s_fetch_memo = strcmp(e, "0") != 0; }
+    { const char* e = getenv("PS3RECOMP_PIPE_MEMO");
+      if (e && *e) s_pipe_memo = strcmp(e, "0") != 0; }
+    { const char* e = getenv("PS3RECOMP_REMAP_CACHE");
+      s_remap_cache = e && *e && strcmp(e, "0") != 0; }
     { const char* e = getenv("EXP_NO_DRAW");
       s_no_draw = e && *e && strcmp(e, "0") != 0; }
     eng_fast_reset_caches();
@@ -6843,6 +7035,8 @@ void rsx_draw_engine_walker_fast_stats(rsx_walker_fast_stats* out)
     out->fetch_misses = s_fetch_misses;
     out->pipeline_hits = s_pipe_hits;
     out->pipeline_misses = s_pipe_misses;
+    out->remap_hits = s_remap_hits;
+    out->remap_misses = s_remap_misses;
 }
 
 u32 rsx_draw_engine_readback_center(void)

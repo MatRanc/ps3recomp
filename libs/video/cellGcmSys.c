@@ -2670,8 +2670,22 @@ static void gcm_rsx_process_fifo_unlocked(void)
      * control file, at most once per drain pass (>= once per flip). The
      * draw engine then refreshes its own cached switch values from it. */
     if (ps3_live_ctl_poll) ps3_live_ctl_poll(cellGcm_flip_request_count());
-    rsx_draw_engine_set_walker_fast(gcm_live_get(PS3_LIVE_WALKER_FAST,
-                                                "PS3RECOMP_WALKER_FAST"));
+    const int walker_fast = gcm_live_get(PS3_LIVE_WALKER_FAST,
+                                         "PS3RECOMP_WALKER_FAST");
+    rsx_draw_engine_set_walker_fast(walker_fast);
+    /* The per-item keys are independent arms, but an unset one must follow
+     * the legacy umbrella (the engine already defaults it that way at init;
+     * the live poll must not turn it back off). */
+    const int fetch_env = getenv("PS3RECOMP_FETCH_MEMO") != NULL;
+    rsx_draw_engine_set_fetch_memo(
+        fetch_env ? gcm_live_get(PS3_LIVE_FETCH_MEMO, "PS3RECOMP_FETCH_MEMO")
+                  : walker_fast);
+    const int pipe_env = getenv("PS3RECOMP_PIPE_MEMO") != NULL;
+    rsx_draw_engine_set_pipe_memo(
+        pipe_env ? gcm_live_get(PS3_LIVE_PIPE_MEMO, "PS3RECOMP_PIPE_MEMO")
+                 : walker_fast);
+    rsx_draw_engine_set_remap_cache(gcm_live_get(PS3_LIVE_REMAP_CACHE,
+                                                 "PS3RECOMP_REMAP_CACHE"));
     rsx_draw_engine_set_no_draw(gcm_live_get(PS3_LIVE_EXP_NO_DRAW, "EXP_NO_DRAW"));
     const int wcap = rsx_wcap_begin_if_triggered();
     const int wdiag = gcm_word_diag(), wmirror = gcm_word_mirror_only();

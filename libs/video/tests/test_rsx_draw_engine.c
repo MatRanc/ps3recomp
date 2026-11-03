@@ -2851,6 +2851,12 @@ static void walker_fast_env(int on)
     else unsetenv("PS3RECOMP_WALKER_FAST");
 }
 
+static void remap_cache_env(int on)
+{
+    if (on) setenv("PS3RECOMP_REMAP_CACHE", "1", 1);
+    else unsetenv("PS3RECOMP_REMAP_CACHE");
+}
+
 static rsx_walker_fast_stats walker_fast_stats(void)
 {
     rsx_walker_fast_stats st = {0};
@@ -3012,6 +3018,38 @@ static void test_walker_fast_pipeline(void)
     walker_fast_env(0);
 }
 
+/* The remap memo is independent of the fetch plan: it keys on the source
+ * reference list alone, so the same index bytes reuse the collapse result
+ * without either fetch or pipeline memo being on. */
+static void test_remap_cache(void)
+{
+    printf("-- remap cache\n");
+    remap_cache_env(1);
+    engine_up();
+    fast_write_vertices(1.0f);
+    static const u16 idx_a[] = { 0, 1, 2, 0, 1, 2 };
+    static const u16 idx_b[] = { 3, 4, 5, 3, 4, 5 };
+    fast_draw_indexed(idx_a, 6);
+    rsx_walker_fast_stats st = walker_fast_stats();
+    CHECK(st.remap_misses == 1 && st.remap_hits == 0,
+          "the first repeated-reference draw builds the collapse (%llu hit / %llu miss)",
+          st.remap_hits, st.remap_misses);
+    CHECK(st.fetch_hits == 0 && st.pipeline_hits == 0,
+          "the remap memo does not turn on the fetch or pipeline memo");
+    fast_draw_indexed(idx_a, 6);
+    st = walker_fast_stats();
+    CHECK(st.remap_hits == 1 && st.remap_misses == 1,
+          "the same reference list reuses the collapse (%llu hit / %llu miss)",
+          st.remap_hits, st.remap_misses);
+    fast_draw_indexed(idx_b, 6);
+    st = walker_fast_stats();
+    CHECK(st.remap_misses == 2,
+          "different index bytes are a different reference list and miss (%llu)",
+          st.remap_misses);
+    engine_down();
+    remap_cache_env(0);
+}
+
 int main(void)
 {
     { void* p = NULL;
@@ -3068,6 +3106,7 @@ int main(void)
     test_draw_fill();
     test_walker_fast_fetch();
     test_walker_fast_pipeline();
+    test_remap_cache();
 
     free(vm_base);
     printf(g_failures ? "\n%d check(s) FAILED\n" : "\nall checks passed\n",

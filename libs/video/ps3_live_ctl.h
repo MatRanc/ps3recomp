@@ -32,6 +32,9 @@ extern "C" {
 
 enum {
     PS3_LIVE_WALKER_FAST = 0,
+    PS3_LIVE_FETCH_MEMO,        /* PS3RECOMP_FETCH_MEMO: fetch plan/remap memo */
+    PS3_LIVE_PIPE_MEMO,         /* PS3RECOMP_PIPE_MEMO: pipeline answer memo */
+    PS3_LIVE_REMAP_CACHE,       /* PS3RECOMP_REMAP_CACHE: dedup memo by ref list */
     PS3_LIVE_WALKER_WAKE,
     PS3_LIVE_EXP_NO_DRAW,
     PS3_LIVE_EXP_FAST_WAKE,

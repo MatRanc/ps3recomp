@@ -517,6 +517,9 @@ void rsx_draw_engine_replay_advance_frame(void);
  * on the walker thread). Changing WALKER_FAST flushes the fetch/pipeline
  * memos so the new arm starts cold. */
 void rsx_draw_engine_set_walker_fast(int on);
+void rsx_draw_engine_set_fetch_memo(int on);
+void rsx_draw_engine_set_pipe_memo(int on);
+void rsx_draw_engine_set_remap_cache(int on);
 void rsx_draw_engine_set_no_draw(int on);
 
 /* Captured dispatcher state: enough to start a replay at the frame boundary
@@ -563,6 +566,7 @@ int  rsx_draw_engine_walker_fast_enabled(void);
 typedef struct rsx_walker_fast_stats {
     unsigned long long fetch_hits, fetch_misses;
     unsigned long long pipeline_hits, pipeline_misses;
+    unsigned long long remap_hits, remap_misses;
 } rsx_walker_fast_stats;
 void rsx_draw_engine_walker_fast_stats(rsx_walker_fast_stats* out);
 /* ---- write colour buffers (WCB): render targets the guest reads ---------
