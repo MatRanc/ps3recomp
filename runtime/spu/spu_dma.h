@@ -404,10 +404,20 @@ static inline int mfc_do_transfer_fast(spu_context* spu, uint32_t lsa, uint64_t 
       if (spu->image_id == 22 && mfc_is_get(cmd) && size > 0x100)
           g_cri_video_dma = 1; }
     if (mfc_is_get(cmd)) {
+        { extern int g_c690_hash_on;
+          if (__builtin_expect(g_c690_hash_on, 0)) {
+              extern void c690_stats_on_transfer(const spu_context*, int, uint32_t, uint64_t, uint32_t);
+              c690_stats_on_transfer(spu, 0, lsa, ea, size);
+          } }
         memcpy(ls_ptr, ea_ptr, size);
         { extern void spu_overlay_note_get(spu_context*, uint32_t, const uint8_t*, uint32_t);
           spu_overlay_note_get(spu, (uint32_t)ea, (const uint8_t*)ls_ptr, size); }
     } else if (mfc_is_put(cmd)) {
+        { extern int g_c690_hash_on;
+          if (__builtin_expect(g_c690_hash_on, 0)) {
+              extern void c690_stats_on_transfer(const spu_context*, int, uint32_t, uint64_t, uint32_t);
+              c690_stats_on_transfer(spu, 1, lsa, ea, size);
+          } }
         mfc_put_coherent(spu, ea_ptr, ls_ptr, ea, size);
         { extern void (*g_spu_put_hook)(uint32_t ea, uint32_t size);
           if (g_spu_put_hook) g_spu_put_hook((uint32_t)ea, size); }

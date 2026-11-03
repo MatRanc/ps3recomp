@@ -60,7 +60,20 @@
 #include "../platform/win32_compat.h"
 #endif
 
+/* Live A/B keys (libs/video's control file): the synthetic c690 cost probe is
+ * flipped mid-run. Optional so standalone SPU harnesses still build. */
+#if defined(__has_include)
+#  if __has_include("ps3_live_ctl.h")
+#    include "ps3_live_ctl.h"
+#    define C690_HAVE_LIVE_CTL 1
+#  endif
+#endif
+
+/* Guest memory, for the transfer hash (read-only). */
+extern uint8_t* vm_base;
+
 int g_c690_stats = 0;
+int g_c690_hash_on = 0;      /* PS3RECOMP_C690_HASH: sample stride, 0 = off */
 
 #define C690_IMAGE_ID        6
 #define C690_JOB_ENTRY_LS    0x135B8u
@@ -158,7 +171,85 @@ static SPU_THREAD_LOCAL struct {
     uint32_t current_lsa;
     uint64_t tr_t0;          /* PS3RECOMP_TRACE: open c690.job span, 0 when untraced */
     uint32_t tr_desc_ea;     /* the job descriptor the jm2 ABI passed in r3 */
+    /* PS3RECOMP_C690_HASH: sampled-job input/output hashes. `hash_tail` is
+     * set at the end command and stays until the next job on this lane, so
+     * the submit epilogue's output PUTs (which happen after the end command)
+     * are part of the output hash. */
+    unsigned hash_active, hash_tail;
+    uint64_t in_hash, out_hash;
+    uint64_t in_bytes, out_bytes;
+    uint32_t frame;
 } t_run;
+
+/* ---- PS3RECOMP_C690_HASH: do repeated jobs produce identical bytes? ----
+ * A sampled job folds every DMA GET (input) and PUT (output) into FNV-1a.
+ * At the next job entry on the lane the previous job's input hash is looked
+ * up in a small open-addressing table; a hit means those inputs were seen
+ * before. Whether the output hash also matches is counted separately, and
+ * the frame number lets the report separate same-frame repeats from
+ * frame-to-frame repeats. The output side is the job body's PUTs plus the
+ * submit epilogue's PUTs plus the LS 0x2F000..0x33000 output page range. */
+#define C690_HASH_SLOTS (1u << 18)
+typedef struct {
+    uint64_t in_hash, out_hash;
+    uint32_t frame;
+    uint8_t  used;
+} c690_hash_entry;
+static c690_hash_entry s_hash_tab[C690_HASH_SLOTS];
+static unsigned char s_hash_lock;
+static unsigned long long s_job_seq;
+static unsigned long long s_hash_samples, s_hash_dup_input, s_hash_dup_output;
+static unsigned long long s_hash_dup_prev_frame, s_hash_dup_same_frame;
+static unsigned long long s_hash_in_bytes, s_hash_out_bytes;
+
+static uint64_t c690_hash_bytes(uint64_t h, const uint8_t* p, uint32_t n)
+{
+    for (uint32_t i = 0; i < n; i++) {
+        h ^= p[i];
+        h *= 0x100000001b3ull;
+    }
+    return h;
+}
+
+static void c690_hash_note_job(uint64_t in_hash, uint64_t out_hash, uint32_t frame)
+{
+    while (__atomic_test_and_set(&s_hash_lock, __ATOMIC_ACQUIRE))
+        ;   /* sampled jobs only: a few hundred per second at most */
+    uint32_t i = (uint32_t)((in_hash * 0x9E3779B97F4A7C15ull) >> (64 - 18));
+    c690_hash_entry* e = NULL;
+    for (uint32_t p = 0; p < 8; p++) {
+        c690_hash_entry* c = &s_hash_tab[(i + p) & (C690_HASH_SLOTS - 1u)];
+        if (!c->used || c->in_hash == in_hash) { e = c; break; }
+    }
+    s_hash_samples++;
+    if (e && e->used) {
+        s_hash_dup_input++;
+        if (e->out_hash == out_hash) s_hash_dup_output++;
+        if (e->frame == frame) s_hash_dup_same_frame++;
+        else                   s_hash_dup_prev_frame++;
+        e->out_hash = out_hash;
+        e->frame = frame;
+    } else if (e) {
+        e->used = 1;
+        e->in_hash = in_hash;
+        e->out_hash = out_hash;
+        e->frame = frame;
+    }
+    __atomic_clear(&s_hash_lock, __ATOMIC_RELEASE);
+}
+
+/* Synthetic extra cost per job (C690_SPIN_US live key). Charged inside the
+ * job wall, so the report's c690 wall moves with it and the A/B reads the
+ * frame-time slope directly. */
+static int c690_spin_us(void)
+{
+#ifdef C690_HAVE_LIVE_CTL
+    if (ps3_live_ctl_get) return ps3_live_ctl_get(PS3_LIVE_C690_SPIN_US);
+#endif
+    static int v = -1;
+    if (v < 0) { const char* e = getenv("C690_SPIN_US"); v = e ? atoi(e) : 0; }
+    return v;
+}
 
 static uint64_t c690_now_ns(void)
 {
@@ -218,6 +309,7 @@ static void c690_record_job(c690_thread_stats* s, uint64_t wall_ns)
 }
 
 static void c690_maybe_periodic(uint64_t now_ns);   /* defined after the report */
+static unsigned c690_frame_flips(void);            /* defined with the report */
 
 void c690_stats_on_lookup(const struct spu_context* ctx, uint32_t lsa)
 {
@@ -231,6 +323,18 @@ void c690_stats_on_lookup(const struct spu_context* ctx, uint32_t lsa)
             if (t_run.current_lsa) c690_charge(s, t_run.current_lsa, now - t_run.last_ns);
             c690_opcode_inc(s, 0x00u);       /* the end command itself */
             c690_record_job(s, now - t_run.job_start_ns);
+            if (t_run.hash_active) {
+                /* The assembled vertex buffer lives at LS 0x2F870; fold the
+                 * output page range so a job whose outputs never leave through
+                 * this lane's DMA still contributes its result. */
+                t_run.out_hash = c690_hash_bytes(t_run.out_hash,
+                                                 ctx->ls + 0x2F000, 0x4000);
+                t_run.out_bytes += 0x4000;
+                /* Keep hashing PUTs until the next job on this lane: the job's
+                 * output DMA is in the submit epilogue, after this command. */
+                t_run.hash_tail = 1;
+                t_run.frame = c690_frame_flips();
+            }
             ps3_trace_end(t_run.tr_t0, PS3_TR_C690_JOB, t_run.tr_desc_ea,
                           (uint32_t)ctx->spu_id);
             /* Timeline: the note is the instant the job's slot PUT can follow,
@@ -253,9 +357,36 @@ void c690_stats_on_lookup(const struct spu_context* ctx, uint32_t lsa)
     }
 
     if (lsa == C690_JOB_ENTRY_LS) {
+        /* Close the previous sampled job's output tail. */
+        if (t_run.hash_active && t_run.hash_tail) {
+            __atomic_fetch_add(&s_hash_in_bytes, t_run.in_bytes, __ATOMIC_RELAXED);
+            __atomic_fetch_add(&s_hash_out_bytes, t_run.out_bytes, __ATOMIC_RELAXED);
+            c690_hash_note_job(t_run.in_hash, t_run.out_hash, t_run.frame);
+        }
+        t_run.hash_active = 0;   /* a body with no tail is discarded */
         t_run.job_active = 1;
         t_run.job_start_ns = now;
-        t_run.last_ns = now;
+        t_run.hash_tail = 0;
+        if (g_c690_hash_on) {
+            const unsigned long long seq =
+                __atomic_fetch_add(&s_job_seq, 1ull, __ATOMIC_RELAXED);
+            if (!t_run.hash_active &&
+                seq % (unsigned long long)g_c690_hash_on == 0) {
+                t_run.hash_active = 1;
+                t_run.in_hash = 0xcbf29ce484222325ull;
+                t_run.out_hash = 0xcbf29ce484222325ull;
+                t_run.in_bytes = 0;
+                t_run.out_bytes = 0;
+            }
+        }
+        const int spin = c690_spin_us();
+        if (spin > 0) {
+            const uint64_t deadline = now + (uint64_t)spin * 1000ull;
+            uint64_t t;
+            do { t = c690_now_ns(); } while (t < deadline);
+            t_run.job_start_ns = now;      /* wall includes the synthetic cost */
+        }
+        t_run.last_ns = c690_now_ns();
         t_run.current_lsa = lsa;
         t_run.tr_desc_ea = ctx->gpr[3]._u32[0];
         t_run.tr_t0 = ps3_trace_begin();
@@ -275,6 +406,26 @@ void c690_stats_on_direct(const struct spu_context* ctx, uint32_t lsa)
     t_run.current_lsa = lsa;
     t_run.last_ns = now;
     c690_maybe_periodic(now);
+}
+
+void c690_stats_on_transfer(const struct spu_context* ctx, int is_put,
+                            uint32_t lsa, uint64_t ea, uint32_t size)
+{
+    if (!ctx || ctx->image_id != C690_IMAGE_ID || !t_run.hash_active ||
+        size == 0)
+        return;
+    if (is_put) {
+        /* Output: job body and the submit epilogue that follows it. */
+        t_run.out_hash = c690_hash_bytes(t_run.out_hash,
+                                         ctx->ls + (lsa & SPU_LS_MASK), size);
+        t_run.out_bytes += size;
+    } else if (!t_run.hash_tail) {
+        /* Input: only while the job body is running, not the epilogue. */
+        if (!vm_base) return;
+        t_run.in_hash = c690_hash_bytes(t_run.in_hash,
+                                        vm_base + (uint32_t)ea, size);
+        t_run.in_bytes += size;
+    }
 }
 
 static unsigned c690_pct_tenths(unsigned long long part, unsigned long long total)
@@ -371,13 +522,34 @@ static void c690_report_common(const char* tag, uint64_t now_ns)
     if (jobs) {
         const unsigned p50 = c690_percentile(50);
         const unsigned p90 = c690_percentile(90);
+        const unsigned p99 = c690_percentile(99);
         fprintf(stderr,
-                "[c690-stats] wall_us p50=%u p90=%u max=%llu%s (sum=%llu)\n",
-                p50, p90, total.wall_max_ns / 1000ull,
+                "[c690-stats] wall_us p50=%u p90=%u p99=%u mean=%.1f max=%llu%s (sum=%llu)\n",
+                p50, p90, p99, (double)wall_us / (double)jobs,
+                total.wall_max_ns / 1000ull,
                 total.wall_max_ns / 1000ull >= C690_WALL_BUCKETS ? "+ (bucket cap)" : "",
                 wall_us);
     } else {
-        fprintf(stderr, "[c690-stats] wall_us p50=n/a p90=n/a max=n/a\n");
+        fprintf(stderr, "[c690-stats] wall_us p50=n/a p90=n/a p99=n/a max=n/a\n");
+    }
+
+    if (g_c690_hash_on) {
+        const unsigned long long n = __atomic_load_n(&s_hash_samples, __ATOMIC_RELAXED);
+        const unsigned long long di = __atomic_load_n(&s_hash_dup_input, __ATOMIC_RELAXED);
+        const unsigned long long dobj = __atomic_load_n(&s_hash_dup_output, __ATOMIC_RELAXED);
+        const unsigned long long dpf = __atomic_load_n(&s_hash_dup_prev_frame, __ATOMIC_RELAXED);
+        const unsigned long long dsf = __atomic_load_n(&s_hash_dup_same_frame, __ATOMIC_RELAXED);
+        const unsigned pdi = c690_pct_tenths(di, n);
+        const unsigned pdo = c690_pct_tenths(dobj, n);
+        fprintf(stderr,
+                "[c690-hash] stride=%d samples=%llu in_MiB=%.2f out_MiB=%.2f "
+                "dup_input=%llu (%u.%u%%) dup_output=%llu (%u.%u%%) "
+                "dup_prev_frame=%llu dup_same_frame=%llu\n",
+                g_c690_hash_on, n,
+                (double)__atomic_load_n(&s_hash_in_bytes, __ATOMIC_RELAXED) / 1048576.0,
+                (double)__atomic_load_n(&s_hash_out_bytes, __ATOMIC_RELAXED) / 1048576.0,
+                di, pdi / 10u, pdi % 10u, dobj, pdo / 10u, pdo % 10u,
+                dpf, dsf);
     }
 
     for (int i = 0; i <= nslots; i++) {
@@ -475,13 +647,17 @@ static void c690_stats_startup(void)
 {
     if (__atomic_exchange_n(&s_started, 1, __ATOMIC_RELAXED)) return;
     const char* e = getenv("PS3RECOMP_C690_STATS");
-    if (!e || strcmp(e, "1") != 0) return;
-    g_c690_stats = 1;
+    const char* h = getenv("PS3RECOMP_C690_HASH");
+    const int hash_stride = (h && *h) ? atoi(h) : 0;
+    if ((!e || strcmp(e, "1") != 0) && hash_stride <= 0) return;
+    g_c690_stats = 1;                     /* job tracking also feeds the hash */
+    g_c690_hash_on = hash_stride > 0 ? hash_stride : 0;
     s_t0_ns = c690_now_ns();
     s_last_report_ns = s_t0_ns;
     atexit(c690_stats_report);
-    fprintf(stderr, "[c690-stats] enabled image=%d clock=%s report=atexit+2s\n",
-            C690_IMAGE_ID, c690_clock_name());
+    fprintf(stderr, "[c690-stats] enabled image=%d clock=%s report=atexit+2s"
+                    " hash_stride=%d\n",
+            C690_IMAGE_ID, c690_clock_name(), g_c690_hash_on);
 }
 
 #if defined(_MSC_VER)

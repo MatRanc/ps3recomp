@@ -44,6 +44,8 @@ static const char* const K_NAME[PS3_LIVE_COUNT] = {
     "GCM_NOP_SKIP",
     "GCM_REF_IMMEDIATE",
     "PS3RECOMP_RSX_TEX_PIN",
+    "C690_SPIN_US",
+    "SPURS_LANE6",
 };
 
 static _Atomic int s_val[PS3_LIVE_COUNT];

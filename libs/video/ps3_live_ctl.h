@@ -45,6 +45,8 @@ enum {
     PS3_LIVE_NOP_SKIP,          /* GCM_NOP_SKIP: skip NV4097 NOP (0x0100) runs */
     PS3_LIVE_GCM_REF_IMMEDIATE, /* GCM_REF_IMMEDIATE: publish SET_REFERENCE now */
     PS3_LIVE_TEX_PIN,           /* PS3RECOMP_RSX_TEX_PIN: never evict a texture bound this frame */
+    PS3_LIVE_C690_SPIN_US,      /* C690_SPIN_US: synthetic extra c690 job cost (ceiling probe) */
+    PS3_LIVE_SPURS_LANE6,       /* SPURS_LANE6: let the mesh workloads use physical lane 5 */
     PS3_LIVE_COUNT
 };
 

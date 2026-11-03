@@ -10,6 +10,12 @@
  */
 
 #include "cellSpurs.h"
+#if defined(__has_include)
+#  if __has_include("../video/ps3_live_ctl.h")
+#    include "../video/ps3_live_ctl.h"
+#    define SPURS_HAVE_LIVE_CTL 1
+#  endif
+#endif
 #include "../../runtime/platform/win32_compat.h"
 #include "../../runtime/ps3_log.h"
 #include "spu_workload.h"   /* SPU image -> lifted-entry dispatch (runtime/spu) */
@@ -1834,9 +1840,21 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
                     vm_read8(ea + SPURS_WKL_STATE1 + wid) != 2 ||
                     !s_workloads[wid].in_use || s_workloads[wid].spurs_ea != ea)
                     continue;
-                if (!vm_read8(ea + SPURS_WKL_INFO1 + wid * SPURS_WKL_INFO_SZ + 0x18 + sn))
+                /* SPURS_LANE6=1 (ceiling probe): this title's MeshJobs0/1
+                 * (wids 1 and 2) set priority[5]=0 and maxContention=5, which
+                 * is what keeps c690 on five physical lanes. Override both so
+                 * the job can use the sixth lane. Throwaway experiment; the
+                 * guest's own SPURS config is the reason lane 5 is idle. */
+                int lane6 = 0;
+#ifdef SPURS_HAVE_LIVE_CTL
+                if ((wid == 1 || wid == 2) && ps3_live_ctl_get)
+                    lane6 = ps3_live_ctl_get(PS3_LIVE_SPURS_LANE6) != 0;
+#endif
+                if (!vm_read8(ea + SPURS_WKL_INFO1 + wid * SPURS_WKL_INFO_SZ + 0x18 + sn) &&
+                    !(lane6 && sn == 5))
                     continue; /* priority zero makes this physical lane ineligible */
                 u32 maxcont = vm_read8(ea + SPURS_WKL_MAXCONT + wid);
+                if (lane6 && maxcont < 6) maxcont = 6;
                 if (!maxcont || si->active[wid] >= maxcont) continue;
                 WklPm* pm = spurs_resolve_pm(wid);
                 if (!pm) continue;
