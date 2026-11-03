@@ -459,6 +459,12 @@ static int lwc_real(void)
 #define LWCOND_FLIP_DONE_EA 0x1245100u
 static volatile long g_lwc_waits, g_lwc_timeouts;
 static volatile long g_lwc_flip_waits, g_lwc_flip_timeouts, g_lwc_flip_signals;
+/* DisplayFlip leaves its flip-done wait on the 2x16683 us deadline after two
+ * consecutive 17000 us cond timeouts. The second one is the frame-level count
+ * (docs/flip-deadline.md). One thread waits on this cond, so a plain run
+ * counter is enough. */
+static long g_lwc_flip_timeout_run;
+static volatile long g_lwc_flip_deadline_frames;
 static int lwc_stats_on(void)
 {
     static int v = -1;
@@ -472,6 +478,14 @@ static void lwc_stats_note(uint32_t lwcond, int timedout)
     if (lwcond == LWCOND_FLIP_DONE_EA) {
         InterlockedIncrement(&g_lwc_flip_waits);
         InterlockedIncrement(timedout ? &g_lwc_flip_timeouts : &g_lwc_flip_signals);
+        if (timedout) {
+            if (++g_lwc_flip_timeout_run >= 2) {
+                g_lwc_flip_timeout_run = 0;
+                InterlockedIncrement(&g_lwc_flip_deadline_frames);
+            }
+        } else {
+            g_lwc_flip_timeout_run = 0;
+        }
     }
     if (!lwc_stats_on()) return;
     static volatile long long next_us;
@@ -479,9 +493,10 @@ static void lwc_stats_note(uint32_t lwcond, int timedout)
     if (now < next_us) return;
     next_us = now + 2000000;
     fprintf(stderr, "[lwcond-stats] waits=%ld timeouts=%ld fallbacks=%ld "
-            "flip-done waits=%ld signal=%ld deadline=%ld%c",
+            "flip-done waits=%ld signal=%ld deadline=%ld deadline_frames=%ld%c",
             n, g_lwc_timeouts, g_lwc_fallbacks,
-            g_lwc_flip_waits, g_lwc_flip_signals, g_lwc_flip_timeouts, 10);
+            g_lwc_flip_waits, g_lwc_flip_signals, g_lwc_flip_timeouts,
+            g_lwc_flip_deadline_frames, 10);
 }
 static uint32_t lwc_fallback_ms(void)
 {
@@ -554,7 +569,16 @@ static void sys_lwcond_wait_real(ppu_context* ctx, struct LwmSlot* sl, lwc_slot*
     vm_write32(lwmutex + LWM_RECUR, 0);
     vm_write32(lwmutex + LWM_OWNER, 0);
     ppu_thread_note_block(ctx->thread_id);
+    const uint32_t lwc_ea = (uint32_t)ctx->gpr[3];
+    const int tr_exit = ps3_trace_on() && lwc_ea == LWCOND_FLIP_DONE_EA;
+    const long long wt0 = tr_exit ? lwc_now_us() : 0;
     int r = lwc_wait(s, self, timeout_us, lwc_fallback_ms(), lwc_unlock_lwm, lwc_relock_lwm, sl);
+    if (tr_exit) {
+        const long long el = lwc_now_us() - wt0;
+        ps3_trace_instant(PS3_TR_FLIP_WAIT_EXIT, (uint32_t)r,
+                          (uint32_t)(el < 0 ? 0 :
+                                     el > 0xFFFFFFFFll ? 0xFFFFFFFFll : el));
+    }
     vm_write32(lwmutex + LWM_OWNER, self);
     vm_write32(lwmutex + LWM_RECUR, rc);
     if (r == LWC_FALLBACK) {

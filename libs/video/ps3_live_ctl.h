@@ -64,6 +64,7 @@ enum {
     PS3_LIVE_FS_WRITE_CHECK,    /* PS3RECOMP_FS_WRITE_CHECK: error on a short/failed cellFsWrite */
     PS3_LIVE_SPURS_TEARDOWN,    /* PS3RECOMP_SPURS_TEARDOWN: real Shutdown/Wait drain */
     PS3_LIVE_GCM_OFFSET_SYNC,   /* PS3RECOMP_GCM_OFFSET_SYNC: publish guest offset tables on map/unmap */
+    PS3_LIVE_PREPARE_FLIP_KEEP_STATUS, /* cellGcmSetPrepareFlip must not complete the outstanding flip */
     PS3_LIVE_COUNT
 };
 

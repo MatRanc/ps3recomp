@@ -135,6 +135,10 @@ enum ps3_tr_ev {
     PS3_TR_VK_PRESENT,         /* span: vkQueuePresentKHR: a = frame                              */
     PS3_TR_IMAGE_SHOWN,        /* the display saw the image: a = frame                            */
     PS3_TR_GCM_USER_HANDLER,   /* the guest's GCM user handler was delivered: a = cmd             */
+    /* Flip-deadline diagnosis. */
+    PS3_TR_GCM_FLIP_REQ_SEQ,   /* a flip request: a = frame (flip count), b = request seq          */
+    PS3_TR_GCM_FLIP_HANDLER,   /* the guest flip handler ran: a = request seq it completed         */
+    PS3_TR_FLIP_WAIT_EXIT,     /* flip-done lwcond exit: a = kind (0 signal,1 timeout,2 fallback,3 poll), b = elapsed us */
     PS3_TR_EV_COUNT
 };
 
@@ -205,6 +209,9 @@ static inline const ps3_tr_desc* ps3_tr_desc_of(uint32_t ev)
         { "present.vkqueue",    "present", PS3_TR_PH_SPAN,  0, "frame", 0 },
         { "present.shown",      "present", PS3_TR_PH_INSTANT, 0, "frame", 0 },
         { "gcm.user_handler",   "gcm",   PS3_TR_PH_INSTANT, 0, "cmd", 0 },
+        { "gcm.flip_req_seq",   "gcm",   PS3_TR_PH_INSTANT, 0, "frame", "req_seq" },
+        { "gcm.flip_handler",   "gcm",   PS3_TR_PH_INSTANT, 0, "req_seq", "req_now" },
+        { "flip.wait_exit",     "gcm",   PS3_TR_PH_INSTANT, 0, "kind", "elapsed_us" },
     };
     return &d[ev < (uint32_t)PS3_TR_EV_COUNT ? ev : 0];
 }

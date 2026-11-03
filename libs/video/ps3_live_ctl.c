@@ -63,6 +63,7 @@ static const char* const K_NAME[PS3_LIVE_COUNT] = {
     "PS3RECOMP_FS_WRITE_CHECK",
     "PS3RECOMP_SPURS_TEARDOWN",
     "PS3RECOMP_GCM_OFFSET_SYNC",
+    "PS3RECOMP_PREPARE_FLIP_KEEP_STATUS",
 };
 
 static _Atomic int s_val[PS3_LIVE_COUNT];

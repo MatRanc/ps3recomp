@@ -979,6 +979,7 @@ void ppu_gcm_pump(void)
         if (s_flip_tick_seq == s_flip_req_seq)
             s_flip_status = CELL_GCM_FLIP_STATUS_DONE;
         FLIP_UNLOCK();
+        ps3_trace_instant(PS3_TR_GCM_FLIP_HANDLER, s_flip_tick_seq, s_flip_req_seq);
         if (s_flip_handler_opd && g_ps3_guest_caller) {
             ydkj_restore_handler_opd(s_flip_handler_opd, s_flip_handler_code);
             g_ps3_guest_caller(s_flip_handler_opd, 1, 0, 0, 0, 0, 0, 0, 0);
@@ -3971,14 +3972,17 @@ static s32 gcm_flip_request(u32 bufferId, int in_fifo)
     }
     /* Flip requested but not yet shown: a subsequent cellGcmSetWaitFlip blocks
      * until the present thread's cellGcmTickFlip marks it done (vsync). */
+    u32 req_seq;
     FLIP_LOCK();
     s_flip_status = CELL_GCM_FLIP_STATUS_WAITING;
     s_flip_req_seq++;
+    req_seq = s_flip_req_seq;
     FLIP_UNLOCK();
     s_last_flip_time = get_timestamp_ns();
     if (PS3_FT_ON()) { const uint64_t t = ps3_ft_now();
                        ps3_ft_span(PS3_FT_FLIP_REQ, 0, bufferId, (uint32_t)in_fifo, t, t); }
     ps3_trace_instant(PS3_TR_GCM_FLIP_REQ, bufferId, (uint32_t)in_fifo);
+    ps3_trace_instant(PS3_TR_GCM_FLIP_REQ_SEQ, flip_seq, req_seq);
     /* Timeline: for this title Gfx_FrameEnd's flip marker is decoded here, on
      * the walker, so this is the frame boundary the analyser uses. */
     if (ps3_trace_on()) {
@@ -4102,9 +4106,38 @@ s32 cellGcmSetPrepareFlip(void* ctx, u32 bufferId)
      * until measured (PS3RECOMP_PREPARE_FLIP_RET, live key). */
     const int ret_id = gcm_live_get(PS3_LIVE_PREPARE_FLIP_RET,
                                     "PS3RECOMP_PREPARE_FLIP_RET");
-
+    /* PS3RECOMP_PREPARE_FLIP_KEEP_STATUS (default off). cellGcmSetPrepareFlip
+     * only queues a flip and returns its buffer id; it is not a flip
+     * completion. The write below also clears WAITING for a flip still in
+     * flight when the title prepares ahead, which looked like the reason
+     * Gfx_DisplayFlip sometimes left on its 2x16683 us deadline. Measured at
+     * the meter it was not: with the write removed the deadline frames stayed
+     * (the display tick is starved by the walker drain) and fps fell 4.3, so
+     * the write stays and this is an investigation switch only. See
+     * docs/flip-deadline.md. */
+    const int keep_status = gcm_live_get(PS3_LIVE_PREPARE_FLIP_KEEP_STATUS,
+                                         "PS3RECOMP_PREPARE_FLIP_KEEP_STATUS");
+    static int pp_stats = -1;
+    if (pp_stats < 0) pp_stats = getenv("PS3RECOMP_FLIP_PREPARE_STATS") ? 1 : 0;
+    static long pp_calls, pp_clobbered;
+    FLIP_LOCK();
+    const int pp_waiting = (s_flip_status == CELL_GCM_FLIP_STATUS_WAITING);
+    if (pp_stats) {
+        if (pp_waiting && !keep_status) pp_clobbered++;
+        pp_calls++;
+    }
+    if (!keep_status) s_flip_status = CELL_GCM_FLIP_STATUS_DONE;
+    FLIP_UNLOCK();
+    if (pp_stats) {
+        static unsigned long long pp_next;
+        const unsigned long long pp_now = gcm_us_now() / 1000ull;
+        if (pp_now >= pp_next) {
+            pp_next = pp_now + 2000ull;
+            fprintf(stderr, "[flip-prepare] calls=%ld clobbered=%ld keep=%d%c",
+                    pp_calls, pp_clobbered, keep_status, 10);
+        }
+    }
     gcm_set_current_display_buffer(bufferId);
-    s_flip_status = CELL_GCM_FLIP_STATUS_DONE;
     s_flip_request_count++;
     s_last_flip_time = get_timestamp_ns();
 
