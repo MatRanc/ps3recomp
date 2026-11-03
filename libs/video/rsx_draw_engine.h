@@ -193,8 +193,18 @@ typedef struct rsx_draw_backend {
      * backend can skip the copy while nothing changed; the engine owns
      * nothing here, the backend keeps the handle in its own cache. 0 when the
      * backend cannot (the engine leaves the unit on the dummy). */
-    u32  (*cube_target_view)(void* user, const rsx_be_cube_face faces[6],
+    u32  (*cube_target_view)(void* user, u32 location, u32 offset,
+                             const rsx_be_cube_face faces[6],
                              const u64 serials[6],
+                             rsx_be_format fmt, u32 w, u32 h,
+                             u32 remap, u32 rsx_format);
+    /* Optional. The most recent complete cube image this backend built for a
+     * guest address. A probe can be incomplete for a frame or two while a
+     * face is rewritten; binding the last complete image keeps the lighting
+     * stable instead of flashing the dummy. 0 when none was ever built there
+     * (the engine then keeps the dummy), and the backend keeps ownership --
+     * the handle is valid only while its cache entry lives. */
+    u32  (*cube_target_last)(void* user, u32 location, u32 offset,
                              rsx_be_format fmt, u32 w, u32 h,
                              u32 remap, u32 rsx_format);
 

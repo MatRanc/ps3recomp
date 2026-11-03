@@ -103,10 +103,13 @@ typedef struct {
     float vp_xf[8];               /* viewport epilogue after the VS constants */
     /* the last cube_render_target request */
     int n_cube_view;
+    int n_cube_last;
     rsx_be_cube_face cube_face[6];
     u64 cube_serial[6];
     rsx_be_format cube_fmt;
     u32 cube_w, cube_h, cube_remap, cube_rsx_fmt, last_cube;
+    u32 cube_location, cube_offset;       /* address of the last complete cube */
+    u32 cube_last_location, cube_last_offset;
 } StubState;
 
 static StubState stub;
@@ -168,7 +171,8 @@ static void stub_color_release(void* u, u32 handle)
 static u32 stub_surface_view(void* u, u32 surface, u32 remap, u32 fmt)
 { (void)u; (void)remap; (void)fmt; return surface; }
 
-static u32 stub_cube_view(void* u, const rsx_be_cube_face faces[6],
+static u32 stub_cube_view(void* u, u32 location, u32 offset,
+                          const rsx_be_cube_face faces[6],
                           const u64 serials[6],
                           rsx_be_format fmt, u32 w, u32 h, u32 remap, u32 rsx_fmt)
 {
@@ -178,7 +182,24 @@ static u32 stub_cube_view(void* u, const rsx_be_cube_face faces[6],
     memcpy(stub.cube_serial, serials, sizeof stub.cube_serial);
     stub.cube_fmt = fmt; stub.cube_w = w; stub.cube_h = h;
     stub.cube_remap = remap; stub.cube_rsx_fmt = rsx_fmt;
+    stub.cube_location = location; stub.cube_offset = offset;
     stub.last_cube = stub_handle();
+    return stub.last_cube;
+}
+
+/* Address-keyed like the Vulkan backend: the last complete image is only
+ * returned for the address that built it, and 0 when none ever did. */
+static u32 stub_cube_last(void* u, u32 location, u32 offset,
+                          rsx_be_format fmt, u32 w, u32 h,
+                          u32 remap, u32 rsx_fmt)
+{
+    (void)u;
+    stub.n_cube_last++;
+    stub.cube_last_location = location; stub.cube_last_offset = offset;
+    if (!stub.last_cube) return 0;
+    if (stub.cube_location != location || stub.cube_offset != offset) return 0;
+    if (stub.cube_fmt != fmt || stub.cube_w != w || stub.cube_h != h ||
+        stub.cube_remap != remap || stub.cube_rsx_fmt != rsx_fmt) return 0;
     return stub.last_cube;
 }
 
@@ -358,6 +379,7 @@ static const rsx_draw_backend g_stub_backend = {
     .color_target_write = stub_color_write,
     .surface_view = stub_surface_view,
     .cube_target_view = stub_cube_view,
+    .cube_target_last = stub_cube_last,
     .depth_target_create = stub_depth_create,
     .depth_target_release = stub_release,
     .depth_snapshot = stub_depth_snapshot,
@@ -643,8 +665,32 @@ static void test_cube_render_target(void)
     CHECK(stub.cube_serial[0] != serial0,
           "a rewritten face reaches the backend with a new serial");
 
-    /* Five faces is not a cube: the unit stays on the dummy and the census
-     * says why. */
+    /* A face target recreated in another format is temporarily incomplete
+     * (the colour serial is 0 and the format no longer matches). The engine
+     * must bind the last complete image for THAT address, not the dummy:
+     * this is the pregame cinematics' bright/dark alternation. */
+    m(M_SURFACE_FORMAT, 0x0Cu);          /* R32G32B32A32F, not 0x85 */
+    m(M_COLOR_A_OFFSET, base + 5u * 0x200u);
+    m(M_CLEAR_BUFFERS, 0xF0u);
+    m(M_SURFACE_FORMAT, 0x85u);          /* restore for the later cubes */
+    const int before_last = stub.n_cube_view;
+    bind_cube_unit(RSX_LOCATION_LOCAL, base, 8, 64);
+    draw_triangle();
+    CHECK(stub.n_cube_view == before_last,
+          "an incomplete cube does not rebuild the image (%d calls)",
+          stub.n_cube_view - before_last);
+    CHECK(stub.n_cube_last > 0 && stub.cube_last_offset == base,
+          "the engine asks for the last complete cube at that address (0x%X)",
+          stub.cube_last_offset);
+    CHECK(stub.bound_tex[0] == stub.last_cube,
+          "and binds it instead of the dummy (%u, want %u)",
+          stub.bound_tex[0], stub.last_cube);
+    CHECK(rsx_tex_miss_run_count(RSX_TEX_MISS_CUBE) == 0,
+          "a served fallback is not counted as a cube miss (%u)",
+          rsx_tex_miss_run_count(RSX_TEX_MISS_CUBE));
+
+    /* Five faces is not a cube: no complete image ever existed at this
+     * address, so the unit stays on the dummy and the census says why. */
     const u32 partial = 0x00280000u;
     for (u32 f = 0; f < 5; f++) {
         m(M_COLOR_A_OFFSET, partial + f * 0x200u);

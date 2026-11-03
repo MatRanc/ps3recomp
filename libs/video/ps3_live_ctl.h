@@ -37,6 +37,7 @@ enum {
     PS3_LIVE_EXP_FAST_WAKE,
     PS3_LIVE_EXP_TICK_US,       /* numeric: display tick period in us */
     PS3_LIVE_CUBE_RT,           /* assemble cube render targets on the GPU */
+    PS3_LIVE_PRESENT_PACE,      /* even out the window present cadence */
     PS3_LIVE_COUNT
 };
 

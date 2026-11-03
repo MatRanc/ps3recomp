@@ -121,12 +121,12 @@ u32 cellGcm_flip_frame_count(void)
     return s_flip_frame_count;
 }
 
-static void gcm_flip_requested(void)
+static u32 gcm_flip_requested(void)
 {
 #if defined(_WIN32)
-    InterlockedIncrement((volatile LONG*)&s_flip_frame_count);
+    return (u32)InterlockedIncrement((volatile LONG*)&s_flip_frame_count);
 #else
-    __atomic_fetch_add(&s_flip_frame_count, 1u, __ATOMIC_RELAXED);
+    return __atomic_add_fetch(&s_flip_frame_count, 1u, __ATOMIC_RELAXED);
 #endif
 }
 static u32  s_debug_level = CELL_GCM_DEBUG_LEVEL0;
@@ -1019,6 +1019,147 @@ unsigned long long ps3_ms_now(void)
 #endif
 }
 
+/* ---------------------------------------------------------------------------
+ * Per-flip lifecycle log (PS3RECOMP_FLIP_LOG=1, default off)
+ *
+ * The user-visible choppiness is not the frame rate: MangoHud present
+ * intervals arrive in pairs, ~1 ms then ~47 ms. Four timestamps on one
+ * monotonic microsecond clock say which stage bunches them:
+ *
+ *   req   the guest asked for the flip (SetFlipCommand, or the FIFO marker
+ *         was written into the ring)
+ *   fin   the walker reached the flip in the drain (the RSX executed it);
+ *         equal to req for an immediate flip
+ *   pres  the frame clock passed the PRESENT_NEW_ONLY edge and handed this
+ *         frame to the window blit
+ *   show  vkQueuePresentKHR returned for it on the present thread
+ *
+ * Consecutive `show` values are what the display (and MangoHud) sees. A pair
+ * of frames finishing back to back shows as a small pres->show gap with two
+ * lines less than a millisecond apart; a frame the presenter skipped has
+ * show=0 and is printed when its slot is reused.
+ * -------------------------------------------------------------------------*/
+#define GCM_FLIP_LOG_N 1024
+typedef struct {
+    u32 seq;
+    unsigned char have_req, have_fin, have_pres, have_show, printed;
+    unsigned long long req_us, fin_us, pres_us, show_us;
+} gcm_flip_log_rec;
+static gcm_flip_log_rec s_flip_log[GCM_FLIP_LOG_N];
+static int s_flip_log_on = -1;
+static unsigned long long s_flip_log_prev_show;
+static u32 s_flip_log_prev_show_seq;
+static u32 s_flip_log_last_present;
+
+/* The flip seq each queued FIFO marker will create, in queue order. */
+#define GCM_FLIP_MARKER_N 256
+static u32 s_flip_marker_seq[GCM_FLIP_MARKER_N];
+
+static unsigned long long gcm_us_now(void)
+{
+#ifdef _WIN32
+    return ps3_ms_now() * 1000ull;
+#else
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (unsigned long long)ts.tv_sec * 1000000ull
+         + (unsigned long long)ts.tv_nsec / 1000ull;
+#endif
+}
+
+static int gcm_flip_log_on_now(void)
+{
+    if (s_flip_log_on < 0) {
+        const char* e = getenv("PS3RECOMP_FLIP_LOG");
+        s_flip_log_on = e && *e && strcmp(e, "0") != 0;
+    }
+    return s_flip_log_on;
+}
+
+static gcm_flip_log_rec* gcm_flip_rec(u32 seq)
+{
+    return &s_flip_log[seq % GCM_FLIP_LOG_N];
+}
+
+static void gcm_flip_log_emit(gcm_flip_log_rec* r, int shown)
+{
+    const unsigned long long req = r->have_req ? r->req_us : 0ull;
+    const unsigned long long fin = r->have_fin ? r->fin_us : 0ull;
+    const unsigned long long pres = r->have_pres ? r->pres_us : 0ull;
+    const unsigned long long show = r->have_show ? r->show_us : 0ull;
+    const unsigned long long rtf = (req && fin && fin >= req) ? fin - req : 0ull;
+    const unsigned long long ftp = (fin && pres && pres >= fin) ? pres - fin : 0ull;
+    const unsigned long long pts = (pres && show && show >= pres) ? show - pres : 0ull;
+    unsigned long long gap = 0ull;
+    if (shown && show && s_flip_log_prev_show && show >= s_flip_log_prev_show)
+        gap = show - s_flip_log_prev_show;
+    fprintf(stderr, "[fliplog] n=%u req=%llu fin=%llu pres=%llu show=%llu "
+            "req_to_fin=%llu fin_to_pres=%llu pres_to_show=%llu show_gap=%llu "
+            "prev=%u%s\n",
+            r->seq, req, fin, pres, show, rtf, ftp, pts, gap,
+            s_flip_log_prev_show_seq, shown ? "" : " skipped");
+    r->printed = 1;
+}
+
+static void gcm_flip_log_req(u32 seq, int from_fifo)
+{
+    if (!gcm_flip_log_on_now()) return;
+    gcm_flip_log_rec* r = gcm_flip_rec(seq);
+    /* The slot is being reused after GCM_FLIP_LOG_N newer flips: whatever was
+     * in it will never be presented now, so report it as skipped. */
+    if (r->seq && r->seq != seq && !r->printed && !r->have_show)
+        gcm_flip_log_emit(r, 0);
+    memset(r, 0, sizeof *r);
+    r->seq = seq;
+    r->req_us = gcm_us_now();
+    r->have_req = 1;
+    if (!from_fifo) { r->fin_us = r->req_us; r->have_fin = 1; }
+    else s_flip_marker_seq[s_fifo_flips_queued % GCM_FLIP_MARKER_N] = seq;
+}
+
+static void gcm_flip_log_fin(u32 seq)
+{
+    if (!gcm_flip_log_on_now() || !seq) return;
+    gcm_flip_log_rec* r = gcm_flip_rec(seq);
+    if (r->seq != seq || r->have_fin) return;
+    r->fin_us = gcm_us_now();
+    r->have_fin = 1;
+}
+
+/* The drain skipped a range: every queued marker in it will never be reached,
+ * but it has executed (was written off) now. */
+static void gcm_flip_log_fin_range(u32 reached, u32 queued)
+{
+    if (!gcm_flip_log_on_now()) return;
+    while (reached != queued) {
+        gcm_flip_log_fin(s_flip_marker_seq[reached % GCM_FLIP_MARKER_N]);
+        reached++;
+    }
+}
+
+void cellGcm_flip_log_present(u32 frame)
+{
+    if (!gcm_flip_log_on_now() || !frame) return;
+    if (s_flip_log_last_present && frame <= s_flip_log_last_present) return;
+    s_flip_log_last_present = frame;
+    gcm_flip_log_rec* r = gcm_flip_rec(frame);
+    if (r->seq != frame) return;   /* requested before the log was on */
+    r->pres_us = gcm_us_now();
+    r->have_pres = 1;
+}
+
+void cellGcm_flip_log_shown(u32 frame)
+{
+    if (!gcm_flip_log_on_now() || !frame) return;
+    gcm_flip_log_rec* r = gcm_flip_rec(frame);
+    if (r->seq != frame || r->have_show) return;
+    r->show_us = gcm_us_now();
+    r->have_show = 1;
+    gcm_flip_log_emit(r, 1);
+    s_flip_log_prev_show = r->show_us;
+    s_flip_log_prev_show_seq = frame;
+}
+
 static u32 s_sema_offset = 0;   /* NV406E semaphore offset (label window) */
 static int s_sema_blocked_pass = 0;   /* this drain stopped on a semaphore acquire */
 static int s_park_pass = 0;           /* this drain stopped on a self-JUMP park */
@@ -1763,7 +1904,11 @@ static void gcm_fifo_resync_why(const char* why, u32* getoff, u32 put)
             /* A flip marker skipped here will never be reached: count it, or
              * every flip after it waits for the drain forever. */
             if ((w & 0xFFFFFF00u) == GCM_FLIP_MARKER &&
-                s_fifo_flips_reached != s_fifo_flips_queued) { s_fifo_flips_reached++; continue; }
+                s_fifo_flips_reached != s_fifo_flips_queued) {
+                gcm_flip_log_fin(s_flip_marker_seq[s_fifo_flips_reached % GCM_FLIP_MARKER_N]);
+                s_fifo_flips_reached++;
+                continue;
+            }
             if ((w >> 29) != 0 || (w & 0x1FFCu) != 0x0050u) continue;
             u32 dea = gcm_io2ea(io + 4); if (!dea) continue;
             gcm_ref_push_at(vm_read32(dea), io);
@@ -2612,6 +2757,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
             /* Whatever the walker had not reached is gone, and so are the flips
              * queued in it: none of them will ever be executed, so do not let a
              * flip wait on them. */
+            gcm_flip_log_fin_range(s_fifo_flips_reached, s_fifo_flips_queued);
             s_fifo_flips_reached = s_fifo_flips_queued;
             why = "no-io-mapping";
             break;
@@ -2737,7 +2883,10 @@ static void gcm_rsx_process_fifo_unlocked(void)
                 gcm_fifo_dump_flip(w);
                 /* Not past `queued`: a resync may already have written off
                  * this flip. */
-                if (s_fifo_flips_reached != s_fifo_flips_queued) s_fifo_flips_reached++;
+                if (s_fifo_flips_reached != s_fifo_flips_queued) {
+                    gcm_flip_log_fin(s_flip_marker_seq[s_fifo_flips_reached % GCM_FLIP_MARKER_N]);
+                    s_fifo_flips_reached++;
+                }
             } else {
                 cellGcmSetFlipCommand(w & 0xFFu);
             }
@@ -3565,7 +3714,11 @@ u32 cellGcm_display_buffer_count(void)
 
 static s32 gcm_flip_request(u32 bufferId, int in_fifo)
 {
-    gcm_flip_requested();
+    const u32 flip_seq = gcm_flip_requested();
+    /* The seq this request has in the per-flip log (PS3RECOMP_FLIP_LOG). For
+     * an in-FIFO flip this is the instant the marker was written; the walker
+     * stamps `fin` when it reaches it. */
+    gcm_flip_log_req(flip_seq, in_fifo);
     /* GCM_FLIPCOUNT=1: every flip, with a timestamp. FLIP_DBG caps at 20 lines,
      * which answers "did it ever flip?" and not "is it still flipping, and how
      * fast?" -- the question that matters when a title stops appearing on

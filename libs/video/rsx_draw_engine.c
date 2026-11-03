@@ -4295,9 +4295,10 @@ static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
                                base_fmt == RSX_TEX_FMT_DXT45;
         /* A cube unit whose base address is a colour target: assemble the six
          * faces on the GPU and bind the cube. If the base target exists but
-         * the six faces do not, keep the dummy and say so; do not let the
-         * 2-D surface path hand a 2-D target to a cube unit (that is the
-         * census's `surface` miss). */
+         * the six faces do not, bind the last complete image for the address;
+         * only a probe that was never complete keeps the dummy (and the
+         * census says so). Never let the 2-D surface path hand a 2-D target
+         * to a cube unit (that is the census's `surface` miss). */
         if (t.cubemap && !compressed && g.be->cube_target_view && eng_cube_rt_on()) {
             eng_cube_desc cd;
             if (eng_cube_collect(&t, &cd)) {
@@ -4305,12 +4306,27 @@ static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
                 if (eng_cube_log_on())
                     eng_cube_log_desc(&t, &cd, cd.complete == all ? "cube" : "incomplete");
                 if (cd.complete == all) {
-                    const u32 cube = g.be->cube_target_view(g.be->user, cd.face,
+                    const u32 cube = g.be->cube_target_view(g.be->user, t.location,
+                                                            t.offset, cd.face,
                                                             cd.serials, cd.fmt,
                                                             cd.w, cd.h,
                                                             t.remap & 0xFFFFu,
                                                             t.format);
                     if (cube) { textures[u] = cube; continue; }
+                }
+                /* A face is being rewritten (its target was recreated) or has
+                 * not been rendered yet this scene. Keep the last complete
+                 * cube image for this address rather than flashing the dummy,
+                 * which the pregame cinematics see as bright/dark
+                 * alternation. Only a probe that was never complete stays on
+                 * the dummy. */
+                if (g.be->cube_target_last) {
+                    const u32 last = g.be->cube_target_last(g.be->user, t.location,
+                                                            t.offset, cd.fmt,
+                                                            cd.w, cd.h,
+                                                            t.remap & 0xFFFFu,
+                                                            t.format);
+                    if (last) { textures[u] = last; continue; }
                 }
                 eng_tex_miss_note_reason(u, &t, RSX_TEX_MISS_CUBE);
                 textures[u] = 0;

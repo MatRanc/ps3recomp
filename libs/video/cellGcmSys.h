@@ -294,6 +294,11 @@ void cellGcmTickFlip(void);
 /* Flips the title actually requested (not SetPrepareFlip); used by
  * PS3RECOMP_VK_PRESENT_NEW_ONLY as its "new guest frame" edge. */
 u32 cellGcm_flip_frame_count(void);
+/* Per-flip lifecycle log (PS3RECOMP_FLIP_LOG=1): the backend stamps the
+ * window-present stages on the frame the guest requested. No-ops when the
+ * env switch is off. */
+void cellGcm_flip_log_present(u32 frame);
+void cellGcm_flip_log_shown(u32 frame);
 
 /* NID: 0xF9BFCDA3 */
 void cellGcmSetSecondVHandler(CellGcmSecondVHandler handler);

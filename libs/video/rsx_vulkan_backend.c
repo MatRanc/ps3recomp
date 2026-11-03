@@ -51,6 +51,7 @@
 #include "rsx_shader_spirv.h"
 #include "rsx_draw_engine.h"
 #include "cellGcmSys.h"
+#include "ps3_live_ctl.h"
 #include "rsx_tex_miss.h"
 #include "ps3emu/thread_name.h"
 #include "vulkan/rsx_vk_fallback_vert.spv.h"
@@ -260,6 +261,8 @@ typedef struct vk_state {
     struct {
         u32          slot;
         u32          idx;
+        u32          frame;          /* guest flip seq, for the per-flip log */
+        unsigned long long due_us;  /* PS3RECOMP_VK_PACE: earliest present */
         VkSemaphore  done;
     }                present_q[VK_PRESENT_SLOTS];
     u32              present_q_head, present_q_tail, present_q_count;
@@ -271,6 +274,13 @@ typedef struct vk_state {
     int              present_thread_on;
     int              present_quit;
     int              present_lost;    /* vkQueuePresentKHR said recreate */
+
+    /* PS3RECOMP_VK_PACE: the present thread holds each queued present until
+     * its scheduled slot, derived from the cadence of NEW guest frames (not
+     * from our own presents, which would feed back). The blit is already
+     * recorded and submitted when the frame ends; only the
+     * vkQueuePresentKHR call is delayed, by at most one frame interval. */
+    unsigned long long pace_last_arrival_us, pace_interval_us, pace_due_us;
 
     /* Optional window (PS3RECOMP_VK_WINDOW=1). Rendering stays offscreen
      * either way -- readback and the tests are unchanged -- and a present
@@ -2118,12 +2128,69 @@ static uint64_t vk_acquire_timeout_ns(void)
  * for ~9 ms. It enqueues the acquired image index and its render-finished
  * semaphore and goes on to the next command buffer.
  * -------------------------------------------------------------------------*/
+/* PS3RECOMP_VK_PACE=1 (live key PS3RECOMP_CTL): even out the window present
+ * cadence in the present thread. Default off, seeded from the environment. */
+static int vk_pace_on(void)
+{
+#if defined(__GNUC__) && !defined(_WIN32)
+    if (ps3_live_ctl_get) return ps3_live_ctl_get(PS3_LIVE_PRESENT_PACE);
+#endif
+    static int on = -1;
+    if (on < 0) {
+        const char* e = getenv("PS3RECOMP_VK_PACE");
+        on = e && *e && strcmp(e, "0") != 0;
+    }
+    return on;
+}
+
+/* When a new guest frame reaches the window, work out the earliest instant
+ * this present may run. The target spacing is an EWMA of the *arrival*
+ * intervals of new frames, so the pacer never measures its own delay (that
+ * would ratchet: a held present makes the next interval look longer). The
+ * schedule advances one interval per frame but never runs ahead of the frame
+ * by more than one interval, and is abandoned for a frame when presents are
+ * already queued behind it. A frame that arrives late is due at once. */
+static unsigned long long vk_pace_frame_due(void)
+{
+    if (!vk_pace_on()) { s_vk.pace_due_us = 0; return 0; }
+    const unsigned long long now = vk_now_us();
+    if (!s_vk.pace_last_arrival_us || now < s_vk.pace_last_arrival_us ||
+        now - s_vk.pace_last_arrival_us > 250000ull) {
+        /* First frame, a clock jump, or a pause longer than any frame: start
+         * a fresh schedule rather than carrying a stale due time. */
+        s_vk.pace_interval_us = 16666;
+        s_vk.pace_due_us = now;
+    } else {
+        const unsigned long long d = now - s_vk.pace_last_arrival_us;
+        if (d > 2000 && d < 250000) {
+            long long iv = (long long)s_vk.pace_interval_us;
+            /* Down faster than up: a cadence that gets faster converges in
+             * a handful of frames; a slow patch does not inflate the target. */
+            const long long alpha = ((long long)d < iv) ? 4 : 16;
+            iv += ((long long)d - iv) / alpha;
+            if (iv < 2000) iv = 2000;
+            if (iv > 100000) iv = 100000;
+            s_vk.pace_interval_us = (unsigned long long)iv;
+        }
+    }
+    s_vk.pace_last_arrival_us = now;
+
+    unsigned long long due = now;
+    if (s_vk.pace_due_us > due) due = s_vk.pace_due_us;
+    const unsigned long long horizon = now + s_vk.pace_interval_us;
+    if (due > horizon) due = horizon;      /* at most one interval of wait */
+    if (s_vk.present_q_count >= 2) due = now;   /* behind: do not compound */
+    s_vk.pace_due_us = due + s_vk.pace_interval_us;
+    return due;
+}
+
 static void* vk_present_thread_main(void* arg)
 {
     (void)arg;
     ps3_thread_name("present");
     for (;;) {
-        u32 slot, idx;
+        u32 slot, idx, frame;
+        unsigned long long due;
         VkSemaphore done;
 
         pthread_mutex_lock(&s_vk.present_q_mu);
@@ -2135,12 +2202,29 @@ static void* vk_present_thread_main(void* arg)
         }
         slot = s_vk.present_q[s_vk.present_q_head].slot;
         idx  = s_vk.present_q[s_vk.present_q_head].idx;
+        frame = s_vk.present_q[s_vk.present_q_head].frame;
+        due = s_vk.present_q[s_vk.present_q_head].due_us;
         done = s_vk.present_q[s_vk.present_q_head].done;
         s_vk.present_q_head = (s_vk.present_q_head + 1) % VK_PRESENT_SLOTS;
         s_vk.present_q_count--;
         pthread_mutex_unlock(&s_vk.present_q_mu);
 
         pvkWaitForFences(s_vk.device, 1, &s_vk.window_fence[slot], VK_TRUE, UINT64_MAX);
+
+        /* PS3RECOMP_VK_PACE: hold the display present, not the frame's GPU
+         * work (the swapchain blit was submitted when the frame ended). The
+         * due time is the arrival-cadence schedule computed in
+         * vk_pace_frame_due; a frame that arrived late is due at once. */
+        if (due && vk_pace_on()) {
+            while (!s_vk.present_quit) {
+                const unsigned long long now = vk_now_us();
+                if (now >= due) break;
+                unsigned long long us = due - now;
+                if (us > 2000) us = 2000;
+                struct timespec ts = { 0, (long)us * 1000L };
+                nanosleep(&ts, NULL);
+            }
+        }
 
         VkPresentInfoKHR pi = {
             .sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR,
@@ -2151,6 +2235,7 @@ static void* vk_present_thread_main(void* arg)
         const unsigned long long q0 = vk_window_stats_on() ? vk_now_us() : 0;
         VkResult r = vk_queue_present(&pi);
         if (q0) { vk_window_stats_max(&s_vkw.q_max_us, vk_now_us() - q0); VKW_ADD(shown); }
+        cellGcm_flip_log_shown(frame);
         if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR)
             __atomic_store_n(&s_vk.present_lost, 1, __ATOMIC_RELEASE);
         else if (r != VK_SUCCESS)
@@ -2229,11 +2314,14 @@ static void vk_present_slot_release(int slot)
     pthread_mutex_unlock(&s_vk.present_q_mu);
 }
 
-static void vk_present_enqueue(u32 slot, u32 idx, VkSemaphore done)
+static void vk_present_enqueue(u32 slot, u32 idx, u32 frame,
+                               unsigned long long due, VkSemaphore done)
 {
     pthread_mutex_lock(&s_vk.present_q_mu);
     s_vk.present_q[s_vk.present_q_tail].slot = slot;
     s_vk.present_q[s_vk.present_q_tail].idx  = idx;
+    s_vk.present_q[s_vk.present_q_tail].frame = frame;
+    s_vk.present_q[s_vk.present_q_tail].due_us = due;
     s_vk.present_q[s_vk.present_q_tail].done = done;
     s_vk.present_q_tail = (s_vk.present_q_tail + 1) % VK_PRESENT_SLOTS;
     s_vk.present_q_count++;
@@ -2266,11 +2354,12 @@ static void vk_present_window(void)
 {
     if (!s_vk.windowed || !s_vk.swapchain) return;
 
+    const u32 present_frame = cellGcm_flip_frame_count();
     if (vk_present_new_only_on()) {
-        const u32 frame = cellGcm_flip_frame_count();
-        if (frame && frame == s_last_present_frame) return;
-        s_last_present_frame = frame;
+        if (present_frame && present_frame == s_last_present_frame) return;
+        s_last_present_frame = present_frame;
     }
+    const unsigned long long pace_due = vk_pace_frame_due();
 
     /* The thread saw the swapchain go stale; drain it before replacing the
      * swapchain out from under queued presents. */
@@ -2365,13 +2454,25 @@ static void vk_present_window(void)
     }
 
     VKW_ADD(enq);
+    cellGcm_flip_log_present(present_frame);
     if (s_vk.present_thread_on) {
-        vk_present_enqueue((u32)slot, idx, s_vk.sc_done[idx]);
+        vk_present_enqueue((u32)slot, idx, present_frame, pace_due,
+                           s_vk.sc_done[idx]);
         return;
     }
 
     /* Fallback when the thread could not start. */
     pvkWaitForFences(s_vk.device, 1, &s_vk.window_fence[slot], VK_TRUE, UINT64_MAX);
+    if (pace_due && vk_pace_on()) {
+        for (;;) {
+            const unsigned long long now = vk_now_us();
+            if (now >= pace_due) break;
+            unsigned long long us = pace_due - now;
+            if (us > 2000) us = 2000;
+            struct timespec ts = { 0, (long)us * 1000L };
+            nanosleep(&ts, NULL);
+        }
+    }
     VkPresentInfoKHR pi = {
         .sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR,
         .waitSemaphoreCount = 1, .pWaitSemaphores = &s_vk.sc_done[idx],
@@ -2380,6 +2481,7 @@ static void vk_present_window(void)
     const unsigned long long q0 = vk_window_stats_on() ? vk_now_us() : 0;
     r = vk_queue_present(&pi);
     if (q0) { vk_window_stats_max(&s_vkw.q_max_us, vk_now_us() - q0); VKW_ADD(shown); }
+    cellGcm_flip_log_shown(present_frame);
     if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR) vk_swapchain_lost();
     else if (r != VK_SUCCESS) VK_LOG("vkQueuePresentKHR failed (VkResult %d)\n", (int)r);
     vk_present_slot_release(slot);
@@ -3155,6 +3257,7 @@ typedef struct {
     rsx_be_cube_face face[6];
     u64      serials[6];
     rsx_be_format fmt;
+    u32      location, offset;     /* guest address the cube belongs to */
     u32      w, h, remap, rsx_fmt, handle;
     unsigned long long tick;
 } vk_cube_rt;
@@ -3191,7 +3294,8 @@ static int vk_cube_rt_copy(u32 handle, const rsx_be_cube_face faces[6], u32 w, u
     return vk_submit_and_wait();
 }
 
-static u32 vk_eng_cube_target_view(void* user, const rsx_be_cube_face faces[6],
+static u32 vk_eng_cube_target_view(void* user, u32 location, u32 offset,
+                                   const rsx_be_cube_face faces[6],
                                    const u64 serials[6],
                                    rsx_be_format fmt, u32 w, u32 h,
                                    u32 remap, u32 rsx_fmt)
@@ -3204,7 +3308,8 @@ static u32 vk_eng_cube_target_view(void* user, const rsx_be_cube_face faces[6],
         vk_cube_rt* c = &s_cube_rt[i];
         if (!c->used) { if (spare < 0) spare = (int)i; continue; }
         if (c->w == w && c->h == h && c->fmt == fmt && c->remap == remap &&
-            c->rsx_fmt == rsx_fmt && !memcmp(c->face, faces, sizeof c->face)) {
+            c->rsx_fmt == rsx_fmt && c->location == location &&
+            c->offset == offset && !memcmp(c->face, faces, sizeof c->face)) {
             e = c; break;
         }
     }
@@ -3223,6 +3328,7 @@ static u32 vk_eng_cube_target_view(void* user, const rsx_be_cube_face faces[6],
         memcpy(e->face, faces, sizeof e->face);
         memcpy(e->serials, serials, sizeof e->serials);
         e->fmt = fmt; e->w = w; e->h = h; e->remap = remap; e->rsx_fmt = rsx_fmt;
+        e->location = location; e->offset = offset;
         e->handle = vk_eng_texture_create(NULL, fmt, w, h, 1, 6, remap, rsx_fmt);
         if (!e->handle) { memset(e, 0, sizeof *e); return 0; }
         e->used = 1;
@@ -3237,6 +3343,32 @@ static u32 vk_eng_cube_target_view(void* user, const rsx_be_cube_face faces[6],
     }
     e->tick = ++s_cube_rt_tick;
     return e->handle;
+}
+
+/* The last complete cube image at a guest address. An incomplete probe (a
+ * face target was just recreated, so its colour serial is 0, or one face has
+ * not been declared yet) binds this instead of the dummy, which is what the
+ * pregame cinematics need: the probe is refreshed in bursts, and flashing
+ * black between refreshes is the bright/dark alternation the user saw. The
+ * handle stays owned by the cache; returning it only bumps its LRU tick so a
+ * live fallback is not evicted while a draw still names it. */
+static u32 vk_eng_cube_target_last(void* user, u32 location, u32 offset,
+                                   rsx_be_format fmt, u32 w, u32 h,
+                                   u32 remap, u32 rsx_fmt)
+{
+    (void)user;
+    vk_cube_rt* best = NULL;
+    for (u32 i = 0; i < VK_CUBE_RT_CACHE; i++) {
+        vk_cube_rt* c = &s_cube_rt[i];
+        if (!c->used || !c->handle) continue;
+        if (c->location != location || c->offset != offset) continue;
+        if (c->fmt != fmt || c->w != w || c->h != h) continue;
+        if (c->remap != remap || c->rsx_fmt != rsx_fmt) continue;
+        if (!best || c->tick > best->tick) best = c;
+    }
+    if (!best) return 0;
+    best->tick = ++s_cube_rt_tick;
+    return best->handle;
 }
 
 /* ---- colour feedback snapshots ---------------------------------------------
@@ -4919,6 +5051,7 @@ static const rsx_draw_backend s_vk_engine_backend = {
     .color_target_release = vk_eng_release,
     .surface_view         = vk_eng_surface_view,
     .cube_target_view     = vk_eng_cube_target_view,
+    .cube_target_last     = vk_eng_cube_target_last,
     .depth_target_create  = vk_eng_depth_target_create,
     .depth_target_release = vk_eng_release,
     .depth_snapshot       = vk_eng_depth_snapshot,

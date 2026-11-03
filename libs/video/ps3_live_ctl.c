@@ -36,6 +36,7 @@ static const char* const K_NAME[PS3_LIVE_COUNT] = {
     "EXP_FAST_WAKE",
     "EXP_TICK_US",
     "PS3RECOMP_RSX_CUBE_RT",
+    "PS3RECOMP_VK_PACE",
 };
 
 static _Atomic int s_val[PS3_LIVE_COUNT];
