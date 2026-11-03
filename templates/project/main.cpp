@@ -125,6 +125,8 @@ void     cellGcmTickFlip(void);
 int      cellGcm_take_flip_pending(void);
 void     cellGcm_rsx_process_fifo(void);      /* drain get -> put */
 unsigned cellGcm_flip_request_count(void);
+void     cellGcmSetFlipPresentPath(int on);   /* PS3RECOMP_FLIP_ON_DONE */
+void     cellGcmFlipOnPresent(void);          /* completes the flip on present */
 }
 
 /* ---------------------------------------------------------------------------
@@ -206,6 +208,10 @@ extern "C" unsigned ppu_boot_frames_presented(void)
 static void present_guest_frame(void)
 {
     rsx_backend_present();
+    /* PS3RECOMP_FLIP_ON_DONE: the guest's flip is done once the frame has
+     * been handed to the display, not on the next 16 ms display tick. The
+     * tick keeps advancing the vblank count/handler at 59.94 Hz. */
+    cellGcmFlipOnPresent();
     /* This thread increments and guest threads read, so interlocked rather
      * than a volatile ++, which on arm64 is neither atomic nor a fence. */
     InterlockedIncrement(&g_frames_presented);
@@ -224,14 +230,19 @@ static DWORD WINAPI frame_clock(LPVOID)
     int rsx_ok = (rsx_backend_init(WINDOW_WIDTH, WINDOW_HEIGHT, title) == 0);
     fprintf(stderr, "[rsx] %s backend init %s\n", RSX_BACKEND_NAME,
             rsx_ok ? "OK -- window open" : "FAILED");
+    /* PS3RECOMP_FLIP_ON_DONE completes a flip in cellGcmFlipOnPresent after
+     * the present is queued. Without a present backend nothing would complete
+     * it, so tell cellGcmSys to keep completing on the display tick. */
+    cellGcmSetFlipPresentPath(rsx_ok);
 
     unsigned  last_flip = 0;
-    /* EXP_TICK_US: period of the display tick that completes flips and
-     * advances the vblank count. Throwaway experiment: default 16000 (16 ms,
-     * what `next_tick += 16` on the millisecond clock did), read live from
-     * PS3RECOMP_CTL so one run can A/B 16 ms against 8 ms. QPC is used so a
-     * sub-millisecond period is possible; on Linux it is the monotonic ns
-     * clock, on Windows the 10 MHz performance counter. */
+    /* EXP_TICK_US: period of the display tick that advances the vblank count
+     * and, unless PS3RECOMP_FLIP_ON_DONE is on, completes flips. Throwaway
+     * experiment: default 16000 (16 ms, what `next_tick += 16` on the
+     * millisecond clock did), but 16683 (59.94 Hz) while FLIP_ON_DONE is on
+     * and EXP_TICK_US is not set. Read live from PS3RECOMP_CTL so one run can
+     * A/B it. QPC is used so a sub-millisecond period is possible; on Linux it
+     * is the monotonic ns clock, on Windows the 10 MHz performance counter. */
     LARGE_INTEGER qpf_li, qpc_li;
     QueryPerformanceFrequency(&qpf_li);
     QueryPerformanceCounter(&qpc_li);

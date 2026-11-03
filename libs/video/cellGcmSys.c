@@ -89,6 +89,8 @@ static u64 get_timestamp_ns(void)
  * -----------------------------------------------------------------------*/
 
 static int  s_gcm_initialized = 0;
+/* Defined with the other switch helpers below. */
+static int  gcm_live_get(int key, const char* env);
 static u32  s_flip_mode   = CELL_GCM_DISPLAY_VSYNC;
 static u32  s_flip_status = CELL_GCM_FLIP_STATUS_DONE;
 /* Flip requests (each puts the status back to WAITING) and the request a
@@ -164,6 +166,10 @@ static u32 s_fifo_flips_completed = 0;   /* reached count at the last completion
 /* A flip requested outside the command stream (cellGcmSetFlipCommand, or a
  * 0xFEAD word the drain met), not completed yet. */
 static volatile int s_flip_direct_pending = 0;
+/* PS3RECOMP_FLIP_ON_DONE: 1 once the runner has a present backend, so a flip
+ * can be completed where its present is queued. 0 keeps the display tick as
+ * the completion edge (headless/replay). */
+static int s_flip_present_path = 0;
 
 /* May this beat complete a flip? Yes if the drain has executed a flip marker
  * since the last completion, or if a flip that never went through the stream
@@ -989,6 +995,13 @@ void cellGcmTickVBlank(void) { s_vblank_count++; GCM_PENDING_SET(1); }
  * the callback IS the flip interrupt -- no flip, no callback. */
 void cellGcmTickFlip(void)
 {
+    /* PS3RECOMP_FLIP_ON_DONE: the flip is completed where its present is
+     * queued (cellGcmFlipOnPresent), so a completion on the display tick
+     * would put the tick's up-to-16 ms latency back into every flipped frame.
+     * With no present path (headless) the tick stays the completion edge. */
+    if (s_flip_present_path && gcm_live_get(PS3_LIVE_FLIP_ON_DONE,
+                                            "PS3RECOMP_FLIP_ON_DONE"))
+        return;
     /* Same rule as cellGcm_request_tick: a flip still ahead of the drain has
      * not happened yet. */
     FLIP_LOCK();
@@ -1001,6 +1014,33 @@ void cellGcmTickFlip(void)
         ps3_trace_note(PS3_TR_NOTE_FLIP_DONE, s_flip_tick_seq);
     }
 }
+
+/* PS3RECOMP_FLIP_ON_DONE, called by the runner after a present has been
+ * queued. The title (like the console's cellGcmSetFlipImmediate) flips as soon
+ * as the RSX executes the frame; nothing in the contract makes completion wait
+ * for the next vsync. Completing here delivers the guest's flip handler and
+ * sets the flip status DONE, which is the edge Gfx_DisplayFlip waits on. The
+ * vblank handler still fires at the 59.94 Hz tick. The "a newer flip must not
+ * be completed by an older tick" rule and the serialized handler pump are the
+ * same as cellGcmTickFlip's. */
+void cellGcmFlipOnPresent(void)
+{
+    if (!gcm_live_get(PS3_LIVE_FLIP_ON_DONE, "PS3RECOMP_FLIP_ON_DONE")) return;
+    FLIP_LOCK();
+    const int waiting = s_flip_status == CELL_GCM_FLIP_STATUS_WAITING &&
+                        gcm_flip_executed_take();
+    if (waiting) s_flip_tick_seq = s_flip_req_seq;
+    FLIP_UNLOCK();
+    if (waiting) GCM_PENDING_SET(2);
+    if (waiting && ps3_trace_on()) {
+        ps3_trace_instant(PS3_TR_GCM_FLIP_DONE, s_flip_tick_seq, 0);
+        ps3_trace_note(PS3_TR_NOTE_FLIP_DONE, s_flip_tick_seq);
+    }
+}
+
+/* Set by the runner once the present backend is up. When it is 0 (backend
+ * init failed, headless replay) the display tick keeps completing flips. */
+void cellGcmSetFlipPresentPath(int on) { s_flip_present_path = on ? 1 : 0; }
 
 /* Drain the game's GCM FIFO into the RSX backend. Called from the present thread
  * (boot_main vblank_ticker). Not yet active: s_control.put stays 0 because

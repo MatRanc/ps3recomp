@@ -57,6 +57,7 @@ static const char* const K_NAME[PS3_LIVE_COUNT] = {
     "SPURS_PM_FAST_RESCHED",
     "SPU_CODE_DMA_MEMO",
     "PS3RECOMP_PREPARE_FLIP_RET",
+    "PS3RECOMP_FLIP_ON_DONE",
 };
 
 static _Atomic int s_val[PS3_LIVE_COUNT];
@@ -246,5 +247,11 @@ const char* ps3_live_ctl_name(int key)
 int ps3_live_ctl_tick_us(void)
 {
     const int us = ps3_live_ctl_get(PS3_LIVE_EXP_TICK_US);
-    return us > 0 ? us : 16000;      /* 16 ms: the historical tick */
+    if (us > 0) return us;           /* an explicit period wins */
+    /* FLIP_ON_DONE leaves the tick as the vblank clock only (the flip is
+     * completed by the present, see cellGcmFlipOnPresent). 16683 us is
+     * 1001/60000 s, the PS3's 59.94 Hz refresh, so a title timing animation
+     * from the vblank handler sees the same rate as on the console. */
+    if (ps3_live_ctl_get(PS3_LIVE_FLIP_ON_DONE)) return 16683;
+    return 16000;                    /* 16 ms: the historical tick */
 }
