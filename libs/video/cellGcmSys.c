@@ -4036,7 +4036,7 @@ s32 cellGcmSetPrepareFlip(void* ctx, u32 bufferId)
     /* The guest stores this return value in its flip queue and its display
      * thread later passes it (masked to 8 bits) to cellGcmSetFlipImmediate
      * (Gfx_FrameEnd at 0x6668c, Gfx_DisplayFlip at 0x69320). The real SDK
-     * returns the buffer id -- RPCS3's gcmSetPrepareFlip does the same. The
+     * returns the buffer id (the guest uses it as such). The
      * old CELL_OK return is 0, so every flip named display buffer 0 while the
      * title rendered alternately into buffers 0 and 1: half the presents
      * showed a buffer that had already been re-rendered, and the next named
