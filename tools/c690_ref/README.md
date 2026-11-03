@@ -56,6 +56,31 @@ The output of the reference is the full 256 KiB LS plus all 128 GPRs, so the
 test is stricter than "the index list matches": any change in an intermediate
 buffer or a leftover register fails it.
 
+## Reproducing the corpus stage pairs
+
+The corpus module itself is in `runtime/spu/c690_corpus.c`. The stage
+snapshots need a small instrumentation edit in the generated lifted tree
+(`recomp-work/spu_lifted/jobmod_c690c2f7b09a_eF5B8/spu_recomp.c`): rename the
+generated body to `jobmod_c690c2f7b09a_eF5B8_spu_func_0000FDA0_body` and add
+
+```c
+void jobmod_c690c2f7b09a_eF5B8_spu_func_0000FDA0(spu_context* ctx) {
+    extern int g_c690_corpus_on;
+    extern void c690_corpus_stage_enter(const spu_context*, uint32_t);
+    extern void c690_corpus_stage_exit(const spu_context*, uint32_t);
+    if (__builtin_expect(!g_c690_corpus_on, 1))
+        __attribute__((musttail)) return jobmod_c690c2f7b09a_eF5B8_spu_func_0000FDA0_body(ctx);
+    c690_corpus_stage_enter(ctx, 0xFDA0u);
+    jobmod_c690c2f7b09a_eF5B8_spu_func_0000FDA0_body(ctx);
+    c690_corpus_stage_exit(ctx, 0xFDA0u);
+}
+```
+
+The recursive calls in the generated body keep the original name, so the
+wrapper sees every entry and the corpus module folds recursion to the
+outermost call. The edit is not committed because that tree is regenerated
+game data.
+
 ## Run
 
 ```sh
