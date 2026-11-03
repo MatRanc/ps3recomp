@@ -2355,14 +2355,14 @@ static int spu_overlay_resident_verified(spu_context* ctx, unsigned slot)
             if (memcmp(ctx->ls + ctx->resident_code[slot].lsa, vm_base + src_ea, span) == 0) {
                 uint64_t g1;
                 if (spu_overlay_src_gen(src_ea, span, &g1) && g1 == g0)
-                    ctx->resident_code[slot].src_seq = g1;
+                    ctx->resident_code_src_seq[slot] = g1;
                 else
-                    ctx->resident_code[slot].src_seq = 0;
+                    ctx->resident_code_src_seq[slot] = 0;
             } else {
-                ctx->resident_code[slot].src_seq = 0;
+                ctx->resident_code_src_seq[slot] = 0;
             }
         } else {
-            ctx->resident_code[slot].src_seq = 0;
+            ctx->resident_code_src_seq[slot] = 0;
         }
         *state = match ? SPU_OVERLAY_VERIFIED : SPU_OVERLAY_REJECTED;
         { extern int g_c690_gap; extern void c690_gap_on_overlay(int,int);
@@ -2388,25 +2388,25 @@ int spu_overlay_code_get_noop(spu_context* ctx, uint32_t ea, uint32_t lsa,
             continue;
         /* O(1) path: the whole source range is unchanged since the last full
          * byte comparison, and the span is still verified. */
-        if (ctx->resident_code[slot].src_seq &&
-            spu_overlay_src_unchanged(src_ea, span, ctx->resident_code[slot].src_seq))
+        if (ctx->resident_code_src_seq[slot] &&
+            spu_overlay_src_unchanged(src_ea, span, ctx->resident_code_src_seq[slot]))
             return 1;
         uint64_t g0 = 0;
         const int tracked = spu_overlay_src_track(src_ea, span, &g0);
         const int eq = memcmp(ctx->ls + lsa, src, size) == 0;
         if (!eq) {
-            ctx->resident_code[slot].src_seq = 0;
+            ctx->resident_code_src_seq[slot] = 0;
             return 0;
         }
         if (tracked) {
             uint64_t g1;
             if (spu_overlay_src_gen(src_ea, span, &g1) && g1 == g0) {
-                ctx->resident_code[slot].src_seq = g1;
+                ctx->resident_code_src_seq[slot] = g1;
                 return 1;
             }
             /* A write raced the compare: copy the current source instead of
              * publishing a generation that no longer describes local store. */
-            ctx->resident_code[slot].src_seq = 0;
+            ctx->resident_code_src_seq[slot] = 0;
             return 0;
         }
         return 1;

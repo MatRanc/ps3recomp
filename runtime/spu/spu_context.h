@@ -311,9 +311,6 @@ typedef struct spu_context {
         /* 0: unchecked legacy region; otherwise SPU_OVERLAY_* state of a
          * region registered with its code bytes (spu_overlay_residency.h). */
         int verify_state, source_index;
-        /* SPU_CODE_DMA_MEMO: source write generation when the whole streamed
-         * span was last proven equal to local store (0 = not tracked). */
-        uint64_t src_seq;
     } resident_code[4];
 
     /* Dispatch cache (spu_lifted_lookup, spu_channels.c). dcache_id names this
@@ -437,6 +434,19 @@ typedef struct spu_context {
      * spu_coh_reserve_fast). Written under that lock, read by the context's
      * own thread. */
     int coh_listed;
+
+    /* SPU_CODE_DMA_MEMO: source write generation when the whole streamed span
+     * was last proven equal to local store (0 = not tracked).
+     *
+     * Keep new fields at the END of spu_context: the lifted SPU modules include
+     * another copy of this header (recomp-work/runtime -> ps3recomp-native/
+     * runtime) and are compiled with its layout. All fields before the end are
+     * shared with that copy, so appending does not move any offset the lifted
+     * code reads or writes. Adding a field in the middle (as an earlier version
+     * of this change did) shifts dcache_id, host_depth and steps, and the lifted
+     * dispatch reads them at the old offsets -> the c690 job stops at 0x1095C
+     * (invalid command) after three jobs. */
+    uint64_t resident_code_src_seq[4];
 } spu_context;
 
 /* event_status is written from more than one host thread: the SPU's own
