@@ -45,6 +45,22 @@ void rsx_draw_engine_methods(u32 method, u32 step, const u8* src, u32 count) { (
 void rsx_draw_engine_note_flip(u32 buffer_id) { (void)buffer_id; }
 void rsx_draw_engine_guest_read(u32 l, u32 o, u32 p, u32 w, u32 h) { (void)l; (void)o; (void)p; (void)w; (void)h; }
 void rsx_draw_engine_guest_wrote(u32 l, u32 o, u32 p, u32 w, u32 h) { (void)l; (void)o; (void)p; (void)w; (void)h; }
+void rsx_draw_engine_guest_read_done(void) {}
+/* The walker's profiling/capture hooks and on-demand wake: no-ops here. */
+unsigned long long rsx_wprof_now(void) { return 0; }
+int  rsx_wprof_enabled(void) { return 0; }
+void rsx_wprof_note_flip(void) {}
+void rsx_wprof_note_drain(unsigned long long ns) { (void)ns; }
+void rsx_wprof_note_dispatch(unsigned long long ns) { (void)ns; }
+void rsx_wprof_drain_end(void) {}
+void rsx_wcap_drain_end(void) {}
+int  rsx_wcap_begin_if_triggered(void) { return 0; }
+void rsx_wcap_word(u32 w) { (void)w; }
+void rsx_wcap_flip(u32 w) { (void)w; }
+void rsx_draw_engine_set_walker_fast(int on) { (void)on; }
+void rsx_draw_engine_set_no_draw(int on) { (void)on; }
+void rsx_draw_engine_wcb_set_wake(void (*wake)(void)) { (void)wake; }
+void rsx_draw_engine_set_display_query(int (*fn)(u32 offset)) { (void)fn; }
 int  rsx_live_draw_enabled(void) { return 0; }
 void rsx_live_draw_method(u32 method, u32 arg) { (void)method; (void)arg; }
 int  rsx_live_draw_blit(u32 a, u32 b, u32 c, u32 d, u32 e, u32 f, u32 w, u32 h)

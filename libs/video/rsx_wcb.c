@@ -543,6 +543,24 @@ int rsx_wcb_service(void)
     }
 }
 
+/* Take every request at once (PS3RECOMP_RSX_WCB_BATCH). The regions stay
+ * RESOLVING, and therefore keep the waiting threads blocked, until the caller
+ * has copied them and calls rsx_wcb_release() for each. */
+uint32_t rsx_wcb_take_requests(uint32_t* cookies, uint32_t max)
+{
+    if (!cookies || !max || !WCB_LOAD(&s_wcbm.requested)) return 0;
+    uint32_t n = 0;
+    wcb_lock();
+    for (uint32_t i = 0; i < s_wcbm.n && n < max; i++) {
+        if (s_wcbm.r[i].state != WCB_REQUESTED) continue;
+        s_wcbm.r[i].state = WCB_RESOLVING;
+        s_wcbm.requested--;
+        cookies[n++] = s_wcbm.r[i].cookie;
+    }
+    wcb_unlock();
+    return n;
+}
+
 /* ---- faults --------------------------------------------------------------- */
 
 int rsx_wcb_on_fault(uintptr_t addr)

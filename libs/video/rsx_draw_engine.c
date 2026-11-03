@@ -133,6 +133,11 @@ typedef struct {
      * cube-face census (which programs produce the six faces). */
     u64 last_writer_fp;
     u32 last_writer_pipe;
+    /* PS3RECOMP_RSX_WCB_SKIP: the colour serial, and the surface-pixel
+     * rectangle, the guest-memory copy was last known to hold. 0 serial = the
+     * bytes are not known to be valid. */
+    u64 guest_valid_serial;
+    u32 guest_valid_x, guest_valid_y, guest_valid_w, guest_valid_h;
 } eng_surface;
 
 typedef struct {
@@ -947,9 +952,39 @@ static struct {
     void (*wake)(void);
     rsx_draw_engine_wcb_stats st, win;
     rsx_wcb_counters mod_mark;  /* module counters at the window start      */
-} s_wcb = { .mode = -1 };
+    /* PS3RECOMP_RSX_WCB_RECT: the rectangle the transfer being resolved asked
+     * for. Set on the walker thread around rsx_wcb_resolve_cookie; -1 when the
+     * resolve is not a transfer's. */
+    int rect_slot;
+    rsx_wcb_copy_rect rect;
+    /* PS3RECOMP_RSX_WCB_RECT: a rectangle-only resolve left this surface's
+     * other pages stale; re-protect them once the transfer has read its
+     * bytes (rsx_draw_engine_guest_read_done). */
+    int partial_slot;
+    /* PS3RECOMP_RSX_WCB_BATCH: this resolve is draining the request queue. */
+    int batching;
+} s_wcb = { .mode = -1, .rect_slot = -1, .partial_slot = -1 };
 
 #define WCB_COUNT(field, v) do { s_wcb.st.field += (v); s_wcb.win.field += (v); } while (0)
+
+/* The readback cuts (docs/readback-cost.md section 6): each is its own live
+ * key, seeded from the environment, so a PS3RECOMP_CTL switch flips it mid-run
+ * like PS3RECOMP_RSX_CUBE_RT. Off by default; a run without them behaves
+ * exactly as before. */
+static int eng_wcb_cut_on(int key, const char* env)
+{
+#if defined(__GNUC__) && !defined(_WIN32)
+    if (ps3_live_ctl_get) return ps3_live_ctl_get(key);
+#endif
+    const char* e = getenv(env);
+    return e && *e && strcmp(e, "0") != 0;
+}
+static int eng_wcb_rect_on(void)
+{ return eng_wcb_cut_on(PS3_LIVE_WCB_RECT, "PS3RECOMP_RSX_WCB_RECT"); }
+static int eng_wcb_batch_on(void)
+{ return eng_wcb_cut_on(PS3_LIVE_WCB_BATCH, "PS3RECOMP_RSX_WCB_BATCH"); }
+static int eng_wcb_skip_on(void)
+{ return eng_wcb_cut_on(PS3_LIVE_WCB_SKIP, "PS3RECOMP_RSX_WCB_SKIP"); }
 
 static void eng_wcb_retire_surface(u32 slot);
 static void eng_wcb_retire_zdepth(u32 slot);
@@ -1434,6 +1469,8 @@ static u32 eng_surface_get(u32 location, u32 offset, u32 want_w, u32 want_h,
     s->handle = handle;
     s->color_serial = 0;
     s->guest_dirty = 0;
+    s->guest_valid_serial = 0;
+    s->guest_valid_x = s->guest_valid_y = s->guest_valid_w = s->guest_valid_h = 0;
     s->last_use = g.frames;
     if (slot == g.n_surfaces) g.n_surfaces++;
     { static u32 logs = 0; if (PS3_LOG_FIRST(logs, 16))
@@ -1531,6 +1568,149 @@ static u32 eng_surface_at(u32 location, u32 offset, u32 pitch, u32* xb, u32* y)
 
 static u8* s_coherence_rows;
 static u32 s_coherence_cap;
+
+/* PWCB cut 1: the page-aligned rectangle of surface pixels that covers the
+ * bytes a transfer reads. The protection is page granular, so the copy is
+ * expanded to the host pages the read touches; expanding per row and taking
+ * the union keeps the rows a transfer never reads out of the copy. 4 KB is
+ * the RSX/linux page the WCB module protects at (rsx_wcb.c: wcb_page_size;
+ * a larger host page only means this copy is the conservative one). */
+#define ENG_WCB_RECT_PAGE 4096ull
+int rsx_wcb_transfer_rect(u32 guest_base, u32 pitch, u32 bpp, u32 xb, u32 byte_w,
+                          u32 y, u32 rows, u32 surf_w, u32 surf_h,
+                          rsx_wcb_copy_rect* out)
+{
+    if (!out || !pitch || !bpp || !byte_w || !rows || !surf_w || !surf_h)
+        return 0;
+    const u32 row_bytes = surf_w * bpp;
+    if (xb >= row_bytes || y >= surf_h) return 0;
+    if (rows > surf_h - y) rows = surf_h - y;
+    u32 x0 = surf_w, x1 = 0, ry0 = surf_h, ry1 = 0;
+    for (u32 r = 0; r < rows; r++) {
+        const u64 row_base = (u64)guest_base + (u64)(y + r) * pitch;
+        u64 a0 = row_base + xb;
+        u64 a1 = a0 + byte_w;
+        if (a1 > row_base + row_bytes) a1 = row_base + row_bytes;
+        if (a1 <= a0) continue;
+        const u64 p0 = a0 & ~(ENG_WCB_RECT_PAGE - 1ull);
+        const u64 p1 = (a1 + ENG_WCB_RECT_PAGE - 1ull) & ~(ENG_WCB_RECT_PAGE - 1ull);
+        u32 b0 = p0 > row_base ? (u32)(p0 - row_base) : 0u;
+        u32 b1 = p1 < row_base + row_bytes ? (u32)(p1 - row_base) : row_bytes;
+        if (b1 <= b0) continue;
+        const u32 px0 = b0 / bpp;
+        u32 px1 = (b1 + bpp - 1u) / bpp;
+        if (px1 > surf_w) px1 = surf_w;
+        if (px0 < x0) x0 = px0;
+        if (px1 > x1) x1 = px1;
+        if (y + r < ry0) ry0 = y + r;
+        if (y + r + 1u > ry1) ry1 = y + r + 1u;
+    }
+    if (x1 <= x0 || ry1 <= ry0) return 0;
+    out->x = x0; out->y = ry0; out->w = x1 - x0; out->h = ry1 - ry0;
+    return 1;
+}
+
+/* The rectangle the guest-memory copy of `s` is known to match, at which
+ * colour serial. A guest write clears it (the bytes are no longer the ones
+ * the engine stored). */
+static void eng_guest_valid_set(eng_surface* s, u32 x, u32 y, u32 w, u32 h)
+{
+    s->guest_valid_serial = s->color_serial;
+    s->guest_valid_x = x; s->guest_valid_y = y;
+    s->guest_valid_w = w; s->guest_valid_h = h;
+}
+
+static void eng_guest_valid_clear(eng_surface* s)
+{
+    s->guest_valid_serial = 0;
+    s->guest_valid_x = s->guest_valid_y = s->guest_valid_w = s->guest_valid_h = 0;
+}
+
+static int eng_guest_valid_covers(const eng_surface* s, u32 x, u32 y, u32 w, u32 h)
+{
+    return s->guest_valid_serial && s->guest_valid_serial == s->color_serial &&
+           x >= s->guest_valid_x && y >= s->guest_valid_y &&
+           x + w <= s->guest_valid_x + s->guest_valid_w &&
+           y + h <= s->guest_valid_y + s->guest_valid_h;
+}
+
+/* PS3RECOMP_LIGHT_PROBE=1: log every guest readback of a small lighting
+ * render target -- the game measures exposure and sky light from 32x32 GPU
+ * renders (ToneMapSample, QuickAmbientSky, HarmonicsSample) and reads their
+ * mip chain on the CPU. Each line names the containing target (or the callsite
+ * refinement), the rectangle the guest got, the decoded RGBA bytes it read,
+ * and whether our guest copy was made at the surface's current colour serial.
+ * `stored` is the serial guest memory held before this copy, `ticket` the
+ * serial of an async copy fetched instead of the live surface, `covers`
+ * whether the previous copy already covered the rectangle, and `fresh`
+ * whether the bytes handed over are from the current serial. Default off;
+ * only 32x32 and <=2x2 targets are logged so the shadow 8x8 copies stay out
+ * of the run. */
+static int s_light_probe = -1;
+static int eng_light_probe_on(void)
+{
+    if (s_light_probe < 0) {
+        const char* e = getenv("PS3RECOMP_LIGHT_PROBE");
+        s_light_probe = e && *e && strcmp(e, "0") != 0;
+    }
+    return s_light_probe;
+}
+
+static void eng_light_probe_log(u32 slot, const eng_surface* s, u32 x, u32 y,
+                                u32 w, u32 h, const char* how, const u8* rows,
+                                u32 row_px, u64 stored, int covers, u64 ticket)
+{
+    if (!eng_light_probe_on()) return;
+    if (!((s->w == 32 && s->h == 32) || s->w * s->h <= 4u)) return;
+    const u32 bpp = eng_transfer_bpp(s->fmt);
+    double mr = -1.0, mg = -1.0, mb = -1.0, luma = -1.0;
+    u32 p0 = 0;
+    if (rows && bpp == 4u && w && h && row_px >= w) {
+        u64 r = 0, g = 0, b = 0;
+        const u64 np = (u64)w * h;
+        for (u32 ry = 0; ry < h; ry++) {
+            const u8* p = rows + (size_t)ry * row_px * 4u;
+            for (u32 rx = 0; rx < w; rx++, p += 4) {
+                r += p[0]; g += p[1]; b += p[2];
+            }
+        }
+        mr = (double)r / (double)np;
+        mg = (double)g / (double)np;
+        mb = (double)b / (double)np;
+        luma = 0.2126 * mr + 0.7152 * mg + 0.0722 * mb;
+        const u8* q = rows;
+        p0 = ((u32)q[3] << 24) | ((u32)q[0] << 16) | ((u32)q[1] << 8) | q[2];
+    }
+    const int fresh = s->guest_valid_serial && s->guest_valid_serial == s->color_serial;
+    fprintf(stderr, "[light probe] frame=%u slot=%u loc=%u addr=0x%08X fmt=0x%02X"
+                    " %ux%u pitch=%u how=%s rect=%u,%u %ux%u mean=%.2f,%.2f,%.2f"
+                    " luma=%.2f p0=%08X serial=%llu stored=%llu ticket=%llu"
+                    " covers=%d fresh=%d dirty=%d\n",
+            g.frames, slot, s->location, s->offset, s->fmt, s->w, s->h, s->pitch,
+            how, x, y, w, h, mr, mg, mb, luma, p0,
+            (unsigned long long)s->color_serial, (unsigned long long)stored,
+            (unsigned long long)ticket, covers, fresh, s->guest_dirty);
+}
+
+/* PS3RECOMP_RSX_WCB_RECT_LOG=<n>: the first n transfers, with the rectangle
+ * the guest asked for and the page-aligned one the copy covers. */
+static int s_rect_log_left = -1;
+static void eng_wcb_rect_log(u32 slot, const eng_surface* s, u32 xb, u32 bytes,
+                             u32 y, u32 h, int pending, const rsx_wcb_copy_rect* rr)
+{
+    if (s_rect_log_left < 0) {
+        const char* e = getenv("PS3RECOMP_RSX_WCB_RECT_LOG");
+        s_rect_log_left = e ? atoi(e) : 0;
+    }
+    if (s_rect_log_left <= 0) return;
+    s_rect_log_left--;
+    fprintf(stderr, "[rsx wcb rect] slot=%u loc=%u addr=0x%08X surf %ux%u pitch=%u"
+                    " ask xb=%u bytes=%u y=%u h=%u pending=%d copy=%s",
+            slot, s->location, s->offset, s->w, s->h, s->pitch, xb, bytes, y, h,
+            pending, rr ? "" : "whole\n");
+    if (rr)
+        fprintf(stderr, "%u,%u %ux%u\n", rr->x, rr->y, rr->w, rr->h);
+}
 
 /* RSX_ENGINE_COHERENCE_LOG=<n>: log the first n transfers the engine syncs,
  * with how many non-zero pixels moved -- the question when a composite comes
@@ -1637,11 +1817,7 @@ void rsx_draw_engine_guest_read(u32 location, u32 offset, u32 pitch, u32 w, u32 
                     location, offset, w, h);
         return;
     }
-    /* Armed for on-demand readback: one full copy, in stream order, covers
-     * this rectangle and reopens the pages. */
-    if (g.surfaces[slot].wcb_pending && rsx_wcb_resolve_cookie(slot, RSX_WCB_REASON_EXPLICIT))
-        return;
-    const eng_surface* s = &g.surfaces[slot];
+    eng_surface* s = &g.surfaces[slot];
     const u32 bpp = eng_transfer_bpp(s->fmt);
     /* The transfer counts 32-bit pixels, so w * 4 bytes per row; an FP16
      * surface pixel is two of them. Read back every surface pixel those bytes
@@ -1651,8 +1827,48 @@ void rsx_draw_engine_guest_read(u32 location, u32 offset, u32 pitch, u32 w, u32 
     if (y + h > s->h) h = s->h - y;
     const u32 x = xb / bpp, skip = xb % bpp;
     const u32 n = (skip + bytes + bpp - 1u) / bpp;
+    const int skip_on = eng_wcb_skip_on();
+    /* Armed for on-demand readback: copy, in stream order, and reopen the
+     * pages. With the skip cut, a copy whose serial is still the one guest
+     * memory holds (and which covers this rectangle) is not made again. */
+    if (s->wcb_pending) {
+        if (skip_on && eng_guest_valid_covers(s, x, y, n, h)) {
+            rsx_wcb_release(slot);
+            s->wcb_pending = 0;
+            WCB_COUNT(skipped, 1);
+            s_wcb.partial_slot = (int)slot;   /* the rest stays stale: re-arm */
+            eng_light_probe_log(slot, s, x, y, n, h, "armedskip", NULL, 0,
+                                s->guest_valid_serial, 1, 0);
+            return;
+        }
+        if (eng_wcb_rect_on()) {
+            rsx_wcb_copy_rect rr;
+            const int have = rsx_wcb_transfer_rect(s->offset, s->pitch, bpp, xb, bytes,
+                                                   y, h, s->w, s->h, &rr);
+            eng_wcb_rect_log(slot, s, xb, bytes, y, h, 1, have ? &rr : NULL);
+            if (have) {
+                s_wcb.rect_slot = (int)slot;
+                s_wcb.rect = rr;
+                const int done = rsx_wcb_resolve_cookie(slot, RSX_WCB_REASON_EXPLICIT);
+                s_wcb.rect_slot = -1;
+                if (done) return;
+            }
+        }
+        if (rsx_wcb_resolve_cookie(slot, RSX_WCB_REASON_EXPLICIT)) return;
+    }
+    /* Not armed: the target has not been drawn since the last copy, and that
+     * copy still covers this rectangle. */
+    if (skip_on && eng_guest_valid_covers(s, x, y, n, h)) {
+        WCB_COUNT(skipped, 1);
+        eng_light_probe_log(slot, s, x, y, n, h, "readskip", NULL, 0,
+                            s->guest_valid_serial, 1, 0);
+        return;
+    }
+    const u64 probe_stored = s->guest_valid_serial;
+    const int probe_covers = eng_guest_valid_covers(s, x, y, n, h);
     u8* rows = eng_coherence_buffer(n * bpp * h);
     if (!rows) return;
+    const unsigned long long t0 = eng_wcb_now_ns();
     g.be->submit_and_wait(g.be->user, RSX_BE_FLUSH_GUEST_REFERENCE);
     g.be->readback(g.be->user, s->handle, x, y, n, h, rows, n * bpp);
     if (eng_coherence_log())
@@ -1660,6 +1876,53 @@ void rsx_draw_engine_guest_read(u32 location, u32 offset, u32 pitch, u32 w, u32 
                         " %u non-zero pixels\n", location, offset, w, h, s->offset, bpp, x, y,
                 eng_nonzero_pixels(rows, n * h, bpp));
     eng_color_rows_store(bpp, location, offset, pitch, rows, n, h, skip, bytes, 0);
+    eng_guest_valid_set(s, x, y, n, h);
+    eng_light_probe_log(slot, s, x, y, n, h, "direct", rows, n,
+                        probe_stored, probe_covers, 0);
+    /* The copy is now what guest memory holds. A rectangle that did not cover
+     * the target leaves the rest stale, so the pages must be armed again
+     * before the next read (the transfer's own read is still to come). This
+     * only matters to the readback cuts; with both off nothing changes here,
+     * exactly as before them. */
+    if (eng_wcb_rect_on() || eng_wcb_skip_on()) {
+        if (x == 0 && y == 0 && n >= s->w && h >= s->h) {
+            s->guest_dirty = 0;
+            if (s_wcb.partial_slot == (int)slot) s_wcb.partial_slot = -1;
+        } else {
+            s->guest_dirty = 1;
+            s_wcb.partial_slot = (int)slot;
+        }
+    }
+    WCB_COUNT(copied, 1);
+    WCB_COUNT(bytes, (unsigned long long)pitch * h);
+    {
+        const unsigned long long done = eng_wcb_now_ns();
+        WCB_COUNT(copy_ns, done - t0);
+        eng_wcb_attr_note(0, slot, (u64)pitch * h, done - t0);
+    }
+}
+
+/* PWCB cut 1: the transfer that read a rectangle has finished reading guest
+ * memory. A rectangle-only resolve left the rest of the target stale and the
+ * pages open; take them away again so a later read of another part faults and
+ * is copied instead of reading old bytes. Called by cellGcmSys around
+ * nv3089_blit, on the walker (owner) thread. */
+void rsx_draw_engine_guest_read_done(void)
+{
+    const int slot = s_wcb.partial_slot;
+    s_wcb.partial_slot = -1;
+    s_wcb.rect_slot = -1;
+    if (slot < 0 || (u32)slot >= g.n_surfaces) return;
+    eng_surface* s = &g.surfaces[(u32)slot];
+    if (!s->handle || s->wcb_pending || !s->guest_dirty) return;
+    const u32 bpp = eng_transfer_bpp(s->fmt);
+    if (!bpp || s->pitch < s->w * bpp || !s->w || !s->h) return;
+    const u32 span = s->pitch * (s->h - 1u) + s->w * bpp;
+    void* host = (void*)eng_guest_ptr_raw(s->location, s->offset, span);
+    if (host && rsx_wcb_protect((u32)slot, host, span) == 0) {
+        s->wcb_pending = 1;
+        WCB_COUNT(armed, 1);
+    }
 }
 
 void rsx_draw_engine_guest_wrote(u32 location, u32 offset, u32 pitch, u32 w, u32 h)
@@ -1675,9 +1938,12 @@ void rsx_draw_engine_guest_wrote(u32 location, u32 offset, u32 pitch, u32 w, u32
         return;
     }
     x /= 4u;
-    const eng_surface* s = &g.surfaces[slot];
+    eng_surface* s = &g.surfaces[slot];
     if (x + w > s->w) w = s->w - x;
     if (y + h > s->h) h = s->h - y;
+    /* Guest bytes replaced the target's: a copy made from the surface no
+     * longer describes guest memory (PWCB cut 3). */
+    if (eng_wcb_skip_on()) eng_guest_valid_clear(s);
     u8* rows = eng_coherence_buffer(w * 4u * h);
     if (!rows) return;
     const int rgba = rsx_texture_argb_is_rgba();
@@ -2434,17 +2700,9 @@ static int eng_surface_to_guest(u32 slot)
     const u32 bpp = eng_transfer_bpp(s->fmt);
     if (!bpp || s->pitch < s->w * bpp || !g.be->readback)
         return 0;
-    const unsigned long long t0 = eng_wcb_now_ns();
     rsx_draw_engine_guest_read(s->location, s->offset, s->pitch, s->w, s->h);
     s->guest_dirty = 0;
     eng_textures_touch(s->location, s->offset, s->pitch * s->h);
-    WCB_COUNT(copied, 1);
-    WCB_COUNT(bytes, (unsigned long long)s->pitch * s->h);
-    {
-        const unsigned long long done = eng_wcb_now_ns();
-        WCB_COUNT(copy_ns, done - t0);
-        eng_wcb_attr_note(0, slot, (u64)s->pitch * s->h, done - t0);
-    }
     return 1;
 }
 
@@ -2669,22 +2927,45 @@ static void eng_wcb_drop_ticket(eng_surface* s)
     WCB_COUNT(async_discarded, 1);
 }
 
-/* Copy colour surface `slot` whole into guest memory through the protection.
- * `ticket`: take the bytes from the async copy queued at the sync point
- * instead of reading the surface as it is now. */
+/* Copy colour surface `slot` into guest memory through the protection. The
+ * rectangle is the transfer's when PS3RECOMP_RSX_WCB_RECT named one, else the
+ * whole target. `ticket`: take the bytes from the async copy queued at the
+ * sync point instead of reading the surface as it is now. */
 static int eng_wcb_copy_surface(u32 slot, int use_ticket)
 {
     eng_surface* s = &g.surfaces[slot];
     const u32 bpp = eng_transfer_bpp(s->fmt);
     if (!bpp || !s->handle || s->pitch < s->w * bpp || !s->w || !s->h) return 0;
+    u32 rx = 0, ry = 0, rw = s->w, rh = s->h;
+    if (s_wcb.rect_slot == (int)slot) {
+        rx = s_wcb.rect.x; ry = s_wcb.rect.y;
+        rw = s_wcb.rect.w; rh = s_wcb.rect.h;
+        s_wcb.rect_slot = -1;
+        if (!rw || !rh || rx + rw > s->w || ry + rh > s->h) { rx = ry = 0; rw = s->w; rh = s->h; }
+    }
+    const int full = rx == 0 && ry == 0 && rw == s->w && rh == s->h;
+    const u64 probe_stored = s->guest_valid_serial;
+    const int probe_covers = eng_guest_valid_covers(s, rx, ry, rw, rh);
+    const u64 probe_ticket = (use_ticket && full && s->wcb_ticket)
+                             ? s->wcb_ticket_serial : 0;
+    /* The serial has not moved since the copy that already covers this
+     * rectangle, and no guest write has replaced its bytes. */
+    if (!use_ticket && eng_wcb_skip_on() && eng_guest_valid_covers(s, rx, ry, rw, rh)) {
+        s->guest_dirty = full ? 0 : 1;
+        if (!full) s_wcb.partial_slot = (int)slot;
+        WCB_COUNT(skipped, 1);
+        eng_light_probe_log(slot, s, rx, ry, rw, rh, "skip", NULL, 0,
+                            probe_stored, probe_covers, 0);
+        return 1;
+    }
     const unsigned long long t0 = eng_wcb_now_ns();
-    u8* rows = eng_coherence_buffer(s->w * bpp * s->h);
+    u8* rows = eng_coherence_buffer(rw * bpp * rh);
     if (!rows) return 0;
     int from_ticket = 0;
-    if (use_ticket && s->wcb_ticket && g.be->readback_async_fetch) {
+    if (use_ticket && full && s->wcb_ticket && g.be->readback_async_fetch) {
         const u32 t = s->wcb_ticket;
         s->wcb_ticket = 0;
-        if (g.be->readback_async_fetch(g.be->user, t, rows, s->w * bpp) == 0) {
+        if (g.be->readback_async_fetch(g.be->user, t, rows, rw * bpp) == 0) {
             from_ticket = 1;
         } else {
             WCB_COUNT(async_discarded, 1);  /* fetch frees the ticket either way */
@@ -2694,27 +2975,202 @@ static int eng_wcb_copy_surface(u32 slot, int use_ticket)
         eng_wcb_drop_ticket(s);
         if (!g.be->readback) return 0;
         g.be->submit_and_wait(g.be->user, RSX_BE_FLUSH_GUEST_REFERENCE);
-        g.be->readback(g.be->user, s->handle, 0, 0, s->w, s->h, rows, s->w * bpp);
+        g.be->readback(g.be->user, s->handle, rx, ry, rw, rh, rows, rw * bpp);
     }
-    eng_color_rows_store(bpp, s->location, s->offset, s->pitch, rows, s->w, s->h, 0, s->w * bpp, 1);
+    eng_color_rows_store(bpp, s->location, s->offset + ry * s->pitch + rx * bpp,
+                         s->pitch, rows, rw, rh, 0, rw * bpp, 1);
     /* Drawn again since the queued copy: guest memory holds the sync point's
-     * bytes, and the next sync point arms it again for the newer ones. */
-    s->guest_dirty = from_ticket && s->color_serial != s->wcb_ticket_serial;
+     * bytes, and the next sync point arms it again for the newer ones. A
+     * rectangle-only copy leaves the rest stale and stays dirty either way. */
+    s->guest_dirty = full ? (from_ticket && s->color_serial != s->wcb_ticket_serial) : 1;
+    if (!full) s_wcb.partial_slot = (int)slot;
+    else if (s_wcb.partial_slot == (int)slot) s_wcb.partial_slot = -1;
+    eng_guest_valid_set(s, rx, ry, rw, rh);
     eng_textures_touch(s->location, s->offset, s->pitch * s->h);
+    eng_light_probe_log(slot, s, rx, ry, rw, rh, full ? "sync" : "rect", rows,
+                        rw, probe_stored, probe_covers, probe_ticket);
     WCB_COUNT(copied, 1);
-    WCB_COUNT(bytes, (unsigned long long)s->pitch * s->h);
+    WCB_COUNT(bytes, (unsigned long long)s->pitch * rh);
     if (from_ticket) WCB_COUNT(async_fetched, 1);
+    if (!full) WCB_COUNT(rect_copies, 1);
     {
         const unsigned long long done = eng_wcb_now_ns();
         WCB_COUNT(copy_ns, done - t0);
-        eng_wcb_attr_note(0, slot, (u64)s->pitch * s->h, done - t0);
+        eng_wcb_attr_note(0, slot, (u64)s->pitch * rh, done - t0);
     }
     return 1;
+}
+
+/* PWCB cut 2: one submission for all the readbacks a fault/transfer pass
+ * needs. Each surface is queued as an asynchronous copy into the open draw
+ * batch (PS3RECOMP_RSX_WCB_BATCH); the first fetch submits that batch, so N
+ * 4 KB mip copies cost one wait instead of N. The regions stay protected
+ * until their bytes have been stored, so no waiter sees stale guest memory. */
+#define ENG_WCB_BATCH_MAX 16
+typedef struct {
+    u32 slot, ticket;
+    u32 x, y, w, h;
+} eng_wcb_bjob;
+static eng_wcb_bjob s_bjobs[ENG_WCB_BATCH_MAX];
+static u32 s_nbjobs;
+
+/* Queue one surface's copy; 1 when it is handled (queued or skipped), 0 when
+ * the caller must copy it the ordinary way. */
+static int eng_wcb_job_queue(u32 slot)
+{
+    eng_surface* s = &g.surfaces[slot];
+    s->wcb_pending = 0;
+    const u32 bpp = eng_transfer_bpp(s->fmt);
+    if (!bpp || !s->handle || s->pitch < s->w * bpp || !s->w || !s->h) return 0;
+    if (!s->guest_dirty) {
+        eng_light_probe_log(slot, s, 0, 0, s->w, s->h, "nodirty", NULL, 0,
+                            s->guest_valid_serial,
+                            eng_guest_valid_covers(s, 0, 0, s->w, s->h), 0);
+        return 1;
+    }
+    u32 rx = 0, ry = 0, rw = s->w, rh = s->h;
+    if (s_wcb.rect_slot == (int)slot) {
+        rx = s_wcb.rect.x; ry = s_wcb.rect.y;
+        rw = s_wcb.rect.w; rh = s_wcb.rect.h;
+        s_wcb.rect_slot = -1;
+        if (!rw || !rh || rx + rw > s->w || ry + rh > s->h) { rx = ry = 0; rw = s->w; rh = s->h; }
+    }
+    const int full = rx == 0 && ry == 0 && rw == s->w && rh == s->h;
+    if (eng_wcb_skip_on() && eng_guest_valid_covers(s, rx, ry, rw, rh)) {
+        s->guest_dirty = full ? 0 : 1;
+        if (!full) s_wcb.partial_slot = (int)slot;
+        WCB_COUNT(skipped, 1);
+        eng_light_probe_log(slot, s, rx, ry, rw, rh, "batchskip", NULL, 0,
+                            s->guest_valid_serial, 1, 0);
+        return 1;
+    }
+    if (!g.be->readback_async) return 0;
+    eng_wcb_drop_ticket(s);
+    const u32 t = g.be->readback_async(g.be->user, s->handle, rx, ry, rw, rh);
+    if (!t) return 0;
+    if (s_nbjobs >= ENG_WCB_BATCH_MAX) {
+        if (g.be->readback_async_release) g.be->readback_async_release(g.be->user, t);
+        return 0;
+    }
+    s_bjobs[s_nbjobs].slot = slot; s_bjobs[s_nbjobs].ticket = t;
+    s_bjobs[s_nbjobs].x = rx; s_bjobs[s_nbjobs].y = ry;
+    s_bjobs[s_nbjobs].w = rw; s_bjobs[s_nbjobs].h = rh;
+    s_nbjobs++;
+    return 1;
+}
+
+static void eng_wcb_job_store(const eng_wcb_bjob* j)
+{
+    eng_surface* s = &g.surfaces[j->slot];
+    const u32 bpp = eng_transfer_bpp(s->fmt);
+    if (!bpp || !g.be->readback_async_fetch) return;
+    const u64 probe_stored = s->guest_valid_serial;
+    const int probe_covers = eng_guest_valid_covers(s, j->x, j->y, j->w, j->h);
+    const unsigned long long t0 = eng_wcb_now_ns();
+    u8* rows = eng_coherence_buffer(j->w * bpp * j->h);
+    if (!rows) { g.be->readback_async_release(g.be->user, j->ticket); return; }
+    if (g.be->readback_async_fetch(g.be->user, j->ticket, rows, j->w * bpp) != 0) return;
+    eng_color_rows_store(bpp, s->location, s->offset + j->y * s->pitch + j->x * bpp,
+                         s->pitch, rows, j->w, j->h, 0, j->w * bpp, 1);
+    const int full = j->x == 0 && j->y == 0 && j->w == s->w && j->h == s->h;
+    s->guest_dirty = full ? 0 : 1;
+    if (!full) s_wcb.partial_slot = (int)j->slot;
+    else if (s_wcb.partial_slot == (int)j->slot) s_wcb.partial_slot = -1;
+    eng_guest_valid_set(s, j->x, j->y, j->w, j->h);
+    eng_textures_touch(s->location, s->offset, s->pitch * s->h);
+    eng_light_probe_log(j->slot, s, j->x, j->y, j->w, j->h, "batch", rows,
+                        j->w, probe_stored, probe_covers, 0);
+    WCB_COUNT(copied, 1);
+    WCB_COUNT(bytes, (unsigned long long)s->pitch * j->h);
+    if (!full) WCB_COUNT(rect_copies, 1);
+    {
+        const unsigned long long done = eng_wcb_now_ns();
+        WCB_COUNT(copy_ns, done - t0);
+        eng_wcb_attr_note(0, j->slot, (u64)s->pitch * j->h, done - t0);
+    }
+}
+
+static void eng_wcb_batch_resolve(u32 cookie, int is_read)
+{
+    u32 extra[RSX_WCB_MAX_REGIONS];
+    const u32 nx = rsx_wcb_take_requests(extra, RSX_WCB_MAX_REGIONS);
+    u32 queued[RSX_WCB_MAX_REGIONS];
+    u32 nq = 0;
+    s_nbjobs = 0;
+    s_wcb.batching = 1;
+    WCB_COUNT(batches, 1);
+    /* The region that faulted. */
+    if (cookie & WCB_COOKIE_DEPTH) {
+        const u32 slot = cookie & 0xFFFFu;
+        if (slot < g.n_zdepths && g.zdepths[slot].wcb_pending) {
+            g.zdepths[slot].wcb_pending = 0;
+            if (g.zdepths[slot].guest_dirty && eng_zdepth_store(slot, 1) && is_read)
+                WCB_COUNT(demand_copies, 1);
+        }
+    } else if (cookie < g.n_surfaces && g.surfaces[cookie].wcb_pending) {
+        const u32 slot = cookie;
+        if (eng_wcb_job_queue(slot)) {
+            if (is_read) {
+                WCB_COUNT(demand_copies, 1);
+                g.surfaces[slot].wcb_reads++;
+                g.surfaces[slot].wcb_last_read = g.frames;
+            }
+        } else {
+            eng_surface* s = &g.surfaces[slot];
+            s->wcb_pending = 0;
+            if (eng_wcb_copy_surface(slot, 0)) {
+                if (is_read) { WCB_COUNT(demand_copies, 1); s->wcb_reads++; s->wcb_last_read = g.frames; }
+            }
+        }
+    }
+    /* Every other request the guest threads are blocked on. */
+    for (u32 i = 0; i < nx; i++) {
+        if (extra[i] & WCB_COOKIE_DEPTH) {
+            const u32 slot = extra[i] & 0xFFFFu;
+            if (slot < g.n_zdepths && g.zdepths[slot].wcb_pending) {
+                g.zdepths[slot].wcb_pending = 0;
+                if (g.zdepths[slot].guest_dirty && eng_zdepth_store(slot, 1) && is_read)
+                    WCB_COUNT(demand_copies, 1);
+            }
+            rsx_wcb_release(extra[i]);
+            continue;
+        }
+        const u32 slot = extra[i];
+        if (slot < g.n_surfaces && g.surfaces[slot].wcb_pending) {
+            if (eng_wcb_job_queue(slot)) {
+                queued[nq++] = extra[i];
+                if (is_read) {
+                    WCB_COUNT(demand_copies, 1);
+                    g.surfaces[slot].wcb_reads++;
+                    g.surfaces[slot].wcb_last_read = g.frames;
+                }
+            } else {
+                eng_surface* s = &g.surfaces[slot];
+                s->wcb_pending = 0;
+                if (eng_wcb_copy_surface(slot, 0) && is_read) {
+                    WCB_COUNT(demand_copies, 1);
+                    s->wcb_reads++;
+                    s->wcb_last_read = g.frames;
+                }
+                rsx_wcb_release(extra[i]);
+            }
+        } else {
+            rsx_wcb_release(extra[i]);
+        }
+    }
+    /* The first fetch submits the whole batch; the rest only read back what
+     * is already complete. */
+    WCB_COUNT(batched_copies, s_nbjobs);
+    for (u32 i = 0; i < s_nbjobs; i++) eng_wcb_job_store(&s_bjobs[i]);
+    for (u32 i = 0; i < nq; i++) rsx_wcb_release(queued[i]);
+    s_nbjobs = 0;
+    s_wcb.batching = 0;
 }
 
 /* rsx_wcb_resolve_fn: the guest (or the engine itself) is about to touch an
  * armed target's pages. Engine thread only. The module reopens the pages when
  * this returns. */
+static void eng_wcb_batch_resolve(u32 cookie, int is_read);
 static void eng_wcb_resolve(void* user, u32 cookie, int reason)
 {
     (void)user;
@@ -2728,6 +3184,15 @@ static void eng_wcb_resolve(void* user, u32 cookie, int reason)
     s_wcb_trigger = (reason == RSX_WCB_REASON_REQUEST || reason == RSX_WCB_REASON_FAULT)
                     ? ENG_WCB_TRIG_GUEST
                     : reason == RSX_WCB_REASON_EXPLICIT ? saved_trig : ENG_WCB_TRIG_OTHER;
+    /* PWCB cut 2: every request this pass is waiting for goes to the GPU as
+     * one batch (one submission, one wait) instead of one submit_and_wait
+     * each. */
+    if ((reason == RSX_WCB_REASON_REQUEST || reason == RSX_WCB_REASON_FAULT) &&
+        !s_wcb.batching && eng_wcb_batch_on()) {
+        eng_wcb_batch_resolve(cookie, is_read);
+        s_wcb_trigger = saved_trig;
+        return;
+    }
     if (cookie & WCB_COOKIE_DEPTH) {
         const u32 slot = cookie & 0xFFFFu;
         if (slot >= g.n_zdepths || !g.zdepths[slot].wcb_pending) { s_wcb_trigger = saved_trig; return; }
@@ -2874,11 +3339,14 @@ static void eng_wcb_frame_tick(void)
     const rsx_wcb_counters* m = &s_wcb.mod_mark;
     const unsigned long long waits = c.waits - m->waits, wait_ns = c.wait_ns - m->wait_ns;
     fprintf(stderr, "[rsx wcb] %u frames, per frame: dirty %.1f armed %.1f copied %.1f (%.0f KB:"
-                    " sync %.1f demand %.1f) async issued %.1f fetched %.1f discarded %.1f;"
+                    " sync %.1f demand %.1f, rect %.1f) skipped %.1f batch %.2f/%u;"
+                    " async issued %.1f fetched %.1f discarded %.1f;"
                     " faults %.1f waits %.1f (avg %.0f us, max %.0f us) copy %.2f ms; timeouts %llu"
                     " pending %u\n",
             s_wcb.win_frames, w->marked_dirty / f, w->armed / f, w->copied / f,
             w->bytes / f / 1024.0, w->sync_copies / f, w->demand_copies / f,
+            w->rect_copies / f, w->skipped / f,
+            w->batches / f, (unsigned)w->batched_copies,
             w->async_issued / f, w->async_fetched / f, w->async_discarded / f,
             (c.faults - m->faults) / f, waits / f, waits ? wait_ns / 1e3 / waits : 0.0,
             c.wait_max_ns / 1e3, w->copy_ns / f / 1e6, (unsigned long long)(c.timeouts - m->timeouts),
@@ -4233,6 +4701,75 @@ static int eng_target_at(u32 location, u32 offset)
 static u64 s_miss_fp_hash;
 static u32 s_miss_pipeline;
 
+/* PS3RECOMP_ENG_FSBIND_LOG=<max lines>: the units a near-full-screen draw
+ * samples, with the size, format and wrap it was decoded with. The tiled
+ * logo wipe is a full-screen draw sampling a texture at a size/scale the
+ * shader's coordinates do not expect; this names it without a GPU capture.
+ * Off by default; `max` caps the lines so a run stays readable. */
+static int s_fsbind_left = -1;
+static int s_fs_draw;
+
+static int eng_fsbind_on(void)
+{
+    if (s_fsbind_left < 0) {
+        const char* e = getenv("PS3RECOMP_ENG_FSBIND_LOG");
+        const char* g = getenv("PS3RECOMP_ENG_FSBIND_GATE");
+        s_fsbind_left = e ? atoi(e) : (g ? 1000000000 : 0);
+    }
+    return s_fsbind_left > 0;
+}
+
+static void eng_fsbind_log(u32 u, const rsx_dsp_texture* t, const eng_surface* target)
+{
+    if (s_fsbind_left <= 0) return;
+    rsx_be_sampler_desc sd;
+    eng_decode_sampler(t->filter, t->wrap, t->control0, &sd);
+    /* The tiled wipe needs the sampler to repeat (or mirror) a coordinate
+     * past its texture. Logging every full-screen draw floods the run with
+     * the clamp-sampled HUD quads, so those are skipped unless
+     * PS3RECOMP_ENG_FSBIND_ALL=1. */
+    static int all = -1;
+    if (all < 0) all = getenv("PS3RECOMP_ENG_FSBIND_ALL") ? 1 : 0;
+    const int wraps = sd.wrap_s == 1u || sd.wrap_s == 2u ||
+                      sd.wrap_t == 1u || sd.wrap_t == 2u;
+    if (!all && !wraps) return;
+    /* Optional file gate: log only while it exists, so a run can cover the
+     * pregame transition without a cap that boots/menus would exhaust. */
+    static const char* gate = (const char*)-1;
+    static int gate_open; static unsigned poll;
+    if (gate == (const char*)-1) gate = getenv("PS3RECOMP_ENG_FSBIND_GATE");
+    if (gate) {
+        if ((poll++ & 63u) == 0) {
+            FILE* g = fopen(gate, "rb");
+            gate_open = g != NULL;
+            if (g) fclose(g);
+        }
+        if (!gate_open) return;
+    }
+    /* One line per distinct binding: the same full-screen quad repeats every
+     * frame and would otherwise bury the run. */
+    static u64 seen[4096];
+    u64 key = (u64)s_miss_fp_hash ^ ((u64)u << 3) ^ ((u64)t->offset << 17) ^
+              ((u64)t->format << 41) ^ ((u64)t->width << 7) ^ ((u64)t->height << 23) ^
+              ((u64)t->wrap << 31) ^ ((u64)t->filter << 11) ^
+              ((u64)t->mipmaps << 47) ^ ((u64)t->cubemap << 53) ^
+              ((u64)(target ? target->offset : 0) << 29);
+    const u32 idx = (u32)(key ^ (key >> 32)) & 4095u;
+    if (seen[idx] == key) return;
+    seen[idx] = key;
+    s_fsbind_left--;
+    fprintf(stderr, "[eng fsbind] frame=%u fp=0x%016llX unit=%u addr=%u:0x%08X"
+                    " fmt=0x%02X %ux%u pitch=%u mips=%u cube=%u dim=%u depth=%u"
+                    " wrap=0x%08X ws=%u wt=%u filter=0x%08X lod=%.2f..%.2f"
+                    " remap=0x%04X rt=0x%08X %ux%u\n",
+            g.frames, (unsigned long long)s_miss_fp_hash, u, t->location,
+            t->offset, t->format, t->width, t->height, t->pitch, t->mipmaps,
+            t->cubemap, t->dimension, t->depth, t->wrap, sd.wrap_s, sd.wrap_t,
+            t->filter, sd.min_lod, sd.max_lod, t->remap & 0xFFFFu,
+            target ? target->offset : 0u, target ? target->w : 0u,
+            target ? target->h : 0u);
+}
+
 static void eng_tex_miss_note_reason(u32 u, const rsx_dsp_texture* t, unsigned reason)
 {
     rsx_tex_miss_note(reason, t->location, t->offset, t->format,
@@ -4268,6 +4805,9 @@ static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
                                    t.pitch, (int)t.cubemap);
             if (span) rsx_wcap_note_texture(t.location, t.offset, span);
         }
+        if (s_fs_draw && eng_fsbind_on())
+            eng_fsbind_log(u, &t, n_targets && target_slots[0] < g.n_surfaces
+                                      ? &g.surfaces[target_slots[0]] : NULL);
         eng_tmemo* mm = &s_tmemo[u];
         if (s_texmemo_on && mm->handle && mm->gen == s_tex_gen && mm->frame == g.frames &&
             ((s_tex_wgen_on && mm->wgen == g.rsx.tex_wgen[u]) || !memcmp(&mm->t, &t, sizeof t))) {
@@ -5196,8 +5736,14 @@ static void sink_end_work(void* user, const rsx_dispatch* r)
     if (wp) wp_t0 = rsx_wprof_now();
     s_miss_fp_hash = fp_hash;
     s_miss_pipeline = pipeline;
+    /* Full-screen draws only, for the tiled-wipe bind log. */
+    s_fs_draw = eng_fsbind_on() && target < g.n_surfaces &&
+                (u64)(sf.clip_w ? sf.clip_w : g.width) *
+                    (sf.clip_h ? sf.clip_h : g.height) * 10ull >=
+                (u64)g.surfaces[target].w * g.surfaces[target].h * 9ull;
     const u32 tex_mask = sink_bind_textures(targets, n_targets, zslot, tex_used,
                                             textures, samplers);
+    s_fs_draw = 0;
     if (wp) wprof_phase(RSX_WPROF_TEX, rsx_wprof_now() - wp_t0);
     if (tex_mask == ENG_INVALID) return;
     if (wp) wp_t0 = rsx_wprof_now();

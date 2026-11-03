@@ -99,6 +99,7 @@ typedef struct {
     u32 last_released;
     float last_clear_depth;
     int n_depth_readback;
+    int n_readback;               /* colour readbacks (transfer coherence) */
     u32 color_w, color_h;         /* size of the last colour surface created */
     float vp_xf[8];               /* viewport epilogue after the VS constants */
     /* the last cube_render_target request */
@@ -326,6 +327,7 @@ static void stub_readback(void* u, u32 s, u32 x, u32 y, u32 w, u32 h,
                           void* out, u32 pitch)
 {
     (void)u; (void)s; (void)x; (void)y;
+    stub.n_readback++;
     const u32 bpp = pitch >= w * 8u ? 8u : 4u;
     for (u32 r = 0; r < h; r++)
         for (u32 c = 0; c < w; c++) {
@@ -1338,6 +1340,78 @@ static void test_queued_flip_buffer(void)
     CHECK(stub.n_present == presents, "noting a flip does not present");
     rsx_draw_engine_present();
     CHECK(presented_surface == first, "host present follows the noted flip");
+    engine_down();
+}
+
+/* PWCB cut 1: the page-aligned rectangle a transfer's bytes cover. The copy
+ * may include page neighbours but must never leave a requested byte out. */
+static void test_wcb_transfer_rect(void)
+{
+    printf("-- wcb transfer rect\n");
+    rsx_wcb_copy_rect r;
+    /* 512x512 A8R8G8B8 at pitch 2048: one 4 KB page covers a whole row, so a
+     * one-row read is one row wide, not the whole target. */
+    CHECK(rsx_wcb_transfer_rect(0x10000u, 2048u, 4u, 0u, 2048u, 100u, 1u,
+                                512u, 512u, &r) &&
+          r.x == 0 && r.y == 100 && r.w == 512 && r.h == 1,
+          "512x512 pitch 2048, one row: %u,%u %ux%u", r.x, r.y, r.w, r.h);
+    CHECK(rsx_wcb_transfer_rect(0x10000u, 2048u, 4u, 0u, 2048u, 0u, 512u,
+                                512u, 512u, &r) &&
+          r.x == 0 && r.y == 0 && r.w == 512 && r.h == 512,
+          "a full-target read stays the full target: %u,%u %ux%u", r.x, r.y, r.w, r.h);
+    /* A row wider than a page: the copy is clipped to the pages the read
+     * touches, page-aligned inside the row. */
+    CHECK(rsx_wcb_transfer_rect(0x10000u, 16384u, 4u, 0x1000u, 16u, 0u, 1u,
+                                4096u, 8u, &r) &&
+          r.x == 1024 && r.y == 0 && r.w == 1024 && r.h == 1,
+          "16 bytes at byte 4096 of a 16 KB row: %u,%u %ux%u", r.x, r.y, r.w, r.h);
+    CHECK(rsx_wcb_transfer_rect(0x10000u, 16384u, 4u, 0x1000u, 16u, 1u, 1u,
+                                4096u, 8u, &r) &&
+          r.x == 1024 && r.y == 1 && r.w == 1024 && r.h == 1,
+          "the next row maps to the same page columns: %u,%u %ux%u", r.x, r.y, r.w, r.h);
+    /* A row that starts inside a page: the partial page at its head is not
+     * copied, the full page the read lands in is. */
+    CHECK(rsx_wcb_transfer_rect(0x10080u, 16384u, 4u, 0x2000u, 16u, 0u, 1u,
+                                4096u, 4u, &r) &&
+          r.x == 2016 && r.w == 1024,
+          "a read in the page after a row's unaligned head: %u,%u %ux%u",
+          r.x, r.y, r.w, r.h);
+    /* Clamped to the target, and empty when outside it. */
+    CHECK(rsx_wcb_transfer_rect(0x10000u, 2048u, 4u, 0u, 2048u, 511u, 10u,
+                                512u, 512u, &r) &&
+          r.y == 511 && r.h == 1,
+          "rows past the bottom are dropped: %u,%u %ux%u", r.x, r.y, r.w, r.h);
+    CHECK(!rsx_wcb_transfer_rect(0x10000u, 2048u, 4u, 2048u, 16u, 0u, 1u,
+                                 512u, 512u, &r),
+          "a read past the row is empty");
+}
+
+/* PWCB cut 3: a copy is reused while the target's serial has not moved and a
+ * guest write to the same bytes invalidates it. */
+static void test_wcb_skip_invalidation(void)
+{
+    printf("-- wcb skip + invalidation\n");
+    setenv("PS3RECOMP_RSX_WCB_SKIP", "1", 1);
+    engine_up();
+    m(M_COLOR_A_PITCH, 1024u);
+    draw_triangle();
+    const u32 base = 0x40000u;
+    stub.n_readback = 0;
+    rsx_draw_engine_guest_read(RSX_LOCATION_LOCAL, base + 1024u, 1024u, 2u, 1u);
+    CHECK(stub.n_readback == 1, "the first read copies (%d)", stub.n_readback);
+    rsx_draw_engine_guest_read(RSX_LOCATION_LOCAL, base + 1024u, 1024u, 2u, 1u);
+    CHECK(stub.n_readback == 1,
+          "the same rectangle at the same serial is not copied again (%d)", stub.n_readback);
+    /* A new write moves the colour serial. */
+    draw_triangle();
+    rsx_draw_engine_guest_read(RSX_LOCATION_LOCAL, base + 1024u, 1024u, 2u, 1u);
+    CHECK(stub.n_readback == 2, "a new draw invalidates the copy (%d)", stub.n_readback);
+    /* A guest write into the same target's bytes invalidates even without a
+     * new draw. */
+    rsx_draw_engine_guest_wrote(RSX_LOCATION_LOCAL, base + 3u * 1024u, 1024u, 2u, 1u);
+    rsx_draw_engine_guest_read(RSX_LOCATION_LOCAL, base + 1024u, 1024u, 2u, 1u);
+    CHECK(stub.n_readback == 3, "a guest write invalidates the copy (%d)", stub.n_readback);
+    unsetenv("PS3RECOMP_RSX_WCB_SKIP");
     engine_down();
 }
 
@@ -2917,6 +2991,8 @@ int main(void)
     test_polygon_offset();
     test_queued_flip_buffer();
     test_transfer_coherence();
+    test_wcb_transfer_rect();
+    test_wcb_skip_invalidation();
     test_transfer_rows();
     test_transfer_reads_fp16();
     test_inline_array();

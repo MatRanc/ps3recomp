@@ -453,6 +453,25 @@ void rsx_draw_engine_note_flip(u32 buffer_id);
 void rsx_draw_engine_guest_read(u32 location, u32 offset, u32 pitch, u32 w, u32 h);
 void rsx_draw_engine_guest_wrote(u32 location, u32 offset, u32 pitch, u32 w, u32 h);
 
+/* PWCB cut 1 (PS3RECOMP_RSX_WCB_RECT): the page-aligned surface-pixel
+ * rectangle covering the byte span a 2-D transfer reads. `guest_base` is the
+ * surface's guest address, `pitch` its row pitch, `bpp` bytes per pixel, `xb`
+ * the first byte read inside a row, `byte_w` bytes per row, `y` the first row
+ * and `rows` how many. The rectangle is clamped to the surface. Returns 1 when
+ * non-empty. Exported for the unit test. */
+typedef struct rsx_wcb_copy_rect {
+    u32 x, y, w, h;
+} rsx_wcb_copy_rect;
+int rsx_wcb_transfer_rect(u32 guest_base, u32 pitch, u32 bpp, u32 xb, u32 byte_w,
+                          u32 y, u32 rows, u32 surf_w, u32 surf_h,
+                          rsx_wcb_copy_rect* out);
+
+/* PWCB cut 1: the transfer's guest read of a rectangle is over (nv3089_blit
+ * has copied the source to its destination). Re-protect the rest of a surface
+ * that a rectangle-only resolve left stale, so a later read of another part
+ * faults and is copied rather than reading old bytes. */
+void rsx_draw_engine_guest_read_done(void);
+
 /* Flush all dirty offscreen render surfaces (and depth buffers) back to guest
  * memory before CPU/SPU synchronization points (SET_REFERENCE, SEMAPHORE_RELEASE,
  * flip). This ensures titles reading back offscreen-rendered textures from guest
@@ -583,6 +602,10 @@ typedef struct rsx_draw_engine_wcb_stats {
     unsigned long long async_issued;    /* copies queued on the GPU                 */
     unsigned long long async_fetched;   /*   ... whose bytes the guest got          */
     unsigned long long async_discarded; /*   ... superseded or dropped unread       */
+    unsigned long long skipped;         /* copies avoided: guest copy still valid   */
+    unsigned long long rect_copies;     /*   ... of the copies, rectangle-only      */
+    unsigned long long batches;         /* batched request resolves (one submission) */
+    unsigned long long batched_copies;  /*   ... copies those batches carried       */
     unsigned long long faults;          /* guest faults on armed pages              */
     unsigned long long waits;           /* guest-thread waits for a copy            */
     unsigned long long wait_ns;         /*   ... total                              */

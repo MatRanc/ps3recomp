@@ -1339,6 +1339,9 @@ static void gcm_row_copy(u32 d, u32 s, u32 n)
 
 static void nv3089_blit(void)
 {
+    /* A rectangle-only WCB resolve left the previous transfer's source pages
+     * open; close them again now that its read is over (PWCB cut 1). */
+    rsx_draw_engine_guest_read_done();
     u32 out_w = s_nv3089.out_sz & 0xFFFF, out_h = s_nv3089.out_sz >> 16;
     u32 out_x = s_nv3089.out_pt & 0xFFFF, out_y = s_nv3089.out_pt >> 16;
     u32 in_pitch = s_nv3089.in_fmt & 0xFFFF;
@@ -1432,6 +1435,7 @@ static void nv3089_blit(void)
           if (cap && _n < cap) { _n++;
             printf("[NV3089] swizzled %ux%u fmt=0x%X src=0x%08X -> NV309E dst=0x%08X%c",
                    out_w, out_h, f, src2, dst2, 10); } }
+        rsx_draw_engine_guest_read_done();
         return;
       } }
     /* 0x3 is A8R8G8B8 in the scaled-image format enum. This title uses it for
@@ -1537,6 +1541,7 @@ static void nv3089_blit(void)
       if (cap && _n < cap) { _n++;
         printf("[NV3089] %ux%u fmt=0x%X src=0x%08X(pitch %u) -> dst=0x%08X(pitch %u) at %u,%u\n",
                out_w, out_h, f, src, in_pitch, dst, dst_pitch, out_x, out_y); } }
+    rsx_draw_engine_guest_read_done();
 }
 
 static void gcm_2d_method(u32 subch, u32 method, u32 data)

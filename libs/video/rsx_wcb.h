@@ -117,7 +117,13 @@ int  rsx_wcb_resolve_cookie(uint32_t cookie, int reason);
 void rsx_wcb_resolve_all(int reason);
 /* Owner thread: resolve regions other threads asked for. Returns how many. */
 int  rsx_wcb_service(void);
-/* Nonzero when a request is waiting for the owner. One relaxed load. */
+/* Owner thread: take every region another thread asked for, marking them
+ * RESOLVING and returning their cookies in `cookies` (at most `max`). The
+ * caller resolves and copies them as one batch, then releases each with
+ * rsx_wcb_release(); the waiters then proceed. Regions sharing pages are not
+ * grouped here -- the caller handles each cookie on its own. Returns how many
+ * cookies were taken. */
+uint32_t rsx_wcb_take_requests(uint32_t* cookies, uint32_t max);/* Nonzero when a request is waiting for the owner. One relaxed load. */
 int  rsx_wcb_requests_pending(void);
 
 /* The fault handler's core, for hosts that dispatch faults themselves:
