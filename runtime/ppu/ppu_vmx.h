@@ -28,6 +28,24 @@ extern "C" {
 #define VMX_INL static inline
 
 /* ---- element access (big-endian) ---- */
+#if defined(PS3RECOMP_VMX_FAST_ACCESSORS) && defined(__GNUC__)
+/* #149: one unaligned load/store plus a byte swap instead of a byte at a time.
+ * Clang folds __builtin_bswap* into a movbe or a single bswap; the byte loop
+ * it replaces was three shifts and three ors per access in the hot lifted TUs. */
+VMX_INL uint16_t vmx_h(const uint8_t* v, int i) {
+    uint16_t x; memcpy(&x, v + 2 * i, 2);
+    return (uint16_t)((x >> 8) | (uint16_t)(x << 8));
+}
+VMX_INL uint32_t vmx_w(const uint8_t* v, int i) {
+    uint32_t x; memcpy(&x, v + 4 * i, 4); return __builtin_bswap32(x);
+}
+VMX_INL void vmx_sh(uint8_t* v, int i, uint16_t x) {
+    x = (uint16_t)((x >> 8) | (uint16_t)(x << 8)); memcpy(v + 2 * i, &x, 2);
+}
+VMX_INL void vmx_sw(uint8_t* v, int i, uint32_t x) {
+    x = __builtin_bswap32(x); memcpy(v + 4 * i, &x, 4);
+}
+#else
 VMX_INL uint16_t vmx_h(const uint8_t* v, int i) { return (uint16_t)(v[2 * i] << 8 | v[2 * i + 1]); }
 VMX_INL uint32_t vmx_w(const uint8_t* v, int i) {
     return (uint32_t)v[4 * i] << 24 | (uint32_t)v[4 * i + 1] << 16 | (uint32_t)v[4 * i + 2] << 8 | v[4 * i + 3];
@@ -36,6 +54,7 @@ VMX_INL void vmx_sh(uint8_t* v, int i, uint16_t x) { v[2 * i] = (uint8_t)(x >> 8
 VMX_INL void vmx_sw(uint8_t* v, int i, uint32_t x) {
     v[4 * i] = (uint8_t)(x >> 24); v[4 * i + 1] = (uint8_t)(x >> 16); v[4 * i + 2] = (uint8_t)(x >> 8); v[4 * i + 3] = (uint8_t)x;
 }
+#endif
 VMX_INL float    vmx_f(uint32_t u) { float f; memcpy(&f, &u, 4); return f; }
 VMX_INL uint32_t vmx_u(float f) { uint32_t u; memcpy(&u, &f, 4); return u; }
 

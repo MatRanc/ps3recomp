@@ -202,6 +202,19 @@ option(PS3RECOMP_SPU_FAST_LS "Vector local-store access, no LS diagnostics, in l
 # tag-update handlers (spu_wrch_fast/spu_rdch_fast, runtime/spu/spu_helpers.h). Same effects; the
 # out-of-line calls come back by themselves while SPU_CHHIST, SPU_POLLTRACE or SPU_TAGPROBE is set.
 option(PS3RECOMP_SPU_WRCH_INLINE "Inline MFC channel writes in lifted SPU code" ON)
+# PS3RECOMP_VMX_FAST_ACCESSORS: lifted PPU VMX element access uses one unaligned
+# load/store plus a byte swap instead of a byte at a time (#149). Semantics are
+# identical; this is a codegen-only switch.
+option(PS3RECOMP_VMX_FAST_ACCESSORS "memcpy+bswap VMX element accessors in lifted PPU code" OFF)
+if(PS3RECOMP_VMX_FAST_ACCESSORS AND TARGET ${PROJECT_NAME})
+    target_compile_definitions(${PROJECT_NAME} PRIVATE PS3RECOMP_VMX_FAST_ACCESSORS=1)
+endif()
+# PS3RECOMP_SPU_AVX2: compile the lifted SPU TUs for AVX2+FMA and forbid
+# contraction, which enables the exact 4-lane float and integer blocks in
+# spu_helpers.h (#69/#137). -mavx2/-mfma are already implied by a
+# -march=native build; -ffp-contract=off is not, and is what keeps the exact
+# path exact. Default off.
+option(PS3RECOMP_SPU_AVX2 "Compile lifted SPU code with AVX2/FMA and fp-contract=off" OFF)
 if(SPU_SOURCES)
     set(_spu_defs SPU_USE_DISPATCH_MT)
     set(_spu_opts "")
@@ -238,6 +251,12 @@ if(SPU_SOURCES)
         if(_spu_x86)
             list(APPEND _spu_opts -mssse3)
         endif()
+    endif()
+    if(PS3RECOMP_SPU_AVX2)
+        if(NOT _spu_x86 OR NOT _spu_gnu_flags)
+            message(FATAL_ERROR "PS3RECOMP_SPU_AVX2 needs Clang or GCC on x86")
+        endif()
+        list(APPEND _spu_opts -mavx2 -mfma -ffp-contract=off)
     endif()
     set_source_files_properties(${SPU_SOURCES} PROPERTIES
         INCLUDE_DIRECTORIES "${PS3RECOMP_DIR}/runtime/spu"
@@ -307,6 +326,14 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
         # and the optimised configurations keep their own levels.
         $<$<NOT:$<CONFIG:Debug,Release,RelWithDebInfo,MinSizeRel>>:-O1>
     )
+    # PS3RECOMP_PPU_X86_64_V3 (#261): movbe for the lifted big-endian loads.
+    # A -march=native build already implies (and exceeds) this, so the option
+    # is deliberately a no-op there rather than overriding native with v3.
+    option(PS3RECOMP_PPU_X86_64_V3 "Compile lifted PPU code for x86-64-v3 when not using -march=native" OFF)
+    string(FIND "${CMAKE_C_FLAGS} ${CMAKE_C_FLAGS_RELEASE} ${CMAKE_CXX_FLAGS} ${CMAKE_CXX_FLAGS_RELEASE}" "-march=native" _ps3_native)
+    if(PS3RECOMP_PPU_X86_64_V3 AND _ps3_native EQUAL -1)
+        target_compile_options(${PROJECT_NAME} PRIVATE -march=x86-64-v3)
+    endif()
 elseif(MSVC)
     target_compile_options(${PROJECT_NAME} PRIVATE
         /W3 /wd4100 /wd4244 /wd4267

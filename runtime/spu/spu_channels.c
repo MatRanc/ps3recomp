@@ -43,6 +43,15 @@
 #include <time.h>
 #include "../platform/win32_compat.h"
 #include "ps3emu/log_first.h"
+/* Live A/B key for the MFC engine memo (libs/video's control file). Kept
+ * optional so the standalone SPU test harnesses, which do not put libs/video
+ * on their include path, still build this file. */
+#if defined(__has_include)
+#  if __has_include("ps3_live_ctl.h")
+#    include "ps3_live_ctl.h"
+#    define SPU_HAVE_LIVE_CTL 1
+#  endif
+#endif
 
 #ifdef __cplusplus
 extern "C" {
@@ -444,6 +453,12 @@ static SPU_TLS struct {
 } s_mfc_recent;
 static int spu_mfc_cache_enabled(void)
 {
+#ifdef SPU_HAVE_LIVE_CTL
+    /* Read the live key on every use so PS3RECOMP_CTL can flip it mid-run.
+     * A relaxed atomic load is far cheaper than the registry SRW lock this
+     * memo exists to avoid. */
+    if (ps3_live_ctl_get) return ps3_live_ctl_get(PS3_LIVE_SPU_MFC_CACHE) != 0;
+#endif
     static atomic_int cached;
     int value = atomic_load_explicit(&cached, memory_order_relaxed);
     if (!value) {

@@ -2619,10 +2619,32 @@ static u32 eng_texture_slot(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
     if (g.n_textures < ENG_MAX_TEXTURES) {
         index = g.n_textures++;
     } else {
+        /* PS3RECOMP_RSX_TEX_PIN (#136): never evict an entry bound this
+         * frame. A texture created mid-frame can otherwise evict the very
+         * one the draw that needed it just bound, forcing a re-upload
+         * cascade (the NHL port's puck-drop stall). Empty slots are taken
+         * first above; when every entry is pinned this frame, fall back to
+         * the plain LRU rather than refusing the bind. */
+        static u32 s_pin_frame = 0xFFFFFFFFu;
+        static u64 s_pin_base;
+        if (s_pin_frame != g.frames) { s_pin_frame = g.frames; s_pin_base = g.texture_use_serial; }
+        const int pin = eng_wcb_cut_on(PS3_LIVE_TEX_PIN, "PS3RECOMP_RSX_TEX_PIN");
         index = 0;
-        for (u32 i = 1; i < g.n_textures; i++)
-            if (g.textures[i].last_use_serial < g.textures[index].last_use_serial)
-                index = i;
+        u32 oldest = 0xFFFFFFFFu; u64 oldest_use = 0;
+        int have_unpinned = 0;
+        for (u32 i = 0; i < g.n_textures; i++) {
+            const u64 use = g.textures[i].last_use_serial;
+            if (pin && use > s_pin_base) {          /* bound this frame */
+                if (!have_unpinned && (oldest == 0xFFFFFFFFu || use < oldest_use)) {
+                    oldest = i; oldest_use = use;
+                }
+                continue;
+            }
+            if (!have_unpinned || use < oldest_use) {
+                index = i; oldest_use = use; have_unpinned = 1;
+            }
+        }
+        if (!have_unpinned && oldest != 0xFFFFFFFFu) index = oldest;
         evicted = g.textures[index].handle;
     }
 

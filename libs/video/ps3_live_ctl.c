@@ -40,6 +40,10 @@ static const char* const K_NAME[PS3_LIVE_COUNT] = {
     "PS3RECOMP_RSX_WCB_RECT",
     "PS3RECOMP_RSX_WCB_BATCH",
     "PS3RECOMP_RSX_WCB_SKIP",
+    "SPU_MFC_LOOKUP_CACHE",
+    "GCM_NOP_SKIP",
+    "GCM_REF_IMMEDIATE",
+    "PS3RECOMP_RSX_TEX_PIN",
 };
 
 static _Atomic int s_val[PS3_LIVE_COUNT];

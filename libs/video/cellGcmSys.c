@@ -2020,6 +2020,18 @@ static void gcm_ring_overrun_log(u32 from, u32 put)
     fprintf(stderr, "\n");
 }
 
+static void gcm_ref_publish_one(int src);
+/* GCM_REF_IMMEDIATE (#61): publish every queued fence the moment the walker
+ * executes SET_REFERENCE instead of one per drain tail. Live: PS3RECOMP_CTL
+ * can flip it mid-run. Defined below, where s_ref_pub_lock lives. */
+static void gcm_ref_publish_now(void);
+static int gcm_ref_immediate_on(void)
+{
+    if (ps3_live_ctl_get) return ps3_live_ctl_get(PS3_LIVE_GCM_REF_IMMEDIATE) != 0;
+    const char* e = getenv("GCM_REF_IMMEDIATE");
+    return e && *e && strcmp(e, "0") != 0;
+}
+
 static void gcm_ref_push_at(u32 v, u32 getoff)
 {
     { static int _d = -1; if (_d < 0) _d = getenv("GCM_REFLOG") ? 1 : 0;
@@ -2033,6 +2045,9 @@ static void gcm_ref_push_at(u32 v, u32 getoff)
     }
     s_ref_q[t % GCM_REF_QLEN] = v;
     s_ref_qtail = t + 1;
+    /* Immediate mode drains the queue through the value just executed, so the
+     * register ends on this fence and any boot backlog is not left to lag. */
+    if (gcm_ref_immediate_on()) gcm_ref_publish_now();
 }
 
 /* Global fence-publication counter: lets the lwmutex convoy trace correlate a
@@ -2193,6 +2208,15 @@ static void gcm_wcb_wake(void)
  * boot froze with all threads parked on fences that were never published in
  * order). TryAcquire: a contended poll just reads the current ref. */
 static SRWLOCK s_ref_pub_lock = SRWLOCK_INIT;
+
+/* Publish down to the queue tail: the walker just executed a SET_REFERENCE and
+ * the title may read the register before the next drain. */
+static void gcm_ref_publish_now(void)
+{
+    AcquireSRWLockExclusive(&s_ref_pub_lock);
+    while (s_ref_qhead != s_ref_qtail) gcm_ref_publish_one(2);
+    ReleaseSRWLockExclusive(&s_ref_pub_lock);
+}
 
 void cellGcm_ref_on_poll(void)
 {
@@ -2620,6 +2644,14 @@ static void gcm_rsx_process_fifo_unlocked(void)
     static int s_nop_watch = -1;
     if (s_nop_watch < 0) s_nop_watch = (getenv("TCONST_FIFO") || gcm_ringdbg()) ? 1 : 0;
     const int nop_skip = !wdiag || (wmirror && !s_nop_watch);
+    /* GCM_NOP_SKIP (#230): NV4097_NO_OPERATION (method 0x0100, count 0) runs
+     * are skipped like zero runs. The word decodes to nothing in this tree --
+     * no state, no draw, no engine call -- so passing the first and the rest
+     * through the method path is pure decode cost. Off by default and never
+     * while a walker capture is being recorded, so the replay stream and its
+     * hash stay identical. Live: PS3RECOMP_CTL can flip it mid-run. */
+    const int nop0100_skip = nop_skip && !wcap &&
+        gcm_live_get(PS3_LIVE_NOP_SKIP, "GCM_NOP_SKIP");
     /* The mirrored engines, read where the first method word reaches them. */
     static int s_live = -1, s_eng = -1;
     /* rsx_state feeds only the legacy vtable backend. With the draw engine
@@ -2836,6 +2868,32 @@ static void gcm_rsx_process_fifo_unlocked(void)
             u32 t = s_fifo_getoff + 4u;
             if (off - t > 4u * GCM_TRACE_N) { s_tr_i += (off - t) / 4u - GCM_TRACE_N; t = off - 4u * GCM_TRACE_N; }
             for (; t < off; t += 4u) { s_tr_off[s_tr_i % GCM_TRACE_N] = t; s_tr_w[s_tr_i % GCM_TRACE_N] = 0; s_tr_i++; }
+            park_off = 0;
+            s_fifo_getoff = off;
+            continue;
+        }
+        /* NV4097_NO_OPERATION run: same bookkeeping as the zero-run skip
+         * above, then one step over the whole run. */
+        if (w == 0x00000100u && nop0100_skip) {
+            const u32 page_end = (s_fifo_getoff | 0xFFFFFu) + 1u;
+            const u32 lim = (put > s_fifo_getoff && put < page_end) ? put : page_end;
+            u32 off = s_fifo_getoff + 4u, nea = ea + 4u;
+            while (off < lim && budget > 0 && vm_read32(nea) == 0x00000100u) {
+                off += 4u; nea += 4u; budget--;
+            }
+            if (gcm_ringdbg() && s_fifo_getoff < s_ring_io_end && off > s_ring_io_end)
+                gcm_ring_overrun_log(s_fifo_getoff, put);
+            if (s_fifo_getoff < put) s_last_ring_off = off;
+            u32 t = s_fifo_getoff + 4u;
+            if (off - t > 4u * GCM_TRACE_N) {
+                s_tr_i += (off - t) / 4u - GCM_TRACE_N;
+                t = off - 4u * GCM_TRACE_N;
+            }
+            for (; t < off; t += 4u) {
+                s_tr_off[s_tr_i % GCM_TRACE_N] = t;
+                s_tr_w[s_tr_i % GCM_TRACE_N] = 0x00000100u;
+                s_tr_i++;
+            }
             park_off = 0;
             s_fifo_getoff = off;
             continue;

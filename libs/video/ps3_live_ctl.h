@@ -41,6 +41,10 @@ enum {
     PS3_LIVE_WCB_RECT,          /* WCB: resolve only the transfer's rectangle */
     PS3_LIVE_WCB_BATCH,         /* WCB: one submission for a pass's readbacks */
     PS3_LIVE_WCB_SKIP,          /* WCB: skip a copy whose serial has not moved */
+    PS3_LIVE_SPU_MFC_CACHE,     /* SPU_MFC_LOOKUP_CACHE: per-thread MFC engine memo */
+    PS3_LIVE_NOP_SKIP,          /* GCM_NOP_SKIP: skip NV4097 NOP (0x0100) runs */
+    PS3_LIVE_GCM_REF_IMMEDIATE, /* GCM_REF_IMMEDIATE: publish SET_REFERENCE now */
+    PS3_LIVE_TEX_PIN,           /* PS3RECOMP_RSX_TEX_PIN: never evict a texture bound this frame */
     PS3_LIVE_COUNT
 };
 
