@@ -163,6 +163,16 @@ static mutex_t       s_audio_mutex;
 /* Output mix buffer (stereo, one block worth) */
 static float s_mix_buffer[CELL_AUDIO_BLOCK_SAMPLES * 2];
 
+/* PS3RECOMP_AUDIO_DIAG=1: one-shot backend/device report plus a once-a-second
+ * mix-thread line (peak, queued samples, port 0 read index). Default off; the
+ * existing failure paths still print. */
+static int audio_diag_on(void)
+{
+    static int v = -1;
+    if (v < 0) { const char* e = getenv("PS3RECOMP_AUDIO_DIAG"); v = (e && *e && *e != '0') ? 1 : 0; }
+    return v;
+}
+
 /* ---------------------------------------------------------------------------
  * Host audio output backend
  * -----------------------------------------------------------------------*/
@@ -192,6 +202,12 @@ static int audio_backend_init(void)
     if (s_sdl_audio_dev == 0) {
         printf("[cellAudio] SDL_OpenAudioDevice failed: %s\n", SDL_GetError());
         return -1;
+    }
+
+    if (audio_diag_on()) {
+        printf("[cellAudio] diag: SDL driver=%s freq=%d format=0x%04x channels=%d samples=%d\n",
+               SDL_GetCurrentAudioDriver() ? SDL_GetCurrentAudioDriver() : "?",
+               have.freq, (unsigned)have.format, have.channels, have.samples);
     }
 
     SDL_PauseAudioDevice(s_sdl_audio_dev, 0); /* Start playback */
@@ -716,6 +732,25 @@ static void* audio_mix_thread_func(void* arg)
             }
         }
 
+        /* PS3RECOMP_AUDIO_DIAG=1: once a second, is the mix nonzero and is
+         * the device consuming it? Port 0 is the title's only port here. */
+        if (audio_diag_on()) {
+            static long long t0; static unsigned n;
+            long long now = audio_now_ns(); if (!t0) t0 = now; n++;
+            if (now - t0 >= 1000000000ll) {
+                float pk = 0.0f;
+                for (u32 i = 0; i < CELL_AUDIO_BLOCK_SAMPLES * 2; i++) {
+                    float a = s_mix_buffer[i]; if (a < 0) a = -a; if (a > pk) pk = a;
+                }
+                fprintf(stderr, "[cellAudio] diag: blocks/s=%.1f peak=%.4f queued=%u "
+                        "port0 run=%d ridx=%llu%c",
+                        n * 1e9 / (double)(now - t0), pk,
+                        audio_backend_queued_samples(), s_ports[0].running,
+                        (unsigned long long)s_ports[0].read_index, 10);
+                n = 0; t0 = now;
+            }
+        }
+
         /* AUDIO_RATE=1: blocks mixed vs real time, like the WASAPI branch. */
         { static int on = -1; if (on < 0) on = getenv("AUDIO_RATE") ? 1 : 0;
           if (on) { static long long t0; static unsigned n, z;
@@ -804,6 +839,8 @@ s32 cellAudioInit(void)
     if (audio_backend_init() < 0) {
         printf("[cellAudio] WARNING: Audio backend init failed, continuing silently\n");
         /* Don't fail -- games should still run without audio */
+    } else if (audio_diag_on()) {
+        printf("[cellAudio] diag: host audio backend open\n");
     }
 
 
