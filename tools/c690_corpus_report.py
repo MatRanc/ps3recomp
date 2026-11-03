@@ -20,6 +20,7 @@ MAGIC = b"C69CORP1"
 HDR = struct.Struct("<8sIIIIIIQ")   # magic, version, job, frame, spu, image, desc, start
 REC = struct.Struct("<IIQII")       # type, size, ea, lsa, aux
 STAGE_META = struct.Struct("<IIII")  # ls_size, gpr_size, pc, image
+STAGE_MAGIC = b"C69STG01"
 
 T_DESC, T_GPR, T_GET, T_PUT, T_STAGE_IN, T_STAGE_OUT, T_OPCODES, T_END = range(1, 9)
 
@@ -95,6 +96,41 @@ def parse(path):
     return job
 
 
+def parse_stage_spool(path):
+    """Read a per-lane stage spool written by c690_corpus.c (stage_<n>.bin).
+
+    Returns {seq: {"in": body, "out": body, "spu", "frame", "lsa"}} where body
+    is the (meta, ls, gpr) payload. Pairs are adjacent per lane; only complete
+    pairs are returned.
+    """
+    blob = open(path, "rb").read()
+    if len(blob) < 12 or blob[:8] != STAGE_MAGIC:
+        raise ValueError("bad stage magic")
+    off = 12
+    pairs = {}
+    n = len(blob)
+    while off + 24 <= n:
+        rtype, size, ea, lsa, aux = struct.unpack_from("<IIQII", blob, off)
+        off += 24
+        if off + size > n:
+            break
+        payload = blob[off:off + size]
+        off += size
+        if rtype not in (T_STAGE_IN, T_STAGE_OUT) or len(payload) < STAGE_META.size:
+            continue
+        ls_size, gpr_size, pc, image = STAGE_META.unpack_from(payload, 0)
+        body = payload[STAGE_META.size:]
+        if len(body) < ls_size + gpr_size:
+            continue
+        seq = ea >> 32
+        ent = pairs.setdefault(seq, {"spu": aux, "frame": ea & 0xFFFFFFFF, "lsa": lsa})
+        ent["in" if rtype == T_STAGE_IN else "out"] = {
+            "ls_size": ls_size, "gpr_size": gpr_size, "pc": pc, "image": image,
+            "ls": body[:ls_size], "gpr": body[ls_size:ls_size + gpr_size],
+        }
+    return {k: v for k, v in pairs.items() if "in" in v and "out" in v}
+
+
 def opcode_signature(job):
     ops = job["opcodes"]
     if not ops:
@@ -136,6 +172,7 @@ def main():
     put_ea_min = put_ea_max = None
     gets = puts = 0
     stage_pairs = 0
+    spool_pairs = 0
     frames = collections.Counter()
     spus = collections.Counter()
     for job in jobs:
@@ -172,6 +209,32 @@ def main():
                             f"desc_ea=0x{job['desc_ea']:08X} frame={job['frame']} "
                             f"spu={job['spu_id']}\n")
 
+    if args.extract_stage:
+        for name in sorted(f for f in os.listdir(args.dir) if f.startswith("stage_") and f.endswith(".bin")):
+            try:
+                spairs = parse_stage_spool(os.path.join(args.dir, name))
+            except Exception as exc:  # noqa: BLE001
+                errors.append((name, str(exc)))
+                continue
+            spool_pairs += len(spairs)
+            for seq, ent in sorted(spairs.items()):
+                base = os.path.join(args.extract_stage, f"spool_{name[6:-4]}_{seq:06d}")
+                with open(base + "_in.bin", "wb") as f:
+                    f.write(ent["in"]["ls"]); f.write(ent["in"]["gpr"])
+                with open(base + "_out.bin", "wb") as f:
+                    f.write(ent["out"]["ls"]); f.write(ent["out"]["gpr"])
+                with open(base + "_meta.txt", "w") as f:
+                    f.write(f"stage_lsa=0x{ent['lsa']:05X} "
+                            f"in_pc=0x{ent['in']['pc']:05X} "
+                            f"out_pc=0x{ent['out']['pc']:05X} "
+                            f"frame={ent['frame']} spu={ent['spu']} spool={name}\n")
+    elif os.path.isdir(args.dir):
+        for name in sorted(f for f in os.listdir(args.dir) if f.startswith("stage_") and f.endswith(".bin")):
+            try:
+                spool_pairs += len(parse_stage_spool(os.path.join(args.dir, name)))
+            except Exception:  # noqa: BLE001
+                pass
+
     summary = {
         "jobs": len(jobs),
         "errors": errors,
@@ -185,6 +248,7 @@ def main():
         "get_ea_range": [get_ea_min, get_ea_max],
         "put_ea_range": [put_ea_min, put_ea_max],
         "stage_pairs": stage_pairs,
+        "spool_stage_pairs": spool_pairs,
         "variants": [
             {"desc": d, "opcodes": o, "count": c}
             for (d, o), c in variants.most_common()
@@ -196,7 +260,8 @@ def main():
         print(json.dumps(summary, indent=2))
     else:
         print(f"jobs={summary['jobs']} frames={summary['frames']} "
-              f"truncated={summary['truncated']} stage_pairs={stage_pairs}")
+              f"truncated={summary['truncated']} stage_pairs={stage_pairs} "
+              f"spool_stage_pairs={spool_pairs}")
         if errors:
             print(f"errors={len(errors)}")
             for name, exc in errors[:10]:

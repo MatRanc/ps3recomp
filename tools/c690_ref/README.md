@@ -11,6 +11,7 @@ runs against the game's lifted stage output.
 | `ref_c690_stage.c` | C reference for LS `0xFDA0` and its continuation blocks (`0xF500..0x105C0`) |
 | `test_ref_c690_stage.c` | offline differential harness (loads a captured LS+GPR image, runs the reference, compares LS and all 128 GPRs) |
 | `run_corpus_test.sh` | extracts the stage pairs from a `PS3RECOMP_C690_CORPUS` directory, builds and runs the harness |
+| `gen_native_stage.py` | flattens the reference into `runtime/spu/c690_native_stage.inc` (the native kernel) |
 
 ## How the reference was produced
 
@@ -80,6 +81,20 @@ The recursive calls in the generated body keep the original name, so the
 wrapper sees every entry and the corpus module folds recursion to the
 outermost call. The edit is not committed because that tree is regenerated
 game data.
+
+## Native kernel (step 2)
+
+`python3 tools/c690_ref/gen_native_stage.py tools/c690_ref/ref_c690_stage.c \
+    runtime/spu/c690_native_stage.inc`
+
+The generator keeps `sr0..sr93` live in one function and turns every
+continuation tail call into a `goto`, removing the per-block `ctx->gpr`
+save/reload. `runtime/spu/c690_native_cull.c` includes it with
+`SPU_FAST_FLOAT` (the lifted module's float path), `SPU_LIFTED_FAST_LS` and
+`SPU_FF_FTZ_HW` (hardware FTZ|DAZ, result zero-sign canonicalisation). It
+adds the default-off `PS3RECOMP_C690_NATIVE_CULL` / `..._SHADOW` switches, the
+layout guard, and the full-LS/GPR shadow comparator. See
+`mlb16-recomp/docs/edge-native-step2.md`.
 
 ## Run
 

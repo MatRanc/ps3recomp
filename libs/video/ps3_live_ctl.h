@@ -51,6 +51,8 @@ enum {
     PS3_LIVE_C690_SPIN_US,      /* C690_SPIN_US: synthetic extra c690 job cost (ceiling probe) */
     PS3_LIVE_SPURS_LANE6,       /* SPURS_LANE6: let the mesh workloads use physical lane 5 */
     PS3_LIVE_TEX_DIRTY,         /* PS3RECOMP_TEX_DIRTY: texture pages by write generation */
+    PS3_LIVE_C690_NATIVE_CULL,  /* PS3RECOMP_C690_NATIVE_CULL: native 0xFDA0 stage */
+    PS3_LIVE_C690_NATIVE_SHADOW,/* PS3RECOMP_C690_NATIVE_SHADOW: run+compare both */
     PS3_LIVE_COUNT
 };
 

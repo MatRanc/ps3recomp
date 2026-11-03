@@ -1055,10 +1055,21 @@ SPU__NV_INLINE u128 spu_fnms(u128 a, u128 b, u128 c) { return SPU__NV_FMA(a, b, 
  * mode accepts too; the exact paths above and below are many times slower. */
 #include <immintrin.h>
 #define SPU__FF_INLINE static inline __attribute__((always_inline))
+#if defined(SPU_FF_FTZ_HW)
+/* Opt-in for a native module that runs with MXCSR FTZ|DAZ. The hardware
+ * turns denormal inputs into zero and flushes denormal results, so only the
+ * SPU rule that a flushed zero has no sign bit is left; doing that on the
+ * result alone is much cheaper than masking every operand. The lifted module
+ * keeps the explicit per-operand mask because it runs with the default MXCSR. */
+SPU__FF_INLINE __m128 spu__ff_ftz(__m128 v) {
+    return _mm_andnot_ps(_mm_cmpeq_ps(v, _mm_setzero_ps()), v);
+}
+#else
 SPU__FF_INLINE __m128 spu__ff_ftz(__m128 v) {
     const __m128i e = _mm_and_si128(_mm_castps_si128(v), _mm_set1_epi32(0x7F800000));
     return _mm_andnot_ps(_mm_castsi128_ps(_mm_cmpeq_epi32(e, _mm_setzero_si128())), v);
 }
+#endif
 SPU__FF_INLINE __m128 spu__ff_ld(u128 a) { return spu__ff_ftz(_mm_loadu_ps((const float*)a._u32)); }
 SPU__FF_INLINE u128 spu__ff_st(__m128 v) { u128 r; _mm_storeu_ps((float*)r._u32, spu__ff_ftz(v)); return r; }
 SPU__FF_INLINE u128 spu_fa(u128 a, u128 b) { return spu__ff_st(_mm_add_ps(spu__ff_ld(a), spu__ff_ld(b))); }

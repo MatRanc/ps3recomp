@@ -50,6 +50,8 @@ static const char* const K_NAME[PS3_LIVE_COUNT] = {
     "C690_SPIN_US",
     "SPURS_LANE6",
     "PS3RECOMP_TEX_DIRTY",
+    "PS3RECOMP_C690_NATIVE_CULL",
+    "PS3RECOMP_C690_NATIVE_SHADOW",
 };
 
 static _Atomic int s_val[PS3_LIVE_COUNT];
