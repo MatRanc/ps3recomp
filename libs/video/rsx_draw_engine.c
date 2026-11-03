@@ -447,6 +447,67 @@ static unsigned long long s_wp_pipe_create_ns, s_wp_pipe_create_n;
 static unsigned long long s_wp_t0_ms;
 static unsigned long long s_wp_last_at_ns;
 
+/* RSX_WPROF2: a finer split of the same draw-group work than the five
+ * phases above. Off by default; the off path is a cached integer test around
+ * every site. Timers nest: `convert` is inside `fetch`/`draw`, `upload` is
+ * inside `tex_slot`, `tex_slot` inside `tex`. The report prints each term as
+ * measured and says which contain which. */
+enum {
+    WPROF2_LAYOUT = 0,
+    WPROF2_SURFACE,        /* render state, targets, surface/viewport/zeta */
+    WPROF2_FETCH_REFS,     /* arrays + index runs -> reference list */
+    WPROF2_FETCH_PLAN,     /* key, remap, fetch-plan prepare, defer choice */
+    WPROF2_CONVERT,        /* vertex fetch/convert into backend memory */
+    WPROF2_VTXOFF,         /* eng_check_gpu_vertex_offload */
+    WPROF2_PIPE_LOOKUP,    /* fingerprint + memo probe */
+    WPROF2_PIPE_ANALYZE,   /* program/state analysis, texture masks */
+    WPROF2_PIPE_KEY,       /* identity hash */
+    WPROF2_PIPE_DIR,       /* pipeline hash-directory lookup */
+    WPROF2_PIPE_DECOMPILE, /* VP/FP decompile + text patching */
+    WPROF2_PIPE_CREATE,    /* be->pipeline_create (host compile) */
+    WPROF2_PIPE_DEBUG,     /* eng_debug_fp */
+    WPROF2_TEX_SLOT,       /* texture cache lookup/hash/decode/upload */
+    WPROF2_TEX_UPLOAD,     /* texture decode + backend upload (inside slot) */
+    WPROF2_TEX_BIND,       /* surface/depth scan, samplers, memo (tex - slot) */
+    WPROF2_VTEX,           /* vertex texture binds */
+    WPROF2_CONST,          /* VP/FP constant blocks */
+    WPROF2_INDEX,          /* topology rebuild + index writer */
+    WPROF2_BIND_BE,        /* backend bind calls (descriptor writes) */
+    WPROF2_SURFTRACK,      /* pd_note, written-target bookkeeping */
+    WPROF2_DRAW_BE,        /* backend draw recording (includes convert) */
+    WPROF2_N
+};
+static int s_wp2 = -1;
+static unsigned long long s_wp2_ns[WPROF2_N], s_wp2_n[WPROF2_N];
+static unsigned long long s_wp2_draws, s_wp2_verts, s_wp2_draw_groups;
+static unsigned long long s_wp2_conv_verts, s_wp2_conv_bytes;
+static unsigned long long s_wp2_pipe_hits, s_wp2_pipe_gets, s_wp2_pipe_created;
+static unsigned long long s_wp2_tex_slots, s_wp2_tex_uploads;
+static unsigned long long s_wp2_fetch_hit, s_wp2_fetch_miss;
+
+static int rsx_wprof2_enabled(void)
+{
+    if (s_wp2 < 0) {
+        const char* e = getenv("PS3RECOMP_WALKER_PROF2");
+        s_wp2 = (e && *e && strcmp(e, "0") != 0) ? 1 : 0;
+    }
+    return s_wp2;
+}
+
+static inline unsigned long long wp2_t0(void)
+{
+    if (s_wp2 < 0) rsx_wprof2_enabled();
+    return s_wp2 > 0 ? rsx_wprof_now() : 0;
+}
+
+static inline void wp2_add(int slot, unsigned long long t0)
+{
+    if (s_wp2 > 0 && t0) {
+        s_wp2_ns[slot] += rsx_wprof_now() - t0;
+        s_wp2_n[slot]++;
+    }
+}
+
 int rsx_wprof_enabled(void)
 {
     if (s_wprof < 0) {
@@ -541,6 +602,57 @@ void rsx_wprof_drain_end(void)
             (double)s_wp_n[RSX_WPROF_PIPE] / f,
             (double)s_wp_n[RSX_WPROF_BIND] / f,
             (double)s_wp_n[RSX_WPROF_DRAW] / f);
+    if (s_wp2 < 0) rsx_wprof2_enabled();
+    if (s_wp2 > 0) {
+        fprintf(stderr,
+                "[walker-prof2] at=%llums draws=%.1f verts=%.1f "
+                "conv_verts=%.1f conv_kb=%.1f "
+                "layout=%.3fms surface=%.3f fetch_refs=%.3f fetch_plan=%.3f "
+                "convert=%.3f vtxoff=%.3f pipe_lookup=%.3f pipe_analyze=%.3f "
+                "pipe_key=%.3f pipe_dir=%.3f pipe_decompile=%.3f "
+                "pipe_create=%.3f pipe_debug=%.3f tex_slot=%.3f "
+                "tex_upload=%.3f tex_bind=%.3f vtex=%.3f const=%.3f "
+                "index=%.3f bind_be=%.3f surftrack=%.3f draw_be=%.3f "
+                "| pipe_hit=%.1f pipe_get=%.1f pipe_new=%.1f "
+                "fetch_hit=%.0f fetch_miss=%.0f tex_binds=%.1f tex_loads=%.1f\n",
+                at_ms, (double)s_wp2_draws / f, (double)s_wp2_verts / f,
+                (double)s_wp2_conv_verts / f,
+                (double)s_wp2_conv_bytes / 1024.0 / f,
+                (double)s_wp2_ns[WPROF2_LAYOUT] / 1e6 / f,
+                (double)s_wp2_ns[WPROF2_SURFACE] / 1e6 / f,
+                (double)s_wp2_ns[WPROF2_FETCH_REFS] / 1e6 / f,
+                (double)s_wp2_ns[WPROF2_FETCH_PLAN] / 1e6 / f,
+                (double)s_wp2_ns[WPROF2_CONVERT] / 1e6 / f,
+                (double)s_wp2_ns[WPROF2_VTXOFF] / 1e6 / f,
+                (double)s_wp2_ns[WPROF2_PIPE_LOOKUP] / 1e6 / f,
+                (double)s_wp2_ns[WPROF2_PIPE_ANALYZE] / 1e6 / f,
+                (double)s_wp2_ns[WPROF2_PIPE_KEY] / 1e6 / f,
+                (double)s_wp2_ns[WPROF2_PIPE_DIR] / 1e6 / f,
+                (double)s_wp2_ns[WPROF2_PIPE_DECOMPILE] / 1e6 / f,
+                (double)s_wp2_ns[WPROF2_PIPE_CREATE] / 1e6 / f,
+                (double)s_wp2_ns[WPROF2_PIPE_DEBUG] / 1e6 / f,
+                (double)s_wp2_ns[WPROF2_TEX_SLOT] / 1e6 / f,
+                (double)s_wp2_ns[WPROF2_TEX_UPLOAD] / 1e6 / f,
+                (double)s_wp2_ns[WPROF2_TEX_BIND] / 1e6 / f,
+                (double)s_wp2_ns[WPROF2_VTEX] / 1e6 / f,
+                (double)s_wp2_ns[WPROF2_CONST] / 1e6 / f,
+                (double)s_wp2_ns[WPROF2_INDEX] / 1e6 / f,
+                (double)s_wp2_ns[WPROF2_BIND_BE] / 1e6 / f,
+                (double)s_wp2_ns[WPROF2_SURFTRACK] / 1e6 / f,
+                (double)s_wp2_ns[WPROF2_DRAW_BE] / 1e6 / f,
+                (double)s_wp2_pipe_hits / f, (double)s_wp2_pipe_gets / f,
+                (double)s_wp2_pipe_created / f,
+                (double)s_wp2_fetch_hit / f, (double)s_wp2_fetch_miss / f,
+                (double)s_wp2_tex_slots / f, (double)s_wp2_tex_uploads / f);
+        fflush(stderr);
+        memset(s_wp2_ns, 0, sizeof s_wp2_ns);
+        memset(s_wp2_n, 0, sizeof s_wp2_n);
+        s_wp2_draws = s_wp2_verts = s_wp2_draw_groups = 0;
+        s_wp2_conv_verts = s_wp2_conv_bytes = 0;
+        s_wp2_pipe_hits = s_wp2_pipe_gets = s_wp2_pipe_created = 0;
+        s_wp2_tex_slots = s_wp2_tex_uploads = 0;
+        s_wp2_fetch_hit = s_wp2_fetch_miss = 0;
+    }
     fflush(stderr);
     memset(s_wp_ns, 0, sizeof s_wp_ns);
     memset(s_wp_n, 0, sizeof s_wp_n);
@@ -2273,9 +2385,9 @@ static unsigned s_tex_miss_reason;
  * the backend. Returns the backend handle, or 0. `into`, when nonzero, is an
  * existing 2D texture of exactly this key to rewrite instead of creating one
  * (rsx_draw_backend.texture_upload_ordered). */
-static u32 eng_texture_upload(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
-                              u32 levels, u32 pitch, int cube, u32 remap, u32 depth,
-                              u32 into)
+static u32 eng_texture_upload_work(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
+                                   u32 levels, u32 pitch, int cube, u32 remap, u32 depth,
+                                   u32 into)
 {
     rsx_tex_level lv[RSX_MAX_TEXTURE_LEVELS];
     const u32 nlv = rsx_texture_mip_chain(fmt, w, h, levels, pitch, lv);
@@ -2526,9 +2638,20 @@ static void eng_cube_log_desc(const rsx_dsp_texture* t, const eng_cube_desc* d,
  * green/black geometry" (rsx_live_draw.c:2326-2334). */
 /* The g.textures index eng_texture_slot's last nonzero answer came from, or
  * ENG_INVALID. */
+static u32 eng_texture_upload(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
+                              u32 levels, u32 pitch, int cube, u32 remap, u32 depth,
+                              u32 into)
+{
+    const unsigned long long wp2 = wp2_t0();
+    const u32 handle = eng_texture_upload_work(location, offset, fmt, w, h, levels,
+                                               pitch, cube, remap, depth, into);
+    if (wp2) { wp2_add(WPROF2_TEX_UPLOAD, wp2); s_wp2_tex_uploads++; }
+    return handle;
+}
+
 static u32 s_tslot_last = ENG_INVALID;
-static u32 eng_texture_slot(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
-                            u32 levels, u32 pitch, int cube, u32 remap, u32 depth)
+static u32 eng_texture_slot_work(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
+                                 u32 levels, u32 pitch, int cube, u32 remap, u32 depth)
 {
     s_tslot_last = ENG_INVALID;
     s_tex_miss_reason = RSX_TEX_MISS_OTHER;
@@ -2668,6 +2791,16 @@ static u32 eng_texture_slot(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
     if (e.handle || !evicted) g.textures[index] = e;
     if (e.handle) s_tslot_last = index;
     return e.handle;
+}
+
+static u32 eng_texture_slot(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
+                            u32 levels, u32 pitch, int cube, u32 remap, u32 depth)
+{
+    const unsigned long long wp2 = wp2_t0();
+    const u32 handle = eng_texture_slot_work(location, offset, fmt, w, h, levels,
+                                             pitch, cube, remap, depth);
+    if (wp2) { wp2_add(WPROF2_TEX_SLOT, wp2); s_wp2_tex_slots++; }
+    return handle;
 }
 
 /* ---- surfaces read through guest memory --------------------------------- */
@@ -3915,6 +4048,8 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
     *out_fixed = 1;
     *out_tex_used = 0;
     *out_fp_hash = 0;
+    const unsigned long long wp2_lookup = wp2_t0();
+    s_wp2_pipe_gets++;
     const u8* vp_uc = NULL;
     const u8* fp_uc = NULL;
     u32 vp_instrs = 0, fp_size = 0;
@@ -3932,11 +4067,15 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
         eng_pipe_memo* memo = eng_pipe_memo_find(pipe_fp);
         if (memo) {
             s_pipe_hits++;
+            s_wp2_pipe_hits++;
             eng_pipe_memo_restore(memo, out_fixed, out_tex_used, out_fp_hash);
+            wp2_add(WPROF2_PIPE_LOOKUP, wp2_lookup);
             return memo->handle;
         }
         s_pipe_misses++;
     }
+    wp2_add(WPROF2_PIPE_LOOKUP, wp2_lookup);
+    const unsigned long long wp2_analyze = wp2_t0();
 
     const u32 fp_ctrl  = rsx_dsp_shader_control(&g.rsx);
     const u32 srgb_output = !fixed && rsx_fp_srgb_output_enabled(
@@ -3991,8 +4130,10 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
             unnorm_dim[u][0] = unnorm_dim[u][1] = unnorm_dim[u][2] = 0;
 
     g.fp_constants.count = 0;
-    if (!fixed && rsx_fp_collect_constants(fp_uc, fp_size, &g.fp_constants) < 0)
+    if (!fixed && rsx_fp_collect_constants(fp_uc, fp_size, &g.fp_constants) < 0) {
+        wp2_add(WPROF2_PIPE_ANALYZE, wp2_analyze);
         return 0;
+    }
 
     /* An antialiased target is held at its sample grid; WPOS must still count
      * pixels (rsx_fp_apply_wpos_grid). */
@@ -4006,6 +4147,8 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
      * a constant change must not be a new pipeline), the export-width bit of
      * SHADER_CONTROL, the cube and vertex-texture masks, the input layout,
      * and the structural render state. */
+    wp2_add(WPROF2_PIPE_ANALYZE, wp2_analyze);
+    const unsigned long long wp2_key = wp2_t0();
     u64 key = 1469598103934665603ull;
     if (fixed) {
         static const u32 fixed_tag = 0x4E464958u;   /* "XIFN" */
@@ -4014,7 +4157,7 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
         key = eng_vp_hash(vp_uc, vp_instrs * 16u, key);
         if (vp_branch_bits_used) key = eng_fnv1a(&vp_branch_bits, sizeof vp_branch_bits, key);
         key = rsx_fp_structural_hash(fp_uc, fp_size, key);
-        if (!key) return 0;
+        if (!key) { wp2_add(WPROF2_PIPE_KEY, wp2_key); return 0; }
         const u32 fp_ctrl_key = fp_ctrl & 0x4Eu; /* colour width and fragment depth export */
         key = eng_fnv1a(&fp_ctrl_key, sizeof fp_ctrl_key, key);
         if (srgb_output) key = eng_fnv1a(&srgb_output, sizeof srgb_output, key);
@@ -4039,6 +4182,8 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
      * a host API matches the two against each other. */
     key = eng_fnv1a(&rt_count, sizeof rt_count, key);
     key = rsx_draw_engine_hash_render_state(rs, key);
+    wp2_add(WPROF2_PIPE_KEY, wp2_key);
+    const unsigned long long wp2_dir = wp2_t0();
 
     u32 slot = eng_pipeline_slot(key);
     for (; g.pipeline_index[slot]; slot = (slot + 1u) & (ENG_PIPELINE_INDEX - 1u)) {
@@ -4051,11 +4196,14 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
             if (s_walker_fast)
                 eng_pipe_memo_save(pipe_fp, p->handle, p->fixed, p->tex_used,
                                    p->fp_hash);
+            wp2_add(WPROF2_PIPE_DIR, wp2_dir);
             return p->handle;
         }
     }
+    wp2_add(WPROF2_PIPE_DIR, wp2_dir);
     if (g.n_pipelines >= ENG_MAX_PIPELINES) return 0;
 
+    const unsigned long long wp2_decompile = wp2_t0();
     u32 handle = 0;
     int vi = 1, fi = 1;
     u32 nconst = 0;
@@ -4093,10 +4241,17 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
                                              rs->alpha_func) < 0)
             fi = -1;
     }
-    if (vi > 0 && fi > 0)
+    if (vi > 0 && fi > 0) {
+        wp2_add(WPROF2_PIPE_DECOMPILE, wp2_decompile);
+        const unsigned long long wp2_create = wp2_t0();
         handle = g.be->pipeline_create(g.be->user, s_vs_hlsl, s_ps_hlsl, rs,
                                        layout, layout->stride, rt_fmt, rt_count);
+        wp2_add(WPROF2_PIPE_CREATE, wp2_create);
+    } else {
+        wp2_add(WPROF2_PIPE_DECOMPILE, wp2_decompile);
+    }
     if (handle) {
+        if (s_wp2 > 0) s_wp2_pipe_created++;
         /* Diagnostic: how fast new pipelines (and so glslang translations) are
          * being created. A steady stream means the key is varying per draw. */
         static unsigned long long s_new_pipes;
@@ -4292,19 +4447,33 @@ static int s_vtx_remap = 1;
 static int s_fill_ok;   /* the last fill's result; -1 before it is called */
 static int dc_fill_verts(void* ctx, void* dst)
 {
+    const unsigned long long wp2 = wp2_t0();
+    const u32 n = *(const u32*)ctx;
     /* Write-only, possibly write-combined memory: streamed, whole vertices. */
-    s_fill_ok = rsx_vertex_fetch_many_stream(&dc.fetch_plan, dc.refs, *(const u32*)ctx,
+    s_fill_ok = rsx_vertex_fetch_many_stream(&dc.fetch_plan, dc.refs, n,
                                              (u8*)dst);
+    if (wp2) {
+        wp2_add(WPROF2_CONVERT, wp2);
+        s_wp2_conv_verts += n;
+        s_wp2_conv_bytes += (unsigned long long)n * dc.layout.stride;
+    }
     return s_fill_ok;
 }
 
 /* Every unique vertex into dc.verts. */
 static int dc_convert_verts(void)
 {
+    const unsigned long long wp2 = wp2_t0();
     if (!dc_reserve_verts((u64)dc.n_refs * dc.layout.stride))
         return 0;
-    return rsx_vertex_fetch_many(&dc.fetch_plan, dc.refs, dc.n_refs,
-                                 dc.layout.stride ? dc.verts : NULL);
+    const int ok = rsx_vertex_fetch_many(&dc.fetch_plan, dc.refs, dc.n_refs,
+                                         dc.layout.stride ? dc.verts : NULL);
+    if (wp2) {
+        wp2_add(WPROF2_CONVERT, wp2);
+        s_wp2_conv_verts += dc.n_refs;
+        s_wp2_conv_bytes += (unsigned long long)dc.n_refs * dc.layout.stride;
+    }
+    return ok;
 }
 
 /* The identity of one fetch/remap answer. It covers everything
@@ -4413,6 +4582,7 @@ static int dc_ensure_occ(u32 n)
  * rsx_live_draw.c's fetch_batches_hoisted (4165-4292). */
 static void dc_fetch(const rsx_vertex_layout_plan* layout, int allow_remap)
 {
+    const unsigned long long wp2_refs = wp2_t0();
     if (dc.n_immediate) {
         dc.n_source_refs = dc.n_immediate;
         if (!dc_reserve_verts((u64)dc.n_immediate * layout->stride)) {
@@ -4424,6 +4594,7 @@ static void dc_fetch(const rsx_vertex_layout_plan* layout, int allow_remap)
                 memcpy(dc.verts + (u64)v * layout->stride + slot * 16u,
                        dc.immediate[v][layout->attrs[slot]], 16u);
         dc.n_verts = dc.n_immediate;
+        wp2_add(WPROF2_FETCH_REFS, wp2_refs);
         return;
     }
     for (u32 b = 0; b < dc.n_arr && dc.fetch_ok; b++)
@@ -4471,8 +4642,10 @@ static void dc_fetch(const rsx_vertex_layout_plan* layout, int allow_remap)
             }
         }
     }
-    if (!dc.fetch_ok) return;
+    if (!dc.fetch_ok) { wp2_add(WPROF2_FETCH_REFS, wp2_refs); return; }
+    wp2_add(WPROF2_FETCH_REFS, wp2_refs);
 
+    const unsigned long long wp2_plan = wp2_t0();
     dc.n_source_refs = dc.n_refs;
     dc.layout = *layout;
 
@@ -4494,6 +4667,7 @@ static void dc_fetch(const rsx_vertex_layout_plan* layout, int allow_remap)
 
     if (fetch_hit) {
         s_fetch_hits++;
+        s_wp2_fetch_hit++;
         /* When the remap did not collapse anything, the source references
          * just built are already the unique list: copying megabytes of them
          * back over themselves is the cost this cut exists to remove. */
@@ -4503,6 +4677,7 @@ static void dc_fetch(const rsx_vertex_layout_plan* layout, int allow_remap)
             (fetch_hit->remapped && fetch_hit->n_source &&
              !dc_ensure_occ(fetch_hit->n_source))) {
             dc.fetch_ok = 0;
+            wp2_add(WPROF2_FETCH_PLAN, wp2_plan);
             return;
         }
         if (need_refs && fetch_hit->n_unique)
@@ -4517,7 +4692,7 @@ static void dc_fetch(const rsx_vertex_layout_plan* layout, int allow_remap)
         }
         dc.fetch_plan = fetch_hit->plan;
     } else {
-        if (s_walker_fast) s_fetch_misses++;
+        if (s_walker_fast) { s_fetch_misses++; s_wp2_fetch_miss++; }
         /* Only a topology this engine rebuilds through an index buffer may
          * share repeated references. A line strip or a point list is drawn in
          * the order it arrived, so collapsing duplicates would reorder it. */
@@ -4560,8 +4735,10 @@ static void dc_fetch(const rsx_vertex_layout_plan* layout, int allow_remap)
         !rsx_vertex_fetch_plan_can_fail(&dc.fetch_plan)) {
         dc.fetch_deferred = 1;
         dc.n_verts = dc.n_refs;
+        wp2_add(WPROF2_FETCH_PLAN, wp2_plan);
         return;
     }
+    wp2_add(WPROF2_FETCH_PLAN, wp2_plan);
     if (!dc_convert_verts()) {
         dc.fetch_ok = 0;
         return;
@@ -5671,6 +5848,7 @@ static void sink_end_work(void* user, const rsx_dispatch* r)
     const int wp = s_wprof > 0;
     unsigned long long wp_t0 = wp ? rsx_wprof_now() : 0;
     if (wp) s_wp_draws++;
+    if (s_wp2 > 0) s_wp2_draw_groups++;
     /* EXP_NO_DRAW ceiling: the draw's own work is gone (fetch plan, texture
      * decode, pipeline lookup/create, and every backend/Vulkan recording).
      * Everything that makes a fence visible lives in cellGcmSys/rsx_commands,
@@ -5702,7 +5880,9 @@ static void sink_end_work(void* user, const rsx_dispatch* r)
     }
 
     rsx_vertex_layout_plan layout;
-    eng_vertex_layout(&layout);
+    { const unsigned long long w2 = wp2_t0();
+      eng_vertex_layout(&layout);
+      wp2_add(WPROF2_LAYOUT, w2); }
     if (wp) wp_t0 = rsx_wprof_now();
     dc_fetch(&layout, rebuild);
     if (wp) wprof_phase(RSX_WPROF_FETCH, rsx_wprof_now() - wp_t0);
@@ -5710,15 +5890,21 @@ static void sink_end_work(void* user, const rsx_dispatch* r)
 
     int indexed = 0;
     u32 n_draw = dc.n_source_refs;
+    const unsigned long long w2_index = wp2_t0();
     if (rebuild) {
-        if (!eng_topology_rebuild(prim, dc.refs_remapped, &indexed)) return;
+        if (!eng_topology_rebuild(prim, dc.refs_remapped, &indexed)) {
+            wp2_add(WPROF2_INDEX, w2_index);
+            return;
+        }
         n_draw = indexed
             ? rsx_draw_engine_topology_index_count(prim, dc.n_source_refs,
                                                    dc.cuts, dc.n_cuts)
             : dc.n_source_refs - dc.n_source_refs % 3u;
     }
+    wp2_add(WPROF2_INDEX, w2_index);
     if (!n_draw) return;
 
+    const unsigned long long w2_surface = wp2_t0();
     rsx_be_render_state rs;
     rsx_draw_engine_decode_render_state(&g.rsx, &rs);
 
@@ -5733,6 +5919,7 @@ static void sink_end_work(void* user, const rsx_dispatch* r)
     rsx_dsp_get_viewport(&g.rsx, &vp);
     const u32 zslot = eng_zdepth_get(sf.zeta_location, sf.zeta_offset,
                                      sf.clip_w, sf.clip_h);
+    wp2_add(WPROF2_SURFACE, w2_surface);
 
     /* A guest program pair that will not translate has no fallback: the draw
      * is dropped, as the reference engine drops it. Substituting the built-in
@@ -5748,7 +5935,10 @@ static void sink_end_work(void* user, const rsx_dispatch* r)
                                           &fp_hash);
     if (wp) wprof_phase(RSX_WPROF_PIPE, rsx_wprof_now() - wp_t0);
     if (!pipeline) return;
-    if (fp_hash && eng_debug_fp(fp_hash, pipeline)) return;
+    { const unsigned long long w2 = wp2_t0();
+      const int dbg = fp_hash && eng_debug_fp(fp_hash, pipeline);
+      wp2_add(WPROF2_PIPE_DEBUG, w2);
+      if (dbg) return; }
 
     /* Textures before any pipeline or target binding: a cache refresh can
      * replace a resource, and the backend is free to submit while doing it. */
@@ -5761,6 +5951,7 @@ static void sink_end_work(void* user, const rsx_dispatch* r)
     memset(vtextures, 0, sizeof vtextures);
     memset(vsamplers, 0, sizeof vsamplers);
     if (wp) wp_t0 = rsx_wprof_now();
+    const unsigned long long w2_texbind = wp2_t0();
     s_miss_fp_hash = fp_hash;
     s_miss_pipeline = pipeline;
     /* Full-screen draws only, for the tiled-wipe bind log. */
@@ -5771,21 +5962,27 @@ static void sink_end_work(void* user, const rsx_dispatch* r)
     const u32 tex_mask = sink_bind_textures(targets, n_targets, zslot, tex_used,
                                             textures, samplers);
     s_fs_draw = 0;
+    wp2_add(WPROF2_TEX_BIND, w2_texbind);
     if (wp) wprof_phase(RSX_WPROF_TEX, rsx_wprof_now() - wp_t0);
     if (tex_mask == ENG_INVALID) return;
     if (wp) wp_t0 = rsx_wprof_now();
+    const unsigned long long w2_vtex = wp2_t0();
     const u32 vtex_mask = sink_bind_vertex_textures(eng_vtex_mask(), vtextures,
                                                     vsamplers);
+    wp2_add(WPROF2_VTEX, w2_vtex);
     if (wp) wprof_phase(RSX_WPROF_TEX, rsx_wprof_now() - wp_t0);
 
     if (indexed) {
-        if (!dc_reserve_indices(n_draw)) return;
+        const unsigned long long w2 = wp2_t0();
+        if (!dc_reserve_indices(n_draw)) { wp2_add(WPROF2_INDEX, w2); return; }
         rsx_draw_engine_write_topology_indices(
             prim, dc.n_source_refs, dc.cuts, dc.n_cuts,
             dc.refs_remapped ? dc.ref_remap.occurrence_to_unique : NULL,
             g.indices);
+        wp2_add(WPROF2_INDEX, w2);
     }
 
+    const unsigned long long w2_const = wp2_t0();
     /* The transform constant block, then the viewport epilogue the vertex
      * program's tail multiplies by: RSX window coordinates mapped into the
      * host's clip space (rsx_live_draw.c:6143-6156). */
@@ -5836,8 +6033,11 @@ static void sink_end_work(void* user, const rsx_dispatch* r)
       alpha[1] = ((win >> 12) & 0xFu) ? (float)(win & 0xFFFu) : 0.0f;
       alpha[2] = ((win >> 16) & 0xFu) ? -0.5f : 0.0f;
       alpha[3] = 0.0f; }
+    wp2_add(WPROF2_CONST, w2_const);
 
-    pd_note(targets, n_targets, zslot, &rs, pipeline, tex_mask);
+    { const unsigned long long w2 = wp2_t0();
+      pd_note(targets, n_targets, zslot, &rs, pipeline, tex_mask);
+      wp2_add(WPROF2_SURFTRACK, w2); }
 
     if (wp) wp_t0 = rsx_wprof_now();
     /* The depth attachment is cleared the first time it is bound, so a title
@@ -5851,6 +6051,7 @@ static void sink_end_work(void* user, const rsx_dispatch* r)
         g.zdepths[zslot].had_write = 0;
     }
 
+    const unsigned long long w2_bind = wp2_t0();
     u32 handles[RSX_BE_MAX_COLOR_TARGETS];
     for (u32 i = 0; i < n_targets; i++) handles[i] = g.surfaces[targets[i]].handle;
     g.be->bind_targets(g.be->user, handles, n_targets, depth_handle);
@@ -5903,17 +6104,24 @@ static void sink_end_work(void* user, const rsx_dispatch* r)
                              /* SURFACE_FORMAT depth: 1 Z16, 2 Z24S8 */
                              sf.depth_format == 1u ? 16u : 24u);
     }
+    wp2_add(WPROF2_BIND_BE, w2_bind);
     if (wp) wprof_phase(RSX_WPROF_BIND, rsx_wprof_now() - wp_t0);
 
     if (wp) wp_t0 = rsx_wprof_now();
     u32 uploaded = indexed ? dc.n_verts : n_draw;
+    const unsigned long long w2_draw = wp2_t0();
     if (dc.fetch_deferred) {
         s_fill_ok = -1;
         rsx_vtx_gpu_desc gpu_desc;
-        eng_check_gpu_vertex_offload(&gpu_desc, uploaded);
-        if (g.be->draw_fill(g.be->user, topology, dc_fill_verts, &gpu_desc,
+        { const unsigned long long w2 = wp2_t0();
+          eng_check_gpu_vertex_offload(&gpu_desc, uploaded);
+          wp2_add(WPROF2_VTXOFF, w2); }
+        const int drew = g.be->draw_fill(g.be->user, topology, dc_fill_verts, &gpu_desc,
                             uploaded, layout.stride, indexed ? g.indices : NULL,
-                            indexed ? n_draw : 0)) {
+                            indexed ? n_draw : 0);
+        wp2_add(WPROF2_DRAW_BE, w2_draw);
+        if (drew) {
+            if (s_wp2 > 0 && s_fill_ok > 0) { s_wp2_draws++; s_wp2_verts += uploaded; }
             /* A conversion that failed drew nothing, as a failed fetch never
              * did; a draw the backend dropped by its own rules counts as one,
              * as it always has. */
@@ -5926,14 +6134,18 @@ static void sink_end_work(void* user, const rsx_dispatch* r)
             /* The backend had no room for them: convert here and hand them
              * over the old way. */
             unsigned long long conv_t0 = wp ? rsx_wprof_now() : 0;
-            if (!dc_convert_verts()) return;
+            if (!dc_convert_verts()) { wp2_add(WPROF2_DRAW_BE, w2_draw); return; }
             if (wp) wprof_phase(RSX_WPROF_FETCH, rsx_wprof_now() - conv_t0);
             g.be->draw(g.be->user, topology, dc.verts, uploaded, layout.stride,
                        indexed ? g.indices : NULL, indexed ? n_draw : 0);
+            wp2_add(WPROF2_DRAW_BE, w2_draw);
+            if (s_wp2 > 0) { s_wp2_draws++; s_wp2_verts += uploaded; }
         }
     } else {
         g.be->draw(g.be->user, topology, dc.verts, uploaded, layout.stride,
                    indexed ? g.indices : NULL, indexed ? n_draw : 0);
+        wp2_add(WPROF2_DRAW_BE, w2_draw);
+        if (s_wp2 > 0) { s_wp2_draws++; s_wp2_verts += uploaded; }
     }
     if (wp) wprof_phase(RSX_WPROF_DRAW, rsx_wprof_now() - wp_t0);
     /* Counted only when the draw ran the guest's OWN programs, which is what
@@ -5941,6 +6153,7 @@ static void sink_end_work(void* user, const rsx_dispatch* r)
      * evidence that the decompile-translate-compile path worked. */
     if (!pipeline_is_fixed) g.guest_draws++;
 
+    const unsigned long long w2_surftrack = wp2_t0();
     if (rs.color_mask) {
         eng_surfaces_wrote(targets, n_targets);
         /* Which program produced each target, for the cube-face census: the
@@ -5955,6 +6168,7 @@ static void sink_end_work(void* user, const rsx_dispatch* r)
         g.zdepths[zslot].had_write = 1;
         eng_zdepth_wrote(zslot, &sf);
     }
+    wp2_add(WPROF2_SURFTRACK, w2_surftrack);
 }
 
 /* Draw source: a group whose active vertex arrays were resolved into one of
@@ -6188,6 +6402,12 @@ static void sink_flip(void* user, const rsx_dispatch* r, u32 arg)
     (void)user; (void)r;
     g.last_flip_buffer = arg & 7u;
     eng_present(g.last_flip_buffer);
+}
+
+void rsx_draw_engine_replay_advance_frame(void)
+{
+    if (!g.ready) return;
+    g.frames++;
 }
 
 /* ---- public API ---------------------------------------------------------- */

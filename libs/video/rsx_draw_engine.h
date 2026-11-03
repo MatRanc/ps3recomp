@@ -507,6 +507,12 @@ void rsx_wprof_note_pipeline_create(unsigned long long ns);
 /* Log and reset the frame counters if a flip was seen in this pass. */
 void rsx_wprof_drain_end(void);
 
+/* Replay only: a replayed capture has no display buffer, so eng_present()
+ * never reaches its frame tick. Advance g.frames by one after each replayed
+ * frame so the per-frame texture revalidation / hash cadence and the
+ * last_use ageing follow the live path instead of staying on frame 0. */
+void rsx_draw_engine_replay_advance_frame(void);
+
 /* Live switches from PS3RECOMP_CTL (cellGcmSys polls the file and calls these
  * on the walker thread). Changing WALKER_FAST flushes the fetch/pipeline
  * memos so the new arm starts cold. */

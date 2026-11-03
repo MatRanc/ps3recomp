@@ -24,8 +24,22 @@ static u64* s_digest;
 static size_t s_digest_cap;
 static u32 s_next_handle = 1;
 
+/* REPLAY_NULL_HASH=0 turns the digest off (it hashes every vertex byte and
+ * every upload, which is real CPU time in a timing run). The draw and vertex
+ * counters are unaffected; use the default for an exactness gate. */
+static int s_gate_on = -1;
+static inline int rg_on(void)
+{
+    if (s_gate_on < 0) {
+        const char* e = getenv("REPLAY_NULL_HASH");
+        s_gate_on = (e && !strcmp(e, "0")) ? 0 : 1;
+    }
+    return s_gate_on;
+}
+
 static inline void rg_bytes(const void* p, size_t n)
 {
+    if (!rg_on()) return;
     const u8* b = (const u8*)p;
     u64 h = s_hash;
     size_t i = 0;

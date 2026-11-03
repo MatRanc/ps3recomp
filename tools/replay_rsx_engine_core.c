@@ -280,6 +280,7 @@ int rsx_engine_replay_run_frame(rsx_engine_replay* r, rsx_engine_replay_stats* o
 
     while (s_ref_qhead != s_ref_qtail) s_ref_qhead++;
 
+    rsx_draw_engine_replay_advance_frame();
     if (out) {
         out->draws = replay_null_draws();
         out->vertices = replay_null_draw_vertices();
