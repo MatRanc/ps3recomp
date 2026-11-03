@@ -30,6 +30,18 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <errno.h>
+#include <sys/stat.h>
+#ifdef _WIN32
+#  include <direct.h>
+#  include <process.h>
+#  define MKDIR(p) _mkdir(p)
+#  define strcasecmp _stricmp
+#else
+#  include <strings.h>
+#  include <unistd.h>
+#  define MKDIR(p) mkdir((p), 0777)
+#endif
 
 #if defined(PS3RECOMP_HAVE_SPIRV_TRANSLATION)
 
@@ -37,6 +49,7 @@
 #include <glslang/Public/ResourceLimits.h>
 #include <glslang/SPIRV/GlslangToSpv.h>
 
+#include <atomic>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -224,6 +237,222 @@ void cache_store(const std::string& path, const std::string& key,
     if (!ok || rename(tmp.c_str(), path.c_str()) != 0) remove(tmp.c_str());
 }
 
+/* ---- guest-keyed disk cache ---------------------------------------------
+ *
+ * One file per (guest key, stage). The key comes from rsx_draw_engine.c and
+ * already covers the microcode plus every input that changes the HLSL; this
+ * layer adds the translator and glslang versions and validates the HLSL the
+ * file was made from before using it. */
+
+const u32 kDiskMagic = 0x44435352u;   /* "RSCD" */
+const u32 kDiskFormat = 1;
+const int kDiskHeaderWords = 15;
+
+u64 fnv1a64(const void* d, size_t n, u64 h)
+{
+    const unsigned char* p = (const unsigned char*)d;
+    for (size_t i = 0; i < n; i++) { h ^= p[i]; h *= 0x100000001b3ull; }
+    return h;
+}
+
+u64 hlsl_hash(const char* hlsl)
+{
+    return fnv1a64(hlsl, strlen(hlsl), 0xcbf29ce484222325ull);
+}
+
+bool mkdir_p(const std::string& path)
+{
+    if (path.empty()) return false;
+    struct stat st;
+    if (stat(path.c_str(), &st) == 0) return S_ISDIR(st.st_mode);
+    const size_t slash = path.find_last_of('/');
+    if (slash != std::string::npos && slash > 0 &&
+        !mkdir_p(path.substr(0, slash)))
+        return false;
+    if (MKDIR(path.c_str()) == 0) return true;
+    return errno == EEXIST && stat(path.c_str(), &st) == 0 && S_ISDIR(st.st_mode);
+}
+
+bool on_word(const char* s)
+{
+    return s && (strcmp(s, "1") == 0 || !strcasecmp(s, "on") ||
+                 !strcasecmp(s, "true") || !strcasecmp(s, "yes"));
+}
+
+struct DiskCache {
+    std::mutex lock;
+    bool env_read = false;
+    bool on = false;
+    std::string dir;
+    u32 version = RSX_SHADER_TRANSLATOR_VERSION;
+    RsxShaderDiskCacheStats stats = {};
+};
+
+DiskCache& disk_cache()
+{
+    static DiskCache c;
+    return c;
+}
+
+void disk_atexit()
+{
+    DiskCache& c = disk_cache();
+    std::lock_guard<std::mutex> guard(c.lock);
+    if (!c.on) return;
+    fprintf(stderr, "[shader-cache] %s: %u hits, %u misses, %u stores,"
+                    " %u rejected (translator v%u)\n",
+            c.dir.c_str(), (unsigned)c.stats.hits, (unsigned)c.stats.misses,
+            (unsigned)c.stats.stores, (unsigned)c.stats.rejected,
+            (unsigned)c.version);
+}
+
+/* Reads the switch once. A value that is not an on-word is the directory. */
+void disk_env(DiskCache& c)
+{
+    if (c.env_read) return;
+    c.env_read = true;
+    c.on = false;
+    c.dir.clear();
+    const char* e = getenv("PS3RECOMP_SHADER_DISK_CACHE");
+    if (!e || !*e || strcmp(e, "0") == 0) return;
+    if (on_word(e)) {
+        const char* root = getenv("PS3_GAMEDATA_ROOT");
+        c.dir = (root && *root) ? std::string(root) + "/shader_cache"
+                                : std::string("recomp-work/shader_cache");
+    } else {
+        c.dir = e;
+    }
+    if (!mkdir_p(c.dir)) {
+        fprintf(stderr, "[shader-cache] cannot create %s; disk cache off\n",
+                c.dir.c_str());
+        c.dir.clear();
+        return;
+    }
+    c.on = true;
+    static bool registered = false;
+    if (!registered) { registered = true; atexit(disk_atexit); }
+    fprintf(stderr, "[shader-cache] %s (translator v%u)\n",
+            c.dir.c_str(), (unsigned)c.version);
+}
+
+std::string disk_path(const DiskCache& c, u64 key, int stage)
+{
+    char name[64];
+    snprintf(name, sizeof name, "/%016llx_%d.spv",
+             (unsigned long long)key, stage);
+    return c.dir + name;
+}
+
+void disk_header(u32 hdr[kDiskHeaderWords], u32 version, int stage, u64 key,
+                 u64 hash, size_t hlen, size_t nwords, u64 sum)
+{
+    const glslang::Version v = glslang::GetVersion();
+    hdr[0] = kDiskMagic;
+    hdr[1] = kDiskFormat;
+    hdr[2] = version;
+    hdr[3] = (u32)v.major;
+    hdr[4] = (u32)v.minor;
+    hdr[5] = (u32)v.patch;
+    hdr[6] = (u32)stage;
+    hdr[7] = (u32)key;
+    hdr[8] = (u32)(key >> 32);
+    hdr[9] = (u32)hash;
+    hdr[10] = (u32)(hash >> 32);
+    hdr[11] = (u32)hlen;
+    hdr[12] = (u32)nwords;
+    hdr[13] = (u32)sum;
+    hdr[14] = (u32)(sum >> 32);
+}
+
+bool disk_load(DiskCache& c, u64 key, int stage, const char* hlsl,
+               u32* words, u32 max_words, u32* out_words)
+{
+    std::lock_guard<std::mutex> guard(c.lock);
+    disk_env(c);
+    if (!c.on) return false;
+
+    const std::string path = disk_path(c, key, stage);
+    const u64 hash = hlsl_hash(hlsl);
+    const size_t hlen = strlen(hlsl);
+    FILE* f = fopen(path.c_str(), "rb");
+    if (!f) { c.stats.misses++; return false; }
+
+    u32 hdr[kDiskHeaderWords];
+    u32 want[kDiskHeaderWords];
+    disk_header(want, c.version, stage, key, hash, hlen, 0, 0);
+    bool ok = fread(hdr, sizeof hdr, 1, f) == 1 &&
+              memcmp(hdr, want, 12 * sizeof(u32)) == 0 &&
+              hdr[12] != 0 && hdr[12] <= max_words &&
+              hdr[12] <= (1u << 24);
+    if (ok) {
+        u64 sum = 0xcbf29ce484222325ull;
+        std::vector<unsigned int> tmp(hdr[12]);
+        ok = fread(tmp.data(), sizeof(u32), tmp.size(), f) == tmp.size();
+        if (ok) {
+            sum = fnv1a64(tmp.data(), tmp.size() * sizeof(u32), sum);
+            ok = (u32)sum == hdr[13] && (u32)(sum >> 32) == hdr[14];
+        }
+        if (ok) {
+            memcpy(words, tmp.data(), tmp.size() * sizeof(u32));
+            *out_words = (u32)tmp.size();
+        }
+    }
+    fclose(f);
+    if (!ok) {
+        c.stats.rejected++;
+        c.stats.misses++;
+        return false;
+    }
+    c.stats.hits++;
+    return true;
+}
+
+/* Written under a temporary name and renamed, so a reader never sees half a
+ * file. A failed write is silent: the translation is already in hand. */
+void disk_store(DiskCache& c, u64 key, int stage, const char* hlsl,
+                const u32* words, u32 nwords)
+{
+    std::lock_guard<std::mutex> guard(c.lock);
+    disk_env(c);
+    if (!c.on) return;
+
+    static std::atomic<unsigned> serial{0};
+    const std::string path = disk_path(c, key, stage);
+    char suffix[64];
+#ifdef _WIN32
+    snprintf(suffix, sizeof suffix, ".%d.%u.tmp",
+             (int)_getpid(), (unsigned)serial.fetch_add(1));
+#else
+    snprintf(suffix, sizeof suffix, ".%d.%u.tmp",
+             (int)getpid(), (unsigned)serial.fetch_add(1));
+#endif
+    const std::string tmp = path + suffix;
+    FILE* f = fopen(tmp.c_str(), "wb");
+    if (!f) return;
+
+    const u64 hash = hlsl_hash(hlsl);
+    const size_t hlen = strlen(hlsl);
+    const u64 sum = fnv1a64(words, (size_t)nwords * sizeof(u32),
+                            0xcbf29ce484222325ull);
+    u32 hdr[kDiskHeaderWords];
+    disk_header(hdr, c.version, stage, key, hash, hlen, nwords, sum);
+    bool ok = fwrite(hdr, sizeof hdr, 1, f) == 1 &&
+              fwrite(words, sizeof(u32), nwords, f) == nwords;
+    ok = (fclose(f) == 0) && ok;
+#ifdef _WIN32
+    if (ok) remove(path.c_str());      /* rename does not replace on Windows */
+#endif
+    if (!ok || rename(tmp.c_str(), path.c_str()) != 0) {
+        remove(tmp.c_str());
+        return;
+    }
+    c.stats.stores++;
+    if ((c.stats.stores & 63u) == 0)
+        fprintf(stderr, "[shader-cache] %u stores, %u hits, %u misses\n",
+                (unsigned)c.stats.stores, (unsigned)c.stats.hits,
+                (unsigned)c.stats.misses);
+}
+
 } // namespace
 
 extern "C" int rsx_hlsl_to_spirv_available(void) { return 1; }
@@ -291,6 +520,64 @@ extern "C" void rsx_hlsl_to_spirv_cache_reset(void)
     c.stats = {};
 }
 
+extern "C" int rsx_hlsl_to_spirv_keyed(u64 guest_key, const char* hlsl,
+                                       int stage, u32* words, u32 max_words,
+                                       u32* out_words, char* log, u32 log_size)
+{
+    if (out_words) *out_words = 0;
+    if (!hlsl || !words || !out_words || max_words == 0)
+        return rsx_hlsl_to_spirv(hlsl, stage, words, max_words, out_words,
+                                 log, log_size);
+    DiskCache& d = disk_cache();
+    {
+        std::lock_guard<std::mutex> guard(d.lock);
+        disk_env(d);
+        if (!d.on)
+            return rsx_hlsl_to_spirv(hlsl, stage, words, max_words, out_words,
+                                     log, log_size);
+    }
+    u32 n = 0;
+    if (disk_load(d, guest_key, stage, hlsl, words, max_words, &n)) {
+        *out_words = n;
+        return 0;
+    }
+    const int r = rsx_hlsl_to_spirv(hlsl, stage, words, max_words, out_words,
+                                    log, log_size);
+    if (r == 0 && *out_words)
+        disk_store(d, guest_key, stage, hlsl, words, *out_words);
+    return r;
+}
+
+extern "C" void rsx_hlsl_to_spirv_disk_stats(RsxShaderDiskCacheStats* out)
+{
+    DiskCache& d = disk_cache();
+    std::lock_guard<std::mutex> guard(d.lock);
+    if (out) *out = d.stats;
+}
+
+extern "C" void rsx_hlsl_to_spirv_disk_reset(void)
+{
+    DiskCache& d = disk_cache();
+    std::lock_guard<std::mutex> guard(d.lock);
+    d.env_read = false;
+    d.version = RSX_SHADER_TRANSLATOR_VERSION;
+    d.stats = {};
+}
+
+extern "C" u32 rsx_hlsl_to_spirv_disk_version(void)
+{
+    DiskCache& d = disk_cache();
+    std::lock_guard<std::mutex> guard(d.lock);
+    return d.version;
+}
+
+extern "C" void rsx_hlsl_to_spirv_disk_set_version(u32 version)
+{
+    DiskCache& d = disk_cache();
+    std::lock_guard<std::mutex> guard(d.lock);
+    d.version = version;
+}
+
 #else /* !PS3RECOMP_HAVE_SPIRV_TRANSLATION */
 
 extern "C" int rsx_hlsl_to_spirv_available(void) { return 0; }
@@ -312,5 +599,23 @@ extern "C" void rsx_hlsl_to_spirv_cache_stats(RsxSpirvCacheStats* out)
 }
 
 extern "C" void rsx_hlsl_to_spirv_cache_reset(void) {}
+
+extern "C" int rsx_hlsl_to_spirv_keyed(u64 guest_key, const char* hlsl,
+                                       int stage, u32* words, u32 max_words,
+                                       u32* out_words, char* log, u32 log_size)
+{
+    (void)guest_key;
+    return rsx_hlsl_to_spirv(hlsl, stage, words, max_words, out_words,
+                             log, log_size);
+}
+
+extern "C" void rsx_hlsl_to_spirv_disk_stats(RsxShaderDiskCacheStats* out)
+{
+    if (out) memset(out, 0, sizeof *out);
+}
+
+extern "C" void rsx_hlsl_to_spirv_disk_reset(void) {}
+extern "C" u32 rsx_hlsl_to_spirv_disk_version(void) { return RSX_SHADER_TRANSLATOR_VERSION; }
+extern "C" void rsx_hlsl_to_spirv_disk_set_version(u32 version) { (void)version; }
 
 #endif

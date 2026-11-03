@@ -231,6 +231,11 @@ typedef struct rsx_draw_backend {
                             const rsx_vertex_layout_plan* layout,
                             u32 vertex_stride, rsx_be_format rt_fmt,
                             u32 rt_count);
+    /* Optional: the engine's 64-bit identity for the pipeline_create that
+     * follows. It hashes the guest microcode plus every input that changes
+     * the HLSL, so a backend can keep an on-disk shader cache keyed by the
+     * guest program instead of by the HLSL text. NULL when unused. */
+    void (*set_pipeline_key)(void* user, u64 key);
     void (*pipeline_release)(void* user, u32 pipeline);
 
     /* Per-draw binding. The backend owns every ring the D3D12 engine used to

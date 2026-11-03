@@ -3976,10 +3976,22 @@ static VkStencilOpState vk_gcm_stencil_face(u32 func, u32 fail, u32 zfail, u32 z
     return s;
 }
 
-static int vk_eng_translate(const char* hlsl, int stage, VkShaderModule* out)
+/* The engine's identity for the pipeline_create in progress. It is the key
+ * of the guest-keyed shader disk cache (PS3RECOMP_SHADER_DISK_CACHE); the
+ * walker is the only caller, so one static is enough. */
+static u64 s_eng_pipe_key;
+
+static void vk_eng_set_pipeline_key(void* user, u64 key)
+{
+    (void)user;
+    s_eng_pipe_key = key;
+}
+
+static int vk_eng_translate(u64 guest_key, const char* hlsl, int stage, VkShaderModule* out)
 {
     u32 words = 0;
-    if (rsx_hlsl_to_spirv(hlsl, stage, s_g.spv, VK_SPV_WORDS, &words, s_g.log, sizeof s_g.log) || !words) {
+    if (rsx_hlsl_to_spirv_keyed(guest_key, hlsl, stage, s_g.spv, VK_SPV_WORDS,
+                                &words, s_g.log, sizeof s_g.log) || !words) {
         VK_LOG("engine: %s translation failed: %s\n",
                stage == RSX_SHADER_STAGE_VERTEX ? "vertex" : "fragment", s_g.log);
         return -1;
@@ -4073,14 +4085,14 @@ static u32 vk_eng_pipeline_create(void* user, const char* vs_hlsl, const char* p
     memset(P, 0, sizeof *P);
     {
         const uint64_t _t = ps3_trace_begin();
-        const int _rc = vk_eng_translate(vs_hlsl, RSX_SHADER_STAGE_VERTEX, &P->vs);
+        const int _rc = vk_eng_translate(s_eng_pipe_key, vs_hlsl, RSX_SHADER_STAGE_VERTEX, &P->vs);
         if (_t) ps3_trace_end(_t, PS3_TR_SHADER_COMPILE, 0,
                               (uint32_t)strlen(vs_hlsl));
         if (_rc) return 0;
     }
     {
         const uint64_t _t = ps3_trace_begin();
-        const int _rc = vk_eng_translate(ps_hlsl, RSX_SHADER_STAGE_FRAGMENT, &P->fs);
+        const int _rc = vk_eng_translate(s_eng_pipe_key, ps_hlsl, RSX_SHADER_STAGE_FRAGMENT, &P->fs);
         if (_t) ps3_trace_end(_t, PS3_TR_SHADER_COMPILE, 1,
                               (uint32_t)strlen(ps_hlsl));
         if (_rc) {
@@ -5297,6 +5309,7 @@ static const rsx_draw_backend s_vk_engine_backend = {
     .depth_snapshot       = vk_eng_depth_snapshot,
     .color_snapshot       = vk_eng_color_snapshot,
     .pipeline_create      = vk_eng_pipeline_create,
+    .set_pipeline_key     = vk_eng_set_pipeline_key,
     .pipeline_release     = vk_eng_pipeline_release,
     .bind_targets         = vk_eng_bind_targets,
     .bind_pipeline        = vk_eng_bind_pipeline,

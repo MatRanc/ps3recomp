@@ -4548,6 +4548,7 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
     if (vi > 0 && fi > 0) {
         wp2_add(WPROF2_PIPE_DECOMPILE, wp2_decompile);
         const unsigned long long wp2_create = wp2_t0();
+        if (g.be->set_pipeline_key) g.be->set_pipeline_key(g.be->user, key);
         handle = g.be->pipeline_create(g.be->user, s_vs_hlsl, s_ps_hlsl, rs,
                                        layout, layout->stride, rt_fmt, rt_count);
         wp2_add(WPROF2_PIPE_CREATE, wp2_create);

@@ -72,6 +72,48 @@ void rsx_hlsl_to_spirv_cache_stats(RsxSpirvCacheStats* out);
  * PS3RECOMP_SPIRV_CACHE again on the next request. Disk files stay. */
 void rsx_hlsl_to_spirv_cache_reset(void);
 
+/* ---- guest-keyed disk cache ---------------------------------------------
+ *
+ * PS3RECOMP_SHADER_DISK_CACHE (default off) keeps the translated SPIR-V under
+ * a key the engine already computes from the guest program: the vertex and
+ * fragment microcode, every input that changes the HLSL and its translation,
+ * and the render state that selects the pipeline variant (the engine's
+ * pipeline identity in rsx_draw_engine.c). A warm run can then rebuild a
+ * pipeline without running glslang at all.
+ *
+ * `1`/`on` uses $PS3_GAMEDATA_ROOT/shader_cache (recomp-work/shader_cache in
+ * the play scripts); any other value is a directory. Files are written under
+ * a temporary name and renamed. A file whose version, stage, key, HLSL hash,
+ * length or word checksum does not match the request is a miss and is
+ * rewritten, never an error.
+ *
+ * Bump RSX_SHADER_TRANSLATOR_VERSION whenever the HLSL that the decompilers
+ * emit, the binding contract in this header, the glslang options in
+ * translate(), or the SPIR-V legalisation changes. The glslang version is
+ * also part of every file, so a glslang update is a miss too.
+ */
+#define RSX_SHADER_TRANSLATOR_VERSION 1u
+
+int rsx_hlsl_to_spirv_keyed(u64 guest_key, const char* hlsl, int stage,
+                            u32* words, u32 max_words, u32* out_words,
+                            char* log, u32 log_size);
+
+typedef struct RsxShaderDiskCacheStats {
+    u32 hits;       /* served from a file */
+    u32 misses;     /* no usable file: translated */
+    u32 stores;     /* files written */
+    u32 rejected;   /* file present but not usable (version/key/checksum/...) */
+} RsxShaderDiskCacheStats;
+
+void rsx_hlsl_to_spirv_disk_stats(RsxShaderDiskCacheStats* out);
+
+/* Zero the counters and read PS3RECOMP_SHADER_DISK_CACHE again on the next
+ * request; the translator version returns to its compiled value. */
+void rsx_hlsl_to_spirv_disk_reset(void);
+
+u32  rsx_hlsl_to_spirv_disk_version(void);
+void rsx_hlsl_to_spirv_disk_set_version(u32 version);   /* tests */
+
 #ifdef __cplusplus
 }
 #endif
