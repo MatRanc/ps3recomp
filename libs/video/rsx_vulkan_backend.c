@@ -2363,6 +2363,12 @@ static void vk_present_enqueue(u32 slot, u32 idx, u32 frame,
  * the window is not black while the title starts. Default off. */
 static int s_present_new_only = -1;
 static u32 s_last_present_frame;
+/* PS3RECOMP_PRESENT_DUMP_DIR: the readback of the copy a present is about to
+ * show. vk_present_window dumps it only after the NEW_ONLY gate, so the files
+ * are exactly the frames the window shows, in display order. */
+static void vk_present_dump_small(const unsigned char* rgba);
+static const unsigned char* s_present_dump_px;
+static int s_present_dump_px_valid;
 
 static int vk_present_new_only_on(void)
 {
@@ -2383,6 +2389,10 @@ static void vk_present_window(void)
     if (vk_present_new_only_on()) {
         if (present_frame && present_frame == s_last_present_frame) return;
         s_last_present_frame = present_frame;
+    }
+    if (s_present_dump_px_valid) {
+        vk_present_dump_small(s_present_dump_px);
+        s_present_dump_px_valid = 0;
     }
     const unsigned long long pace_due = vk_pace_frame_due();
 
@@ -2569,6 +2579,63 @@ static void vk_present_wait_gpu(void)
         pvkWaitForFences(s_vk.device, 1, &s_vk.present_fence, VK_TRUE, UINT64_MAX);
 }
 
+/* PS3RECOMP_PRESENT_DUMP_DIR=<dir>: write a small grayscale PGM of every
+ * presented frame (default 160x90, PS3RECOMP_PRESENT_DUMP_MAX frames) so the
+ * displayed sequence can be checked offline for backward steps. Downsampled
+ * on the CPU from the readback the present already made; default off. */
+static void vk_present_dump_small(const unsigned char* rgba)
+{
+    static int on = -1;
+    static const char* dir;
+    static u32 maxn, n, dw, dh;
+    if (on < 0) {
+        const char* e = getenv("PS3RECOMP_PRESENT_DUMP_DIR");
+        dir = (e && *e) ? e : NULL;
+        const char* m = getenv("PS3RECOMP_PRESENT_DUMP_MAX");
+        maxn = m && atoi(m) > 0 ? (u32)atoi(m) : 240u;
+        const char* w = getenv("PS3RECOMP_PRESENT_DUMP_W");
+        const char* h = getenv("PS3RECOMP_PRESENT_DUMP_H");
+        dw = w && atoi(w) > 0 ? (u32)atoi(w) : 160u;
+        dh = h && atoi(h) > 0 ? (u32)atoi(h) : 90u;
+        on = dir != NULL;
+        if (on) VK_LOG("present dump: %ux%u PGM into %s, max %u frames\n", dw, dh, dir, maxn);
+    }
+    if (!on || !dir || n >= maxn) return;
+    unsigned char* img = (unsigned char*)malloc((size_t)dw * dh);
+    if (!img) { on = 0; return; }
+    const u32 sw = s_vk.width, sh = s_vk.height;
+    for (u32 y = 0; y < dh; y++) {
+        const u32 y0 = (u32)((unsigned long long)y * sh / dh);
+        u32 y1 = (u32)((unsigned long long)(y + 1) * sh / dh);
+        if (y1 <= y0) y1 = y0 + 1;
+        for (u32 x = 0; x < dw; x++) {
+            const u32 x0 = (u32)((unsigned long long)x * sw / dw);
+            u32 x1 = (u32)((unsigned long long)(x + 1) * sw / dw);
+            if (x1 <= x0) x1 = x0 + 1;
+            unsigned long long sum = 0, cnt = 0;
+            for (u32 yy = y0; yy < y1 && yy < sh; yy++)
+                for (u32 xx = x0; xx < x1 && xx < sw; xx++) {
+                    const unsigned char* p = rgba + ((size_t)yy * sw + xx) * 4;
+                    sum += (unsigned)p[0] * 77u + (unsigned)p[1] * 150u + (unsigned)p[2] * 29u;
+                    cnt++;
+                }
+            img[(size_t)y * dw + x] = cnt ? (unsigned char)(sum / (cnt * 256u)) : 0;
+        }
+    }
+    char path[1024];
+    snprintf(path, sizeof path, "%s/present_%05u.pgm", dir, n);
+    FILE* f = fopen(path, "wb");
+    if (!f) { on = 0; free(img); return; }
+    fprintf(f, "P5\n%u %u\n255\n", dw, dh);
+    fwrite(img, 1, (size_t)dw * dh, f);
+    fclose(f);
+    u64 hsh = 1469598103934665603ull;
+    for (size_t i = 0; i < (size_t)dw * dh; i++) hsh = (hsh ^ img[i]) * 1099511628211ull;
+    fprintf(stderr, "[pdump] n=%u hash=%016llx\n", n, (unsigned long long)hsh);
+    free(img);
+    n++;
+}
+
 /* present_mu held. */
 static void vk_present_complete_locked(void)
 {
@@ -2584,6 +2651,8 @@ static void vk_present_complete_locked(void)
     s_vk.last_center = ((u32)px[c] << 16) | ((u32)px[c + 1] << 8) | (u32)px[c + 2];
     s_vk.presented++;
     if (s_vk.dump_path && (s_vk.presented % s_vk.dump_every) == 0) vk_dump_ppm(px);
+    s_present_dump_px = px;
+    s_present_dump_px_valid = 1;
     vk_present_window();
 }
 

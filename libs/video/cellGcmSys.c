@@ -4033,6 +4033,18 @@ s32 cellGcmSetPrepareFlip(void* ctx, u32 bufferId)
 
     printf("[cellGcmSys] SetPrepareFlip(bufferId=%u)\n", bufferId);
 
+    /* The guest stores this return value in its flip queue and its display
+     * thread later passes it (masked to 8 bits) to cellGcmSetFlipImmediate
+     * (Gfx_FrameEnd at 0x6668c, Gfx_DisplayFlip at 0x69320). The real SDK
+     * returns the buffer id -- RPCS3's gcmSetPrepareFlip does the same. The
+     * old CELL_OK return is 0, so every flip named display buffer 0 while the
+     * title rendered alternately into buffers 0 and 1: half the presents
+     * showed a buffer that had already been re-rendered, and the next named
+     * the other one, so the displayed image stepped backward. Default off
+     * until measured (PS3RECOMP_PREPARE_FLIP_RET, live key). */
+    const int ret_id = gcm_live_get(PS3_LIVE_PREPARE_FLIP_RET,
+                                    "PS3RECOMP_PREPARE_FLIP_RET");
+
     gcm_set_current_display_buffer(bufferId);
     s_flip_status = CELL_GCM_FLIP_STATUS_DONE;
     s_flip_request_count++;
@@ -4045,7 +4057,7 @@ s32 cellGcmSetPrepareFlip(void* ctx, u32 bufferId)
     if (s_flip_handler_opd && g_ps3_guest_caller && !gcm_flipcb_on_tick_only())
         g_ps3_guest_caller(s_flip_handler_opd, 0, 0, 0, 0, 0, 0, 0, 0);
 
-    return CELL_OK;
+    return ret_id ? (s32)bufferId : CELL_OK;
 }
 
 /* NID: 0x1BFAB6EE */

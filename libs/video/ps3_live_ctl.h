@@ -57,6 +57,7 @@ enum {
     PS3_LIVE_PIN_LAYOUT,        /* PS3RECOMP_PIN_LAYOUT: named affinity layout */
     PS3_LIVE_SPURS_PM_FAST_RESCHED, /* SPURS_PM_FAST_RESCHED: re-run a still-ready PM without the kernel round trip */
     PS3_LIVE_SPU_CODE_DMA_MEMO, /* SPU_CODE_DMA_MEMO: skip a code GET already resident byte-identical */
+    PS3_LIVE_PREPARE_FLIP_RET,  /* cellGcmSetPrepareFlip returns the display buffer id */
     PS3_LIVE_COUNT
 };
 

@@ -56,6 +56,7 @@ static const char* const K_NAME[PS3_LIVE_COUNT] = {
     "PS3RECOMP_PIN_LAYOUT",
     "SPURS_PM_FAST_RESCHED",
     "SPU_CODE_DMA_MEMO",
+    "PS3RECOMP_PREPARE_FLIP_RET",
 };
 
 static _Atomic int s_val[PS3_LIVE_COUNT];

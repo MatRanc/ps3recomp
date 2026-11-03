@@ -51,6 +51,9 @@ extern u32 ppu_vm_size;
  * offline engine fixtures (which compile this file alone) still link; the
  * `at=` field is then 0 and simply unused. */
 extern unsigned long long ps3_ms_now(void) __attribute__((weak));
+/* cellGcmSys.c: the guest flip counter (PS3RECOMP_PRESENT_TRACE). Weak so the
+ * standalone engine fixtures still link. */
+extern u32 cellGcm_flip_frame_count(void) __attribute__((weak));
 
 /* ------------------------------------------------------------------------- */
 
@@ -122,6 +125,7 @@ typedef struct {
     u32 handle;
     u32 feedback;          /* last immutable own-target copy, engine-owned */
     u64 color_serial;       /* g.write_serial of the last colour write, or 0 */
+    u64 last_write_serial;  /* any colour write, 3D or 2D (present trace)     */
     int guest_dirty;        /* rendered since guest memory last got a copy   */
     u32 last_use;           /* g.frames when last bound, sampled or presented */
     /* PS3RECOMP_RSX_WCB ondemand/async (docs/wcb-async.md). */
@@ -253,6 +257,11 @@ static struct {
 
     rsx_fp_constant_block fp_constants;
 } g;
+
+/* PS3RECOMP_PRESENT_TRACE=1 (default off): see eng_present_trace. Declared
+ * here so a 2D colour-target write only bumps color_serial while the trace is
+ * on; last_write_serial is diagnostic and gates nothing else. */
+static int s_ptrace = -1;
 
 /* ==========================================================================
  * PS3RECOMP_WALKER_FAST: cut 1 (fetch plan/remap) and cut 3 (pipeline input
@@ -1660,6 +1669,7 @@ static u32 eng_surface_get(u32 location, u32 offset, u32 want_w, u32 want_h,
     s->w = want_w; s->h = want_h; s->fmt = want_fmt; s->aa_grid = aa_grid;
     s->handle = handle;
     s->color_serial = 0;
+    s->last_write_serial = 0;
     s->guest_dirty = 0;
     s->guest_valid_serial = 0;
     s->guest_valid_x = s->guest_valid_y = s->guest_valid_w = s->guest_valid_h = 0;
@@ -2150,6 +2160,10 @@ void rsx_draw_engine_guest_wrote(u32 location, u32 offset, u32 pitch, u32 w, u32
                         " %u non-zero pixels\n", location, offset, w, h, s->offset, x, y,
                 eng_nonzero_pixels(rows, w * h, 4u));
     g.be->color_target_write(g.be->user, s->handle, x, y, w, h, rows, w * 4u);
+    /* A 2D transfer is a write to this target too; the present trace needs to
+     * know the frame is newer than the one last presented. */
+    s->last_write_serial = ++g.write_serial;
+    if (s_ptrace > 0) s->color_serial = s->last_write_serial;
 }
 
 static u32 eng_current_surface(void)
@@ -3284,6 +3298,7 @@ static void eng_surfaces_wrote(const u32* targets, u32 n_targets)
     const u64 serial = ++g.write_serial;
     for (u32 i = 0; i < n_targets; i++) {
         g.surfaces[targets[i]].color_serial = serial;
+        g.surfaces[targets[i]].last_write_serial = serial;
         if (!g.surfaces[targets[i]].guest_dirty) WCB_COUNT(marked_dirty, 1);
         g.surfaces[targets[i]].guest_dirty = 1;
     }
@@ -6763,12 +6778,44 @@ void rsx_draw_engine_flush_dirty_to_guest(void)
     }
 }
 
+/* PS3RECOMP_PRESENT_TRACE=1 (default off): one line per presented guest
+ * frame with the source surface's last colour write serial. A present whose
+ * source was last written before the previous present's source is showing an
+ * image older than one already shown -- the backward-frame symptom. Cheap:
+ * one compare and, when on, one fprintf per present. */
+static u64 s_ptrace_prev_wseq, s_ptrace_back, s_ptrace_presents;
+
+static void eng_present_trace(u32 buffer_id, u32 target)
+{
+    if (s_ptrace < 0) {
+        const char* e = getenv("PS3RECOMP_PRESENT_TRACE");
+        s_ptrace = e && *e && strcmp(e, "0") != 0;
+    }
+    if (!s_ptrace) return;
+    const u64 ws = (target != ENG_INVALID && target < g.n_surfaces)
+                 ? g.surfaces[target].last_write_serial : 0ull;
+    const u32 off = (target != ENG_INVALID && target < g.n_surfaces)
+                  ? g.surfaces[target].offset : 0u;
+    const int back = (s_ptrace_prev_wseq && ws && ws < s_ptrace_prev_wseq);
+    if (back) s_ptrace_back++;
+    fprintf(stderr, "[ptrace] n=%llu flip=%u buf=%u off=0x%08X slot=%d wseq=%llu prev=%llu back=%d frames=%u draws=%u\n",
+            (unsigned long long)s_ptrace_presents,
+            cellGcm_flip_frame_count ? cellGcm_flip_frame_count() : 0u,
+            buffer_id, off, (int)target, (unsigned long long)ws,
+            (unsigned long long)s_ptrace_prev_wseq, back, g.frames, g.guest_draws);
+    if (ws) s_ptrace_prev_wseq = ws;
+    if (++s_ptrace_presents % 300ull == 0ull)
+        fprintf(stderr, "[ptrace] summary: %llu presents, %llu stale-source (backward)\n",
+                (unsigned long long)s_ptrace_presents, (unsigned long long)s_ptrace_back);
+}
+
 static void eng_present(u32 buffer_id)
 {
     if (!g.ready) return;
     rsx_draw_engine_flush_dirty_to_guest();
     const u32 target = eng_present_surface(buffer_id);
     if (target == ENG_INVALID) return;
+    eng_present_trace(buffer_id, target);
     g.surfaces[target].last_use = g.frames;
     if (getenv("PS3RECOMP_METAL_FRAME_DUMP") && g.frames % 120 == 0) {
         u32 current = eng_current_surface();
