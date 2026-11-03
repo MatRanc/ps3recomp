@@ -75,6 +75,7 @@ extern uint8_t* vm_base;
 
 int g_c690_stats = 0;
 int g_c690_hash_on = 0;      /* PS3RECOMP_C690_HASH: sample stride, 0 = off */
+int g_c690_gap = 0;          /* PS3RECOMP_C690_GAP: inter-job turnover breakdown */
 
 #define C690_IMAGE_ID        6
 #define C690_JOB_ENTRY_LS    0x135B8u
@@ -137,6 +138,14 @@ static int c690_opcode_for_lsa(uint32_t lsa)
     return -1;
 }
 
+#define C690_GAP_FN_MAX 128
+typedef struct {
+    int img;
+    uint32_t lsa;
+    uint64_t ns;
+    unsigned long long n;
+} c690_gap_fn_ent;
+
 typedef struct {
     /* Written only by the owning host thread while it runs jobs; read by the
      * periodic and exit reports. Relaxed 64-bit accesses are atomic on every
@@ -149,6 +158,13 @@ typedef struct {
     unsigned long long job_ns_sum;
     unsigned long long wall_max_ns;
     unsigned spu_id;
+    /* PS3RECOMP_C690_GAP: turnover counters for this lane. */
+    unsigned long long gap_jobs, gap_total_ns, gap_max_ns;
+    unsigned long long gap_first_ns_sum, gap_first_n;
+    unsigned long long gap_ctr[12];
+    unsigned gap_fn_n;
+    unsigned long long gap_fn_other_ns, gap_fn_other_n;
+    c690_gap_fn_ent gap_fn[C690_GAP_FN_MAX];
 } c690_thread_stats;
 
 static c690_thread_stats s_threads[C690_MAX_THREADS];
@@ -180,6 +196,12 @@ static SPU_THREAD_LOCAL struct {
     uint64_t in_hash, out_hash;
     uint64_t in_bytes, out_bytes;
     uint32_t frame;
+    /* PS3RECOMP_C690_GAP: inter-job turnover on this lane. */
+    unsigned gap_active, gap_first;
+    uint64_t gap_t0, gap_last, gap_first_ns;
+    int gap_cur_img;
+    uint32_t gap_cur_lsa;
+    unsigned gap_entries;
 } t_run;
 
 /* ---- PS3RECOMP_C690_HASH: do repeated jobs produce identical bytes? ----
@@ -278,6 +300,155 @@ static const char* c690_clock_name(void)
 #endif
 }
 
+/* ===========================================================================
+ * PS3RECOMP_C690_GAP: where the time between two c690 jobs on one lane goes.
+ *
+ * The job span is 0x135B8..0x12AB8; everything a lane does between the end
+ * command and the next entry of 0x135B8 is its job turnover: the c690 submit
+ * epilogue, the WWS policy module's list/ticket handling, its descriptor and
+ * code DMAs, the GETLLAR/PUTLLC claim, and the runtime's MFC/coherency work
+ * inside all of those. Off by default; measurement only.
+ *
+ * Exclusive time is the same "last entry owns the interval" model the job
+ * counters use, but across ALL lifted images (the PM is image 2) and only
+ * while a gap is open. Function entries are only visible at indirect dispatch
+ * (spu_lifted_lookup) and SPU_DIRECT; a direct host call inside the PM is
+ * charged to the function it was entered from, so the table is a lower bound
+ * for that function and the "other" bucket absorbs any overflow. The counters
+ * below separate the runtime pieces that sit inside those intervals.
+ * ===========================================================================*/
+static unsigned int s_gap_hist[C690_WALL_BUCKETS];
+
+static c690_thread_stats* c690_slot(void);   /* defined below */
+uint64_t c690_gap_now(void) { return c690_now_ns(); }
+
+static void c690_gap_charge(int img, uint32_t lsa, uint64_t dt)
+{
+    if (!dt || !lsa) return;
+    c690_thread_stats* const s = c690_slot();
+    for (unsigned i = 0; i < s->gap_fn_n; i++) {
+        if (s->gap_fn[i].img == img && s->gap_fn[i].lsa == lsa) {
+            s->gap_fn[i].ns += dt;
+            s->gap_fn[i].n++;
+            return;
+        }
+    }
+    if (s->gap_fn_n < C690_GAP_FN_MAX) {
+        c690_gap_fn_ent* e = &s->gap_fn[s->gap_fn_n++];
+        e->img = img; e->lsa = lsa; e->ns = dt; e->n = 1;
+    } else {
+        s->gap_fn_other_ns += dt;
+        s->gap_fn_other_n++;
+    }
+}
+
+static void c690_gap_entry_at(const struct spu_context* ctx, uint32_t lsa,
+                              uint64_t now)
+{
+    if (!t_run.gap_active || !lsa) return;
+    if (t_run.gap_cur_lsa)
+        c690_gap_charge(t_run.gap_cur_img, t_run.gap_cur_lsa, now - t_run.gap_last);
+    t_run.gap_last = now;
+    t_run.gap_cur_img = ctx ? ctx->image_id : -1;
+    t_run.gap_cur_lsa = lsa;
+    t_run.gap_entries++;
+    if (!t_run.gap_first) {
+        t_run.gap_first = 1;
+        t_run.gap_first_ns = now - t_run.gap_t0;
+    }
+}
+
+static void c690_gap_open(uint64_t now)
+{
+    t_run.gap_active = 1;
+    t_run.gap_first = 0;
+    t_run.gap_t0 = now;
+    t_run.gap_last = now;
+    t_run.gap_first_ns = 0;
+    t_run.gap_cur_img = C690_IMAGE_ID;
+    t_run.gap_cur_lsa = C690_JOB_END_LS;
+    t_run.gap_entries = 0;
+}
+
+static void c690_gap_close(uint64_t now)
+{
+    if (!t_run.gap_active) return;
+    if (t_run.gap_cur_lsa)
+        c690_gap_charge(t_run.gap_cur_img, t_run.gap_cur_lsa, now - t_run.gap_last);
+    const uint64_t dt = now - t_run.gap_t0;
+    t_run.gap_active = 0;
+    t_run.gap_cur_lsa = 0;
+    if (!dt) return;
+    c690_thread_stats* const s = c690_slot();
+    unsigned us = (unsigned)(dt / 1000u);
+    if (us >= C690_WALL_BUCKETS) us = C690_WALL_BUCKETS - 1u;
+    __atomic_fetch_add(&s_gap_hist[us], 1u, __ATOMIC_RELAXED);
+    s->gap_jobs++;
+    s->gap_total_ns += dt;
+    if (dt > s->gap_max_ns) s->gap_max_ns = dt;
+    if (t_run.gap_first) {
+        s->gap_first_ns_sum += t_run.gap_first_ns;
+        s->gap_first_n++;
+    }
+}
+
+/* Called from spu_lifted_lookup for every indirect dispatch (any image). The
+ * c690 job entry itself closes the gap; every other entry is charged. */
+void c690_gap_on_lookup(const struct spu_context* ctx, uint32_t lsa, uint64_t now)
+{
+    if (!g_c690_gap || !ctx) return;
+    if (ctx->image_id == C690_IMAGE_ID && lsa == C690_JOB_ENTRY_LS && !t_run.job_active)
+        c690_gap_close(now);
+    else
+        c690_gap_entry_at(ctx, lsa, now);
+}
+
+/* Called from SPU_DIRECT (tail-call entries) for any image. */
+void c690_gap_on_direct(const struct spu_context* ctx, uint32_t lsa, uint64_t now)
+{
+    if (!g_c690_gap || !ctx) return;
+    c690_gap_entry_at(ctx, lsa, now);
+}
+
+void c690_gap_on_dma(const struct spu_context* ctx, int is_put, uint32_t lsa,
+                     uint32_t size)
+{
+    if (!g_c690_gap || !ctx || !t_run.gap_active) return;
+    c690_thread_stats* const s = c690_slot();
+    if (is_put) {
+        s->gap_ctr[1]++; s->gap_ctr[3] += size;
+    } else {
+        s->gap_ctr[0]++; s->gap_ctr[2] += size;
+        /* The c690 job-code module loads at LS 0x4000 and its lifted code ends
+         * at 0x14840 (job entry 0x135B8). A GET landing there is a re-load. */
+        if (lsa >= 0x4000u && lsa < 0x14840u) {
+            s->gap_ctr[4]++; s->gap_ctr[5] += size;
+        }
+    }
+}
+
+void c690_gap_on_atomic(const struct spu_context* ctx, int kind, int ok)
+{
+    if (!g_c690_gap || !ctx || !t_run.gap_active) return;
+    c690_thread_stats* const s = c690_slot();
+    if (kind == 0) s->gap_ctr[6]++;
+    else {
+        s->gap_ctr[7]++;
+        if (!ok) s->gap_ctr[8]++;
+    }
+}
+
+void c690_gap_on_overlay(int kind, int ok)
+{
+    if (!g_c690_gap) return;
+    c690_thread_stats* const s = c690_slot();
+    if (kind == 0) s->gap_ctr[9]++;
+    else {
+        s->gap_ctr[10]++;
+        if (!ok) s->gap_ctr[11]++;
+    }
+}
+
 static c690_thread_stats* c690_slot(void)
 {
     if (__builtin_expect(t_slot != NULL, 1)) return t_slot;
@@ -314,9 +485,11 @@ static unsigned c690_frame_flips(void);            /* defined with the report */
 
 void c690_stats_on_lookup(const struct spu_context* ctx, uint32_t lsa)
 {
-    if (!ctx || ctx->image_id != C690_IMAGE_ID) return;
+    if (!ctx) return;
     if (lsa == 0) return;                    /* LS 0 is an end, not an entry */
     const uint64_t now = c690_now_ns();
+    if (__builtin_expect(g_c690_gap, 0)) c690_gap_on_lookup(ctx, lsa, now);
+    if (ctx->image_id != C690_IMAGE_ID) return;
     c690_thread_stats* const s = c690_slot();
 
     if (t_run.job_active) {
@@ -346,6 +519,7 @@ void c690_stats_on_lookup(const struct spu_context* ctx, uint32_t lsa)
             t_run.job_active = 0;
             t_run.current_lsa = 0;
             __atomic_fetch_sub(&s_active_jobs, 1u, __ATOMIC_RELAXED);
+            if (__builtin_expect(g_c690_gap, 0)) c690_gap_open(now);
             c690_maybe_periodic(now);
             return;
         }
@@ -406,7 +580,13 @@ void c690_stats_on_lookup(const struct spu_context* ctx, uint32_t lsa)
 
 void c690_stats_on_direct(const struct spu_context* ctx, uint32_t lsa)
 {
-    if (!ctx || ctx->image_id != C690_IMAGE_ID) return;
+    if (!ctx) return;
+    if (lsa != 0 && __builtin_expect(g_c690_gap, 0)) {
+        /* SPU_DIRECT fires for every image; the gap tracer needs the PM's
+         * (image 2) tail calls too. */
+        c690_gap_on_direct(ctx, lsa, c690_now_ns());
+    }
+    if (ctx->image_id != C690_IMAGE_ID) return;
     if (!t_run.job_active || lsa == 0) return;
     const uint64_t now = c690_now_ns();
     c690_thread_stats* const s = c690_slot();
@@ -491,6 +671,147 @@ static unsigned c690_frame_flips(void)
 #endif
 }
 
+static unsigned c690_gap_percentile(unsigned pct)
+{
+    unsigned long long total = 0, cum = 0, target;
+    for (unsigned i = 0; i < C690_WALL_BUCKETS; i++)
+        total += __atomic_load_n(&s_gap_hist[i], __ATOMIC_RELAXED);
+    if (!total) return 0;
+    target = (total * pct + 99u) / 100u;
+    for (unsigned i = 0; i < C690_WALL_BUCKETS; i++) {
+        cum += __atomic_load_n(&s_gap_hist[i], __ATOMIC_RELAXED);
+        if (cum >= target) return i;
+    }
+    return C690_WALL_BUCKETS - 1u;
+}
+
+static void c690_gap_report(void)
+{
+    if (!g_c690_gap) return;
+    unsigned long long jobs = 0, total = 0, max = 0, fsum = 0, fn = 0;
+    unsigned long long ctr[12] = {0};
+    static c690_gap_fn_ent agg[C690_MAX_THREADS * 8 + 16];
+    unsigned an = 0;
+
+    const int n = __atomic_load_n(&s_thread_count, __ATOMIC_RELAXED);
+    const int nslots = n < C690_MAX_THREADS ? n : C690_MAX_THREADS;
+    for (int i = 0; i <= nslots; i++) {
+        const c690_thread_stats* st;
+        if (i < nslots) st = &s_threads[i];
+        else {
+            if (n <= C690_MAX_THREADS) break;
+            st = &s_overflow;
+        }
+        jobs += st->gap_jobs; total += st->gap_total_ns;
+        if (st->gap_max_ns > max) max = st->gap_max_ns;
+        fsum += st->gap_first_ns_sum; fn += st->gap_first_n;
+        for (unsigned k = 0; k < 12u; k++) ctr[k] += st->gap_ctr[k];
+        for (unsigned k = 0; k < st->gap_fn_n; k++) {
+            const c690_gap_fn_ent* e = &st->gap_fn[k];
+            unsigned j = 0;
+            for (; j < an; j++)
+                if (agg[j].img == e->img && agg[j].lsa == e->lsa) break;
+            if (j == an && an < sizeof agg / sizeof agg[0]) {
+                agg[an].img = e->img; agg[an].lsa = e->lsa;
+                agg[an].ns = 0; agg[an].n = 0;
+                an++;
+            }
+            if (j < an) { agg[j].ns += e->ns; agg[j].n += e->n; }
+        }
+    }
+    if (!jobs) {
+        fprintf(stderr, "[c690-gap] no completed inter-job gaps\n");
+        return;
+    }
+    for (unsigned i = 1; i < an; i++) {          /* insertion sort, ns desc */
+        const c690_gap_fn_ent v = agg[i];
+        int j = (int)i - 1;
+        while (j >= 0 && agg[j].ns < v.ns) { agg[j + 1] = agg[j]; j--; }
+        agg[j + 1] = v;
+    }
+    fprintf(stderr,
+            "[c690-gap] gaps=%llu total_us=%llu mean_us=%.2f p50=%u p90=%u "
+            "p99=%u max_us=%llu first_entry_us=%.2f\n",
+            jobs, total / 1000ull, (double)total / (double)jobs / 1000.0,
+            c690_gap_percentile(50), c690_gap_percentile(90),
+            c690_gap_percentile(99), max / 1000ull,
+            fn ? (double)fsum / (double)fn / 1000.0 : 0.0);
+    fprintf(stderr, "[c690-gap] exclusive intervals (%llu us):\n", total / 1000ull);
+    const unsigned show = an < 24u ? an : 24u;
+    for (unsigned i = 0; i < show; i++) {
+        const unsigned p = c690_pct_tenths(agg[i].ns, total);
+        fprintf(stderr, "[c690-gap]   img=%d 0x%05X  %10llu us  %u.%u%%  n=%llu  avg=%.2f us\n",
+                agg[i].img, agg[i].lsa, agg[i].ns / 1000ull, p / 10u, p % 10u,
+                agg[i].n, (double)agg[i].ns / (double)agg[i].n / 1000.0);
+    }
+    fprintf(stderr, "[c690-gap] runtime: mfc_get=%llu (%.2f MiB) mfc_put=%llu (%.2f MiB) "
+                    "code_get=%llu (%.2f MiB) getllar=%llu putllc=%llu fail=%llu "
+                    "ovl_load=%llu ovl_verify=%llu ovl_bad=%llu\n",
+            ctr[0], (double)ctr[2] / 1048576.0, ctr[1], (double)ctr[3] / 1048576.0,
+            ctr[4], (double)ctr[5] / 1048576.0, ctr[6], ctr[7], ctr[8],
+            ctr[9], ctr[10], ctr[11]);
+}
+
+/* Rolling 2 s window for A/B: a per-window delta of the job wall and the
+ * inter-job gaps, so each arm's lane occupancy and gap percentiles can be read
+ * straight from the log without a timeline dump. */
+static unsigned long long w_jobs, w_job_ns, w_gap_jobs, w_gap_total;
+static unsigned int w_gap_hist[C690_WALL_BUCKETS];
+static int w_gap_init;
+
+static unsigned c690_hist_percentile(const unsigned int* h, unsigned pct)
+{
+    unsigned long long total = 0, cum = 0, target;
+    for (unsigned i = 0; i < C690_WALL_BUCKETS; i++) total += h[i];
+    if (!total) return 0;
+    target = (total * pct + 99u) / 100u;
+    for (unsigned i = 0; i < C690_WALL_BUCKETS; i++) {
+        cum += h[i];
+        if (cum >= target) return i;
+    }
+    return C690_WALL_BUCKETS - 1u;
+}
+
+static void c690_gap_window_report(unsigned long long jobs, unsigned long long wall_ns)
+{
+    if (!g_c690_gap) return;
+    unsigned long long gj = 0, gt = 0;
+    const int n = __atomic_load_n(&s_thread_count, __ATOMIC_RELAXED);
+    const int nslots = n < C690_MAX_THREADS ? n : C690_MAX_THREADS;
+    for (int i = 0; i <= nslots; i++) {
+        const c690_thread_stats* st;
+        if (i < nslots) st = &s_threads[i];
+        else { if (n <= C690_MAX_THREADS) break; st = &s_overflow; }
+        gj += st->gap_jobs; gt += st->gap_total_ns;
+    }
+    if (!w_gap_init) {
+        w_gap_init = 1;
+        w_jobs = jobs; w_job_ns = wall_ns; w_gap_jobs = gj; w_gap_total = gt;
+        for (unsigned i = 0; i < C690_WALL_BUCKETS; i++)
+            w_gap_hist[i] = __atomic_load_n(&s_gap_hist[i], __ATOMIC_RELAXED);
+        return;
+    }
+    const unsigned long long d_jobs = jobs - w_jobs;
+    const unsigned long long d_wall = wall_ns - w_job_ns;
+    const unsigned long long d_gj = gj - w_gap_jobs;
+    const unsigned long long d_gt = gt - w_gap_total;
+    static unsigned int dh[C690_WALL_BUCKETS];
+    for (unsigned i = 0; i < C690_WALL_BUCKETS; i++) {
+        const unsigned cur = __atomic_load_n(&s_gap_hist[i], __ATOMIC_RELAXED);
+        dh[i] = cur - w_gap_hist[i];
+        w_gap_hist[i] = cur;
+    }
+    w_jobs = jobs; w_job_ns = wall_ns; w_gap_jobs = gj; w_gap_total = gt;
+    if (!d_gj || !d_jobs) return;
+    fprintf(stderr,
+            "[c690-gap-window] jobs=%llu job_us=%llu gaps=%llu gap_us=%llu "
+            "gap_p50=%u gap_p90=%u gap_p99=%u lane_busy=%.3f\n",
+            d_jobs, d_wall / 1000ull, d_gj, d_gt / 1000ull,
+            c690_hist_percentile(dh, 50), c690_hist_percentile(dh, 90),
+            c690_hist_percentile(dh, 99),
+            d_wall + d_gt ? (double)d_wall / (double)(d_wall + d_gt) : 0.0);
+}
+
 static void c690_report_common(const char* tag, uint64_t now_ns)
 {
     c690_thread_stats total;
@@ -572,6 +893,9 @@ static void c690_report_common(const char* tag, uint64_t now_ns)
         fprintf(stderr, "[c690-stats] worker=%d spu=%u jobs=%llu\n",
                 i, per_thread_spu[i], per_thread_jobs[i]);
     }
+
+    c690_gap_report();
+    c690_gap_window_report(jobs, wall_ns);
 
     unsigned long long cmd_total = 0;
     for (unsigned i = 0; i < 256u; i++) cmd_total += total.opcode[i];
@@ -657,10 +981,13 @@ static void c690_stats_startup(void)
     const char* e = getenv("PS3RECOMP_C690_STATS");
     const char* h = getenv("PS3RECOMP_C690_HASH");
     const char* c = getenv("PS3RECOMP_C690_CORPUS");
+    const char* g = getenv("PS3RECOMP_C690_GAP");
     const int hash_stride = (h && *h) ? atoi(h) : 0;
     const int corpus_on = c && *c;
-    if ((!e || strcmp(e, "1") != 0) && hash_stride <= 0 && !corpus_on) return;
+    const int gap_on = g && *g && strcmp(g, "0") != 0;
+    if ((!e || strcmp(e, "1") != 0) && hash_stride <= 0 && !corpus_on && !gap_on) return;
     g_c690_stats = 1;                     /* job tracking also feeds the hash/corpus */
+    g_c690_gap = gap_on;
     g_c690_hash_on = hash_stride > 0 ? hash_stride : 0;
     s_t0_ns = c690_now_ns();
     s_last_report_ns = s_t0_ns;

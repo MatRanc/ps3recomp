@@ -1762,6 +1762,102 @@ static WklPm* spurs_resolve_pm(u32 wid)
     return r->fn ? r : NULL;
 }
 
+/* SPURS_PM_FAST_RESCHED: a policy module exits to the kernel after a job even
+ * when its workload still has ready work, and the real kernel would select it
+ * again immediately. Our HLE does that through the coordinator thread, two
+ * condition-variable hops and the instance lock: measured at the meter as
+ * 27 us p50 (52 us mean) between two policy quanta on the same lane. When the
+ * same workload is still dispatchable, run it again in the same worker and
+ * mirror exactly the bookkeeping the coordinator does for a dispatch (consume
+ * one ready unit or clear the signal bit, refresh the current-contention
+ * byte). Off by default; the env and live key name it. */
+static int spurs_ready_level(void)
+{
+    static int s = -1;
+    if (s < 0) s = getenv("SPURS_READY_LEVEL") ? 1 : 0;
+    return s;
+}
+
+static int spurs_pm_fast_resched_limit(void)
+{
+    int n = 0;
+#ifdef SPURS_HAVE_LIVE_CTL
+    if (ps3_live_ctl_get) n = ps3_live_ctl_get(PS3_LIVE_SPURS_PM_FAST_RESCHED);
+    else
+#endif
+    {
+        static int s = -2;
+        if (s == -2) {
+            const char* e = getenv("SPURS_PM_FAST_RESCHED");
+            s = (e && *e) ? atoi(e) : 0;
+        }
+        n = s;
+    }
+    if (n < 0) n = 0;
+    if (n > 64) n = 64;      /* bound a workload that exits with ready stale */
+    return n;
+}
+
+/* Called with si->lock held, after a policy run returned. Returns 1 when the
+ * same workload is still eligible on this lane and the coordinator would have
+ * dispatched it again. Anything that could have changed the dispatch -- a
+ * removal, a different PM image/data, a lost priority slot -- falls back to
+ * the normal coordinator path. */
+static int spurs_pm_fast_can_rerun(struct SpursInst* si, struct SpursPmSlot* slot)
+{
+    if (si->stopping) return 0;
+    const u32 wid = slot->wid, ea = slot->ea;
+    if (wid >= 16 || !ea) return 0;
+
+    u32 pm_size; const uint8_t* pm; u64 data;
+    AcquireSRWLockExclusive(&s_workload_registry_lock);
+    SpursWorkload* w = &s_workloads[wid];
+    int ok = w->in_use && w->spurs_ea == ea;
+    pm_size = ok ? w->sizePm : 0;
+    pm = ok ? vm_base + (u32)(uintptr_t)w->pm : NULL;
+    ReleaseSRWLockExclusive(&s_workload_registry_lock);
+    if (!ok || pm != slot->pm || pm_size != slot->pm_size) return 0;
+    data = vm_read64(ea + SPURS_WKL_INFO1 + wid * SPURS_WKL_INFO_SZ + 8);
+    if (data != slot->data) return 0;
+
+    if (!(vm_read32(ea + SPURS_WKL_ENABLED) & (0x80000000u >> wid))) return 0;
+    if (vm_read8(ea + SPURS_WKL_STATE1 + wid) != 2) return 0;
+    if (!vm_read8(ea + SPURS_WKL_INFO1 + wid * SPURS_WKL_INFO_SZ + 0x18 + slot->spu_num))
+        return 0;
+    const u32 maxcont = vm_read8(ea + SPURS_WKL_MAXCONT + wid);
+    if (!maxcont || si->active[wid] >= maxcont) return 0;
+
+    spu_lockline_lock();
+    const u32 ready = vm_read8(ea + SPURS_WKL_READY1 + wid);
+    const u32 signal = vm_read16(ea + SPURS_WKL_SIGNAL1);
+    const u32 idle = vm_read8(ea + SPURS_WKL_IDLE2 + wid);
+    spu_lockline_unlock();
+    if (!ready && !(signal & (0x8000u >> wid))) return 0;
+    if (spurs_ready_level() && ready && si->active[wid] >= ready + idle) return 0;
+    return 1;
+}
+
+/* The consume half of a coordinator dispatch, without the coordinator: one
+ * ready unit (or the signal bit), the current-contention byte, the idle
+ * reset. Taken under the same lock-line lock the coordinator uses. */
+static void spurs_pm_fast_consume(struct SpursInst* si, struct SpursPmSlot* slot)
+{
+    const u32 wid = slot->wid, ea = slot->ea;
+    const u32 bit = 0x8000u >> wid;
+    spu_lockline_lock();
+    const u32 ready = vm_read8(ea + SPURS_WKL_READY1 + wid);
+    const u32 signal = vm_read16(ea + SPURS_WKL_SIGNAL1);
+    if (!spurs_ready_level() && ready)
+        vm_base[ea + SPURS_WKL_READY1 + wid] = (u8)(ready - 1);
+    if (signal & bit)
+        ef_w16(ea + SPURS_WKL_SIGNAL1, (u16)(signal & ~bit));
+    vm_base[ea + SPURS_WKL_CURCONT + wid] = si->active[wid];
+    ef_line_end(ea);                 /* notify if reserved, then unlock */
+    si->idle[wid] = 0;
+    ps3_trace_instant(PS3_TR_SPURS_KICK, wid,
+                      slot->spu_num | ((ready & 0xFFu) << 8));
+}
+
 /* One persistent worker for each configured virtual SPU. A waiting policy
  * occupies only its own slot; a later runnable producer can use another slot.
  * Admission and lifecycle state are serialized per instance. Guest execution
@@ -1783,17 +1879,27 @@ static DWORD WINAPI spurs_pm_worker(LPVOID p)
         while (!slot->busy && !si->stopping)
             SleepConditionVariableSRW(&si->wake, &si->lock, INFINITE, 0);
         if (si->stopping && !slot->busy) break;
-        ReleaseSRWLockExclusive(&si->lock);
-        const uint64_t ft_t0 = PS3_FT_ON() ? ps3_ft_now() : 0;
-        const uint64_t tr_t0 = ps3_trace_begin();
-        spu_run_policy_module(slot->fn, slot->image_id, slot->pm, slot->pm_size,
-                              slot->data, slot->wid, slot->ea, slot->spu_num);
-        ps3_trace_end(tr_t0, PS3_TR_SPU_POLICY, (uint32_t)slot->image_id, slot->wid);
-        if (ft_t0)   /* PS3_FTRACE: SPURS SPUs never block on a channel, so their busy time is the module run */
-            ps3_ft_span(PS3_FT_SPU_BUSY, slot->spu_num, (uint32_t)slot->image_id, slot->wid, ft_t0, ps3_ft_now());
+        int fast_limit = spurs_pm_fast_resched_limit();
+        int fast_runs = 0;
+        for (;;) {
+            ReleaseSRWLockExclusive(&si->lock);
+            const uint64_t ft_t0 = PS3_FT_ON() ? ps3_ft_now() : 0;
+            const uint64_t tr_t0 = ps3_trace_begin();
+            spu_run_policy_module(slot->fn, slot->image_id, slot->pm, slot->pm_size,
+                                  slot->data, slot->wid, slot->ea, slot->spu_num);
+            ps3_trace_end(tr_t0, PS3_TR_SPU_POLICY, (uint32_t)slot->image_id, slot->wid);
+            if (ft_t0)   /* PS3_FTRACE: SPURS SPUs never block on a channel, so their busy time is the module run */
+                ps3_ft_span(PS3_FT_SPU_BUSY, slot->spu_num, (uint32_t)slot->image_id, slot->wid, ft_t0, ps3_ft_now());
+            AcquireSRWLockExclusive(&si->lock);
+            if (fast_runs < fast_limit && spurs_pm_fast_can_rerun(si, slot)) {
+                spurs_pm_fast_consume(si, slot);
+                fast_runs++;
+                continue;
+            }
+            break;
+        }
         extern SPU_THREAD_LOCAL volatile unsigned g_spurs_pm_polls;
         unsigned polls = g_spurs_pm_polls;
-        AcquireSRWLockExclusive(&si->lock);
         u32 wid = slot->wid;
         if (si->active[wid]) si->active[wid]--;
         spu_lockline_lock();
@@ -1881,8 +1987,7 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
                 }
                 /* SPURS_READY_LEVEL=1 (experiment): the ready count is a level -- up to
                  * min(ready, maxContention) SPUs, left for the workload to lower. */
-                static int ready_level = -1;
-                if (ready_level < 0) ready_level = getenv("SPURS_READY_LEVEL") ? 1 : 0;
+                const int ready_level = spurs_ready_level();
                 const u32 idle = vm_read8(ea + SPURS_WKL_IDLE2 + wid);   /* cellSpursRequestIdleSpu */
                 if (ready_level && ready && si->active[wid] >= ready + idle) continue;
                 int kicked = ready || (signal & (0x8000u >> wid));

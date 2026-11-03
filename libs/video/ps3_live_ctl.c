@@ -54,6 +54,8 @@ static const char* const K_NAME[PS3_LIVE_COUNT] = {
     "PS3RECOMP_C690_NATIVE_SHADOW",
     "PS3RECOMP_SPU_IDLE_BACKOFF",
     "PS3RECOMP_PIN_LAYOUT",
+    "SPURS_PM_FAST_RESCHED",
+    "SPU_CODE_DMA_MEMO",
 };
 
 static _Atomic int s_val[PS3_LIVE_COUNT];

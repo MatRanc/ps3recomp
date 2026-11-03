@@ -28,6 +28,16 @@ extern "C" {
 /* Set once at startup from PS3RECOMP_C690_STATS=1. Read-only afterwards. */
 extern int g_c690_stats;
 
+/* PS3RECOMP_C690_GAP=1: inter-job turnover breakdown (measurement only). */
+extern int g_c690_gap;
+uint64_t c690_gap_now(void);
+void c690_gap_on_lookup(const struct spu_context* ctx, uint32_t lsa, uint64_t now);
+void c690_gap_on_direct(const struct spu_context* ctx, uint32_t lsa, uint64_t now);
+void c690_gap_on_dma(const struct spu_context* ctx, int is_put, uint32_t lsa,
+                     uint32_t size);
+void c690_gap_on_atomic(const struct spu_context* ctx, int kind, int ok);
+void c690_gap_on_overlay(int kind, int ok);
+
 /* PS3RECOMP_C690_HASH=<stride>: sample every stride-th c690 job and fold the
  * bytes of its DMA GETs (input) and PUTs (output) into FNV-1a hashes. Zero
  * when off; the DMA fast path tests it with one predicted-not-taken branch

@@ -7,6 +7,8 @@
 extern "C" {
 #endif
 
+struct spu_context;
+
 /* Exact code bytes a lifted streamed overlay was generated from, at the
  * local-store addresses the title loads it to. */
 typedef struct spu_overlay_code_segment {
@@ -28,6 +30,13 @@ typedef struct spu_overlay_code_segment {
 int spu_overlay_register_verified_region(uint32_t content_ea, uint32_t load_lsa,
     uint32_t span, int image_id, const spu_overlay_code_segment* code,
     unsigned count);
+
+/* SPU_CODE_DMA_MEMO (spu_channels.c): a GET into a verified code span whose
+ * source bytes already equal the local-store bytes changes nothing. Returns 1
+ * when the transfer can be skipped; the span stays verified. */
+int spu_code_dma_memo_on(void);
+int spu_overlay_code_get_noop(struct spu_context* ctx, uint32_t ea, uint32_t lsa,
+                              uint32_t size, const uint8_t* src);
 
 #ifdef __cplusplus
 }

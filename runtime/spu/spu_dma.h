@@ -400,6 +400,10 @@ static inline int mfc_do_transfer_fast(spu_context* spu, uint32_t lsa, uint64_t 
     }
     uint8_t* ls_ptr = &spu->ls[lsa];
     uint8_t* ea_ptr = vm_base + (uint32_t)ea;
+    { extern int g_c690_gap;
+      if (__builtin_expect(g_c690_gap, 0)) {
+          extern void c690_gap_on_dma(const spu_context*, int, uint32_t, uint32_t);
+          c690_gap_on_dma(spu, mfc_is_put(cmd), lsa, size); } }
     { extern int g_cri_video_dma;
       if (spu->image_id == 22 && mfc_is_get(cmd) && size > 0x100)
           g_cri_video_dma = 1; }
@@ -414,9 +418,16 @@ static inline int mfc_do_transfer_fast(spu_context* spu, uint32_t lsa, uint64_t 
               extern void c690_corpus_dma(const spu_context*, int, uint32_t, uint64_t, uint32_t, const uint8_t*);
               c690_corpus_dma(spu, 0, lsa, ea, size, ea_ptr);
           } }
-        memcpy(ls_ptr, ea_ptr, size);
-        { extern void spu_overlay_note_get(spu_context*, uint32_t, const uint8_t*, uint32_t);
-          spu_overlay_note_get(spu, (uint32_t)ea, (const uint8_t*)ls_ptr, size); }
+        { extern int spu_code_dma_memo_on(void);
+          extern int spu_overlay_code_get_noop(spu_context*, uint32_t, uint32_t, uint32_t, const uint8_t*);
+          if (__builtin_expect(spu_code_dma_memo_on(), 0) &&
+              spu_overlay_code_get_noop(spu, (uint32_t)ea, lsa, size, ea_ptr))
+              ;                       /* already identical: the GET is a no-op */
+          else {
+              memcpy(ls_ptr, ea_ptr, size);
+              { extern void spu_overlay_note_get(spu_context*, uint32_t, const uint8_t*, uint32_t);
+                spu_overlay_note_get(spu, (uint32_t)ea, (const uint8_t*)ls_ptr, size); }
+          } }
     } else if (mfc_is_put(cmd)) {
         { extern int g_c690_hash_on;
           if (__builtin_expect(g_c690_hash_on, 0)) {
@@ -723,6 +734,10 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
 
     uint8_t* ls_ptr = &spu->ls[lsa];
     uint8_t* ea_ptr = vm_base + (uint32_t)ea; /* PS3 uses 32-bit effective addresses for SPU DMA */
+    { extern int g_c690_gap;
+      if (__builtin_expect(g_c690_gap, 0)) {
+          extern void c690_gap_on_dma(const spu_context*, int, uint32_t, uint32_t);
+          c690_gap_on_dma(spu, mfc_is_put(cmd), lsa, size); } }
 
     /* SPU_STACKEA_WATCH=1: the LBP JobManagerWorker completion protocol hands the
      * SPU job a completion-word EA (param[4]) that lives on the PPU stack
@@ -884,7 +899,12 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
               extern void c690_corpus_dma(const spu_context*, int, uint32_t, uint64_t, uint32_t, const uint8_t*);
               c690_corpus_dma(spu, 0, lsa, ea, size, ea_ptr);
           } }
-        memcpy(ls_ptr, ea_ptr, size);
+        int _code_noop = 0;
+        { extern int spu_code_dma_memo_on(void);
+          extern int spu_overlay_code_get_noop(spu_context*, uint32_t, uint32_t, uint32_t, const uint8_t*);
+          if (__builtin_expect(spu_code_dma_memo_on(), 0))
+              _code_noop = spu_overlay_code_get_noop(spu, (uint32_t)ea, lsa, size, ea_ptr); }
+        if (!_code_noop) memcpy(ls_ptr, ea_ptr, size);
         /* SPU_STACKEA_WATCH (b): scan the just-loaded payload for a 0xD00Cxxxx
          * dword = the completion-word EA arriving in a job buffer. */
         { static int s_se = -1; if (s_se < 0) s_se = getenv("SPU_STACKEA_WATCH") ? 1 : 0;
@@ -914,8 +934,11 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
         /* Swappable-overlay tracking: a GET from a registered overlay source
          * (by EA or by content signature) marks that overlay's lifted
          * functions resident for this context. */
-        { extern void spu_overlay_note_get(spu_context*, uint32_t, const uint8_t*, uint32_t);
-          spu_overlay_note_get(spu, (uint32_t)ea, (const uint8_t*)ls_ptr, size); }
+        if (!_code_noop) {
+            /* A skipped reload is byte-identical, so the span stays verified. */
+            { extern void spu_overlay_note_get(spu_context*, uint32_t, const uint8_t*, uint32_t);
+              spu_overlay_note_get(spu, (uint32_t)ea, (const uint8_t*)ls_ptr, size); }
+        }
         /* SPU_LS_WATCH: a DMA GET landing on a watched LS line is how the PPU
          * delivers commands into the SPU's queue (bypasses spu_ls_write128). */
         { int _n; unsigned* _w = spu_ls_watch_list(&_n);

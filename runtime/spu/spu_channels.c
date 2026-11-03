@@ -894,6 +894,10 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
         if (!llar_fast) { ctx->resv_ea = ea; ctx->resv_valid = 1; }   /* the fast path published it already */
         ctx->atomic_stat = 4;
         ctx->dbg_getllar++;
+        { extern int g_c690_gap;
+          if (__builtin_expect(g_c690_gap, 0)) {
+              extern void c690_gap_on_atomic(const spu_context*, int, int);
+              c690_gap_on_atomic(ctx, 0, 1); } }
         /* A GETLLAR re-issued millions of times on one line is an SPU spin-wait
          * that nobody is releasing (a ticket lock, a counter barrier). Say so
          * once per line with the line's head, so the stuck word is visible
@@ -1062,6 +1066,10 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
                       ctx->gpr[0]._u32[0] & SPU_LS_MASK, ea); }
         ctx->resv_valid = 0;                           /* reservation consumed */
         spu_lockline_unlock();
+        { extern int g_c690_gap;
+          if (__builtin_expect(g_c690_gap, 0)) {
+              extern void c690_gap_on_atomic(const spu_context*, int, int);
+              c690_gap_on_atomic(ctx, 1, ctx->atomic_stat == 0); } }
         if (ps3_trace_on()) spu_tr_putllc(ea, ctx->atomic_stat == 0);
         if (ctx->atomic_stat == 0) {
             spu_taskset_line_committed(ea & ~127u);
@@ -2263,8 +2271,49 @@ static int spu_overlay_resident_verified(spu_context* ctx, unsigned slot)
         for (unsigned i = 0; match && i < o->code_count; ++i)
             match = !memcmp(ctx->ls + o->code[i].lsa, o->code[i].bytes, o->code[i].size);
         *state = match ? SPU_OVERLAY_VERIFIED : SPU_OVERLAY_REJECTED;
+        { extern int g_c690_gap; extern void c690_gap_on_overlay(int,int);
+          if (__builtin_expect(g_c690_gap, 0)) c690_gap_on_overlay(1, match); }
     }
     return *state == SPU_OVERLAY_VERIFIED;
+}
+
+/* SPU_CODE_DMA_MEMO: a streamed job module is re-DMA'd into the same local
+ * store on every job even when the source bytes are unchanged. When the GET
+ * lands in a VERIFIED code span at the matching source offset and the bytes
+ * already in local store are identical to the source, the transfer cannot
+ * change anything: skip the copy and leave the span verified, instead of
+ * copying 67 KB and re-verifying it at the next dispatch. Exact by
+ * construction -- the bytes are compared, not assumed. */
+int spu_code_dma_memo_on(void)
+{
+#ifdef SPU_HAVE_LIVE_CTL
+    if (ps3_live_ctl_get) return ps3_live_ctl_get(PS3_LIVE_SPU_CODE_DMA_MEMO) != 0;
+#endif
+    static int s = -1;
+    if (s < 0) {
+        const char* e = getenv("SPU_CODE_DMA_MEMO");
+        s = e && *e && strcmp(e, "0") != 0;
+    }
+    return s;
+}
+
+int spu_overlay_code_get_noop(spu_context* ctx, uint32_t ea, uint32_t lsa,
+                              uint32_t size, const uint8_t* src)
+{
+    if (!ctx || !src || !size) return 0;
+    for (unsigned slot = 0; slot < 4; ++slot) {
+        if (!ctx->resident_code[slot].image_id ||
+            ctx->resident_code[slot].verify_state != SPU_OVERLAY_VERIFIED)
+            continue;
+        const uint32_t base = ctx->resident_code[slot].lsa;
+        const uint32_t span = ctx->resident_code[slot].size;
+        if (lsa < base || (uint64_t)lsa + size > (uint64_t)base + span)
+            continue;
+        if (ea != ctx->resident_code[slot].source_ea + (lsa - base))
+            continue;
+        if (memcmp(ctx->ls + lsa, src, size) == 0) return 1;
+    }
+    return 0;
 }
 
 /* Register one-way runtime entries that replace the guest call stack.
@@ -2480,6 +2529,8 @@ void spu_overlay_note_get(spu_context* ctx, uint32_t ea, const uint8_t* ls, uint
                     ctx->resident_code[slot].verify_state = o->code ? SPU_OVERLAY_PENDING : 0;
                     ctx->resident_code[slot].source_index = i;
                     spu_dcache_residency_changed(ctx);
+                    { extern int g_c690_gap; extern void c690_gap_on_overlay(int,int);
+                      if (__builtin_expect(g_c690_gap, 0)) c690_gap_on_overlay(0, 1); }
                     ps3_trace_instant(PS3_TR_SPU_OVERLAY_LOAD, ea, (uint32_t)o->image_id);
                     return;
                 }
