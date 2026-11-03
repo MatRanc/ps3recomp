@@ -257,7 +257,11 @@ u64 fnv1a64(const void* d, size_t n, u64 h)
 
 u64 hlsl_hash(const char* hlsl)
 {
-    return fnv1a64(hlsl, strlen(hlsl), 0xcbf29ce484222325ull);
+    /* Seeded with this file's build stamp so a translate()/binding change
+     * invalidates disk entries even if nobody bumps the version constant. */
+    const u64 seed = fnv1a64(kTranslatorBuild, sizeof kTranslatorBuild,
+                             0xcbf29ce484222325ull);
+    return fnv1a64(hlsl, strlen(hlsl), seed);
 }
 
 bool mkdir_p(const std::string& path)
