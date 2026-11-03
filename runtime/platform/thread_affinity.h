@@ -20,7 +20,21 @@
 extern "C" {
 #endif
 
+/* Strong link anchor: the executable takes its address so the static linker
+ * extracts the platform object even though thread_name.h only has a weak
+ * reference to ps3_thread_pin_by_name(). */
+void ps3_thread_pin_link_anchor(void);
+
 void ps3_thread_pin_by_name(const char* name);
+
+/* The SPURS lane workers share one thread name; this gives the lane index so
+ * the "lanes" layout can put each busy lane on its own physical core. */
+void ps3_thread_pin_spurs_lane(int lane);
+
+/* Re-read PS3RECOMP_PIN_LAYOUT (control file first, then env) and reapply the
+ * masks. Called from the walker's drain pass; does nothing unless the name
+ * changed. */
+void ps3_thread_pin_poll(void);
 
 #ifdef __cplusplus
 }

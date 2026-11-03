@@ -621,6 +621,92 @@ static void spu_tr_putllc(uint32_t ea, int ok)
     }
 }
 
+/* PS3RECOMP_SPU_IDLE_BACKOFF: NHL #45 (b) shape for the GETLLAR poll loop.
+ *
+ * An idle SPURS policy module polls the same lock line with GETLLAR in a tight
+ * guest loop. Each poll is a full 128-byte copy plus the reservation
+ * bookkeeping, so a lane with nothing to do still burns a core; on this title
+ * that is what the loading / idle SPU threads spend a core on. When the line
+ * has not changed since the previous poll of the same line, spin briefly,
+ * then yield, then take a short nap (at most one 100 us nap per ms). Any
+ * change to the line, any change of line, or any change of context resets the
+ * state, so a real wake-up is never delayed by more than the nap. The next
+ * GETLLAR happens right after this, so a missed wake-up costs latency only,
+ * never correctness: the guest re-reads the line either way.
+ *
+ * Plain DMA GET polls already have the identical-transfer watchdog's back-off
+ * (mfc_repeat_watch in spu_dma.h); this covers the atomic path, which had
+ * none. Default off; env and live control-file key. */
+#define SPU_IDLE_SPIN_REPS   32u
+#define SPU_IDLE_YIELD_REPS  96u
+#define SPU_IDLE_SLEEP_NS    100000ull
+
+static int spu_idle_backoff_on(void)
+{
+#ifdef SPU_HAVE_LIVE_CTL
+    /* Seeded from the environment, so this covers both the env and the
+     * PS3RECOMP_CTL key. */
+    if (ps3_live_ctl_get) return ps3_live_ctl_get(PS3_LIVE_SPU_IDLE_BACKOFF) != 0;
+#endif
+    static int s = -1;
+    if (s < 0) {
+        const char* e = getenv("PS3RECOMP_SPU_IDLE_BACKOFF");
+        s = e && *e && strcmp(e, "0") != 0;
+    }
+    return s;
+}
+
+static SPU_THREAD_LOCAL struct {
+    spu_context* ctx;
+    uint32_t     ea;
+    unsigned     reps;
+    uint64_t     next_sleep_ns;
+    uint8_t      snap[MFC_ATOMIC_LINE];
+} t_idle_backoff;
+
+static void spu_idle_backoff(spu_context* ctx, uint32_t ea, const uint8_t* mem)
+{
+    if (!spu_idle_backoff_on()) return;
+    if (t_idle_backoff.ctx != ctx || t_idle_backoff.ea != ea) {
+        t_idle_backoff.ctx = ctx;
+        t_idle_backoff.ea = ea;
+        t_idle_backoff.reps = 0;
+        t_idle_backoff.next_sleep_ns = 0;
+        memcpy(t_idle_backoff.snap, mem, MFC_ATOMIC_LINE);
+        return;
+    }
+    if (memcmp(t_idle_backoff.snap, mem, MFC_ATOMIC_LINE) != 0) {
+        memcpy(t_idle_backoff.snap, mem, MFC_ATOMIC_LINE);
+        t_idle_backoff.reps = 0;
+        t_idle_backoff.next_sleep_ns = 0;
+        return;
+    }
+    if (t_idle_backoff.reps < SPU_IDLE_YIELD_REPS) {
+        if (++t_idle_backoff.reps < SPU_IDLE_SPIN_REPS) {
+#if defined(__x86_64__) || defined(__i386__)
+            __builtin_ia32_pause();
+#endif
+        } else {
+#ifdef _WIN32
+            SwitchToThread();
+#else
+            sched_yield();
+#endif
+        }
+        return;
+    }
+    const uint64_t now = spu_host_ns();
+    if (now >= t_idle_backoff.next_sleep_ns) {
+#ifdef _WIN32
+        Sleep(0);
+#else
+        struct timespec ts = { 0, (long)SPU_IDLE_SLEEP_NS };
+        nanosleep(&ts, NULL);
+#endif
+        t_idle_backoff.next_sleep_ns = spu_host_ns() + 900000ull;
+    }
+}
+
 /* Returns 1 if `cmd` is an atomic line op and was handled here, else 0. */
 static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
 {
@@ -752,6 +838,8 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
       } }
     switch (cmd) {
     case MFC_GETLLAR_CMD:
+        /* Optional idle poll back-off (PS3RECOMP_SPU_IDLE_BACKOFF). */
+        spu_idle_backoff(ctx, ea, mem);
         /* Lockstep tick: a guest GETLLAR..PUTLLC poll loop is intra-function
          * (all gotos), so it never crosses the SPU_DRAIN tick site -- without a
          * tick here a polling SPU would hold the run token forever while the

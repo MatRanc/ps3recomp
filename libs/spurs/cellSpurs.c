@@ -51,6 +51,11 @@ uint32_t g_ydkj_real_spurs_ea   = 0;   /* real CellSpurs instance EA (for the ta
 #include <time.h>
 #endif
 #include "ps3emu/thread_name.h"
+/* Opt-in role pinning (runtime/platform/thread_affinity.c). Weak so a fixture
+ * that links the SPURS HLE without the platform layer still builds. */
+#if defined(__GNUC__) && !defined(_WIN32)
+extern void ps3_thread_pin_spurs_lane(int) __attribute__((weak));
+#endif
 
 /* ---------------------------------------------------------------------------
  * Internal workload tracking
@@ -1765,6 +1770,9 @@ static DWORD WINAPI spurs_pm_worker(LPVOID p)
 {
     struct SpursPmSlot* slot = (struct SpursPmSlot*)p;
     ps3_thread_name("spurs pm");
+#if defined(__GNUC__) && !defined(_WIN32)
+    if (ps3_thread_pin_spurs_lane) ps3_thread_pin_spurs_lane((int)slot->spu_num);
+#endif
     struct SpursInst* si = slot->instance;
 #ifdef _WIN32
     { ULONG g = 256 * 1024; SetThreadStackGuarantee(&g); }

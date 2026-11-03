@@ -52,11 +52,24 @@ static const char* const K_NAME[PS3_LIVE_COUNT] = {
     "PS3RECOMP_TEX_DIRTY",
     "PS3RECOMP_C690_NATIVE_CULL",
     "PS3RECOMP_C690_NATIVE_SHADOW",
+    "PS3RECOMP_SPU_IDLE_BACKOFF",
+    "PS3RECOMP_PIN_LAYOUT",
 };
 
 static _Atomic int s_val[PS3_LIVE_COUNT];
 /* 1 once the control file has named the key; from then on the file wins. */
 static _Atomic int s_file_set[PS3_LIVE_COUNT];
+/* String-valued keys (PS3RECOMP_PIN_LAYOUT) keep their text here; the walker
+ * is the only writer (apply_file), so no synchronisation is needed for the
+ * same-thread reader in thread_affinity.c. */
+#define CTL_STR_CAP 48
+static char s_str[PS3_LIVE_COUNT][CTL_STR_CAP];
+static _Atomic int s_str_set[PS3_LIVE_COUNT];
+
+static int key_is_string(int i)
+{
+    return i == PS3_LIVE_PIN_LAYOUT;
+}
 static const char* s_path;
 static pthread_once_t s_once = PTHREAD_ONCE_INIT;
 
@@ -86,6 +99,10 @@ static void seed_env(void)
         atomic_store_explicit(&s_val[i], e ? parse_value(e) : 0,
                               memory_order_relaxed);
         atomic_store_explicit(&s_file_set[i], 0, memory_order_relaxed);
+        if (key_is_string(i) && e) {
+            snprintf(s_str[i], CTL_STR_CAP, "%s", e);
+            atomic_store_explicit(&s_str_set[i], 1, memory_order_relaxed);
+        }
     }
 }
 
@@ -135,6 +152,16 @@ static void apply_file(uint32_t flip, int log_changes)
 
             for (int i = 0; i < PS3_LIVE_COUNT; i++) {
                 if (strcmp(name, K_NAME[i]) != 0) continue;
+                if (key_is_string(i)) {
+                    const int old_set = atomic_load_explicit(&s_str_set[i], memory_order_relaxed);
+                    if (log_changes && (!old_set || strcmp(s_str[i], value) != 0))
+                        fprintf(stderr, "[live-ctl] flip=%u %s=%s (was %s)\n",
+                                flip, K_NAME[i], value, old_set ? s_str[i] : "(unset)");
+                    snprintf(s_str[i], CTL_STR_CAP, "%s", value);
+                    atomic_store_explicit(&s_str_set[i], 1, memory_order_relaxed);
+                    atomic_store_explicit(&s_file_set[i], 1, memory_order_relaxed);
+                    break;
+                }
                 const int v = parse_value(value);
                 const int old = atomic_load_explicit(&s_val[i], memory_order_relaxed);
                 atomic_store_explicit(&s_file_set[i], 1, memory_order_relaxed);
@@ -170,6 +197,14 @@ void ps3_live_ctl_refresh_env(void)
         const char* e = getenv(K_NAME[i]);
         atomic_store_explicit(&s_val[i], e ? parse_value(e) : 0,
                               memory_order_relaxed);
+        if (key_is_string(i)) {
+            if (e) {
+                snprintf(s_str[i], CTL_STR_CAP, "%s", e);
+                atomic_store_explicit(&s_str_set[i], 1, memory_order_relaxed);
+            } else {
+                atomic_store_explicit(&s_str_set[i], 0, memory_order_relaxed);
+            }
+        }
     }
 }
 
@@ -178,6 +213,14 @@ int ps3_live_ctl_get(int key)
     if (key < 0 || key >= PS3_LIVE_COUNT) return 0;
     pthread_once(&s_once, init_once);
     return atomic_load_explicit(&s_val[key], memory_order_relaxed);
+}
+
+const char* ps3_live_ctl_get_str(int key)
+{
+    if (key < 0 || key >= PS3_LIVE_COUNT) return NULL;
+    pthread_once(&s_once, init_once);
+    return atomic_load_explicit(&s_str_set[key], memory_order_relaxed)
+               ? s_str[key] : NULL;
 }
 
 int ps3_live_ctl_enabled(void)

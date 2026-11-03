@@ -12,6 +12,11 @@
 #include "rsx_draw_engine.h"
 #include "ps3_live_ctl.h"
 #include "cellGcmSys.h"
+/* Live pin-layout switch (runtime/platform/thread_affinity.c), weak so the
+ * FIFO-walker fixtures still link without the platform layer. */
+#if defined(__GNUC__) && !defined(_WIN32)
+extern void ps3_thread_pin_poll(void) __attribute__((weak));
+#endif
 #include "../../runtime/platform/win32_compat.h"
 #include "../../runtime/ppu/ppu_memory.h"   /* vm_write32 (translate + byte-swap, OOB-safe) */
 #include "../../runtime/memory/vm.h"    /* VM_HLE_INJECT_BASE */
@@ -2670,6 +2675,9 @@ static void gcm_rsx_process_fifo_unlocked(void)
      * control file, at most once per drain pass (>= once per flip). The
      * draw engine then refreshes its own cached switch values from it. */
     if (ps3_live_ctl_poll) ps3_live_ctl_poll(cellGcm_flip_request_count());
+#if defined(__GNUC__) && !defined(_WIN32)
+    if (ps3_thread_pin_poll) ps3_thread_pin_poll();
+#endif
     const int walker_fast = gcm_live_get(PS3_LIVE_WALKER_FAST,
                                          "PS3RECOMP_WALKER_FAST");
     rsx_draw_engine_set_walker_fast(walker_fast);

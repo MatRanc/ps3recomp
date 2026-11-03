@@ -53,6 +53,8 @@ enum {
     PS3_LIVE_TEX_DIRTY,         /* PS3RECOMP_TEX_DIRTY: texture pages by write generation */
     PS3_LIVE_C690_NATIVE_CULL,  /* PS3RECOMP_C690_NATIVE_CULL: native 0xFDA0 stage */
     PS3_LIVE_C690_NATIVE_SHADOW,/* PS3RECOMP_C690_NATIVE_SHADOW: run+compare both */
+    PS3_LIVE_SPU_IDLE_BACKOFF,  /* PS3RECOMP_SPU_IDLE_BACKOFF: idle SPU poll back-off */
+    PS3_LIVE_PIN_LAYOUT,        /* PS3RECOMP_PIN_LAYOUT: named affinity layout */
     PS3_LIVE_COUNT
 };
 
@@ -62,6 +64,11 @@ void ps3_live_ctl_refresh_env(void) PS3_LIVE_CTL_WEAK;
 
 /* Current value of a switch (0/1). Initialises the table on first use. */
 int ps3_live_ctl_get(int key) PS3_LIVE_CTL_WEAK;
+
+/* Current value of a string-valued switch (PS3RECOMP_PIN_LAYOUT), or NULL.
+ * The returned buffer is written only by the walker thread's poll, so callers
+ * on the walker may use it directly; every other caller copies it. */
+const char* ps3_live_ctl_get_str(int key) PS3_LIVE_CTL_WEAK;
 
 /* True when PS3RECOMP_CTL names a control file. */
 int ps3_live_ctl_enabled(void) PS3_LIVE_CTL_WEAK;

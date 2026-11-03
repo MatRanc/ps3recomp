@@ -67,10 +67,12 @@
  * What the scaffold gives this file
  * -----------------------------------------------------------------------*/
 /* thread_name.h reaches the pinning helper through a weak symbol so fixtures
- * that do not link the platform layer still build. Keep the real definition
- * in this executable's link. */
-extern "C" void ps3_thread_pin_by_name(const char*);
-__attribute__((used)) static void (*s_pin_anchor)(const char*) = ps3_thread_pin_by_name;
+ * that do not link the platform layer still build. A weak reference does not
+ * make the static linker extract the platform archive member, so take the
+ * address of a non-weak anchor in that same object instead; that is what
+ * actually keeps PS3RECOMP_PIN live in this executable's link. */
+extern "C" void ps3_thread_pin_link_anchor(void);
+__attribute__((used)) static void (*s_pin_anchor)(void) = ps3_thread_pin_link_anchor;
 /* Same for PS3RECOMP_CTL: cellGcmSys/ppu_sysprx reference it weakly so the
  * standalone fixtures link, so this strong reference is what pulls it in. */
 extern "C" int ps3_live_ctl_get(int);
