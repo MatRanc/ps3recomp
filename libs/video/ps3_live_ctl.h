@@ -47,6 +47,7 @@ enum {
     PS3_LIVE_TEX_PIN,           /* PS3RECOMP_RSX_TEX_PIN: never evict a texture bound this frame */
     PS3_LIVE_C690_SPIN_US,      /* C690_SPIN_US: synthetic extra c690 job cost (ceiling probe) */
     PS3_LIVE_SPURS_LANE6,       /* SPURS_LANE6: let the mesh workloads use physical lane 5 */
+    PS3_LIVE_TEX_DIRTY,         /* PS3RECOMP_TEX_DIRTY: texture pages by write generation */
     PS3_LIVE_COUNT
 };
 

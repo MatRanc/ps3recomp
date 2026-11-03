@@ -6,6 +6,7 @@
  */
 
 #include "cellFsUtility.h"
+#include "ps3emu/guest_access.h"
 #include "../../runtime/ppu/ppu_memory.h"   /* GUEST_PTR, vm_write*: guest EA -> host pointer */
 #include <stdio.h>
 #include <string.h>
@@ -64,6 +65,7 @@ s32 cellFsUtilReadFile(const char* path, void* buf, u64 bufSize, u64* bytesRead)
     FILE* f = fopen(path, "rb");
     if (!f) return (s32)CELL_FS_UTIL_ERROR_NOT_FOUND;
 
+    ps3_guest_write(buf, (size_t)bufSize);
     size_t n = fread(buf, 1, (size_t)bufSize, f);
     fclose(f);
 

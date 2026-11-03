@@ -12,6 +12,7 @@
 #define PPU_MEMORY_H
 
 #include "../../include/ps3emu/endian.h"
+#include "../../include/ps3emu/guest_access.h"
 #include "ppu_context.h"
 #include "../spu/spu_coh_bitmap.h"
 
@@ -256,6 +257,7 @@ static inline void vm_block_notify(uint32_t guest_dst, size_t len)
 
 static inline void vm_memcpy_to(uint32_t guest_dst, const void* host_src, size_t len)
 {
+    ps3_guest_write(vm_ptr8(guest_dst), len);
     if (vm_block_reserved(guest_dst, len)) {
         spu_lockline_lock();
         memcpy(vm_ptr8(guest_dst), host_src, len);
@@ -268,6 +270,7 @@ static inline void vm_memcpy_to(uint32_t guest_dst, const void* host_src, size_t
 
 static inline void vm_memset(uint32_t guest_dst, int val, size_t len)
 {
+    ps3_guest_write(vm_ptr8(guest_dst), len);
     if (vm_block_reserved(guest_dst, len)) {
         spu_lockline_lock();
         memset(vm_ptr8(guest_dst), val, len);

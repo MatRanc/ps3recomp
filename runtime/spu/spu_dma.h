@@ -418,6 +418,7 @@ static inline int mfc_do_transfer_fast(spu_context* spu, uint32_t lsa, uint64_t 
               extern void c690_stats_on_transfer(const spu_context*, int, uint32_t, uint64_t, uint32_t);
               c690_stats_on_transfer(spu, 1, lsa, ea, size);
           } }
+        ps3_guest_write(ea_ptr, size);
         mfc_put_coherent(spu, ea_ptr, ls_ptr, ea, size);
         { extern void (*g_spu_put_hook)(uint32_t ea, uint32_t size);
           if (g_spu_put_hook) g_spu_put_hook((uint32_t)ea, size); }
@@ -916,6 +917,7 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
           } }
     } else if (mfc_is_put(cmd)) {
         /* PUT: local store -> main memory (mfc_put_coherent). */
+        ps3_guest_write(ea_ptr, size);
         mfc_put_coherent(spu, ea_ptr, (const uint8_t*)ls_ptr, ea, size);
         /* Tell whoever is listening where this PUT landed.
          *

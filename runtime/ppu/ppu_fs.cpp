@@ -18,6 +18,7 @@
 #include "../../libs/filesystem/edat.h"
 #include "ps3emu/nid.h"      /* ps3_compute_nid */
 #include "ps3emu/guest_call.h" /* ps3_invoke_guest: AIO completion is a guest OPD */
+#include "ps3emu/guest_access.h"
 #include "sdata_decrypt.h"   /* SDATA/EDAT (NPD) decryption for cellFsSdataOpen */
 #include <stdint.h>
 #include <stdio.h>
@@ -487,6 +488,7 @@ static void cellFsRead(ppu_context* ctx)
     if (ppu_vm_size && (uint64_t)buf + nbytes > ppu_vm_size) nbytes = ppu_vm_size - buf;
     fs_prefault(buf, nbytes);
     fs_set_dir(fd, f, 1);
+    ps3_guest_write(vm_base + buf, (size_t)nbytes);
     size_t n = fread(vm_base + buf, 1, (size_t)nbytes, f);   /* raw bytes, no swap */
     /* PS3_FSLOG_EOF=<fd>,<bytes>: report end-of-file past <bytes> on one descriptor.
      * The intro cinematic is 28 seconds and this port renders it at a few frames
@@ -985,6 +987,7 @@ static void fs_aio_submit(ppu_context* ctx, bool write)
          * lock). */
         HOST_LOCKFILE(f);
         const int64_t pos = (int64_t)HOST_FTELL64(f);
+        if (!write) ps3_guest_write(vm_base + buf, (size_t)size);
         if (HOST_FSEEK64(f, offset) == 0)
             n = write ? fwrite(vm_base + buf, 1, (size_t)size, f)
                       : fread(vm_base + buf, 1, (size_t)size, f);

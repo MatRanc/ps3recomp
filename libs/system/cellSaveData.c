@@ -8,6 +8,7 @@
 #include "cellSaveData.h"
 #include "ps3_psf.h"
 #include "ps3emu/guest_call.h"
+#include "ps3emu/guest_access.h"
 #include "../../runtime/ppu/ppu_memory.h"
 #include "../../runtime/memory/vm.h"
 #include <stdio.h>
@@ -702,6 +703,7 @@ static s32 process_file_op(const char* save_path, CellSaveDataFileSet* set)
         }
         size_t read_size = (size_t)set->fileSize;
         if (read_size > set->fileBufSize) read_size = set->fileBufSize;
+        ps3_guest_write(set->fileBuf, read_size);
         size_t got = fread(set->fileBuf, 1, read_size, fp);
         int failed = ferror(fp);
         if (fclose(fp) != 0) failed = 1;

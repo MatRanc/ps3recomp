@@ -7,6 +7,7 @@
  */
 
 #include "cellHttp.h"
+#include "ps3emu/guest_access.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -716,6 +717,7 @@ s32 cellHttpRecvResponse(CellHttpTransId transId, void* buf, u32 size,
         /* buf is a guest address (the overflow copy above already translates
          * it); recv() into the raw value wrote to the host address of the same
          * number whenever a body outgrew the header read. */
+        ps3_guest_write(GUEST_PTR(buf, char*) + filled, (size_t)want);
         int n = recv(t->sock, GUEST_PTR(buf, char*) + filled, (int)want, 0);
         if (n < 0) {
             /* Error - if we already have some data, return it */

@@ -3,6 +3,7 @@
  */
 
 #include "sys_fs.h"
+#include "ps3emu/guest_access.h"
 #include "../../libs/filesystem/edat.h"
 #include "../memory/vm.h"
 #include <string.h>
@@ -512,6 +513,7 @@ int64_t sys_fs_read(ppu_context* ctx)
      * as a read error on every movie and never decoded a frame -- solid green
      * video. ppu_fs.cpp fs_prefault is the same fix for cellFs. */
     if (size) vm_commit(buf_addr, (uint32_t)size);
+    ps3_guest_write(buf, (size_t)size);
     size_t nread = fread(buf, 1, (size_t)size, f->fp);
 
     /* PS3_FSTRACE=<n>: every nth read, the fd and the file offset it came from.

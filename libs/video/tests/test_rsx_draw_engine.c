@@ -16,6 +16,7 @@
 #include "rsx_primitives.h"   /* RSX_PRIMITIVE_* */
 #include "rsx_tex_miss.h"     /* RSX_TEX_MISS_* */
 #include "rsx_test_programs.h"
+#include "ps3emu/guest_access.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -890,6 +891,55 @@ static void test_texture_lookup_memo(void)
     CHECK(stub.n_texture_create == 3 && stub.alive[b] == 0,
           "changed bytes behind a memoized entry are re-decoded");
     engine_down();
+}
+
+/* PS3RECOMP_TEX_DIRTY: a texture is revalidated from the write sequence of
+ * its guest pages. A tracked writer (the ps3_guest_write hook every MFC PUT,
+ * 2D transfer and file read uses) must re-upload on the next bind, and so
+ * must a direct PPU store, which lands on a write-protected page and faults
+ * into the engine's handler. */
+static void test_texture_dirty_generation(void)
+{
+    printf("-- texture dirty generation\n");
+    setenv("PS3RECOMP_TEX_DIRTY", "1", 1);
+    engine_up();
+    memset(vm_base + TEX_OFFSET, 0x11, 4 * 4 * 4);
+    bind_texture_unit(RSX_LOCATION_MAIN, TEX_OFFSET);
+    draw_triangle();
+    const int created = stub.n_texture_create;
+    CHECK(created == 1, "the first bind uploads the texture");
+
+    rsx_draw_engine_present();
+    bind_texture_unit(RSX_LOCATION_MAIN, TEX_OFFSET);
+    draw_triangle();
+    CHECK(stub.n_texture_create == created,
+          "unchanged pages are not re-decoded (%d creates)", stub.n_texture_create);
+
+    /* A tracked bulk writer: the same call an SPU PUT or 2D transfer makes. */
+    rsx_draw_engine_present();
+    ps3_guest_write(vm_base + TEX_OFFSET, 16);
+    bind_texture_unit(RSX_LOCATION_MAIN, TEX_OFFSET);
+    draw_triangle();
+    CHECK(stub.n_texture_create == created + 1 && stub.alive[stub.last_created_texture],
+          "a tracked writer marks the page and the next bind re-uploads (%d creates)",
+          stub.n_texture_create);
+
+    /* A direct PPU store: the page is read-only, so this faults, the handler
+     * opens it and charges the write, and the store retries and succeeds. */
+    rsx_draw_engine_present();
+    bind_texture_unit(RSX_LOCATION_MAIN, TEX_OFFSET);
+    draw_triangle();
+    const int before_store = stub.n_texture_create;
+    *(volatile u32*)(vm_base + TEX_OFFSET + 4) = 0x11223344u;
+    rsx_draw_engine_present();
+    bind_texture_unit(RSX_LOCATION_MAIN, TEX_OFFSET);
+    draw_triangle();
+    CHECK(stub.n_texture_create == before_store + 1,
+          "a direct PPU store faults and the next bind re-uploads (%d creates)",
+          stub.n_texture_create);
+
+    engine_down();
+    setenv("PS3RECOMP_TEX_DIRTY", "0", 1);
 }
 
 /* A 128x128 A8R8G8B8 linear texture on unit 0: 64 KB, past the size that is
@@ -2964,8 +3014,12 @@ static void test_walker_fast_pipeline(void)
 
 int main(void)
 {
-    vm_base = (u8*)calloc(1, GUEST_BYTES);
-    if (!vm_base) { printf("[FAIL] guest memory\n"); return 1; }
+    { void* p = NULL;
+      if (posix_memalign(&p, 4096, GUEST_BYTES) != 0 || !p) {
+          printf("[FAIL] guest memory\n"); return 1;
+      }
+      vm_base = (u8*)p;
+      memset(vm_base, 0, GUEST_BYTES); }
     ppu_vm_size = GUEST_BYTES;
     /* Three vertices of float4 position, so the fetch has something real to
      * read: the engine treats an unreadable ATTR0 as a failed group. */
@@ -2980,6 +3034,7 @@ int main(void)
     test_mrt_set();
     test_texture_cache();
     test_texture_lookup_memo();
+    test_texture_dirty_generation();
     test_texture_sparse_rehash();
     test_pipeline_key();
     test_restart_expansion();

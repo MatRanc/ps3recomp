@@ -528,6 +528,7 @@ s32 cellFsRead(CellFsFd fd, void* buf, u64 nbytes, u64* nread)
          * which made this look handled -- but the file contents were being read
          * to a raw guest address interpreted as a host one, so nothing the
          * title loaded ever landed in guest memory. */
+        ps3_guest_write(gptr(buf), (size_t)nbytes);
         bytes_read = (u64)fread(gptr(buf), 1, (size_t)nbytes, s_files[fd].host_fp);
     }
 

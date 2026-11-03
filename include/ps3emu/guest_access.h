@@ -33,6 +33,24 @@ static inline void ps3_guest_access(const void* host, size_t len)
     if (fn) fn(host, len);
 }
 
+/* About to WRITE guest memory from host code (SPU/MFC PUT, a 2D transfer, a
+ * file read, an HLE memcpy). Resolves any render-target readback on the
+ * range, then tells texture page tracking it is dirty and opens its
+ * read-only pages. One load each when neither is armed. */
+extern void (*volatile g_ps3_guest_write_hook)(const void* host, size_t len);
+
+static inline void ps3_guest_write(const void* host, size_t len)
+{
+    /* Nothing to do (and byte-identical behaviour to before this hook) when
+     * texture page tracking is off: the write hook is only published while
+     * it is on. */
+    void (*w)(const void*, size_t) = g_ps3_guest_write_hook;
+    if (!w) return;
+    void (*a)(const void*, size_t) = g_ps3_guest_access_hook;
+    if (a) a(host, len);
+    w(host, len);
+}
+
 #ifdef __cplusplus
 }
 #endif

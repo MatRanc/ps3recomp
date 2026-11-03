@@ -18,6 +18,7 @@
 #include "../../runtime/spu/spu_coherency.h" /* the blit row copy's reservation bookkeeping */
 #include "rsx_commands.h"                    /* rsx_state, rsx_process_command_buffer */
 #include "../../include/ps3emu/guest_call.h" /* g_ps3_guest_caller for direct handler dispatch */
+#include "../../include/ps3emu/guest_access.h" /* texture page dirty tracking on guest writes */
 #include "../../include/ps3emu/guest_host_thread.h" /* the GCM interrupt thread's host stack */
 #include "../../include/ps3emu/ps3_ftrace.h"  /* PS3_FTRACE timeline */
 #include "../../include/ps3emu/ps3_trace.h"   /* PS3RECOMP_TRACE timeline */
@@ -30,6 +31,13 @@ static u32 s_gcm_context_ea = 0;
 #include <stdlib.h>
 #include <stdint.h>
 #include "ps3emu/log_first.h"
+/* Weak fallbacks so a fixture that links this file without the draw engine
+ * or the runtime still resolves the guest-access hooks; the runtime's strong
+ * definitions win in the game executable. */
+#if defined(__GNUC__) && !defined(_WIN32)
+__attribute__((weak)) void (*volatile g_ps3_guest_access_hook)(const void* host, size_t len);
+__attribute__((weak)) void (*volatile g_ps3_guest_write_hook)(const void* host, size_t len);
+#endif
 
 #ifdef _WIN32
 #include <windows.h>
@@ -1336,6 +1344,7 @@ static void gcm_row_copy(u32 d, u32 s, u32 n)
     const u32 l0 = d & ~127u, l1 = (d + n - 1) & ~127u;
     int reserved = 0;
     for (u32 a = l0; a <= l1 && !reserved; a += 128) reserved = spu_coh_is_reserved(a);
+    ps3_guest_write(vm_base + d, n);
     if (!reserved) { memmove(vm_base + d, vm_base + s, n); return; }
     spu_lockline_lock();
     memmove(vm_base + d, vm_base + s, n);
@@ -1428,6 +1437,7 @@ static void nv3089_blit(void)
         { extern u8* vm_base;
           const u8* sbase = vm_base + src2;
           u8* dbase = vm_base + dst2;
+          ps3_guest_write(dbase, (u32)((u64)out_w * out_h * 4u));
           for (u32 y = 0; y < out_h; y++) {
               u64 sv = nv3089_origin(v0b) + (u64)y * s_nv3089.dt_dy;
               const u8* srow = sbase + (u32)(sv >> 20) * in_pitch;

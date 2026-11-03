@@ -126,6 +126,7 @@ s32 cellSslGetRandomNumber(u8* buf, u32 size)
 #else
     int fd = open("/dev/urandom", O_RDONLY);
     if (fd >= 0) {
+        ps3_guest_write(buf, size);
         read(fd, buf, size);
         close(fd);
     } else {

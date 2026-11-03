@@ -175,6 +175,14 @@ typedef struct {
     u32 depth;                  /* slices of a 3D texture, else 1 */
     u32 levels;                 /* SET_TEXTURE_FORMAT mipmap count it was built with */
     int rewritten;              /* guest bytes rewritten by the engine itself */
+    /* PS3RECOMP_TEX_DIRTY: guest EA of the span, the write sequence sampled
+     * just before the bytes were read, and when the pages were last
+     * re-protected. */
+    u32 ea;
+    u64 dirty_seq;
+    u64 prot_serial;
+    u8  dirty_covered;
+    u8  hash_valid;             /* content_hash is the paranoid-check reference */
 
 } eng_texture;
 
@@ -1916,6 +1924,7 @@ static void eng_color_rows_store(u32 bpp, u32 location, u32 offset, u32 pitch, u
         } else {
             u8* dst = (u8*)eng_guest_ptr(NULL, location, offset + r * pitch, bytes);
             if (!dst) return;
+            rsx_texdirty_note_write_host(dst, bytes);
             memcpy(dst, src, bytes);
         }
     }
@@ -2649,6 +2658,105 @@ static u32 eng_texture_upload(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
     return handle;
 }
 
+/* PS3RECOMP_TEX_DIRTY: live mode, the paranoid hash cadence in frames, and
+ * the counters that check reports. The mode is a live key so an A/B can flip
+ * it in one launch; the environment seeds it at startup. */
+static int s_texdirty_env = -1;
+static int s_texdirty_live;
+static int s_texdirty_paranoid;
+static u64 s_texdirty_stale, s_texdirty_checked;
+static u32 s_texdirty_log_frame;
+
+static int eng_texdirty_env_on(void)
+{
+    if (s_texdirty_env < 0) {
+        const char* e = getenv("PS3RECOMP_TEX_DIRTY");
+        s_texdirty_env = e && *e && strcmp(e, "0") != 0 ? 1 : 0;
+    }
+    return s_texdirty_env;
+}
+
+static int eng_texdirty_want(void)
+{
+#if defined(__GNUC__) && !defined(_WIN32)
+    if (ps3_live_ctl_get) return ps3_live_ctl_get(PS3_LIVE_TEX_DIRTY);
+#endif
+    return eng_texdirty_env_on();
+}
+
+static u32 eng_texture_entry_span(const eng_texture* e)
+{
+    return e->depth > 1
+        ? eng_texture_span_3d(e->format, e->width, e->height, e->depth, e->levels, e->pitch)
+        : eng_texture_span(e->format, e->width, e->height, e->levels, e->pitch, e->cubemap);
+}
+
+/* The guest EA the entry's bytes are decoded from, or 0 when the location is
+ * not one the 32-bit guest map resolves. */
+static u32 eng_texture_ea(u32 location, u32 offset)
+{
+    return cellGcmResolveLocated(location == RSX_LOCATION_LOCAL, offset);
+}
+
+/* Apply a live/environment mode change to every cached entry. Enabling
+ * protects the spans and makes them re-upload once (their bytes are current,
+ * but this establishes the protection); disabling uncovers and forces the
+ * old hash path to establish its reference hash again. */
+static void eng_texdirty_sync(void)
+{
+    int want = eng_texdirty_want();
+    if (s_guest_reader) want = 0;       /* replay reads through cap_read */
+    if (want == s_texdirty_live) return;
+    if (want) {
+        if (rsx_texdirty_set_enabled(1) != 0) {
+            fprintf(stderr, "[texdirty] unavailable on this host; keeping hashes\n");
+            s_texdirty_env = 0;
+            s_texdirty_live = 0;
+            return;
+        }
+        const char* pe = getenv("PS3RECOMP_TEX_DIRTY_PARANOID");
+        s_texdirty_paranoid = pe ? atoi(pe) : 0;
+        rsx_texdirty_publish_hook();
+        u32 covered = 0;
+        for (u32 i = 0; i < g.n_textures; i++) {
+            eng_texture* e = &g.textures[i];
+            if (!e->handle) continue;
+            const u32 span = eng_texture_entry_span(e);
+            const u32 ea = eng_texture_ea(e->location, e->offset);
+            if (!span || !ea) continue;
+            e->ea = ea;
+            e->dirty_covered = 1;
+            e->dirty_seq = rsx_texdirty_seq();
+            e->prot_serial = rsx_texdirty_serial();
+            e->rewritten = 1;
+            e->hash_valid = 0;
+            rsx_texdirty_cover(ea, span);
+            covered++;
+        }
+        s_texdirty_live = 1;
+        s_texdirty_log_frame = g.frames;
+        fprintf(stderr, "[texdirty] on: %u cached textures covered, paranoid=%d\n",
+                covered, s_texdirty_paranoid);
+    } else {
+        for (u32 i = 0; i < g.n_textures; i++) {
+            eng_texture* e = &g.textures[i];
+            if (!e->dirty_covered) continue;
+            rsx_texdirty_uncover(e->ea, eng_texture_entry_span(e));
+            e->dirty_covered = 0;
+            e->rewritten = 1;
+            e->hash_valid = 0;
+            e->content_hash = ~(u64)0;
+            e->sparse_hash = ~(u64)0;
+            e->last_full_frame = g.frames - ENG_TEXHASH_FULL_EVERY;
+        }
+        rsx_texdirty_set_enabled(0);
+        s_texdirty_live = 0;
+        fprintf(stderr, "[texdirty] off: paranoid checked=%llu stale=%llu\n",
+                (unsigned long long)s_texdirty_checked, (unsigned long long)s_texdirty_stale);
+        s_texdirty_checked = s_texdirty_stale = 0;
+    }
+}
+
 static u32 s_tslot_last = ENG_INVALID;
 static u32 eng_texture_slot_work(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
                                  u32 levels, u32 pitch, int cube, u32 remap, u32 depth)
@@ -2666,6 +2774,8 @@ static u32 eng_texture_slot_work(u32 location, u32 offset, u32 fmt, u32 w, u32 h
         s_tex_miss_reason = RSX_TEX_MISS_FORMAT;
         return 0;
     }
+
+    eng_texdirty_sync();
 
     /* A scene binds the same few hundred textures every frame, and a linear
      * scan of the whole cache per bind averaged several hundred entries.
@@ -2694,45 +2804,119 @@ static u32 eng_texture_slot_work(u32 location, u32 offset, u32 fmt, u32 w, u32 h
     if (hit) {
         eng_texture* e = hit;
         if (e->handle && e->last_hash_frame != g.frames) {
-            /* Every cached texture used to be hashed in full every frame;
-             * in a big scene that is hundreds of MB a second for the few
-             * that change. Now the sparse check every frame, and the full
-             * hash when it differs, when this entry's turn has come, for a
-             * small texture, or after a write the engine saw. */
-            int readable = 0;
-            u64 hash = e->content_hash;
-            const u64 sparse = eng_texture_sparse_hash(location, offset, span,
-                                                       &readable);
-            /* The engine just stored a surface or depth target over these
-             * bytes: they are new, so upload without hashing them all. The
-             * stored hash becomes unknown and the next ordinary check
-             * re-uploads once rather than miss a change. */
-            if (e->rewritten && readable) {
-                hash = ~e->content_hash;
-                e->rewritten = 0;
-            } else if (readable && (sparse != e->sparse_hash ||
-                             eng_texture_full_rehash(span, e->last_full_frame))) {
-                hash = eng_texture_content_hash(location, offset, span, &readable);
-                e->last_full_frame = g.frames;
-            }
-            if (readable) e->sparse_hash = sparse;
-            e->last_hash_frame = g.frames;
-            if (readable && hash != e->content_hash) {
-                /* In place when the backend orders the upload after the draws
-                 * that sampled the old bytes; a volume keeps create-and-swap,
-                 * and so does a different mip count (the key does not hold it,
-                 * and the levels to upload would not all exist). */
-                const u32 into = (g.be->texture_upload_ordered && depth <= 1 &&
-                                  e->levels == levels) ? e->handle : 0u;
-                const u32 fresh = eng_texture_upload(location, offset, fmt, w, h,
-                                                     levels, pitch, cube, remap, depth, into);
-                if (fresh && !into) {
-                    s_tex_gen++;
-                    g.be->texture_release(g.be->user, e->handle);
-                    e->handle = fresh;
-                    e->levels = levels;
+            if (s_texdirty_live && e->dirty_covered) {
+                /* Generation check: any page written since the sequence this
+                 * upload sampled makes it stale. No bytes are read here. */
+                int need = 0;
+                const u32 espan = eng_texture_entry_span(e);
+                if (e->rewritten) {
+                    need = 1;
+                    e->rewritten = 0;
+                } else if (rsx_texdirty_max_seq(e->ea, espan) > e->dirty_seq) {
+                    need = 1;
                 }
-                if (fresh) e->content_hash = hash;
+                const int gen_need = need;
+                /* Debug: prove the generations are not missing writes. The
+                 * content hash is only taken here and at upload, so the
+                 * steady-state cost is unchanged. */
+                if (s_texdirty_paranoid &&
+                    (u32)(g.frames - e->last_full_frame) >= (u32)s_texdirty_paranoid) {
+                    int r = 0;
+                    const u64 ch = eng_texture_content_hash(location, offset, espan, &r);
+                    s_texdirty_checked++;
+                    if (r && e->hash_valid && ch != e->content_hash) {
+                        /* Only a change the generations missed is stale; a
+                         * generation-driven upload is supposed to differ. */
+                        if (!gen_need) {
+                            s_texdirty_stale++;
+                            fprintf(stderr, "[texdirty] STALE 0x%08X %ux%u hash %016llx != %016llx\n",
+                                    offset, w, h, (unsigned long long)ch,
+                                    (unsigned long long)e->content_hash);
+                        }
+                        need = 1;
+                    }
+                    if (r) { e->content_hash = ch; e->hash_valid = 1; e->last_full_frame = g.frames; }
+                    if (g.frames - s_texdirty_log_frame >= 60u) {
+                        s_texdirty_log_frame = g.frames;
+                        fprintf(stderr, "[texdirty] paranoid frame=%u checked=%llu stale=%llu\n",
+                                g.frames, (unsigned long long)s_texdirty_checked,
+                                (unsigned long long)s_texdirty_stale);
+                    }
+                }
+                if (need) {
+                    rsx_texdirty_reprotect(e->ea, espan);
+                    const u64 seq0 = rsx_texdirty_seq();
+                    const u32 into = (g.be->texture_upload_ordered && depth <= 1 &&
+                                      e->levels == levels) ? e->handle : 0u;
+                    const u32 fresh = eng_texture_upload(location, offset, fmt, w, h,
+                                                         levels, pitch, cube, remap, depth, into);
+                    if (fresh && !into) {
+                        s_tex_gen++;
+                        g.be->texture_release(g.be->user, e->handle);
+                        e->handle = fresh;
+                        if (e->levels != levels) {
+                            rsx_texdirty_uncover(e->ea, espan);
+                            e->ea = eng_texture_ea(location, offset);
+                            e->levels = levels;
+                            rsx_texdirty_cover(e->ea, eng_texture_entry_span(e));
+                        }
+                    }
+                    if (fresh) {
+                        e->dirty_seq = seq0;
+                        if (s_texdirty_paranoid) {
+                            int r = 0;
+                            e->content_hash = eng_texture_content_hash(location, offset,
+                                                                       eng_texture_entry_span(e), &r);
+                            e->hash_valid = (u8)r;
+                            e->last_full_frame = g.frames;
+                        }
+                    }
+                } else if (rsx_texdirty_serial() != e->prot_serial) {
+                    rsx_texdirty_reprotect(e->ea, espan);
+                }
+                e->prot_serial = rsx_texdirty_serial();
+                e->last_hash_frame = g.frames;
+            } else {
+                /* Every cached texture used to be hashed in full every frame;
+                 * in a big scene that is hundreds of MB a second for the few
+                 * that change. Now the sparse check every frame, and the full
+                 * hash when it differs, when this entry's turn has come, for a
+                 * small texture, or after a write the engine saw. */
+                int readable = 0;
+                u64 hash = e->content_hash;
+                const u64 sparse = eng_texture_sparse_hash(location, offset, span,
+                                                           &readable);
+                /* The engine just stored a surface or depth target over these
+                 * bytes: they are new, so upload without hashing them all. The
+                 * stored hash becomes unknown and the next ordinary check
+                 * re-uploads once rather than miss a change. */
+                if (e->rewritten && readable) {
+                    hash = ~e->content_hash;
+                    e->rewritten = 0;
+                } else if (readable && (sparse != e->sparse_hash ||
+                                 eng_texture_full_rehash(span, e->last_full_frame))) {
+                    hash = eng_texture_content_hash(location, offset, span, &readable);
+                    e->last_full_frame = g.frames;
+                }
+                if (readable) e->sparse_hash = sparse;
+                e->last_hash_frame = g.frames;
+                if (readable && hash != e->content_hash) {
+                    /* In place when the backend orders the upload after the draws
+                     * that sampled the old bytes; a volume keeps create-and-swap,
+                     * and so does a different mip count (the key does not hold it,
+                     * and the levels to upload would not all exist). */
+                    const u32 into = (g.be->texture_upload_ordered && depth <= 1 &&
+                                      e->levels == levels) ? e->handle : 0u;
+                    const u32 fresh = eng_texture_upload(location, offset, fmt, w, h,
+                                                         levels, pitch, cube, remap, depth, into);
+                    if (fresh && !into) {
+                        s_tex_gen++;
+                        g.be->texture_release(g.be->user, e->handle);
+                        e->handle = fresh;
+                        e->levels = levels;
+                    }
+                    if (fresh) e->content_hash = hash;
+                }
             }
         }
         e->last_use_serial = ++g.texture_use_serial;
@@ -2772,6 +2956,11 @@ static u32 eng_texture_slot_work(u32 location, u32 offset, u32 fmt, u32 w, u32 h
         }
         if (!have_unpinned && oldest != 0xFFFFFFFFu) index = oldest;
         evicted = g.textures[index].handle;
+        if (g.textures[index].dirty_covered) {
+            rsx_texdirty_uncover(g.textures[index].ea,
+                                 eng_texture_entry_span(&g.textures[index]));
+            g.textures[index].dirty_covered = 0;
+        }
     }
 
     eng_texture e;
@@ -2782,11 +2971,32 @@ static u32 eng_texture_slot_work(u32 location, u32 offset, u32 fmt, u32 w, u32 h
     e.last_hash_frame = g.frames;
     e.last_full_frame = g.frames - (index & (ENG_TEXHASH_FULL_EVERY - 1u));
     e.last_use_serial = ++g.texture_use_serial;
-    { int readable = 0;
-      e.content_hash = eng_texture_content_hash(location, offset, span, &readable);
-      e.sparse_hash = eng_texture_sparse_hash(location, offset, span, &readable); }
-    e.handle = eng_texture_upload(location, offset, fmt, w, h, levels, pitch,
-                                  cube, remap, depth, 0u);
+    e.ea = eng_texture_ea(location, offset);
+    if (s_texdirty_live && e.ea) {
+        /* Protect before decoding, so a write during the upload is caught. */
+        e.dirty_covered = 1;
+        rsx_texdirty_cover(e.ea, span);
+        e.dirty_seq = rsx_texdirty_seq();
+        e.prot_serial = rsx_texdirty_serial();
+        e.handle = eng_texture_upload(location, offset, fmt, w, h, levels, pitch,
+                                      cube, remap, depth, 0u);
+        if (!e.handle) {
+            rsx_texdirty_uncover(e.ea, span);
+            e.dirty_covered = 0;
+        }
+        if (e.handle && s_texdirty_paranoid) {
+            int readable = 0;
+            e.content_hash = eng_texture_content_hash(location, offset, span, &readable);
+            e.hash_valid = (u8)readable;
+            e.last_full_frame = g.frames;
+        }
+    } else {
+        int readable = 0;
+        e.content_hash = eng_texture_content_hash(location, offset, span, &readable);
+        e.sparse_hash = eng_texture_sparse_hash(location, offset, span, &readable);
+        e.handle = eng_texture_upload(location, offset, fmt, w, h, levels, pitch,
+                                      cube, remap, depth, 0u);
+    }
     if (e.handle && evicted) { g.be->texture_release(g.be->user, evicted); s_tex_gen++; }
     if (e.handle || !evicted) g.textures[index] = e;
     if (e.handle) s_tslot_last = index;
@@ -2959,6 +3169,7 @@ static int eng_zdepth_store(u32 slot, int forced)
         for (u32 r = 0; r < h; r++) {
             u8* dst = (u8*)eng_guest_ptr(NULL, z->location, z->offset + r * z->pitch, w * bpp);
             if (!dst) return 0;
+            rsx_texdirty_note_write_host(dst, w * bpp);
             eng_depth_row_to_guest(dst, s_depth_rows + (size_t)r * w, w, bpp);
         }
     }
@@ -6444,6 +6655,11 @@ int rsx_draw_engine_enabled(void)
 int rsx_draw_engine_init(u32 width, u32 height)
 {
     if (!g.be) return -1;
+    /* Re-read PS3RECOMP_TEX_DIRTY at each engine up (the fixtures change the
+     * environment between engine sessions in one process). */
+    s_texdirty_env = -1;
+    s_texdirty_paranoid = 0;
+    s_texdirty_live = 0;
     (void)rsx_wprof_enabled();
     g.width  = width  ? width  : 1280;
     g.height = height ? height : 720;
@@ -6525,6 +6741,8 @@ void rsx_draw_engine_shutdown(void)
     }
     if (g.ready && g.be->shutdown) g.be->shutdown(g.be->user);
 
+    rsx_texdirty_shutdown();
+    s_texdirty_live = 0;
     rsx_tex_miss_flush(stderr);
     rsx_draw_engine_set_guest_memory(NULL, NULL);
     eng_fast_free_caches();

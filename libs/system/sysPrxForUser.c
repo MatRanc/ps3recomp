@@ -9,6 +9,7 @@
 #include "sysPrxForUser.h"
 #include "../../runtime/memory/vm.h"
 #include <ps3emu/guest_call.h>
+#include <ps3emu/guest_access.h>
 #include "../../runtime/ppu/ppu_memory.h"   /* vm_base, vm_write32: translate + byte-swap */
 #include <stdio.h>
 #include <stdarg.h>
@@ -382,14 +383,14 @@ s32 _sys_strncmp(const char* s1, const char* s2, u32 size)
 void* _sys_memset(void* dst, s32 val, u32 size)
 {
     void* d = yz_g2h(dst);
-    if (d) memset(d, val, size);
+    if (d) { ps3_guest_write(d, size); memset(d, val, size); }
     return dst;
 }
 
 void* _sys_memcpy(void* dst, const void* src, u32 size)
 {
     void* d = yz_g2h(dst); const void* s = yz_g2h(src);
-    if (d && s) memcpy(d, s, size);
+    if (d && s) { ps3_guest_write(d, size); memcpy(d, s, size); }
     return dst;
 }
 
@@ -1120,6 +1121,7 @@ s32 sys_get_random_number(void* buf, u64 size)
     /* Use /dev/urandom on Unix */
     FILE* f = fopen("/dev/urandom", "rb");
     if (f) {
+        ps3_guest_write(buf, (size_t)size);
         fread(buf, 1, (size_t)size, f);
         fclose(f);
     } else {

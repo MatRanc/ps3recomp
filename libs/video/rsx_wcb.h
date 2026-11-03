@@ -133,6 +133,32 @@ int  rsx_wcb_on_fault(uintptr_t addr);
 
 void rsx_wcb_counters_get(rsx_wcb_counters* out);
 
+/* ---- texture page dirty tracking (PS3RECOMP_TEX_DIRTY) -------------------
+ *
+ * Textures are validated from a per-4K-guest-page write sequence instead of
+ * hashing their bytes. Every writer that can be intercepted calls
+ * rsx_texdirty_note_write/note_write_host; the pages of cached textures are
+ * write-protected (PROT_READ) so the PPU's own inlined stores fault and are
+ * caught by the same handler. A texture remembers the sequence at upload;
+ * revalidation is a max over its pages. All entry points are cheap when the
+ * switch is off.
+ */
+int      rsx_texdirty_enabled(void);
+/* Enable/disable. Returns 0 on success, -1 when the host cannot support it
+ * (page size other than 4K, or an unaligned guest base). */
+int      rsx_texdirty_set_enabled(int on);
+void     rsx_texdirty_shutdown(void);
+uint64_t rsx_texdirty_seq(void);                 /* current write sequence */
+uint64_t rsx_texdirty_serial(void);              /* bumped when a page opens */
+void     rsx_texdirty_cover(uint32_t ea, uint32_t span);
+void     rsx_texdirty_uncover(uint32_t ea, uint32_t span);
+uint64_t rsx_texdirty_max_seq(uint32_t ea, uint32_t span);
+void     rsx_texdirty_reprotect(uint32_t ea, uint32_t span);
+void     rsx_texdirty_note_write(uint32_t ea, uint32_t len);
+void     rsx_texdirty_note_write_host(const void* host, size_t len);
+int      rsx_texdirty_on_fault(uintptr_t addr);
+void     rsx_texdirty_publish_hook(void);
+
 /* Readback attribution (PS3RECOMP_RSX_WCB_ATTR): collect, per region, how
  * long guest threads waited for a copy. Off by default. */
 void rsx_wcb_attr_set(int on);

@@ -99,18 +99,38 @@ static uintptr_t wcb_page_size(void)
     return s_page;
 }
 
+/* Texture page-dirty tracking (PS3RECOMP_TEX_DIRTY) lives in this file too:
+ * it shares the region table's page-protection state and the one fault
+ * handler. These are defined at the bottom; the region code calls them while
+ * it holds the lock. */
+extern uint8_t* vm_base;
+extern void (*volatile g_ps3_guest_write_hook)(const void* host, size_t len);
+static int  td_page_wants_ro(uintptr_t page);       /* lock held */
+static void td_open_note_locked(uintptr_t lo, uintptr_t hi, int ro);
+static void td_forget_prot_locked(uintptr_t lo, uintptr_t hi);
+int  rsx_texdirty_on_fault(uintptr_t addr);
+static void td_install_faults(void);
+
 /* 0 on success. `open` restores read/write: render targets live in ordinary
- * read/write guest memory, which is the only kind the engine arms. */
-static int wcb_set_access(uintptr_t lo, uintptr_t hi, int open)
+ * read/write guest memory, which is the only kind the engine arms. TEX_DIRTY
+ * texture pages stay read-only when reopened, so their writes keep faulting. */
+static int wcb_set_access_prot(uintptr_t lo, uintptr_t hi, int prot)
 {
     if (hi <= lo) return 0;
 #ifdef _WIN32
     DWORD old;
-    return VirtualProtect((void*)lo, (SIZE_T)(hi - lo), open ? PAGE_READWRITE : PAGE_NOACCESS, &old)
-           ? 0 : -1;
+    DWORD p = prot == 0 ? PAGE_NOACCESS : (prot == 1 ? PAGE_READONLY : PAGE_READWRITE);
+    return VirtualProtect((void*)lo, (SIZE_T)(hi - lo), p, &old) ? 0 : -1;
 #else
-    return mprotect((void*)lo, (size_t)(hi - lo), open ? (PROT_READ | PROT_WRITE) : PROT_NONE);
+    return mprotect((void*)lo, (size_t)(hi - lo), prot == 0 ? PROT_NONE
+                                                    : (prot == 1 ? PROT_READ
+                                                                 : (PROT_READ | PROT_WRITE)));
 #endif
+}
+
+static int wcb_set_access(uintptr_t lo, uintptr_t hi, int open)
+{
+    return wcb_set_access_prot(lo, hi, open ? 2 : 0);
 }
 
 /* ---- state -------------------------------------------------------------- */
@@ -218,6 +238,8 @@ int rsx_wcb_forced_store(void) { return s_wcbm.forced; }
 int rsx_wcb_store(void* host_dst, const void* src, size_t n)
 {
     if (!n) return 0;
+    rsx_texdirty_note_write_host(host_dst, n);   /* the /proc/self/mem path
+                                                  * bypasses page protection */
 #ifndef _WIN32
     if (s_wcbm.forced) {
         const unsigned char* s = (const unsigned char*)src;
@@ -254,18 +276,28 @@ static int wcb_page_covered(uintptr_t page, int skip)
 }
 
 /* Reopen region i's pages that no other region covers, and free the slot.
- * Lock held. */
+ * Lock held. A page still covered by a cached texture reopens read-only so
+ * the next guest store faults and charges the write to that texture. */
 static void wcb_reopen_uncovered(int i)
 {
     const wcb_region* r = &s_wcbm.r[i];
     const uintptr_t pg = wcb_page_size();
     uintptr_t run = 0;
+    int run_prot = -1;
     for (uintptr_t p = r->lo; p < r->hi; p += pg) {
         const int keep = wcb_page_covered(p, i);
-        if (!keep && !run) run = p;
-        if (keep && run) { wcb_set_access(run, p, 1); run = 0; }
+        const int prot = keep ? 0 : (td_page_wants_ro(p) ? 1 : 2);
+        if (run && (!keep || prot != run_prot)) {
+            wcb_set_access_prot(run, p, run_prot);
+            td_open_note_locked(run, p, run_prot == 1);
+            run = 0;
+        }
+        if (!keep && !run) { run = p; run_prot = prot; }
     }
-    if (run) wcb_set_access(run, r->hi, 1);
+    if (run) {
+        wcb_set_access_prot(run, r->hi, run_prot);
+        td_open_note_locked(run, r->hi, run_prot == 1);
+    }
 }
 
 static void wcb_release_locked(int i)
@@ -307,6 +339,7 @@ int rsx_wcb_protect(uint32_t cookie, void* host, size_t len)
         wcb_unlock();
         return -1;
     }
+    td_forget_prot_locked(lo, hi);      /* PROT_NONE now owns these pages */
     s_wcbm.r[slot].cookie = cookie;
     s_wcbm.r[slot].lo = lo;
     s_wcbm.r[slot].hi = hi;
@@ -579,7 +612,9 @@ int rsx_wcb_on_fault(uintptr_t addr)
         /* The owner touched a page whose region it is itself copying: there
          * is nothing to wait for and waiting would never end. Open the page
          * (the copy completes into it) rather than loop or die. */
-        wcb_set_access(page, page + pg, 1);
+        const int ro = td_page_wants_ro(page);
+        wcb_set_access_prot(page, page + pg, ro ? 1 : 2);
+        td_open_note_locked(page, page + pg, ro);
         wcb_unlock();
         WCB_ADD64(&s_wcbm.c.late_faults, 1);
         return 1;
@@ -615,13 +650,17 @@ static LONG WINAPI wcb_veh(EXCEPTION_POINTERS* ep)
     const EXCEPTION_RECORD* er = ep->ExceptionRecord;
     if (er->ExceptionCode != EXCEPTION_ACCESS_VIOLATION || er->NumberParameters < 2)
         return EXCEPTION_CONTINUE_SEARCH;
-    return rsx_wcb_on_fault((uintptr_t)er->ExceptionInformation[1])
+    const uintptr_t at = (uintptr_t)er->ExceptionInformation[1];
+    return (rsx_texdirty_on_fault(at) || rsx_wcb_on_fault(at))
            ? EXCEPTION_CONTINUE_EXECUTION : EXCEPTION_CONTINUE_SEARCH;
 }
 static void wcb_install_handler(void)
 {
     /* First in line: a demand-commit handler would otherwise "commit" our
      * PAGE_NOACCESS page read-write and let the read through stale. */
+    static int once;
+    if (once) return;
+    once = 1;
     AddVectoredExceptionHandler(1, wcb_veh);
 }
 #else
@@ -649,13 +688,19 @@ static void wcb_chain(int sig, siginfo_t* si, void* uctx)
 static void wcb_signal(int sig, siginfo_t* si, void* uctx)
 {
     const int saved = errno;
-    if (si && rsx_wcb_on_fault((uintptr_t)si->si_addr)) { errno = saved; return; }
+    if (si) {
+        const uintptr_t at = (uintptr_t)si->si_addr;
+        if (rsx_texdirty_on_fault(at) || rsx_wcb_on_fault(at)) { errno = saved; return; }
+    }
     errno = saved;
     wcb_chain(sig, si, uctx);
 }
 
+static int s_handler_done;
 static void wcb_install_handler(void)
 {
+    if (s_handler_done) return;
+    s_handler_done = 1;
     struct sigaction sa;
     memset(&sa, 0, sizeof sa);
     sa.sa_sigaction = wcb_signal;
@@ -665,6 +710,11 @@ static void wcb_install_handler(void)
     sigaction(SIGBUS, &sa, &s_prev_bus);
 }
 #endif
+
+static void td_install_faults(void)
+{
+    wcb_install_handler();
+}
 
 /* ---- lifecycle ----------------------------------------------------------- */
 
@@ -758,4 +808,332 @@ int rsx_wcb_attr_take_wait(uint32_t cookie, uint64_t* ns, uint32_t* n)
         }
     wcb_unlock();
     return found;
+}
+
+/* ---- texture page dirty tracking (PS3RECOMP_TEX_DIRTY) -------------------
+ *
+ * A 4K-guest-page write sequence. The pages a cached texture was decoded from
+ * are write-protected; every write path the engine can intercept bumps the
+ * sequence for its range and opens the pages, and the PPU's own inlined
+ * stores fault into td_on_fault (the same handler as the WCB). A texture
+ * remembers the sequence sampled just before it read the bytes; it is stale
+ * when any page in its span has a newer sequence. No content hashing.
+ *
+ * The state lives here because it shares both the page protection primitives
+ * and wcb_lock with the region table: a page can be a render target waiting
+ * for a copy and a texture's source at the same time, and the two must agree
+ * on which protection it has.
+ */
+#define TD_PAGE_SIZE_4K 4096u
+#define TD_NPAGES   (1u << 20)                  /* 4 GB / 4K */
+#define TD_TEX_PROT 0x01u                       /* page is PROT_READ for us */
+#define TD_WCB_PROT 0x02u                       /* page is PROT_NONE for WCB */
+
+static struct {
+    volatile int on;
+    unsigned long long seq;                     /* monotonic write sequence */
+    uint64_t* page_seq;                         /* TD_NPAGES, newest write */
+    uint16_t* page_cov;                         /* texture entries covering   */
+    uint8_t*  page_flags;
+    uint64_t  writes, protect_calls, fault_opens, serial;
+    int       failed;
+} s_td;
+
+static int td_supported(void)
+{
+    if (wcb_page_size() != TD_PAGE_SIZE_4K) return 0;
+    return ((uintptr_t)vm_base & (TD_PAGE_SIZE_4K - 1u)) == 0;
+}
+
+static uint32_t td_index(uintptr_t host_off)
+{
+    const uint32_t i = (uint32_t)(host_off >> 12);
+    return i < TD_NPAGES ? i : TD_NPAGES;
+}
+
+/* Open a run [lo,hi) of guest pages at `prot` (1 = read-only, 2 = read/write)
+ * and update the per-page bookkeeping. Lock held. */
+static void td_open_run_locked(uintptr_t lo, uintptr_t hi, int prot)
+{
+    wcb_set_access_prot(lo, hi, prot);
+    const uint32_t a = td_index(lo - (uintptr_t)vm_base);
+    const uint32_t b = td_index(hi - (uintptr_t)vm_base);
+    for (uint32_t i = a; i < b && i < TD_NPAGES; i++) {
+        s_td.page_flags[i] &= (uint8_t)~TD_WCB_PROT;
+        if (prot == 1) s_td.page_flags[i] |= TD_TEX_PROT;
+        else           s_td.page_flags[i] &= (uint8_t)~TD_TEX_PROT;
+    }
+}
+
+static void td_forget_prot_locked(uintptr_t lo, uintptr_t hi)
+{
+    if (!s_td.on || !s_td.page_flags) return;
+    const uint32_t a = td_index(lo - (uintptr_t)vm_base);
+    const uint32_t b = td_index(hi - (uintptr_t)vm_base);
+    for (uint32_t i = a; i < b && i < TD_NPAGES; i++)
+        s_td.page_flags[i] = (uint8_t)((s_td.page_flags[i] & (uint8_t)~TD_TEX_PROT) | TD_WCB_PROT);
+    __atomic_add_fetch(&s_td.serial, 1, __ATOMIC_RELAXED);
+}
+
+static int td_page_wants_ro(uintptr_t page)
+{
+    if (!s_td.on || !s_td.page_cov) return 0;
+    const uint32_t i = td_index(page - (uintptr_t)vm_base);
+    return i < TD_NPAGES && s_td.page_cov[i] != 0;
+}
+
+static void td_open_note_locked(uintptr_t lo, uintptr_t hi, int ro)
+{
+    if (!s_td.on || !s_td.page_flags) return;
+    const uint32_t a = td_index(lo - (uintptr_t)vm_base);
+    const uint32_t b = td_index(hi - (uintptr_t)vm_base);
+    for (uint32_t i = a; i < b && i < TD_NPAGES; i++) {
+        s_td.page_flags[i] &= (uint8_t)~TD_WCB_PROT;
+        if (ro) s_td.page_flags[i] |= TD_TEX_PROT;
+        else    s_td.page_flags[i] &= (uint8_t)~TD_TEX_PROT;
+    }
+}
+
+/* Charge `ea..ea+len` to every page, opening protected runs. Lock held. */
+static void td_note_write_locked(uint32_t ea, uint32_t len)
+{
+    if (!s_td.on || !s_td.page_seq) return;
+    if (!len) len = 1;
+    const uint64_t seq = __atomic_add_fetch(&s_td.seq, 1, __ATOMIC_RELAXED);
+    uint64_t end = (uint64_t)ea + len;
+    if (end > ((uint64_t)TD_NPAGES << 12)) end = (uint64_t)TD_NPAGES << 12;
+    if ((uint64_t)ea >= end) return;
+    const uint32_t p0 = ea >> 12, p1 = (uint32_t)((end - 1) >> 12);
+    for (uint32_t i = p0; i <= p1 && i < TD_NPAGES; i++)
+        s_td.page_seq[i] = seq;
+    s_td.writes++;
+
+    /* Open runs of pages we had write-protected. */
+    uintptr_t run = 0;
+    for (uint32_t i = p0; i <= p1 && i < TD_NPAGES; i++) {
+        const int prot = (s_td.page_flags[i] & TD_TEX_PROT) != 0;
+        if (prot && !run) run = (uintptr_t)vm_base + ((uintptr_t)i << 12);
+        if (!prot && run) {
+            td_open_run_locked(run, (uintptr_t)vm_base + ((uintptr_t)i << 12), 2);
+            __atomic_add_fetch(&s_td.serial, 1, __ATOMIC_RELAXED);
+            run = 0;
+        }
+    }
+    if (run) {
+        td_open_run_locked(run, (uintptr_t)vm_base + (((uintptr_t)p1 + 1) << 12), 2);
+        __atomic_add_fetch(&s_td.serial, 1, __ATOMIC_RELAXED);
+    }
+}
+
+/* Protect the covered pages of [ea,ea+span) that are not already protected.
+ * Lock held. */
+static void td_protect_locked(uint32_t ea, uint32_t span)
+{
+    if (!s_td.on || !s_td.page_seq || !span) return;
+    uint64_t end = (uint64_t)ea + span;
+    if (end > ((uint64_t)TD_NPAGES << 12)) end = (uint64_t)TD_NPAGES << 12;
+    if ((uint64_t)ea >= end) return;
+    const uint32_t p0 = ea >> 12, p1 = (uint32_t)((end - 1) >> 12);
+    uintptr_t run = 0;
+    for (uint32_t i = p0; i <= p1 && i < TD_NPAGES; i++) {
+        const int want = s_td.page_cov[i] != 0 &&
+                         !(s_td.page_flags[i] & (TD_TEX_PROT | TD_WCB_PROT));
+        if (want && !run) run = (uintptr_t)vm_base + ((uintptr_t)i << 12);
+        if (!want && run) {
+            td_open_run_locked(run, (uintptr_t)vm_base + ((uintptr_t)i << 12), 1);
+            s_td.protect_calls++;
+            run = 0;
+        }
+    }
+    if (run) {
+        td_open_run_locked(run, (uintptr_t)vm_base + (((uintptr_t)p1 + 1) << 12), 1);
+        s_td.protect_calls++;
+    }
+}
+
+int rsx_texdirty_enabled(void) { return s_td.on; }
+
+int rsx_texdirty_set_enabled(int on)
+{
+    if (!on) {
+        wcb_lock();
+        if (s_td.on) {
+            /* Open everything still read-only. */
+            uintptr_t run = 0;
+            for (uint32_t i = 0; i < TD_NPAGES; i++) {
+                const int prot = s_td.page_flags && (s_td.page_flags[i] & TD_TEX_PROT);
+                if (prot && !run) run = (uintptr_t)vm_base + ((uintptr_t)i << 12);
+                if (!prot && run) {
+                    td_open_run_locked(run, (uintptr_t)vm_base + ((uintptr_t)i << 12), 2);
+                    run = 0;
+                }
+            }
+            if (run) td_open_run_locked(run, (uintptr_t)vm_base + ((uintptr_t)TD_NPAGES << 12), 2);
+            if (s_td.page_cov) memset(s_td.page_cov, 0, TD_NPAGES * sizeof(uint16_t));
+            if (s_td.page_flags) memset(s_td.page_flags, 0, TD_NPAGES);
+            if (s_td.page_seq) memset(s_td.page_seq, 0, TD_NPAGES * sizeof(uint64_t));
+        }
+        s_td.on = 0;
+        g_ps3_guest_write_hook = NULL;
+        wcb_unlock();
+        return 0;
+    }
+    if (s_td.on) return 0;
+    if (!td_supported()) return -1;
+    wcb_lock();
+    if (!s_td.page_seq) {
+        s_td.page_seq = (uint64_t*)calloc(TD_NPAGES, sizeof(uint64_t));
+        s_td.page_cov = (uint16_t*)calloc(TD_NPAGES, sizeof(uint16_t));
+        s_td.page_flags = (uint8_t*)calloc(TD_NPAGES, 1);
+        if (!s_td.page_seq || !s_td.page_cov || !s_td.page_flags) {
+            free(s_td.page_seq); free(s_td.page_cov); free(s_td.page_flags);
+            s_td.page_seq = NULL; s_td.page_cov = NULL; s_td.page_flags = NULL;
+            wcb_unlock();
+            return -1;
+        }
+    } else {
+        memset(s_td.page_seq, 0, TD_NPAGES * sizeof(uint64_t));
+        memset(s_td.page_cov, 0, TD_NPAGES * sizeof(uint16_t));
+        memset(s_td.page_flags, 0, TD_NPAGES);
+    }
+    __atomic_store_n(&s_td.seq, 1, __ATOMIC_RELAXED);
+    s_td.writes = s_td.protect_calls = s_td.fault_opens = 0;
+    s_td.on = 1;
+    wcb_unlock();
+    td_install_faults();
+    return 0;
+}
+
+void rsx_texdirty_shutdown(void)
+{
+    rsx_texdirty_set_enabled(0);
+    wcb_lock();
+    free(s_td.page_seq); free(s_td.page_cov); free(s_td.page_flags);
+    s_td.page_seq = NULL; s_td.page_cov = NULL; s_td.page_flags = NULL;
+    wcb_unlock();
+}
+
+uint64_t rsx_texdirty_seq(void)
+{
+    return __atomic_load_n(&s_td.seq, __ATOMIC_RELAXED);
+}
+
+uint64_t rsx_texdirty_serial(void)
+{
+    return __atomic_load_n(&s_td.serial, __ATOMIC_RELAXED);
+}
+
+void rsx_texdirty_cover(uint32_t ea, uint32_t span)
+{
+    if (!s_td.on || !span) return;
+    uint64_t end = (uint64_t)ea + span;
+    if (end > ((uint64_t)TD_NPAGES << 12)) end = (uint64_t)TD_NPAGES << 12;
+    if ((uint64_t)ea >= end) return;
+    const uint32_t p0 = ea >> 12, p1 = (uint32_t)((end - 1) >> 12);
+    wcb_lock();
+    for (uint32_t i = p0; i <= p1 && i < TD_NPAGES; i++)
+        if (s_td.page_cov[i] != 0xFFFFu) s_td.page_cov[i]++;
+    td_protect_locked(ea, span);
+    wcb_unlock();
+}
+
+void rsx_texdirty_uncover(uint32_t ea, uint32_t span)
+{
+    if (!s_td.on || !span) return;
+    uint64_t end = (uint64_t)ea + span;
+    if (end > ((uint64_t)TD_NPAGES << 12)) end = (uint64_t)TD_NPAGES << 12;
+    if ((uint64_t)ea >= end) return;
+    const uint32_t p0 = ea >> 12, p1 = (uint32_t)((end - 1) >> 12);
+    wcb_lock();
+    for (uint32_t i = p0; i <= p1 && i < TD_NPAGES; i++)
+        if (s_td.page_cov[i]) s_td.page_cov[i]--;
+    td_protect_locked(ea, span);       /* leaves uncovered pages alone */
+    /* Open runs that no texture covers any more. */
+    uintptr_t run = 0;
+    for (uint32_t i = p0; i <= p1 && i < TD_NPAGES; i++) {
+        const int open = s_td.page_cov[i] == 0 && (s_td.page_flags[i] & TD_TEX_PROT);
+        if (open && !run) run = (uintptr_t)vm_base + ((uintptr_t)i << 12);
+        if (!open && run) {
+            td_open_run_locked(run, (uintptr_t)vm_base + ((uintptr_t)i << 12), 2);
+            run = 0;
+        }
+    }
+    if (run) td_open_run_locked(run, (uintptr_t)vm_base + (((uintptr_t)p1 + 1) << 12), 2);
+    wcb_unlock();
+}
+
+uint64_t rsx_texdirty_max_seq(uint32_t ea, uint32_t span)
+{
+    if (!s_td.on || !span) return 0;
+    uint64_t end = (uint64_t)ea + span;
+    if (end > ((uint64_t)TD_NPAGES << 12)) end = (uint64_t)TD_NPAGES << 12;
+    if ((uint64_t)ea >= end) return UINT64_MAX;
+    const uint32_t p0 = ea >> 12, p1 = (uint32_t)((end - 1) >> 12);
+    uint64_t m = 0;
+    wcb_lock();
+    for (uint32_t i = p0; i <= p1 && i < TD_NPAGES; i++)
+        if (s_td.page_seq[i] > m) m = s_td.page_seq[i];
+    wcb_unlock();
+    return m;
+}
+
+void rsx_texdirty_reprotect(uint32_t ea, uint32_t span)
+{
+    if (!s_td.on) return;
+    wcb_lock();
+    td_protect_locked(ea, span);
+    wcb_unlock();
+}
+
+void rsx_texdirty_note_write(uint32_t ea, uint32_t len)
+{
+    if (!s_td.on) return;
+    wcb_lock();
+    td_note_write_locked(ea, len);
+    wcb_unlock();
+}
+
+void rsx_texdirty_note_write_host(const void* host, size_t len)
+{
+    if (!s_td.on || !host || !len) return;
+    const uintptr_t off = (uintptr_t)host - (uintptr_t)vm_base;
+    if (off >= ((uintptr_t)TD_NPAGES << 12)) return;
+    rsx_texdirty_note_write((uint32_t)off, (uint32_t)len);
+}
+
+int rsx_texdirty_on_fault(uintptr_t addr)
+{
+    if (!s_td.on || !s_td.page_flags) return 0;
+    const uintptr_t off = addr - (uintptr_t)vm_base;
+    if (off >= ((uintptr_t)TD_NPAGES << 12)) return 0;
+    const uint32_t i = (uint32_t)(off >> 12);
+    int ours = 0;
+    wcb_lock();
+    ours = (s_td.page_flags[i] & TD_TEX_PROT) != 0;
+    if (ours) {
+        td_note_write_locked((uint32_t)(i << 12), 1);
+        s_td.fault_opens++;
+    }
+    wcb_unlock();
+    return ours;
+}
+
+/* The runtime hook for a write into guest memory (see ps3emu/guest_access.h).
+ * This one marks the pages dirty and removes our read-only protection. */
+static void td_guest_write_hook(const void* host, size_t len)
+{
+    rsx_texdirty_note_write_host(host, len);
+}
+
+/* Set by rsx_draw_engine_init / the mode switch. Declared weak beside the
+ * read hook so an engine-only test binary links without the runtime. */
+#if !defined(_WIN32) && (defined(__GNUC__) || defined(__clang__))
+__attribute__((weak)) void (*volatile g_ps3_guest_write_hook)(const void* host, size_t len);
+#else
+extern void (*volatile g_ps3_guest_write_hook)(const void* host, size_t len);
+#endif
+
+void rsx_texdirty_publish_hook(void)
+{
+    if (s_td.on) g_ps3_guest_write_hook = td_guest_write_hook;
 }

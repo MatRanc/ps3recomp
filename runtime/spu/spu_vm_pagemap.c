@@ -19,3 +19,5 @@ unsigned char g_vm_page_bitmap[65536 / 8];
  * TU handles MFC. */
 #include <stddef.h>
 void (*volatile g_ps3_guest_access_hook)(const void* host, size_t len);
+/* The write side (texture page dirty tracking); set by libs/video/rsx_wcb.c. */
+void (*volatile g_ps3_guest_write_hook)(const void* host, size_t len);
