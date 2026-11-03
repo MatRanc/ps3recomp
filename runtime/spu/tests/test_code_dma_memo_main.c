@@ -4,6 +4,8 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include <sys/mman.h>
+#include <unistd.h>
 
 uint8_t* vm_base;
 static int dummy_calls;
@@ -16,10 +18,43 @@ void spu_overlay_note_get(spu_context* ctx, uint32_t ea, const uint8_t* ls, uint
 static int fails;
 #define CHECK(c, m) do { if (!(c)) { printf("FAIL: %s\n", m); fails++; } else printf("ok: %s\n", m); } while (0)
 
+/* ---- TEX_DIRTY range tracker (the real one is rsx_wcb.c) ------------------
+ * The runtime declares these weak, so this fixture supplies a model of the
+ * page-write generation: a tracked range stays unchanged until the test bumps
+ * fake_gen (a write to its source). */
+static int fake_track;
+static uint64_t fake_gen = 1;
+static uint32_t fake_ea, fake_span;
+
+int rsx_texdirty_track_range(uint32_t ea, uint32_t span, uint64_t* gen)
+{
+    if (!fake_track) return -1;
+    fake_ea = ea; fake_span = span;
+    if (gen) *gen = fake_gen;
+    return 0;
+}
+int rsx_texdirty_range_gen(uint32_t ea, uint32_t span, uint64_t* gen)
+{
+    if (!fake_track || ea != fake_ea || span != fake_span) return 0;
+    if (gen) *gen = fake_gen;
+    return 1;
+}
+int rsx_texdirty_range_unchanged(uint32_t ea, uint32_t span, uint64_t gen)
+{
+    uint64_t cur;
+    return rsx_texdirty_range_gen(ea, span, &cur) && cur == gen;
+}
+
 int main(void)
 {
-    static uint8_t mem[0x4000];
+    const size_t page = (size_t)sysconf(_SC_PAGESIZE);
+    const size_t map = page * 4;
+    uint8_t* mem = mmap(NULL, map, PROT_READ | PROT_WRITE,
+                        MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (mem == MAP_FAILED) { perror("mmap"); return 2; }
+    memset(mem, 0, map);
     vm_base = mem;
+
     static spu_context ctx;
     uint8_t code[0x100];
     for (int i = 0; i < 0x100; i++) code[i] = (uint8_t)(i * 7 + 3);
@@ -38,6 +73,7 @@ int main(void)
     spu_overlay_note_get(&ctx, 0x1000, ctx.ls + 0x4000, 0x100);
     CHECK(spu_lifted_lookup(&ctx, 0x4000) == dummy_fn, "lifted lookup verifies the load");
 
+    /* Fallback (range not tracked): every case still uses the byte compare. */
     CHECK(spu_overlay_code_get_noop(&ctx, 0x1000, 0x4000, 0x100, mem + 0x1000) == 1,
           "identical reload is a no-op");
     CHECK(spu_overlay_code_get_noop(&ctx, 0x1010, 0x4010, 0x40, mem + 0x1010) == 1,
@@ -57,7 +93,44 @@ int main(void)
           "changed local store is not a no-op");
     ctx.ls[0x4000 + 4] ^= 0xFF;
 
+    /* ---- tracked source generation (O(1) path) --------------------------- */
+    fake_track = 1;
+    CHECK(spu_overlay_code_get_noop(&ctx, 0x1000, 0x4000, 0x100, mem + 0x1000) == 1,
+          "tracked identical reload establishes the generation");
+
+    /* The next call must not touch the source at all: make it inaccessible.
+     * Only the generation compare can answer it. */
+    if (mprotect(mem + 0x1000, page, PROT_NONE) != 0) { perror("mprotect"); return 2; }
+    CHECK(spu_overlay_code_get_noop(&ctx, 0x1000, 0x4000, 0x100, mem + 0x1000) == 1,
+          "unchanged tracked source skips without reading source bytes");
+    if (mprotect(mem + 0x1000, page, PROT_READ | PROT_WRITE) != 0) { perror("mprotect"); return 2; }
+
+    /* A write that does not change the bytes still moves the generation, so
+     * the next GET re-compares and re-establishes it. */
+    fake_gen++;
+    CHECK(spu_overlay_code_get_noop(&ctx, 0x1000, 0x4000, 0x100, mem + 0x1000) == 1,
+          "a source write falls back to compare, then re-tracks");
+
+    /* A real source change must not be skipped. */
+    mem[0x1000 + 9] ^= 0xFF;
+    fake_gen++;
+    CHECK(spu_overlay_code_get_noop(&ctx, 0x1000, 0x4000, 0x100, mem + 0x1000) == 0,
+          "changed source is not a no-op under tracking");
+    mem[0x1000 + 9] ^= 0xFF;
+    fake_gen++;
+    CHECK(spu_overlay_code_get_noop(&ctx, 0x1000, 0x4000, 0x100, mem + 0x1000) == 1,
+          "restored source is a no-op again");
+
+    /* With the tracker off, the changed-local-store case falls back to the
+     * byte compare as before. */
+    fake_track = 0;
+    ctx.ls[0x4000 + 4] ^= 0xFF;
+    CHECK(spu_overlay_code_get_noop(&ctx, 0x1000, 0x4000, 0x100, mem + 0x1000) == 0,
+          "untracked changed local store is not a no-op");
+    ctx.ls[0x4000 + 4] ^= 0xFF;
+
     printf("%s (%d failures)\n", fails ? "FAILED" : "PASS", fails);
+    munmap(mem, map);
     return fails ? 1 : 0;
 }
 

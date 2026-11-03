@@ -2262,28 +2262,30 @@ int spu_overlay_register_verified_region(uint32_t content_ea, uint32_t load_lsa,
     return 1;
 }
 
-static int spu_overlay_resident_verified(spu_context* ctx, unsigned slot)
-{
-    int* state = &ctx->resident_code[slot].verify_state;
-    if (*state == SPU_OVERLAY_PENDING) {
-        const spu_ovl_src* o = &s_ovl_src[ctx->resident_code[slot].source_index];
-        int match = 1;
-        for (unsigned i = 0; match && i < o->code_count; ++i)
-            match = !memcmp(ctx->ls + o->code[i].lsa, o->code[i].bytes, o->code[i].size);
-        *state = match ? SPU_OVERLAY_VERIFIED : SPU_OVERLAY_REJECTED;
-        { extern int g_c690_gap; extern void c690_gap_on_overlay(int,int);
-          if (__builtin_expect(g_c690_gap, 0)) c690_gap_on_overlay(1, match); }
-    }
-    return *state == SPU_OVERLAY_VERIFIED;
-}
-
 /* SPU_CODE_DMA_MEMO: a streamed job module is re-DMA'd into the same local
  * store on every job even when the source bytes are unchanged. When the GET
  * lands in a VERIFIED code span at the matching source offset and the bytes
  * already in local store are identical to the source, the transfer cannot
  * change anything: skip the copy and leave the span verified, instead of
- * copying 67 KB and re-verifying it at the next dispatch. Exact by
- * construction -- the bytes are compared, not assumed. */
+ * copying 67 KB and re-verifying it at the next dispatch.
+ *
+ * Exact by construction: the first GET after a load compares the bytes. It
+ * also registers the source range with the TEX_DIRTY page write sequence, so
+ * every later GET is one generation compare instead of a second 67 KB scan.
+ * A source write bumps the range generation (the registered range is
+ * write-protected, so even an inlined PPU store faults into the same counter)
+ * and the next GET falls back to the byte compare. Untracked ranges -- the
+ * switch off, TEX_DIRTY off, or the range table full -- always use the byte
+ * compare. */
+#if defined(__GNUC__) || defined(__clang__)
+extern int rsx_texdirty_track_range(uint32_t, uint32_t, uint64_t*) __attribute__((weak));
+extern int rsx_texdirty_range_gen(uint32_t, uint32_t, uint64_t*) __attribute__((weak));
+extern int rsx_texdirty_range_unchanged(uint32_t, uint32_t, uint64_t) __attribute__((weak));
+#define SPU_HAVE_TEXDIRTY_RANGE 1
+#else
+#define SPU_HAVE_TEXDIRTY_RANGE 0
+#endif
+
 int spu_code_dma_memo_on(void)
 {
 #ifdef SPU_HAVE_LIVE_CTL
@@ -2295,6 +2297,78 @@ int spu_code_dma_memo_on(void)
         s = e && *e && strcmp(e, "0") != 0;
     }
     return s;
+}
+
+/* Register (or re-protect) a source range and return its current generation. */
+static int spu_overlay_src_track(uint32_t ea, uint32_t span, uint64_t* gen)
+{
+#if SPU_HAVE_TEXDIRTY_RANGE
+    return rsx_texdirty_track_range &&
+           rsx_texdirty_track_range(ea, span, gen) == 0;
+#else
+    (void)ea; (void)span; (void)gen;
+    return 0;
+#endif
+}
+
+static int spu_overlay_src_gen(uint32_t ea, uint32_t span, uint64_t* gen)
+{
+#if SPU_HAVE_TEXDIRTY_RANGE
+    return rsx_texdirty_range_gen &&
+           rsx_texdirty_range_gen(ea, span, gen);
+#else
+    (void)ea; (void)span; (void)gen;
+    return 0;
+#endif
+}
+
+static int spu_overlay_src_unchanged(uint32_t ea, uint32_t span, uint64_t gen)
+{
+#if SPU_HAVE_TEXDIRTY_RANGE
+    return rsx_texdirty_range_unchanged &&
+           rsx_texdirty_range_unchanged(ea, span, gen);
+#else
+    (void)ea; (void)span; (void)gen;
+    return 0;
+#endif
+}
+
+static int spu_overlay_resident_verified(spu_context* ctx, unsigned slot)
+{
+    int* state = &ctx->resident_code[slot].verify_state;
+    if (*state == SPU_OVERLAY_PENDING) {
+        const spu_ovl_src* o = &s_ovl_src[ctx->resident_code[slot].source_index];
+        const uint32_t src_ea = ctx->resident_code[slot].source_ea;
+        const uint32_t span = ctx->resident_code[slot].size;
+        /* Protect/sample before the compare so a source write racing it moves
+         * the generation the compare result is published with. */
+        uint64_t g0 = 0;
+        const int tracked = spu_code_dma_memo_on() &&
+                            spu_overlay_src_track(src_ea, span, &g0);
+        int match = 1;
+        for (unsigned i = 0; match && i < o->code_count; ++i)
+            match = !memcmp(ctx->ls + o->code[i].lsa, o->code[i].bytes, o->code[i].size);
+        if (match && tracked) {
+            /* The lifted code matched. The full streamed span is the region a
+             * later GET may skip, so require it to equal the source now too;
+             * the 0x30-byte header is not part of the verified code. */
+            if (memcmp(ctx->ls + ctx->resident_code[slot].lsa, vm_base + src_ea, span) == 0) {
+                uint64_t g1;
+                if (spu_overlay_src_gen(src_ea, span, &g1) && g1 == g0)
+                    ctx->resident_code[slot].src_seq = g1;
+                else
+                    ctx->resident_code[slot].src_seq = 0;
+            } else {
+                ctx->resident_code[slot].src_seq = 0;
+            }
+        } else {
+            ctx->resident_code[slot].src_seq = 0;
+        }
+        *state = match ? SPU_OVERLAY_VERIFIED : SPU_OVERLAY_REJECTED;
+        { extern int g_c690_gap; extern void c690_gap_on_overlay(int,int);
+          if (__builtin_expect(g_c690_gap, 0)) c690_gap_on_overlay(1, match); }
+    }
+    return *state == SPU_OVERLAY_VERIFIED;
 }
 
 int spu_overlay_code_get_noop(spu_context* ctx, uint32_t ea, uint32_t lsa,
@@ -2309,9 +2383,33 @@ int spu_overlay_code_get_noop(spu_context* ctx, uint32_t ea, uint32_t lsa,
         const uint32_t span = ctx->resident_code[slot].size;
         if (lsa < base || (uint64_t)lsa + size > (uint64_t)base + span)
             continue;
-        if (ea != ctx->resident_code[slot].source_ea + (lsa - base))
+        const uint32_t src_ea = ctx->resident_code[slot].source_ea;
+        if (ea != src_ea + (lsa - base))
             continue;
-        if (memcmp(ctx->ls + lsa, src, size) == 0) return 1;
+        /* O(1) path: the whole source range is unchanged since the last full
+         * byte comparison, and the span is still verified. */
+        if (ctx->resident_code[slot].src_seq &&
+            spu_overlay_src_unchanged(src_ea, span, ctx->resident_code[slot].src_seq))
+            return 1;
+        uint64_t g0 = 0;
+        const int tracked = spu_overlay_src_track(src_ea, span, &g0);
+        const int eq = memcmp(ctx->ls + lsa, src, size) == 0;
+        if (!eq) {
+            ctx->resident_code[slot].src_seq = 0;
+            return 0;
+        }
+        if (tracked) {
+            uint64_t g1;
+            if (spu_overlay_src_gen(src_ea, span, &g1) && g1 == g0) {
+                ctx->resident_code[slot].src_seq = g1;
+                return 1;
+            }
+            /* A write raced the compare: copy the current source instead of
+             * publishing a generation that no longer describes local store. */
+            ctx->resident_code[slot].src_seq = 0;
+            return 0;
+        }
+        return 1;
     }
     return 0;
 }

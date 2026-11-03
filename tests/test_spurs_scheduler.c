@@ -255,5 +255,118 @@ int main(void)
     pthread_join(a,NULL);pthread_join(b,NULL);assert(direct_rc[0]==-2 && direct_rc[1]==0);
     spurs_policy_release_instance(0x11000);spurs_policy_release_instance(0x12000);
     puts("SPURS same workload/lane across instances retains separate LS and TLS exit classification PASS");
+
+    /* SPURS_PM_FAST_RESCHED bookkeeping drives the same lock-line critical
+     * section the coordinator uses. The first A/B attempt died with a double
+     * unlock (`pthread_mutex_lock.c:88 __owner == 0`) because the consume path
+     * unlocked after ef_line_end() had already done it. Drive the real
+     * consume/can_rerun functions and re-acquire the line after every call so
+     * a missing or duplicated unlock fails here. */
+    {
+        const u32 ea = 0x1E000u;
+        struct SpursInst si;
+        memset(&si, 0, sizeof si);
+        si.ea = ea;
+        struct SpursPmSlot* slot = &si.slots[0];
+        slot->instance = &si;
+        slot->wid = 0; slot->spu_num = 0; slot->ea = ea;
+        si.active[0] = 2;
+        memset(vm_base + ea, 0, 0x2000);
+        vm_base[ea + SPURS_WKL_READY1] = 3;
+        ef_w16(ea + SPURS_WKL_SIGNAL1, 0x8000);
+        si.idle[0] = 3;
+
+        for (int i = 0; i < 64; i++) {
+            spurs_pm_fast_consume(&si, slot);
+            spu_lockline_lock(); spu_lockline_unlock();
+        }
+        assert(si.idle[0] == 0);
+        assert(vm_base[ea + SPURS_WKL_CURCONT] == 2);
+        assert(vm_base[ea + SPURS_WKL_READY1] == 0);
+        assert(!(ef_r16(ea + SPURS_WKL_SIGNAL1) & 0x8000u));
+        puts("SPURS fast consume takes exactly one lock-line lock/unlock PASS");
+
+        /* Every can_rerun early return must also leave the line unlocked. */
+        memset(&s_workloads[0], 0, sizeof s_workloads[0]);
+        s_workloads[0].in_use = 1;
+        s_workloads[0].spurs_ea = ea;
+        /* s_workloads keeps the guest EA (the public API form), not a host
+         * pointer. */
+        s_workloads[0].pm = (void*)(uintptr_t)0x1D000;
+        s_workloads[0].sizePm = 16;
+        slot->pm = vm_base + 0x1D000;
+        slot->pm_size = 16;
+        slot->data = 0;
+        si.active[0] = 0;
+        vm_write32(ea + SPURS_WKL_ENABLED, 0x80000000u);
+        vm_write8(ea + SPURS_WKL_STATE1, 2);
+        vm_write8(ea + SPURS_WKL_INFO1 + 0x18 + 0, 1);
+        vm_write8(ea + SPURS_WKL_MAXCONT, 1);
+        vm_write8(ea + SPURS_WKL_READY1, 0);
+        ef_w16(ea + SPURS_WKL_SIGNAL1, 0x8000);
+        vm_write64(ea + SPURS_WKL_INFO1 + 8, slot->data);
+        int r;
+
+        si.stopping = 1;
+        r = spurs_pm_fast_can_rerun(&si, slot); si.stopping = 0;
+        spu_lockline_lock(); spu_lockline_unlock();
+        assert(r == 0);
+
+        slot->wid = 16;
+        r = spurs_pm_fast_can_rerun(&si, slot); slot->wid = 0;
+        spu_lockline_lock(); spu_lockline_unlock();
+        assert(r == 0);
+
+        slot->ea = 0;
+        r = spurs_pm_fast_can_rerun(&si, slot); slot->ea = ea;
+        spu_lockline_lock(); spu_lockline_unlock();
+        assert(r == 0);
+
+        s_workloads[0].in_use = 0;
+        r = spurs_pm_fast_can_rerun(&si, slot); s_workloads[0].in_use = 1;
+        spu_lockline_lock(); spu_lockline_unlock();
+        assert(r == 0);
+
+        slot->data = 1;
+        r = spurs_pm_fast_can_rerun(&si, slot); slot->data = 0;
+        spu_lockline_lock(); spu_lockline_unlock();
+        assert(r == 0);
+
+        vm_write32(ea + SPURS_WKL_ENABLED, 0);
+        r = spurs_pm_fast_can_rerun(&si, slot);
+        vm_write32(ea + SPURS_WKL_ENABLED, 0x80000000u);
+        spu_lockline_lock(); spu_lockline_unlock();
+        assert(r == 0);
+
+        vm_write8(ea + SPURS_WKL_STATE1, 3);
+        r = spurs_pm_fast_can_rerun(&si, slot);
+        vm_write8(ea + SPURS_WKL_STATE1, 2);
+        spu_lockline_lock(); spu_lockline_unlock();
+        assert(r == 0);
+
+        vm_write8(ea + SPURS_WKL_INFO1 + 0x18, 0);
+        r = spurs_pm_fast_can_rerun(&si, slot);
+        vm_write8(ea + SPURS_WKL_INFO1 + 0x18, 1);
+        spu_lockline_lock(); spu_lockline_unlock();
+        assert(r == 0);
+
+        vm_write8(ea + SPURS_WKL_MAXCONT, 0);
+        r = spurs_pm_fast_can_rerun(&si, slot);
+        vm_write8(ea + SPURS_WKL_MAXCONT, 1);
+        spu_lockline_lock(); spu_lockline_unlock();
+        assert(r == 0);
+
+        ef_w16(ea + SPURS_WKL_SIGNAL1, 0);
+        r = spurs_pm_fast_can_rerun(&si, slot);
+        spu_lockline_lock(); spu_lockline_unlock();
+        assert(r == 0);
+
+        ef_w16(ea + SPURS_WKL_SIGNAL1, 0x8000);
+        r = spurs_pm_fast_can_rerun(&si, slot);
+        spu_lockline_lock(); spu_lockline_unlock();
+        assert(r == 1);
+        memset(&s_workloads[0], 0, sizeof s_workloads[0]);
+        puts("SPURS fast can_rerun early returns leave the lock line unlocked PASS");
+    }
     free(vm_base);return 0;
 }

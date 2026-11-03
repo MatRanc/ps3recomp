@@ -828,6 +828,14 @@ int rsx_wcb_attr_take_wait(uint32_t cookie, uint64_t* ns, uint32_t* n)
 #define TD_NPAGES   (1u << 20)                  /* 4 GB / 4K */
 #define TD_TEX_PROT 0x01u                       /* page is PROT_READ for us */
 #define TD_WCB_PROT 0x02u                       /* page is PROT_NONE for WCB */
+#define TD_RANGE_MAX 16u                        /* tracked source ranges     */
+
+typedef struct {
+    volatile int used;
+    uint32_t ea, span;
+    uint64_t epoch;
+    uint64_t gen;                               /* seq of the last overlap   */
+} td_range;
 
 static struct {
     volatile int on;
@@ -836,6 +844,9 @@ static struct {
     uint16_t* page_cov;                         /* texture entries covering   */
     uint8_t*  page_flags;
     uint64_t  writes, protect_calls, fault_opens, serial;
+    td_range  ranges[TD_RANGE_MAX];
+    uint64_t  range_epoch;                      /* bumped when ranges reset  */
+    uint32_t  range_n;                          /* live entries              */
     int       failed;
 } s_td;
 
@@ -894,6 +905,18 @@ static void td_open_note_locked(uintptr_t lo, uintptr_t hi, int ro)
     }
 }
 
+/* Drop every tracked source range. Registration is per enable epoch, so a
+ * range from before a disable/enable cycle is never mistaken for the new
+ * page state. Lock held. */
+static void td_ranges_reset_locked(void)
+{
+    for (uint32_t i = 0; i < TD_RANGE_MAX; i++)
+        __atomic_store_n(&s_td.ranges[i].used, 0, __ATOMIC_RELEASE);
+    __atomic_add_fetch(&s_td.range_epoch, 1, __ATOMIC_RELEASE);
+    s_td.range_n = 0;
+    memset(s_td.ranges, 0, sizeof s_td.ranges);
+}
+
 /* Charge `ea..ea+len` to every page, opening protected runs. Lock held. */
 static void td_note_write_locked(uint32_t ea, uint32_t len)
 {
@@ -907,6 +930,19 @@ static void td_note_write_locked(uint32_t ea, uint32_t len)
     for (uint32_t i = p0; i <= p1 && i < TD_NPAGES; i++)
         s_td.page_seq[i] = seq;
     s_td.writes++;
+
+    /* Source-range tracking (SPU_CODE_DMA_MEMO): charge the write to every
+     * registered range it overlaps. Skipped entirely (one load) until the
+     * memo actually registers a range, so the baseline write path is
+     * unchanged when the switch is off. */
+    if (__builtin_expect(s_td.range_n != 0, 0))
+        for (uint32_t i = 0; i < TD_RANGE_MAX; i++) {
+            td_range* r = &s_td.ranges[i];
+            if (!__atomic_load_n(&r->used, __ATOMIC_ACQUIRE)) continue;
+            const uint64_t rend = (uint64_t)r->ea + r->span;
+            if ((uint64_t)ea < rend && end > (uint64_t)r->ea)
+                __atomic_store_n(&r->gen, seq, __ATOMIC_RELEASE);
+        }
 
     /* Open runs of pages we had write-protected. */
     uintptr_t run = 0;
@@ -972,6 +1008,7 @@ int rsx_texdirty_set_enabled(int on)
             if (s_td.page_cov) memset(s_td.page_cov, 0, TD_NPAGES * sizeof(uint16_t));
             if (s_td.page_flags) memset(s_td.page_flags, 0, TD_NPAGES);
             if (s_td.page_seq) memset(s_td.page_seq, 0, TD_NPAGES * sizeof(uint64_t));
+            td_ranges_reset_locked();
         }
         s_td.on = 0;
         g_ps3_guest_write_hook = NULL;
@@ -998,6 +1035,7 @@ int rsx_texdirty_set_enabled(int on)
     }
     __atomic_store_n(&s_td.seq, 1, __ATOMIC_RELAXED);
     s_td.writes = s_td.protect_calls = s_td.fault_opens = 0;
+    td_ranges_reset_locked();
     s_td.on = 1;
     wcb_unlock();
     td_install_faults();
@@ -1083,6 +1121,86 @@ void rsx_texdirty_reprotect(uint32_t ea, uint32_t span)
     wcb_lock();
     td_protect_locked(ea, span);
     wcb_unlock();
+}
+
+/* Find a live tracked range for this epoch. Lock held. */
+static int td_range_find_locked(uint32_t ea, uint32_t span)
+{
+    const uint64_t ep = __atomic_load_n(&s_td.range_epoch, __ATOMIC_RELAXED);
+    for (uint32_t i = 0; i < TD_RANGE_MAX; i++) {
+        td_range* r = &s_td.ranges[i];
+        if (!__atomic_load_n(&r->used, __ATOMIC_ACQUIRE)) continue;
+        if (__atomic_load_n(&r->epoch, __ATOMIC_RELAXED) != ep) continue;
+        if (r->ea == ea && r->span == span) return (int)i;
+    }
+    return -1;
+}
+
+int rsx_texdirty_track_range(uint32_t ea, uint32_t span, uint64_t* gen)
+{
+    if (!s_td.on || !span) return -1;
+    if ((uint64_t)ea + span > ((uint64_t)TD_NPAGES << 12)) return -1;
+
+    wcb_lock();
+    int idx = td_range_find_locked(ea, span);
+    int is_new = 0;
+    if (idx < 0) {
+        for (uint32_t i = 0; i < TD_RANGE_MAX; i++)
+            if (!__atomic_load_n(&s_td.ranges[i].used, __ATOMIC_ACQUIRE)) {
+                idx = (int)i;
+                break;
+            }
+        if (idx < 0) { wcb_unlock(); return -1; }
+        td_range* r = &s_td.ranges[idx];
+        r->ea = ea;
+        r->span = span;
+        __atomic_store_n(&r->epoch,
+                         __atomic_load_n(&s_td.range_epoch, __ATOMIC_RELAXED),
+                         __ATOMIC_RELAXED);
+        __atomic_store_n(&r->gen, __atomic_load_n(&s_td.seq, __ATOMIC_RELAXED),
+                         __ATOMIC_RELAXED);
+        __atomic_store_n(&r->used, 1, __ATOMIC_RELEASE);
+        s_td.range_n++;
+        is_new = 1;
+    }
+    wcb_unlock();
+
+    /* Protect the pages (a new range also establishes the coverage count).
+     * A write racing this call either happened before the caller's compare,
+     * which sees it, or bumps the generation the caller samples after it. */
+    if (is_new) rsx_texdirty_cover(ea, span);
+    else        rsx_texdirty_reprotect(ea, span);
+
+    wcb_lock();
+    idx = td_range_find_locked(ea, span);
+    if (idx < 0) { wcb_unlock(); return -1; }
+    td_range* r = &s_td.ranges[idx];
+    const uint64_t g = __atomic_load_n(&s_td.seq, __ATOMIC_RELAXED);
+    __atomic_store_n(&r->gen, g, __ATOMIC_RELEASE);
+    if (gen) *gen = g;
+    wcb_unlock();
+    return 0;
+}
+
+int rsx_texdirty_range_gen(uint32_t ea, uint32_t span, uint64_t* gen)
+{
+    if (!s_td.on || !span) return 0;
+    const uint64_t ep = __atomic_load_n(&s_td.range_epoch, __ATOMIC_ACQUIRE);
+    for (uint32_t i = 0; i < TD_RANGE_MAX; i++) {
+        td_range* r = &s_td.ranges[i];
+        if (!__atomic_load_n(&r->used, __ATOMIC_ACQUIRE)) continue;
+        if (__atomic_load_n(&r->epoch, __ATOMIC_RELAXED) != ep) continue;
+        if (r->ea != ea || r->span != span) continue;
+        if (gen) *gen = __atomic_load_n(&r->gen, __ATOMIC_ACQUIRE);
+        return 1;
+    }
+    return 0;
+}
+
+int rsx_texdirty_range_unchanged(uint32_t ea, uint32_t span, uint64_t gen)
+{
+    uint64_t cur;
+    return rsx_texdirty_range_gen(ea, span, &cur) && cur == gen;
 }
 
 void rsx_texdirty_note_write(uint32_t ea, uint32_t len)

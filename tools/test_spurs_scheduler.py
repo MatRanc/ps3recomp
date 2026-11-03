@@ -9,7 +9,7 @@ with tempfile.TemporaryDirectory(prefix='spurs-scheduler-') as tmp:
     out=Path(tmp)/'test'
     units=['spu_channels','spu_drain','spu_lockstep','spu_coherency','spu_workload',
            'spurs_policy','spurs_job','spu_tsp_weak','spu_vm_pagemap',
-           'spurs_policy_blob_weak','spu_interp']
+           'spurs_policy_blob_weak','spu_interp','c690_stats','c690_corpus']
     subprocess.run([os.environ.get('CC','cc'),'-std=gnu17','-O1','-UNDEBUG',
         '-ffunction-sections','-fdata-sections',
         '-Wl,-dead_strip' if platform.system()=='Darwin' else '-Wl,--gc-sections',

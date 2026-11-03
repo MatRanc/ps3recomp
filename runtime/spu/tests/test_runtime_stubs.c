@@ -46,3 +46,27 @@ WEAK volatile unsigned g_spu_putllc_sync_hit;
 WEAK void ydkj_wake_all_event_flags(void) {}
 WEAK uint64_t spurs_pm_build_context(uint8_t* ls, uint32_t ts, uint32_t tid, uint32_t a, uint32_t b)
 { (void)ls; (void)ts; (void)tid; (void)a; (void)b; return 0; }
+
+/* c690 measurement/corpus hooks reached from the generated spu_dma.h. These
+ * fixtures do not link spu_channels.c/c690_stats.c; none of them arms the
+ * counters, so the test-visible globals are zero and the hooks are no-ops. */
+WEAK int g_c690_gap;
+WEAK int g_c690_hash_on;
+WEAK int g_c690_corpus_on;
+WEAK int g_c690_jobcap_arm;
+WEAK unsigned g_c690_jobcap_n;
+WEAK int spu_code_dma_memo_on(void) { return 0; }
+WEAK int spu_overlay_code_get_noop(spu_context* c, uint32_t ea, uint32_t lsa,
+                                   uint32_t n, const uint8_t* s)
+{ (void)c; (void)ea; (void)lsa; (void)n; (void)s; return 0; }
+WEAK void c690_stats_on_transfer(const spu_context* c, int p, uint32_t lsa,
+                                 uint64_t ea, uint32_t n)
+{ (void)c; (void)p; (void)lsa; (void)ea; (void)n; }
+WEAK void c690_corpus_dma(const spu_context* c, int p, uint32_t lsa, uint64_t ea,
+                          uint32_t n, const uint8_t* b)
+{ (void)c; (void)p; (void)lsa; (void)ea; (void)n; (void)b; }
+WEAK void c690_gap_on_dma(const spu_context* c, int p, uint32_t lsa, uint32_t n)
+{ (void)c; (void)p; (void)lsa; (void)n; }
+WEAK int g_c690_stats;
+WEAK void c690_stats_on_direct(const spu_context* c, uint32_t lsa) { (void)c; (void)lsa; }
+WEAK void c690_stats_on_lookup(const spu_context* c, uint32_t lsa) { (void)c; (void)lsa; }

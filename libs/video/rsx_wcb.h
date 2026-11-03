@@ -159,6 +159,22 @@ void     rsx_texdirty_note_write_host(const void* host, size_t len);
 int      rsx_texdirty_on_fault(uintptr_t addr);
 void     rsx_texdirty_publish_hook(void);
 
+/* Source-range write tracking on top of the page sequence (SPU_CODE_DMA_MEMO).
+ * A small fixed table remembers a handful of guest ranges and the sequence of
+ * the last write that overlapped each. Registering protects the pages like a
+ * cached texture, so a PPU store faults into the same write counter. That makes
+ * "unchanged since I sampled it" one generation compare instead of comparing
+ * the whole range. Falls back (-1 / 0) when TEX_DIRTY is off, the host cannot
+ * protect pages, or the table is full.
+ *
+ *   track_range: register (or re-protect) and return the current generation.
+ *   range_gen:   read the generation without taking a lock; 1 on success.
+ *   unchanged:   1 when the range is still tracked at `gen`.
+ */
+int      rsx_texdirty_track_range(uint32_t ea, uint32_t span, uint64_t* gen);
+int      rsx_texdirty_range_gen(uint32_t ea, uint32_t span, uint64_t* gen);
+int      rsx_texdirty_range_unchanged(uint32_t ea, uint32_t span, uint64_t gen);
+
 /* Readback attribution (PS3RECOMP_RSX_WCB_ATTR): collect, per region, how
  * long guest threads waited for a copy. Off by default. */
 void rsx_wcb_attr_set(int on);

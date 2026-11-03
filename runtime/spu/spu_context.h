@@ -311,6 +311,9 @@ typedef struct spu_context {
         /* 0: unchecked legacy region; otherwise SPU_OVERLAY_* state of a
          * region registered with its code bytes (spu_overlay_residency.h). */
         int verify_state, source_index;
+        /* SPU_CODE_DMA_MEMO: source write generation when the whole streamed
+         * span was last proven equal to local store (0 = not tracked). */
+        uint64_t src_seq;
     } resident_code[4];
 
     /* Dispatch cache (spu_lifted_lookup, spu_channels.c). dcache_id names this
