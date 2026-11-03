@@ -52,6 +52,7 @@
 #include "rsx_draw_engine.h"
 #include "cellGcmSys.h"
 #include "ps3_live_ctl.h"
+#include "ps3emu/ps3_trace.h"   /* PS3RECOMP_TIMELINE: present and fence events */
 #include "rsx_tex_miss.h"
 #include "ps3emu/thread_name.h"
 #include "vulkan/rsx_vk_fallback_vert.spv.h"
@@ -263,6 +264,7 @@ typedef struct vk_state {
         u32          idx;
         u32          frame;          /* guest flip seq, for the per-flip log */
         unsigned long long due_us;  /* PS3RECOMP_VK_PACE: earliest present */
+        unsigned long long submit_us; /* when the blit was submitted (timeline) */
         VkSemaphore  done;
     }                present_q[VK_PRESENT_SLOTS];
     u32              present_q_head, present_q_tail, present_q_count;
@@ -2190,7 +2192,7 @@ static void* vk_present_thread_main(void* arg)
     ps3_thread_name("present");
     for (;;) {
         u32 slot, idx, frame;
-        unsigned long long due;
+        unsigned long long due, submit_us;
         VkSemaphore done;
 
         pthread_mutex_lock(&s_vk.present_q_mu);
@@ -2204,12 +2206,30 @@ static void* vk_present_thread_main(void* arg)
         idx  = s_vk.present_q[s_vk.present_q_head].idx;
         frame = s_vk.present_q[s_vk.present_q_head].frame;
         due = s_vk.present_q[s_vk.present_q_head].due_us;
+        submit_us = s_vk.present_q[s_vk.present_q_head].submit_us;
         done = s_vk.present_q[s_vk.present_q_head].done;
         s_vk.present_q_head = (s_vk.present_q_head + 1) % VK_PRESENT_SLOTS;
         s_vk.present_q_count--;
         pthread_mutex_unlock(&s_vk.present_q_mu);
 
-        pvkWaitForFences(s_vk.device, 1, &s_vk.window_fence[slot], VK_TRUE, UINT64_MAX);
+        {
+            const uint64_t tl_t0 = ps3_trace_begin();
+            pvkWaitForFences(s_vk.device, 1, &s_vk.window_fence[slot], VK_TRUE, UINT64_MAX);
+            if (tl_t0) {
+                const uint64_t t1 = ps3_trace_now();
+                ps3_trace_span(PS3_TR_PRESENT_FENCE_WAIT, tl_t0, t1, frame, 0);
+                /* The causal event is the window blit submission; the lag
+                 * includes the GPU's blit time, which is exactly what this
+                 * wait is for. */
+                if (submit_us) {
+                    const unsigned long long lag = vk_now_us() - submit_us;
+                    ps3_trace_instant(PS3_TR_WAIT_WAKE_LAG,
+                                      (uint32_t)(lag > 0xFFFFFFFFull ? 0xFFFFFFFFull : lag),
+                                      (uint32_t)PS3_TR_NOTE_PRESENT_SUBMIT |
+                                      ((uint32_t)PS3_TR_WAIT_PRESENT_FENCE << 8));
+                }
+            }
+        }
 
         /* PS3RECOMP_VK_PACE: hold the display present, not the frame's GPU
          * work (the swapchain blit was submitted when the frame ended). The
@@ -2233,9 +2253,12 @@ static void* vk_present_thread_main(void* arg)
             .pImageIndices = &idx,
         };
         const unsigned long long q0 = vk_window_stats_on() ? vk_now_us() : 0;
+        const uint64_t tp0 = ps3_trace_begin();
         VkResult r = vk_queue_present(&pi);
+        ps3_trace_end(tp0, PS3_TR_VK_PRESENT, frame, 0);
         if (q0) { vk_window_stats_max(&s_vkw.q_max_us, vk_now_us() - q0); VKW_ADD(shown); }
         cellGcm_flip_log_shown(frame);
+        ps3_trace_instant(PS3_TR_IMAGE_SHOWN, frame, 0);
         if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR)
             __atomic_store_n(&s_vk.present_lost, 1, __ATOMIC_RELEASE);
         else if (r != VK_SUCCESS)
@@ -2315,13 +2338,15 @@ static void vk_present_slot_release(int slot)
 }
 
 static void vk_present_enqueue(u32 slot, u32 idx, u32 frame,
-                               unsigned long long due, VkSemaphore done)
+                               unsigned long long due, unsigned long long submit_us,
+                               VkSemaphore done)
 {
     pthread_mutex_lock(&s_vk.present_q_mu);
     s_vk.present_q[s_vk.present_q_tail].slot = slot;
     s_vk.present_q[s_vk.present_q_tail].idx  = idx;
     s_vk.present_q[s_vk.present_q_tail].frame = frame;
     s_vk.present_q[s_vk.present_q_tail].due_us = due;
+    s_vk.present_q[s_vk.present_q_tail].submit_us = submit_us;
     s_vk.present_q[s_vk.present_q_tail].done = done;
     s_vk.present_q_tail = (s_vk.present_q_tail + 1) % VK_PRESENT_SLOTS;
     s_vk.present_q_count++;
@@ -2455,8 +2480,15 @@ static void vk_present_window(void)
 
     VKW_ADD(enq);
     cellGcm_flip_log_present(present_frame);
+    const unsigned long long submit_us = vk_now_us();
+    if (ps3_trace_on()) {
+        ps3_trace_instant(PS3_TR_PRESENT_QUEUED, present_frame, (uint32_t)slot);
+        ps3_trace_instant(PS3_TR_PRESENT_SUBMIT, present_frame, (uint32_t)slot);
+        ps3_trace_note_at(PS3_TR_NOTE_PRESENT_SUBMIT,
+                          (uint64_t)submit_us * 1000ull, present_frame);
+    }
     if (s_vk.present_thread_on) {
-        vk_present_enqueue((u32)slot, idx, present_frame, pace_due,
+        vk_present_enqueue((u32)slot, idx, present_frame, pace_due, submit_us,
                            s_vk.sc_done[idx]);
         return;
     }
@@ -4556,6 +4588,7 @@ static void vk_eng_flush_async(void)
     if (vk_queue_submit(&si, s_vk.fence) != VK_SUCCESS) { VK_LOG("vkQueueSubmit (pipelined) failed\n"); return; }
     s_eb_batch_id++;
     s_eb.flushes++;
+    ps3_trace_instant(PS3_TR_DRAW_SUBMIT, s_eb_batch_id, (uint32_t)s_eb.flushes);
     vk_ebs_swap();
 }
 
@@ -4662,6 +4695,7 @@ static void vk_eng_flush(void)
     s_eb_pending = 0;               /* first: the submit below must not re-enter */
     vk_submit_and_wait();
     s_eb_batch_id++;
+    ps3_trace_instant(PS3_TR_DRAW_SUBMIT, s_eb_batch_id, (uint32_t)s_eb.flushes);
     s_wait_tag = 8;
     s_eb.vb_head = s_eb.ib_head = s_eb.ub_head = s_eb.sb_head = 0;
     s_eb.raw_vb_head = s_eb.remap_head = 0;

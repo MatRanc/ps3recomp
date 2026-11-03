@@ -25,6 +25,7 @@
 #include "rsx_tex_miss.h"
 #include "rsx_tex_miss.c"
 #include "ps3_live_ctl.h"
+#include "ps3emu/ps3_trace.h"   /* PS3RECOMP_TIMELINE: readback done */
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -999,6 +1000,8 @@ static unsigned long long eng_wcb_now_ns(void)
 /* One copy finished: count it against its target and trigger. */
 static void eng_wcb_attr_note(int depth, u32 slot, u64 bytes, u64 ns)
 {
+    if (ps3_trace_on())
+        ps3_trace_instant(PS3_TR_WCB_DONE, (uint32_t)(bytes >> 10), (uint32_t)(ns / 1000u));
     if (!s_wcb.attr_on) return;
     const u32 idx = depth ? ENG_MAX_SURFACES + slot : slot;
     if (idx >= ENG_MAX_SURFACES + ENG_MAX_ZDEPTHS) return;

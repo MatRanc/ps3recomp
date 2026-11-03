@@ -530,12 +530,43 @@ static void sys_lwcond_wait(ppu_context* ctx)
     }
     ctx->gpr[3] = 0;
 }
+/* The ref register the FUN_000655cc wait is really waiting for. Defined in
+ * cellGcmSys.c (GCM_CONTROL_GUEST_ADDR + 8); weak so a fixture that builds
+ * this file alone still links. */
+extern "C" uint32_t cellGcm_debug_ref_value(void) __attribute__((weak));
+
 /* PS3RECOMP_TRACE: the wait as a span. A wrapper, so the body above stays the
- * self-contained function tools/test_lwcond_layout.py builds. */
+ * self-contained function tools/test_lwcond_layout.py builds. PS3RECOMP_
+ * TIMELINE also wants the wake-up lag: how long after the ref/flip event it
+ * was waiting for did this thread actually run again. */
 static void sys_lwcond_wait_traced(ppu_context* ctx)
 {
-    PS3_TRACE_SCOPE(PS3_TR_PPU_LWCOND, (uint32_t)ctx->gpr[3], 0);
+    const uint32_t lwcond = (uint32_t)ctx->gpr[3];
+    const uint64_t tl_t0 = ps3_trace_begin();
+    uint32_t tl_ref = 0;
+    if (tl_t0 && cellGcm_debug_ref_value) tl_ref = cellGcm_debug_ref_value();
+    PS3_TRACE_SCOPE(PS3_TR_PPU_LWCOND, lwcond, 0);
     sys_lwcond_wait(ctx);
+    if (tl_t0) {
+        /* 0x1245090 is FUN_000655cc's ref cond; 0x12450c8 the flip queue and
+         * 0x1245100 the flip-done cond (docs/ppu-critical-path.md). */
+        if (lwcond == 0x1245090u) {
+            ps3_trace_wake_lag(tl_t0, PS3_TR_WAIT_REF,
+                               PS3_TR_NOTE_REF_PUB, PS3_TR_NOTE_USER_HANDLER, -1);
+            /* ppu main just resumed: this is the start of the next frame's
+             * guest work (the flip request earlier is the boundary before). */
+            static uint32_t s_tl_frame;
+            ps3_trace_instant(PS3_TR_PPU_FRAME_BEGIN, ++s_tl_frame, tl_ref);
+        } else if (lwcond == 0x12450c8u)
+            ps3_trace_wake_lag(tl_t0, PS3_TR_WAIT_FLIP_QUEUE,
+                               PS3_TR_NOTE_FLIP_REQ, PS3_TR_NOTE_USER_HANDLER, -1);
+        else if (lwcond == 0x1245100u)
+            ps3_trace_wake_lag(tl_t0, PS3_TR_WAIT_FLIP_DONE,
+                               PS3_TR_NOTE_FLIP_DONE, PS3_TR_NOTE_USER_HANDLER, -1);
+        else
+            ps3_trace_wake_lag(tl_t0, PS3_TR_WAIT_LWCOND_OTHER, -1, -1, -1);
+        (void)tl_ref;
+    }
 }
 
 /* sys_ppu_thread_get_id(vm::ptr<u64> id) -> *id = calling thread's real id.

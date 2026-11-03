@@ -233,6 +233,9 @@ void c690_stats_on_lookup(const struct spu_context* ctx, uint32_t lsa)
             c690_record_job(s, now - t_run.job_start_ns);
             ps3_trace_end(t_run.tr_t0, PS3_TR_C690_JOB, t_run.tr_desc_ea,
                           (uint32_t)ctx->spu_id);
+            /* Timeline: the note is the instant the job's slot PUT can follow,
+             * i.e. the signal a walker wait is waiting for. */
+            if (ps3_trace_on()) ps3_trace_note(PS3_TR_NOTE_C690_END, (uint32_t)ctx->spu_id);
             t_run.tr_t0 = 0;
             t_run.job_active = 0;
             t_run.current_lsa = 0;

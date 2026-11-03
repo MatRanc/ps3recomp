@@ -949,6 +949,10 @@ void ppu_gcm_pump(void)
     }
     if (user) {
         u32 cmd = (u32)user;
+        if (ps3_trace_on()) {
+            ps3_trace_instant(PS3_TR_GCM_USER_HANDLER, cmd, 0);
+            ps3_trace_note(PS3_TR_NOTE_USER_HANDLER, cmd);
+        }
         if (s_user_handler_opd && g_ps3_guest_caller)
             g_ps3_guest_caller(s_user_handler_opd, (uint64_t)cmd, 0, 0, 0, 0, 0, 0, 0);
     }
@@ -979,7 +983,10 @@ void cellGcmTickFlip(void)
     if (waiting) s_flip_tick_seq = s_flip_req_seq;
     FLIP_UNLOCK();
     if (waiting) GCM_PENDING_SET(2);
-    if (waiting) ps3_trace_instant(PS3_TR_GCM_FLIP_DONE, s_flip_tick_seq, 0);
+    if (waiting && ps3_trace_on()) {
+        ps3_trace_instant(PS3_TR_GCM_FLIP_DONE, s_flip_tick_seq, 0);
+        ps3_trace_note(PS3_TR_NOTE_FLIP_DONE, s_flip_tick_seq);
+    }
 }
 
 /* Drain the game's GCM FIFO into the RSX backend. Called from the present thread
@@ -1785,7 +1792,10 @@ void gcm_note_spu_put(u32 ea, u32 size)
     u32 room = 0;
     u32 io = gcm_ea2io_range(ea, &room);
     if (io == 0xFFFFFFFFu || size > room) return;   /* not in RSX-visible memory */
-    if (ps3_trace_on()) ps3_trace_instant(PS3_TR_GCM_SPU_PUT, io, size);
+    if (ps3_trace_on()) {
+        ps3_trace_instant(PS3_TR_GCM_SPU_PUT, io, size);
+        ps3_trace_note(PS3_TR_NOTE_SPU_PUT, io);
+    }
     gcm_walker_wake_for_put(io, size);
 
     /* Coalesce with the previous block when an SPU emits one buffer in several
@@ -2071,7 +2081,10 @@ static void gcm_ref_publish_one(int src)
     if (h == s_ref_qtail) return;
     const u32 val = s_ref_q[h % GCM_REF_QLEN];
     vm_write32(GCM_CONTROL_GUEST_ADDR + 8, val);
-    if (ps3_trace_on()) ps3_trace_instant(PS3_TR_GCM_REF_PUB, val, (u32)src);
+    if (ps3_trace_on()) {
+        ps3_trace_instant(PS3_TR_GCM_REF_PUB, val, (u32)src);
+        ps3_trace_note(PS3_TR_NOTE_REF_PUB, val);
+    }
     /* stderr, deliberately: [DRAIN] uses printf and stdout is block-buffered
      * when redirected, so its interleaving with an stderr probe is not a
      * timeline. Same stream = same ordering. */
@@ -2137,6 +2150,7 @@ static volatile u32 s_walker_park_get = 0xFFFFFFFFu;
 static void gcm_walker_kick(void)
 {
     if (s_gcm_kick_ev) SetEvent(s_gcm_kick_ev);
+    ps3_trace_note(PS3_TR_NOTE_KICK, 0);
 }
 
 /* Live switch value, with the environment as the fallback for a fixture that
@@ -2172,6 +2186,8 @@ void cellGcm_fifo_kick_wait(unsigned ms)
     static int on = -1;
     if (on < 0) { const char* e = getenv("GCM_FIFO_KICK"); on = (e && *e == '0') ? 0 : 1; }
     HANDLE ev = on ? (HANDLE)cellGcm_fifo_kick_event() : NULL;
+    const uint64_t tl_t0 = ps3_trace_begin();
+    const u32 tl_get = s_walker_park_get;
     /* EXP_FAST_WAKE: a throwaway ceiling test. Instead of parking the walker
      * for up to `ms`, re-check the kick event and yield. With PS3RECOMP_PIN=1
      * the walker has its own core, so the busy poll cannot steal the PPU's;
@@ -2185,6 +2201,12 @@ void cellGcm_fifo_kick_wait(unsigned ms)
 #endif
     } else if (ev) WaitForSingleObject(ev, ms);
     else    Sleep(ms);
+    if (tl_t0) {
+        const uint64_t t1 = ps3_trace_now();
+        ps3_trace_span(PS3_TR_RSX_IDLE_WAIT, tl_t0, t1, tl_get, 0);
+        /* Wake-up lag: how long after the kick did this thread get to run. */
+        ps3_trace_wake_lag(tl_t0, PS3_TR_WAIT_WALKER_IDLE, PS3_TR_NOTE_KICK, -1, -1);
+    }
     /* A guest thread blocked on a render target's bytes (on-demand WCB) kicks
      * this wait; copy them before anything else. */
     if (rsx_draw_engine_enabled()) {
@@ -2199,6 +2221,7 @@ static void gcm_wcb_wake(void)
 {
     HANDLE ev = (HANDLE)cellGcm_fifo_kick_event();
     if (ev) SetEvent(ev);
+    ps3_trace_note(PS3_TR_NOTE_KICK, 0);
 }
 
 
@@ -2237,8 +2260,10 @@ void cellGcm_ref_on_poll(void)
         dry = (s_ref_qhead == s_ref_qtail);
     }
     ReleaseSRWLockExclusive(&s_ref_pub_lock);
-    if (dry && s_gcm_kick_ev)
+    if (dry && s_gcm_kick_ev) {
         SetEvent(s_gcm_kick_ev);       /* dry: ask the present thread to walk */
+        ps3_trace_note(PS3_TR_NOTE_KICK, 0);
+    }
 }
 
 static uint64_t s_ft_sema_t0;          /* PS3_FTRACE: when the walker began waiting on the current acquire */
@@ -2399,8 +2424,11 @@ void cellGcm_rsx_process_fifo(void)
     if (tr_t0) {
         ps3_trace_thread_name_default("rsx walker");
         const u32 tr_get0 = s_fifo_getoff;
+        const u32 tr_put0 = vm_read32(GCM_CONTROL_GUEST_ADDR + 0);
         gcm_rsx_process_fifo_unlocked();
         gcm_tr_pass(tr_t0, tr_get0);
+        /* Timeline: the FIFO put the pass acted on, and where get ended. */
+        ps3_trace_instant(PS3_TR_FIFO_PUT_SEEN, tr_put0, s_fifo_getoff);
     } else {
         gcm_rsx_process_fifo_unlocked();
     }
@@ -3861,6 +3889,13 @@ static s32 gcm_flip_request(u32 bufferId, int in_fifo)
     if (PS3_FT_ON()) { const uint64_t t = ps3_ft_now();
                        ps3_ft_span(PS3_FT_FLIP_REQ, 0, bufferId, (uint32_t)in_fifo, t, t); }
     ps3_trace_instant(PS3_TR_GCM_FLIP_REQ, bufferId, (uint32_t)in_fifo);
+    /* Timeline: for this title Gfx_FrameEnd's flip marker is decoded here, on
+     * the walker, so this is the frame boundary the analyser uses. */
+    if (ps3_trace_on()) {
+        ps3_trace_instant(PS3_TR_GFX_FRAME_END, s_flip_request_count, bufferId);
+        ps3_trace_instant(PS3_TR_PPU_FRAME_END, bufferId, s_flip_request_count);
+        ps3_trace_note(PS3_TR_NOTE_FLIP_REQ, bufferId);
+    }
     /* The [flip] lines carry the vblank counter and the trace carries
      * (request, vblank) on every flip: the tick count per flip is what
      * separates a guest frame that is simply longer than a tick from one the
@@ -5153,6 +5188,10 @@ u32 cellGcm_syscall_bringup(u32 local_size)
  * `lwz r3,0x18(r9)` / `addi r3,r3,64`), so the syscall returns this minus 0x40
  * and the driver's own flushes land exactly where the walker reads. */
 u32 cellGcm_control_guest_addr(void) { return GCM_CONTROL_GUEST_ADDR; }
+
+/* Timeline: the ctrl->ref value the guest is currently waiting for. Read at a
+ * lwcond wait begin so a ref-wait span carries the value awaited. */
+u32 cellGcm_debug_ref_value(void) { return vm_read32(GCM_CONTROL_GUEST_ADDR + 8); }
 
 /* sys_rsx_context_iomap / iounmap: the same 1MB-page offset table
  * cellGcmMapEaIoAddress fills, which is what gcm_io2ea() and every offset

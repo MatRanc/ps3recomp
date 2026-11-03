@@ -116,8 +116,25 @@ enum ps3_tr_ev {
     PS3_TR_GCM_SPU_PUT,        /* an SPU DMA PUT landed in RSX-visible memory: a = IO offset, b = size */
     PS3_TR_GCM_LABEL_REL,      /* an SPU DMA PUT landed in the GCM label window: a = label offset, b = value */
     PS3_TR_RSX_PARK,           /* the walker stopped on a self-JUMP park: a = get, b = put */
-    PS3_TR_GCM_REF_SET,        /* a NV406E_SET_REFERENCE was reached: a = get, b = value */
+    PS3_TR_GCM_REF_SET,        /* a NV406E_SET_REFERENCE was reached: a = get, b = value          */
     PS3_TR_GCM_REF_PUB,        /* the ref register was made guest-visible: a = value, b = source (0=drain tail, 1=poll) */
+    /* Timeline events (PS3RECOMP_TIMELINE; also written by PS3RECOMP_TRACE).
+     * These exist to answer "when did the thing this wait wanted actually
+     * happen", so every one is a timestamp an analyser can subtract. */
+    PS3_TR_PPU_FRAME_BEGIN,    /* ppu main resumed from the ref wait: a = frame seq              */
+    PS3_TR_PPU_FRAME_END,      /* the flip word was executed: a = buffer, b = flip count         */
+    PS3_TR_GFX_FRAME_END,      /* Gfx_FrameEnd proxy: the guest flip request                      */
+    PS3_TR_WAIT_WAKE_LAG,      /* a = wake lag us, b = cause | (wait << 8)                        */
+    PS3_TR_RSX_IDLE_WAIT,      /* span: walker idle wait, a = get it parked on                    */
+    PS3_TR_FIFO_PUT_SEEN,      /* a walker pass saw put: a = put, b = get after                   */
+    PS3_TR_WCB_DONE,           /* a readback copy finished: a = KiB, b = duration us              */
+    PS3_TR_DRAW_SUBMIT,        /* a draw batch was submitted: a = batch, b = flushes              */
+    PS3_TR_PRESENT_SUBMIT,     /* the window blit was submitted: a = frame                        */
+    PS3_TR_PRESENT_FENCE_WAIT, /* span: present thread waiting the blit fence: a = frame          */
+    PS3_TR_PRESENT_QUEUED,     /* a present job was queued: a = frame                             */
+    PS3_TR_VK_PRESENT,         /* span: vkQueuePresentKHR: a = frame                              */
+    PS3_TR_IMAGE_SHOWN,        /* the display saw the image: a = frame                            */
+    PS3_TR_GCM_USER_HANDLER,   /* the guest's GCM user handler was delivered: a = cmd             */
     PS3_TR_EV_COUNT
 };
 
@@ -174,6 +191,20 @@ static inline const ps3_tr_desc* ps3_tr_desc_of(uint32_t ev)
         { "rsx.park",           "rsx",   PS3_TR_PH_INSTANT, 3, "get", "put" },
         { "gcm.ref_set",        "gcm",   PS3_TR_PH_INSTANT, 1, "get", "value" },
         { "gcm.ref_pub",        "gcm",   PS3_TR_PH_INSTANT, 0, "value", "source" },
+        { "ppu.frame_begin",    "ppu",   PS3_TR_PH_INSTANT, 0, "frame", 0 },
+        { "ppu.frame_end",      "ppu",   PS3_TR_PH_INSTANT, 0, "buffer", "flip" },
+        { "gfx.frame_end",      "gfx",   PS3_TR_PH_INSTANT, 0, "flip", 0 },
+        { "wait.wake_lag",      "wait",  PS3_TR_PH_INSTANT, 0, "lag_us", "cause" },
+        { "rsx.idle_wait",      "rsx",   PS3_TR_PH_SPAN,    3, "get", 0 },
+        { "rsx.fifo_put_seen",  "rsx",   PS3_TR_PH_INSTANT, 3, "put", "get" },
+        { "rsx.wcb_done",       "rsx",   PS3_TR_PH_INSTANT, 0, "kib", "us" },
+        { "rsx.draw_submit",    "rsx",   PS3_TR_PH_INSTANT, 0, "batch", "flushes" },
+        { "present.submit",     "present", PS3_TR_PH_INSTANT, 0, "frame", 0 },
+        { "present.fence_wait", "present", PS3_TR_PH_SPAN,  0, "frame", 0 },
+        { "present.queued",     "present", PS3_TR_PH_INSTANT, 0, "frame", 0 },
+        { "present.vkqueue",    "present", PS3_TR_PH_SPAN,  0, "frame", 0 },
+        { "present.shown",      "present", PS3_TR_PH_INSTANT, 0, "frame", 0 },
+        { "gcm.user_handler",   "gcm",   PS3_TR_PH_INSTANT, 0, "cmd", 0 },
     };
     return &d[ev < (uint32_t)PS3_TR_EV_COUNT ? ev : 0];
 }
@@ -226,6 +257,12 @@ typedef struct {
     int on;                     /* 0 unknown, 1 off (or finished), 2 recording, 3 initialising */
     int lock;                   /* the consumer side: flusher and shutdown */
     int first;                  /* no event written yet (comma placement) */
+    /* PS3RECOMP_TIMELINE: the same rings, written as a binary record stream
+     * instead of chrome JSON. The wake-lag hook reads these "when did the
+     * causal event happen" notes. */
+    int binary;
+    uint64_t note_ns[8];
+    uint32_t note_a[8];
     uint32_t nrings, next_tid;
     uint64_t ring_recs, flush_recs, min_ns, base, written;
     /* PS3RECOMP_TRACE_TRIGGER=<path> + PS3RECOMP_TRACE_SECS=<n>: record only
@@ -376,12 +413,69 @@ static inline void ps3_tr_write_name(FILE* f, ps3_tr_ring* r)
     fputs("}}", f);
 }
 
+/* ---- binary timeline output (PS3RECOMP_TIMELINE) -----------------------
+ * Chunks, so a truncated tail (SIGKILL) is still readable:
+ *   kind 1, tid, len, name bytes padded to 4
+ *   kind 2, tid, count, count * 32-byte ps3_tr_rec
+ * All integers are little-endian host order; the analyser is on this host. */
+enum { PS3_TL_CHUNK_NAME = 1, PS3_TL_CHUNK_EVENTS = 2 };
+
+static inline void ps3_tr_write_u32(FILE* f, uint32_t v) { fwrite(&v, sizeof v, 1, f); }
+
+static inline void ps3_tr_write_name_bin(FILE* f, ps3_tr_ring* r)
+{
+    const uint32_t g = __atomic_load_n(&r->name_gen, __ATOMIC_ACQUIRE);
+    if (g == r->name_out) return;
+    char name[sizeof r->name];
+    memcpy(name, r->name, sizeof name);
+    name[sizeof name - 1] = 0;
+    if (__atomic_load_n(&r->name_gen, __ATOMIC_ACQUIRE) != g) return;
+    r->name_out = g;
+    uint32_t len = (uint32_t)strlen(name) + 1u;
+    uint32_t kind = PS3_TL_CHUNK_NAME, tid = r->tid;
+    ps3_tr_write_u32(f, kind);
+    ps3_tr_write_u32(f, tid);
+    ps3_tr_write_u32(f, len);
+    fwrite(name, 1, len, f);
+    while (len & 3u) { fputc(0, f); len++; }
+}
+
+static inline void ps3_tr_drain_bin(void)
+{
+    ps3_tr_state* s = &g_ps3_tr;
+    FILE* f = s->f;
+    const uint32_t n = __atomic_load_n(&s->nrings, __ATOMIC_ACQUIRE);
+    for (uint32_t i = 0; i < n && i < PS3_TR_MAX_RINGS; i++) {
+        ps3_tr_ring* r = __atomic_load_n(&s->rings[i], __ATOMIC_ACQUIRE);
+        if (!r) continue;
+        ps3_tr_write_name_bin(f, r);
+        const uint64_t h = __atomic_load_n(&r->head, __ATOMIC_ACQUIRE);
+        const uint64_t t = r->tail;
+        if (h == t) continue;
+        uint32_t kind = PS3_TL_CHUNK_EVENTS, tid = r->tid;
+        uint32_t count = (uint32_t)(h - t);
+        ps3_tr_write_u32(f, kind);
+        ps3_tr_write_u32(f, tid);
+        ps3_tr_write_u32(f, count);
+        uint64_t p = t;
+        while (p != h) {
+            const uint64_t idx = p & r->mask;
+            const uint64_t run = (h - p) < ((r->mask + 1) - idx) ? (h - p) : ((r->mask + 1) - idx);
+            fwrite(&r->buf[idx], sizeof(ps3_tr_rec), (size_t)run, f);
+            p += run;
+        }
+        s->written += h - t;
+        __atomic_store_n(&r->tail, h, __ATOMIC_RELEASE);
+    }
+}
+
 /* Write every pending record of every ring. */
 static inline void ps3_tr_drain(void)
 {
     ps3_tr_state* s = &g_ps3_tr;
     FILE* f = s->f;
     if (!f) return;
+    if (s->binary) { ps3_tr_drain_bin(); fflush(f); return; }
     const uint32_t n = __atomic_load_n(&s->nrings, __ATOMIC_ACQUIRE);
     for (uint32_t i = 0; i < n && i < PS3_TR_MAX_RINGS; i++) {
         ps3_tr_ring* r = __atomic_load_n(&s->rings[i], __ATOMIC_ACQUIRE);
@@ -470,14 +564,17 @@ static inline void ps3_trace_shutdown(void)
     }
     FILE* f = s->f;
     if (f) {
-        /* Last, so the array ends on an element rather than a comma. */
-        ps3_tr_sep(f);
-        fprintf(f, "{\"name\":\"process_name\",\"ph\":\"M\",\"pid\":1,\"args\":{\"name\":\"ps3recomp\","
-                   "\"events\":%llu,\"dropped\":%llu}}\n]\n",
-                (unsigned long long)s->written, (unsigned long long)dropped);
+        if (!s->binary) {
+            /* Last, so the array ends on an element rather than a comma. */
+            ps3_tr_sep(f);
+            fprintf(f, "{\"name\":\"process_name\",\"ph\":\"M\",\"pid\":1,\"args\":{\"name\":\"ps3recomp\","
+                       "\"events\":%llu,\"dropped\":%llu}}\n]\n",
+                    (unsigned long long)s->written, (unsigned long long)dropped);
+        }
         fclose(f);
         s->f = NULL;
-        fprintf(stderr, "[trace] wrote %llu events (%llu dropped) from %u threads to %s\n",
+        fprintf(stderr, "[%s] wrote %llu events (%llu dropped) from %u threads to %s\n",
+                s->binary ? "timeline" : "trace",
                 (unsigned long long)s->written, (unsigned long long)dropped, n, s->path);
     }
     ps3_tr_unlock();
@@ -502,23 +599,41 @@ static inline int ps3_tr_init(void)
     if (!__atomic_compare_exchange_n(&s->on, &expect, 3, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
         return expect == 2;
     int on = 1;
+    /* PS3RECOMP_TIMELINE=<path|1> writes the same rings as a binary record
+     * stream; PS3RECOMP_TRACE=<path> keeps the chrome JSON. Timeline wins if
+     * both are set: the binary form is the analysis input. */
+    const char* tl = getenv("PS3RECOMP_TIMELINE");
     const char* path = getenv("PS3RECOMP_TRACE");
-    if (path && *path) {
+    const int binary = tl && *tl && strcmp(tl, "0") != 0;
+    if (binary) {
+        if (strchr(tl, '/') || strchr(tl, '.')) snprintf(s->path, sizeof s->path, "%s", tl);
+        else snprintf(s->path, sizeof s->path, "%s", "ps3_timeline.bin");
+        s->binary = 1;
+    } else if (path && *path) {
         snprintf(s->path, sizeof s->path, "%s", path);
-        const double ring_mb = ps3_tr_env_num("PS3RECOMP_TRACE_RING_MB", 2.0);
+    }
+    if (s->path[0]) {
+        const char* pfx = binary ? "PS3RECOMP_TIMELINE_" : "PS3RECOMP_TRACE_";
+        char knob[64];
+        snprintf(knob, sizeof knob, "%sRING_MB", pfx);
+        const double ring_mb = ps3_tr_env_num(knob, binary ? 8.0 : 2.0);
         uint64_t want = (uint64_t)(ring_mb * 1048576.0) / sizeof(ps3_tr_rec);
         uint64_t recs = 64;
         while (recs < want && recs < (1ull << 30)) recs <<= 1;
         s->ring_recs = recs;
-        s->flush_recs = (uint64_t)(ps3_tr_env_num("PS3RECOMP_TRACE_FLUSH_MB", 4.0) * 1048576.0) / sizeof(ps3_tr_rec);
+        snprintf(knob, sizeof knob, "%sFLUSH_MB", pfx);
+        s->flush_recs = (uint64_t)(ps3_tr_env_num(knob, binary ? 32.0 : 4.0) * 1048576.0) / sizeof(ps3_tr_rec);
         if (!s->flush_recs) s->flush_recs = 1;
-        s->min_ns = (uint64_t)(ps3_tr_env_num("PS3RECOMP_TRACE_MIN_US", 0.0) * 1000.0);
+        snprintf(knob, sizeof knob, "%sMIN_US", pfx);
+        s->min_ns = (uint64_t)(ps3_tr_env_num(knob, 0.0) * 1000.0);
         {
-            const char* trig = getenv("PS3RECOMP_TRACE_TRIGGER");
+            snprintf(knob, sizeof knob, "%sTRIGGER", pfx);
+            const char* trig = getenv(knob);
             if (trig && *trig) {
                 snprintf(s->trigger, sizeof s->trigger, "%s", trig);
                 s->win_armed = 1;
-                s->win_secs = (uint64_t)(ps3_tr_env_num("PS3RECOMP_TRACE_SECS", 10.0) * 1e9);
+                snprintf(knob, sizeof knob, "%sSECS", pfx);
+                s->win_secs = (uint64_t)(ps3_tr_env_num(knob, 10.0) * 1e9);
             }
         }
         s->f = fopen(s->path, "wb");
@@ -533,9 +648,18 @@ static inline int ps3_tr_init(void)
             if (s->f) { fclose(s->f); s->f = NULL; }
         } else {
             setvbuf(s->f, NULL, _IOFBF, 1u << 20);
-            fputs("[\n", s->f);
             s->first = 1;
             s->base = ps3_trace_now();
+            if (binary) {
+                /* "PSTL", version, record size, base timestamp. */
+                uint32_t ver = 1u, rsz = (uint32_t)sizeof(ps3_tr_rec);
+                fwrite("PSTL", 1, 4, s->f);
+                fwrite(&ver, sizeof ver, 1, s->f);
+                fwrite(&rsz, sizeof rsz, 1, s->f);
+                fwrite(&s->base, sizeof s->base, 1, s->f);
+            } else {
+                fputs("[\n", s->f);
+            }
             atexit(ps3_tr_atexit);
             on = 2;
             __atomic_store_n(&s->on, on, __ATOMIC_RELEASE);   /* the flusher checks it */
@@ -660,6 +784,80 @@ static inline void ps3_trace_instant(int ev, uint32_t a, uint32_t b)
     ps3_tr_ring* r = ps3_tr_ring_self();
     if (r) ps3_tr_put(r, (uint32_t)ev, t, t, a, b);
 }
+
+/* ---- causal-event notes (wake-up lag) ---------------------------------
+ * A wait can only report how long it took. To say how long it took AFTER the
+ * thing it wanted happened, the producers leave a timestamp here and the
+ * waiter subtracts it at wake. The slots are process-wide and racy by
+ * design: the newest producer wins, and a stale one simply shows up as a
+ * larger lag. */
+enum {
+    PS3_TR_NOTE_REF_PUB = 0,   /* ctrl->ref published (gcm_ref_publish_one)       */
+    PS3_TR_NOTE_FLIP_DONE,     /* cellGcmTickFlip completed a flip                */
+    PS3_TR_NOTE_FLIP_REQ,      /* a flip was requested / executed                 */
+    PS3_TR_NOTE_KICK,          /* the walker's idle wait was kicked               */
+    PS3_TR_NOTE_SPU_PUT,       /* an SPU DMA PUT landed in RSX-visible memory     */
+    PS3_TR_NOTE_PRESENT_SUBMIT,/* the window blit was submitted                   */
+    PS3_TR_NOTE_USER_HANDLER,  /* the guest GCM user handler ran                  */
+    PS3_TR_NOTE_C690_END,      /* a c690 job ended (its slot PUT is the signal)   */
+    PS3_TR_NOTE_COUNT
+};
+
+static inline void ps3_trace_note_at(int which, uint64_t t, uint32_t a)
+{
+    if (PS3_TR_LIKELY(!ps3_trace_on())) return;
+    if ((unsigned)which >= PS3_TR_NOTE_COUNT) return;
+    __atomic_store_n(&g_ps3_tr.note_a[which], a, __ATOMIC_RELAXED);
+    __atomic_store_n(&g_ps3_tr.note_ns[which], t, __ATOMIC_RELEASE);
+}
+
+static inline void ps3_trace_note(int which, uint32_t a)
+{
+    if (PS3_TR_LIKELY(!ps3_trace_on())) return;
+    ps3_trace_note_at(which, ps3_trace_now(), a);
+}
+
+static inline uint64_t ps3_trace_note_time(int which)
+{
+    return __atomic_load_n(&g_ps3_tr.note_ns[which], __ATOMIC_ACQUIRE);
+}
+
+/* Record one wake-up lag: the newest of up to three causal notes that landed
+ * inside [wait_begin, now]. `wait_id` names the wait for the analyser.
+ * Causes: 0 refpub, 1 flipdone, 2 flipreq, 3 kick, 4 spuput, 5 present submit,
+ * 6 user handler, 7 c690 end. */
+static inline void ps3_trace_wake_lag(uint64_t wait_begin, int wait_id,
+                                      int c0, int c1, int c2)
+{
+    if (PS3_TR_LIKELY(!wait_begin)) return;
+    const uint64_t now = ps3_trace_now();
+    int best = -1;
+    uint64_t best_t = 0;
+    const int cs[3] = { c0, c1, c2 };
+    for (int i = 0; i < 3; i++) {
+        if (cs[i] < 0 || cs[i] >= PS3_TR_NOTE_COUNT) continue;
+        const uint64_t t = ps3_trace_note_time(cs[i]);
+        if (t >= wait_begin && t <= now && t > best_t) { best_t = t; best = cs[i]; }
+    }
+    if (best < 0) return;                       /* nothing happened while waiting */
+    uint64_t lag_us = (now - best_t) / 1000u;
+    if (lag_us > 0xFFFFFFFFu) lag_us = 0xFFFFFFFFu;
+    ps3_tr_ring* r = ps3_tr_ring_self();
+    if (!r) return;
+    ps3_tr_put(r, PS3_TR_WAIT_WAKE_LAG, now, now,
+               (uint32_t)lag_us, (uint32_t)best | ((uint32_t)wait_id << 8));
+}
+
+/* Wait ids used by ps3_trace_wake_lag. */
+enum {
+    PS3_TR_WAIT_REF = 0,        /* FUN_000655cc ref lwcond (0x1245090)   */
+    PS3_TR_WAIT_FLIP_QUEUE,     /* DisplayFlip flip-queue lwcond         */
+    PS3_TR_WAIT_FLIP_DONE,      /* DisplayFlip flip-done lwcond          */
+    PS3_TR_WAIT_LWCOND_OTHER,   /* any other lwcond                      */
+    PS3_TR_WAIT_WALKER_IDLE,    /* cellGcm_fifo_kick_wait                */
+    PS3_TR_WAIT_PRESENT_FENCE,  /* present thread VkFence                */
+    PS3_TR_WAIT_SPU_CHANNEL,    /* spu_ch_wait                           */
+};
 
 /* A wait the runtime only sees as a guest spinning on one call (a status
  * read, a register poll). Calls of one event on one thread closer than
