@@ -24,6 +24,7 @@ enum {
     RSX_TEX_MISS_SURFACE,       /* render target or tiled surface not usable  */
     RSX_TEX_MISS_ADDRESS,       /* guest address could not be resolved/read    */
     RSX_TEX_MISS_SIZE,          /* width/height/pitch outside what we upload   */
+    RSX_TEX_MISS_CUBE,          /* cube render target incomplete, no six faces */
     RSX_TEX_MISS_OTHER,         /* allocation, backend create, kind mismatch   */
     RSX_TEX_MISS_REASONS
 };

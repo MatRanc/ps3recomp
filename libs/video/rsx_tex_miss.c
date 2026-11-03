@@ -42,6 +42,7 @@ const char* rsx_tex_miss_reason_name(unsigned reason)
     case RSX_TEX_MISS_SURFACE: return "surface";
     case RSX_TEX_MISS_ADDRESS: return "address";
     case RSX_TEX_MISS_SIZE:    return "size";
+    case RSX_TEX_MISS_CUBE:    return "cube";
     default:                   return "other";
     }
 }
@@ -175,11 +176,11 @@ unsigned rsx_tex_miss_frame(FILE* out, unsigned frame_no)
     const unsigned total = s_frame_total;
     if (total) {
         fprintf(out, "[tex-miss] frame=%u misses=%u format=%u surface=%u "
-                     "address=%u size=%u other=%u total=%llu\n",
+                     "address=%u size=%u cube=%u other=%u total=%llu\n",
                 frame_no, total, s_frame[RSX_TEX_MISS_FORMAT],
                 s_frame[RSX_TEX_MISS_SURFACE], s_frame[RSX_TEX_MISS_ADDRESS],
-                s_frame[RSX_TEX_MISS_SIZE], s_frame[RSX_TEX_MISS_OTHER],
-                s_run_total);
+                s_frame[RSX_TEX_MISS_SIZE], s_frame[RSX_TEX_MISS_CUBE],
+                s_frame[RSX_TEX_MISS_OTHER], s_run_total);
         if (s_frames_since_top >= RSX_TEX_MISS_EVERY) {
             rsx_tex_miss_top(out, RSX_TEX_MISS_TOP);
             s_frames_since_top = 0;
@@ -196,10 +197,10 @@ void rsx_tex_miss_flush(FILE* out)
     if (!rsx_tex_miss_enabled() || !s_run_total) return;
     if (!out) out = stderr;
     fprintf(out, "[tex-miss] end: misses=%llu format=%llu surface=%llu "
-                 "address=%llu size=%llu other=%llu\n",
+                 "address=%llu size=%llu cube=%llu other=%llu\n",
             s_run_total, s_run[RSX_TEX_MISS_FORMAT], s_run[RSX_TEX_MISS_SURFACE],
             s_run[RSX_TEX_MISS_ADDRESS], s_run[RSX_TEX_MISS_SIZE],
-            s_run[RSX_TEX_MISS_OTHER]);
+            s_run[RSX_TEX_MISS_CUBE], s_run[RSX_TEX_MISS_OTHER]);
     rsx_tex_miss_top(out, RSX_TEX_MISS_TOP);
 }
 

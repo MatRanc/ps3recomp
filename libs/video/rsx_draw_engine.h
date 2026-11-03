@@ -139,6 +139,14 @@ typedef struct rsx_vtx_gpu_desc {
 
 /* ---- the backend interface ---------------------------------------------- */
 
+/* One face of a cube map assembled from colour targets. `x, y, w, h` is the
+ * rectangle of `handle` that holds the face (a face is either its own target,
+ * or a window into a stacked one). */
+typedef struct rsx_be_cube_face {
+    u32 handle;
+    u32 x, y, w, h;
+} rsx_be_cube_face;
+
 #define RSX_BE_HAS_COLOR_SNAPSHOT 1
 typedef struct rsx_draw_backend {
     void* user;
@@ -179,6 +187,16 @@ typedef struct rsx_draw_backend {
      * in when it is decoded, so only a surface bind needs this; 0 means the
      * backend has no view and the engine binds the target itself. */
     u32  (*surface_view)(void* user, u32 surface, u32 remap, u32 rsx_format);
+    /* Optional. Build (or refresh) a six-layer cube image from six colour
+     * targets with a GPU copy, one layer per face, and return a texture
+     * handle with a cube view. `serials` are the faces' colour serials, so a
+     * backend can skip the copy while nothing changed; the engine owns
+     * nothing here, the backend keeps the handle in its own cache. 0 when the
+     * backend cannot (the engine leaves the unit on the dummy). */
+    u32  (*cube_target_view)(void* user, const rsx_be_cube_face faces[6],
+                             const u64 serials[6],
+                             rsx_be_format fmt, u32 w, u32 h,
+                             u32 remap, u32 rsx_format);
 
     /* One depth target per guest zeta address. */
     u32  (*depth_target_create)(void* user, u32 w, u32 h);

@@ -14,6 +14,7 @@
  */
 #include "rsx_draw_engine.h"
 #include "rsx_primitives.h"   /* RSX_PRIMITIVE_* */
+#include "rsx_tex_miss.h"     /* RSX_TEX_MISS_* */
 #include "rsx_test_programs.h"
 
 #include <stdio.h>
@@ -100,6 +101,12 @@ typedef struct {
     int n_depth_readback;
     u32 color_w, color_h;         /* size of the last colour surface created */
     float vp_xf[8];               /* viewport epilogue after the VS constants */
+    /* the last cube_render_target request */
+    int n_cube_view;
+    rsx_be_cube_face cube_face[6];
+    u64 cube_serial[6];
+    rsx_be_format cube_fmt;
+    u32 cube_w, cube_h, cube_remap, cube_rsx_fmt, last_cube;
 } StubState;
 
 static StubState stub;
@@ -160,6 +167,20 @@ static void stub_color_release(void* u, u32 handle)
 
 static u32 stub_surface_view(void* u, u32 surface, u32 remap, u32 fmt)
 { (void)u; (void)remap; (void)fmt; return surface; }
+
+static u32 stub_cube_view(void* u, const rsx_be_cube_face faces[6],
+                          const u64 serials[6],
+                          rsx_be_format fmt, u32 w, u32 h, u32 remap, u32 rsx_fmt)
+{
+    (void)u;
+    stub.n_cube_view++;
+    memcpy(stub.cube_face, faces, sizeof stub.cube_face);
+    memcpy(stub.cube_serial, serials, sizeof stub.cube_serial);
+    stub.cube_fmt = fmt; stub.cube_w = w; stub.cube_h = h;
+    stub.cube_remap = remap; stub.cube_rsx_fmt = rsx_fmt;
+    stub.last_cube = stub_handle();
+    return stub.last_cube;
+}
 
 static u32 stub_depth_create(void* u, u32 w, u32 h)
 { (void)u; (void)w; (void)h; stub.n_depth_create++; return stub_handle(); }
@@ -336,6 +357,7 @@ static const rsx_draw_backend g_stub_backend = {
     .color_target_release = stub_color_release,
     .color_target_write = stub_color_write,
     .surface_view = stub_surface_view,
+    .cube_target_view = stub_cube_view,
     .depth_target_create = stub_depth_create,
     .depth_target_release = stub_release,
     .depth_snapshot = stub_depth_snapshot,
@@ -450,6 +472,20 @@ static void bind_texture_unit(u32 location, u32 offset)
     m(M_TEX_UNIT + 0x18, (4u << 16) | 4u);    /* image rect 4x4 */
 }
 
+/* Bind unit 0 as an 8x8, one-level A8R8G8B8 linear CUBE at `offset`, with the
+ * face pitch the layout needs. */
+static void bind_cube_unit(u32 location, u32 offset, u32 size, u32 pitch)
+{
+    const u32 dma = (location == RSX_LOCATION_MAIN) ? 2u : 1u;
+    m(M_TEX_UNIT + 0x00, offset);
+    m(M_TEX_UNIT + 0x04, dma | (2u << 4) | ((0x85u | 0x20u) << 8) |
+                         (1u << 2) | (1u << 16));
+    m(M_TEX_UNIT + 0x0C, 0x80000000u);
+    m(M_TEX_UNIT + 0x10, 0xAAE4u);
+    m(M_TEX_UNIT + 0x18, (size << 16) | size);
+    m(0x1840u, pitch);                 /* TEX_SIZE1 unit 0: bytes per row */
+}
+
 /* ---- 1. the surface set -------------------------------------------------- */
 
 static void test_surface_set(void)
@@ -551,6 +587,100 @@ static void test_surface_aliasing(void)
           "a unit in the other context uploads instead of aliasing");
 
     engine_down();
+}
+
+/* ---- 1b. cube render targets (PS3RECOMP_RSX_CUBE_RT) ------------------- */
+
+static void test_cube_render_target(void)
+{
+    printf("-- cube render targets\n");
+    setenv("PS3RECOMP_RSX_CUBE_RT", "1", 1);
+    rsx_tex_miss_set_enabled(1);
+    rsx_tex_miss_reset();
+    engine_up();
+
+    m(M_CONTEXT_DMA_COLOR_A, DMA_LOCAL);
+    m(M_SURFACE_CLIP_H, 8u << 16);
+    m(M_SURFACE_CLIP_V, 8u << 16);
+    m(M_COLOR_A_PITCH, 64u);
+    m(M_SURFACE_FORMAT, 0x85u);
+
+    /* Six 8x8 targets one face stride (pitch 64 * height 8 = 0x200) apart. */
+    const u32 base = 0x00200000u;
+    u32 faces[6];
+    for (u32 f = 0; f < 6; f++) {
+        m(M_COLOR_A_OFFSET, base + f * 0x200u);
+        m(M_CLEAR_BUFFERS, 0xF0u);
+        faces[f] = stub.last_created_color;
+    }
+    const int creates = stub.n_cube_view;
+    bind_cube_unit(RSX_LOCATION_LOCAL, base, 8, 64);
+    draw_triangle();
+
+    CHECK(stub.n_cube_view == creates + 1,
+          "a cube unit over six colour targets asks the backend (%d calls)",
+          stub.n_cube_view);
+    int same = 1, placed = 1;
+    for (u32 f = 0; f < 6; f++) {
+        if (stub.cube_face[f].handle != faces[f]) same = 0;
+        if (stub.cube_face[f].x || stub.cube_face[f].y ||
+            stub.cube_face[f].w != 8 || stub.cube_face[f].h != 8) placed = 0;
+    }
+    CHECK(same, "the six faces are the six targets, in face order");
+    CHECK(placed, "each face is its own 8x8 window at 0,0");
+    CHECK(stub.cube_fmt == RSX_BE_FMT_R8G8B8A8 && stub.cube_w == 8 &&
+          stub.cube_h == 8 && stub.cube_remap == 0xAAE4u,
+          "the cube is built in the targets' format with the unit's crossbar");
+    CHECK(stub.bound_tex[0] == stub.last_cube,
+          "the unit samples the assembled cube (%u)", stub.bound_tex[0]);
+
+    /* Rewriting one face moves its serial, so the backend is asked to refresh
+     * even though the same six targets are named. */
+    const u64 serial0 = stub.cube_serial[0];
+    m(M_COLOR_A_OFFSET, base);
+    m(M_CLEAR_BUFFERS, 0xF0u);
+    draw_triangle();
+    CHECK(stub.cube_serial[0] != serial0,
+          "a rewritten face reaches the backend with a new serial");
+
+    /* Five faces is not a cube: the unit stays on the dummy and the census
+     * says why. */
+    const u32 partial = 0x00280000u;
+    for (u32 f = 0; f < 5; f++) {
+        m(M_COLOR_A_OFFSET, partial + f * 0x200u);
+        m(M_CLEAR_BUFFERS, 0xF0u);
+    }
+    const int calls = stub.n_cube_view;
+    bind_cube_unit(RSX_LOCATION_LOCAL, partial, 8, 64);
+    draw_triangle();
+    CHECK(stub.n_cube_view == calls && stub.bound_tex[0] == 0,
+          "an incomplete cube keeps the dummy (%d calls, unit %u)",
+          stub.n_cube_view, stub.bound_tex[0]);
+    CHECK(rsx_tex_miss_run_count(RSX_TEX_MISS_CUBE) == 1,
+          "and is counted as a cube miss (%u)",
+          rsx_tex_miss_run_count(RSX_TEX_MISS_CUBE));
+
+    /* One stacked 8x48 target holds the six faces as rows. */
+    const u32 stacked = 0x00300000u;
+    m(M_SURFACE_CLIP_V, 48u << 16);
+    m(M_COLOR_A_OFFSET, stacked);
+    m(M_CLEAR_BUFFERS, 0xF0u);
+    const u32 stacked_handle = stub.last_created_color;
+    const int before = stub.n_cube_view;
+    bind_cube_unit(RSX_LOCATION_LOCAL, stacked, 8, 64);
+    draw_triangle();
+    CHECK(stub.n_cube_view == before + 1,
+          "a stacked cube target is assembled too (%d calls)", stub.n_cube_view);
+    int rows = stub.n_cube_view == before + 1;
+    for (u32 f = 0; f < 6; f++)
+        if (stub.cube_face[f].handle != stacked_handle ||
+            stub.cube_face[f].x != 0 || stub.cube_face[f].y != f * 8u)
+            rows = 0;
+    CHECK(rows, "the six faces are rows 0..5 of the one target");
+
+    rsx_tex_miss_set_enabled(0);
+    engine_down();
+    unsetenv("PS3RECOMP_RSX_CUBE_RT");
 }
 
 /* ---- 2b. the MRT set ----------------------------------------------------- */
@@ -2726,6 +2856,7 @@ int main(void)
 
     test_surface_set();
     test_surface_aliasing();
+    test_cube_render_target();
     test_mrt_set();
     test_texture_cache();
     test_texture_lookup_memo();

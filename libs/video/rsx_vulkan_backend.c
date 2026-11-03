@@ -3142,6 +3142,103 @@ static u32 vk_eng_surface_view(void* user, u32 surface, u32 remap, u32 rsx_forma
     o->surface = surface; o->remap = remap; o->rsx_fmt = rsx_format;
     return hd;
 }
+/* ---- cube render targets (PS3RECOMP_RSX_CUBE_RT) -------------------------
+ * The game renders an 8x8 cube environment probe into ordinary colour
+ * targets; a TextureCube unit cannot sample a 2-D target. Assemble one
+ * six-layer cube image on the GPU, copying each face from its target once per
+ * face-content change, and hand back a cube-view handle. The cache is keyed
+ * by the six face windows, their colour serials and the crossbar, so every
+ * draw in a frame reuses the same image and no face is copied twice. */
+#define VK_CUBE_RT_CACHE 32
+typedef struct {
+    int      used;
+    rsx_be_cube_face face[6];
+    u64      serials[6];
+    rsx_be_format fmt;
+    u32      w, h, remap, rsx_fmt, handle;
+    unsigned long long tick;
+} vk_cube_rt;
+
+static vk_cube_rt s_cube_rt[VK_CUBE_RT_CACHE];
+static unsigned long long s_cube_rt_tick;
+
+/* Copy each face window into one layer of the cube image, in command order,
+ * and wait: the sources may include writes recorded earlier in the current
+ * batch, and the draw that samples the cube follows this call. */
+static int vk_cube_rt_copy(u32 handle, const rsx_be_cube_face faces[6], u32 w, u32 h)
+{
+    vk_eng_obj* dst = vk_eng_get(handle, VK_ENG_TEXTURE);
+    if (!dst || !dst->cube) return -1;
+    for (u32 f = 0; f < 6; f++)
+        if (!vk_eng_get(faces[f].handle, VK_ENG_COLOR)) return -1;
+    if (vk_begin()) return -1;
+    for (u32 f = 0; f < 6; f++)
+        vk_barrier_image(s_eobj[faces[f].handle].im.img, VK_IMAGE_ASPECT_COLOR_BIT,
+                         VK_IMAGE_LAYOUT_GENERAL);
+    vk_barrier_image(dst->im.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL);
+    for (u32 f = 0; f < 6; f++) {
+        const vk_eng_obj* src = &s_eobj[faces[f].handle];
+        VkImageCopy c = {
+            .srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
+            .srcOffset = { (int32_t)faces[f].x, (int32_t)faces[f].y, 0 },
+            .dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, (u32)f, 1 },
+            .extent = { w, h, 1 },
+        };
+        pvkCmdCopyImage(s_vk.cmd, src->im.img, VK_IMAGE_LAYOUT_GENERAL,
+                        dst->im.img, VK_IMAGE_LAYOUT_GENERAL, 1, &c);
+    }
+    vk_barrier_image(dst->im.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL);
+    return vk_submit_and_wait();
+}
+
+static u32 vk_eng_cube_target_view(void* user, const rsx_be_cube_face faces[6],
+                                   const u64 serials[6],
+                                   rsx_be_format fmt, u32 w, u32 h,
+                                   u32 remap, u32 rsx_fmt)
+{
+    (void)user;
+    if (!w || w != h) return 0;
+    vk_cube_rt* e = NULL;
+    int spare = -1;
+    for (u32 i = 0; i < VK_CUBE_RT_CACHE; i++) {
+        vk_cube_rt* c = &s_cube_rt[i];
+        if (!c->used) { if (spare < 0) spare = (int)i; continue; }
+        if (c->w == w && c->h == h && c->fmt == fmt && c->remap == remap &&
+            c->rsx_fmt == rsx_fmt && !memcmp(c->face, faces, sizeof c->face)) {
+            e = c; break;
+        }
+    }
+    if (!e) {
+        if (spare < 0) {
+            /* Evict the least recently used; a pending batch may still name
+             * its image, so let that batch finish first. */
+            unsigned long long oldest = (unsigned long long)-1;
+            for (u32 i = 0; i < VK_CUBE_RT_CACHE; i++)
+                if (s_cube_rt[i].tick < oldest) { oldest = s_cube_rt[i].tick; spare = (int)i; }
+            if (s_eb_pending) vk_eng_flush();
+            vk_eng_release(NULL, s_cube_rt[spare].handle);
+            memset(&s_cube_rt[spare], 0, sizeof s_cube_rt[spare]);
+        }
+        e = &s_cube_rt[spare];
+        memcpy(e->face, faces, sizeof e->face);
+        memcpy(e->serials, serials, sizeof e->serials);
+        e->fmt = fmt; e->w = w; e->h = h; e->remap = remap; e->rsx_fmt = rsx_fmt;
+        e->handle = vk_eng_texture_create(NULL, fmt, w, h, 1, 6, remap, rsx_fmt);
+        if (!e->handle) { memset(e, 0, sizeof *e); return 0; }
+        e->used = 1;
+        if (vk_cube_rt_copy(e->handle, faces, w, h)) {
+            vk_eng_release(NULL, e->handle);
+            memset(e, 0, sizeof *e);
+            return 0;
+        }
+    } else if (memcmp(e->serials, serials, sizeof e->serials)) {
+        if (vk_cube_rt_copy(e->handle, faces, w, h)) return 0;
+        memcpy(e->serials, serials, sizeof e->serials);
+    }
+    e->tick = ++s_cube_rt_tick;
+    return e->handle;
+}
+
 /* ---- colour feedback snapshots ---------------------------------------------
  * A draw that samples a colour target it is also writing (in-place deferred
  * lighting: read the albedo, write the lit colour over it) gets a copy of
@@ -4821,6 +4918,7 @@ static const rsx_draw_backend s_vk_engine_backend = {
     .color_target_create  = vk_eng_color_target_create,
     .color_target_release = vk_eng_release,
     .surface_view         = vk_eng_surface_view,
+    .cube_target_view     = vk_eng_cube_target_view,
     .depth_target_create  = vk_eng_depth_target_create,
     .depth_target_release = vk_eng_release,
     .depth_snapshot       = vk_eng_depth_snapshot,

@@ -24,6 +24,7 @@
 #include "rsx_wcb.c"
 #include "rsx_tex_miss.h"
 #include "rsx_tex_miss.c"
+#include "ps3_live_ctl.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -128,6 +129,10 @@ typedef struct {
     u64 wcb_ticket_serial;  /* color_serial the ticket's copy captured        */
     u32 wcb_reads;          /* guest reads that needed a copy                 */
     u32 wcb_last_read;      /* g.frames of the last one                       */
+    /* PS3RECOMP_RSX_CUBE_RT=1: the last draw that wrote this target, for the
+     * cube-face census (which programs produce the six faces). */
+    u64 last_writer_fp;
+    u32 last_writer_pipe;
 } eng_surface;
 
 typedef struct {
@@ -2023,6 +2028,172 @@ static u32 eng_texture_upload(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
         }
     }
     return handle;
+}
+
+/* ---- cube render targets (PS3RECOMP_RSX_CUBE_RT) -------------------------
+ *
+ * The dummy census found the dark players: an 8x8, one-mip cube texture whose
+ * guest address is also a colour target. A TextureCube unit cannot sample the
+ * 2-D target, so the backend reads the dummy. The game renders the six faces
+ * as ordinary colour targets -- either six targets at the texture's face
+ * stride, or one stacked target -- so assemble them on the GPU: one six-layer
+ * cube image, one copy per face, refreshed when a face's colour serial moves.
+ */
+#define ENG_CUBE_FACES 6
+
+typedef struct {
+    rsx_be_cube_face face[ENG_CUBE_FACES];
+    u64 serials[ENG_CUBE_FACES];
+    rsx_be_format fmt;
+    u32 w, h;              /* face size                                    */
+    u32 found, complete;   /* bitmasks of faces with a target / usable one */
+    u32 stride;            /* the face stride that matched, or 0           */
+} eng_cube_desc;
+
+static int s_cube_rt_env = -1;
+static int s_cube_log = -1;
+
+/* Live: PS3RECOMP_CTL can flip this mid-run (the A/B arms do); the
+ * environment value seeds the live key. */
+static int eng_cube_rt_on(void)
+{
+#if defined(__GNUC__) && !defined(_WIN32)
+    if (ps3_live_ctl_get) return ps3_live_ctl_get(PS3_LIVE_CUBE_RT);
+#endif
+    if (s_cube_rt_env < 0) {
+        const char* e = getenv("PS3RECOMP_RSX_CUBE_RT");
+        s_cube_rt_env = e && *e && strcmp(e, "0") != 0 ? 1 : 0;
+    }
+    return s_cube_rt_env;
+}
+
+static int eng_cube_log_on(void)
+{
+    if (s_cube_log < 0) { const char* e = getenv("PS3RECOMP_CUBE_RT_LOG");
+                          s_cube_log = e && *e && strcmp(e, "0") != 0 ? 1 : 0; }
+    return s_cube_log;
+}
+
+static u32 eng_surface_at_exact(u32 location, u32 offset)
+{
+    for (u32 i = 0; i < g.n_surfaces; i++) {
+        const eng_surface* s = &g.surfaces[i];
+        if (s->handle && s->location == location && s->offset == offset) return i;
+    }
+    return ENG_INVALID;
+}
+
+/* The six faces of `t` when at least its base address is a colour target.
+ * Returns 1 and fills `d`; `complete` says whether all six can be copied.
+ * The face layout is tried in the orders the hardware can leave it in:
+ * six targets one face-stride apart (the usual cube-RT setup), then one
+ * stacked target with the faces in rows (or columns). */
+static int eng_cube_collect(const rsx_dsp_texture* t, eng_cube_desc* d)
+{
+    memset(d, 0, sizeof *d);
+    const u32 base = eng_surface_at_exact(t->location, t->offset);
+    if (base == ENG_INVALID) return 0;
+
+    const u32 w = t->width, h = t->height;
+    d->w = w; d->h = h;
+    d->fmt = g.surfaces[base].fmt;
+    d->serials[0] = g.surfaces[base].color_serial;
+
+    u32 stride[3];
+    int ns = 0;
+    const u32 s_texture = rsx_texture_cube_face_stride(t->format, w, h,
+                                                       t->mipmaps, t->pitch);
+    const u32 s_pitch = t->pitch * h;
+    const u32 s_base = g.surfaces[base].pitch * h;
+    if (s_texture) stride[ns++] = s_texture;
+    if (s_pitch && (ns == 0 || s_pitch != stride[0])) stride[ns++] = s_pitch;
+    if (s_base && (ns == 0 || (s_base != stride[0] && (ns < 2 || s_base != stride[1]))))
+        stride[ns++] = s_base;
+
+    /* Six separate targets. A face must have been written (serial) and be at
+     * least face-sized; extra pixels are ignored. */
+    const u32 all = (1u << ENG_CUBE_FACES) - 1u;
+    for (int c = 0; c < ns; c++) {
+        u32 found = 0, complete = 0;
+        for (u32 f = 0; f < ENG_CUBE_FACES; f++) {
+            const u64 addr = (u64)t->offset + (u64)f * stride[c];
+            if (addr > 0xFFFFFFFFu) break;
+            const u32 slot = eng_surface_at_exact(t->location, (u32)addr);
+            if (slot == ENG_INVALID) continue;
+            const eng_surface* s = &g.surfaces[slot];
+            found |= 1u << f;
+            if (s->fmt != d->fmt || s->w < w || s->h < h || !s->color_serial) continue;
+            complete |= 1u << f;
+            d->face[f].handle = s->handle;
+            d->face[f].x = 0; d->face[f].y = 0;
+            d->face[f].w = w; d->face[f].h = h;
+            d->serials[f] = s->color_serial;
+        }
+        if (found == all && complete == found) {
+            d->found = found; d->complete = complete; d->stride = stride[c];
+            return 1;
+        }
+        if (found > d->found) { d->found = found; d->complete = complete; d->stride = 0; }
+    }
+
+    /* One stacked target: rows (or, failing that, columns), each face a
+     * window of the same colour serial. */
+    {
+        const eng_surface* s = &g.surfaces[base];
+        if (s->fmt == d->fmt && s->color_serial && s->w >= w &&
+            s->h >= (u64)h * ENG_CUBE_FACES) {
+            for (u32 f = 0; f < ENG_CUBE_FACES; f++) {
+                d->face[f].handle = s->handle;
+                d->face[f].x = 0; d->face[f].y = f * h;
+                d->face[f].w = w; d->face[f].h = h;
+                d->serials[f] = s->color_serial;
+            }
+            d->found = d->complete = all;
+            d->stride = 0;
+            return 1;
+        }
+        if (s->fmt == d->fmt && s->color_serial && s->h >= h &&
+            s->w >= (u64)w * ENG_CUBE_FACES) {
+            for (u32 f = 0; f < ENG_CUBE_FACES; f++) {
+                d->face[f].handle = s->handle;
+                d->face[f].x = f * w; d->face[f].y = 0;
+                d->face[f].w = w; d->face[f].h = h;
+                d->serials[f] = s->color_serial;
+            }
+            d->found = d->complete = all;
+            d->stride = 0;
+            return 1;
+        }
+    }
+    return 1;   /* base target exists, but the six faces are not all there */
+}
+
+static void eng_cube_log_desc(const rsx_dsp_texture* t, const eng_cube_desc* d,
+                              const char* what)
+{
+    static u32 last_frame = 0xFFFFFFFFu;
+    static u32 last_off = 0xFFFFFFFFu;
+    if (g.frames == last_frame && t->offset == last_off) return;
+    last_frame = g.frames; last_off = t->offset;
+    fprintf(stderr, "[cube-rt] frame=%u %s addr=0x%08X %ux%u fmt=0x%02X stride=0x%X "
+                    "found=0x%02X complete=0x%02X\n",
+            g.frames, what, t->offset, d->w, d->h, t->format, d->stride,
+            d->found, d->complete);
+    for (u32 f = 0; f < ENG_CUBE_FACES; f++) {
+        const eng_surface* s = NULL;
+        for (u32 i = 0; i < g.n_surfaces; i++)
+            if (g.surfaces[i].handle && g.surfaces[i].handle == d->face[f].handle) {
+                s = &g.surfaces[i]; break;
+            }
+        fprintf(stderr, "[cube-rt]   face %u %s handle=%u %ux%u at %u,%u serial=%llu "
+                        "writer_fp=0x%016llx pipe=%u\n",
+                f, (d->complete >> f) & 1u ? "ready" : "missing",
+                d->face[f].handle, d->face[f].w, d->face[f].h,
+                d->face[f].x, d->face[f].y,
+                (unsigned long long)d->serials[f],
+                s ? (unsigned long long)s->last_writer_fp : 0ull,
+                s ? s->last_writer_pipe : 0u);
+    }
 }
 
 /* The cache slot for a texture unit's bytes, keyed on where they are and what
@@ -3994,6 +4165,30 @@ static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
         const int compressed = base_fmt == RSX_TEX_FMT_DXT1 ||
                                base_fmt == RSX_TEX_FMT_DXT23 ||
                                base_fmt == RSX_TEX_FMT_DXT45;
+        /* A cube unit whose base address is a colour target: assemble the six
+         * faces on the GPU and bind the cube. If the base target exists but
+         * the six faces do not, keep the dummy and say so; do not let the
+         * 2-D surface path hand a 2-D target to a cube unit (that is the
+         * census's `surface` miss). */
+        if (t.cubemap && !compressed && g.be->cube_target_view && eng_cube_rt_on()) {
+            eng_cube_desc cd;
+            if (eng_cube_collect(&t, &cd)) {
+                const u32 all = (1u << ENG_CUBE_FACES) - 1u;
+                if (eng_cube_log_on())
+                    eng_cube_log_desc(&t, &cd, cd.complete == all ? "cube" : "incomplete");
+                if (cd.complete == all) {
+                    const u32 cube = g.be->cube_target_view(g.be->user, cd.face,
+                                                            cd.serials, cd.fmt,
+                                                            cd.w, cd.h,
+                                                            t.remap & 0xFFFFu,
+                                                            t.format);
+                    if (cube) { textures[u] = cube; continue; }
+                }
+                eng_tex_miss_note_reason(u, &t, RSX_TEX_MISS_CUBE);
+                textures[u] = 0;
+                continue;
+            }
+        }
         for (u32 i = 0; i < g.n_surfaces && !compressed; i++) {
             if (!g.surfaces[i].handle || g.surfaces[i].location != t.location ||
                 g.surfaces[i].offset != t.offset)
@@ -4994,7 +5189,16 @@ static void sink_end_work(void* user, const rsx_dispatch* r)
      * evidence that the decompile-translate-compile path worked. */
     if (!pipeline_is_fixed) g.guest_draws++;
 
-    if (rs.color_mask) eng_surfaces_wrote(targets, n_targets);
+    if (rs.color_mask) {
+        eng_surfaces_wrote(targets, n_targets);
+        /* Which program produced each target, for the cube-face census: the
+         * six faces of an environment probe are ordinary colour targets and
+         * the only way to name their producer is to remember the last draw. */
+        for (u32 i = 0; i < n_targets; i++) {
+            g.surfaces[targets[i]].last_writer_fp = s_miss_fp_hash;
+            g.surfaces[targets[i]].last_writer_pipe = s_miss_pipeline;
+        }
+    }
     if (zslot != ENG_INVALID && rs.depth_test && rs.depth_write) {
         g.zdepths[zslot].had_write = 1;
         eng_zdepth_wrote(zslot, &sf);
