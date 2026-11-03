@@ -50,7 +50,11 @@ static struct LwmSlot* lwm_slot(uint32_t lwmutex) { s_asked = lwmutex; return nu
 static void lwm_release(struct LwmSlot*) {}
 static int lwm_acquire(struct LwmSlot*, uint64_t) { return 1; }
 static void Sleep(unsigned) {}
+static int sched_yield(void) { return 0; }
 static void ppu_thread_note_block(uint64_t) {}
+static int ps3_live_ctl_get(int) { return 0; }
+#define PS3_LIVE_EXP_FAST_WAKE 0
+static void lwc_stats_note(uint32_t, int) {}
 /* PS3_LWCOND_REAL off: the poll path, the one the layout checks run on. */
 typedef struct lwc_slot lwc_slot;
 static int lwc_real(void) { return 0; }

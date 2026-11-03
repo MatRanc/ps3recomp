@@ -34,6 +34,9 @@
 #include "../platform/win32_compat.h"
 
 #define LWC_HASH 4096u
+/* A destroyed lwcond leaves a tombstone: the open-addressed probe chain past
+ * it must stay intact, but the slot may be reused by a later create. */
+#define LWC_TOMBSTONE ((long)-1)
 
 enum { LWC_SIGNALLED = 0, LWC_TIMEDOUT = 1, LWC_FALLBACK = 2 };
 
@@ -68,28 +71,71 @@ static inline long long lwc_now_us(void)
  * waiter may still be on one when the guest destroys or recreates the lwcond.
  * Lookups go through the table lock, which also orders the slot's init
  * before its publication on weakly ordered hosts. */
+/* `fresh` only for an unused slot. A tombstoned slot keeps its already
+ * initialised lock and condition variable: re-initialising a live host lock is
+ * undefined, and freeing the slot does not mean a stale waiter pointer cannot
+ * still be about to enter it. */
+static inline void lwc_slot_init(lwc_slot* s, uint32_t addr, int fresh)
+{
+    if (fresh) {
+        InitializeCriticalSection(&s->lock);
+        InitializeConditionVariable(&s->cv);
+    }
+    s->waiters = NULL;
+    s->addr = (long)addr;
+}
+
 static inline lwc_slot* lwc_slot_get(uint32_t addr, int create)
 {
     if (!addr) return NULL;
     lwc_slot* r = NULL;
+    lwc_slot* tomb = NULL;
     uint32_t h = (addr * 2654435761u) & (LWC_HASH - 1);
     AcquireSRWLockExclusive(&g_lwc_tab);
     for (uint32_t i = 0; i < LWC_HASH; i++) {
         lwc_slot* s = &g_lwc[(h + i) & (LWC_HASH - 1)];
-        if ((uint32_t)s->addr == addr) { r = s; break; }
-        if (s->addr == 0) {
+        const long cur = s->addr;
+        if ((uint32_t)cur == addr) { r = s; break; }
+        if (cur == 0) {
             if (create) {
-                InitializeCriticalSection(&s->lock);
-                InitializeConditionVariable(&s->cv);
-                s->waiters = NULL;
-                s->addr = (long)addr;
-                r = s;
+                lwc_slot* use = tomb ? tomb : s;
+                lwc_slot_init(use, addr, use->addr == 0);
+                r = use;
             }
             break;
         }
+        if (cur == LWC_TOMBSTONE && !tomb) tomb = s;
     }
+    /* A table whose only free entries are tombstones still has room. */
+    if (!r && create && tomb) { lwc_slot_init(tomb, addr, 0); r = tomb; }
     ReleaseSRWLockExclusive(&g_lwc_tab);
     return r;
+}
+
+/* Free the slot for `addr` if no thread is parked on it. Returns 1 when the
+ * slot was released, 0 while a waiter (marked or not) is still on the queue,
+ * -1 when there is no slot. The check and the tombstone happen under the slot
+ * lock, so a destroy cannot free a slot a waiter has just enqueued on. */
+static inline int lwc_slot_free(uint32_t addr)
+{
+    if (!addr) return -1;
+    int rc = -1;
+    uint32_t h = (addr * 2654435761u) & (LWC_HASH - 1);
+    AcquireSRWLockExclusive(&g_lwc_tab);
+    for (uint32_t i = 0; i < LWC_HASH; i++) {
+        lwc_slot* s = &g_lwc[(h + i) & (LWC_HASH - 1)];
+        const long cur = s->addr;
+        if ((uint32_t)cur == addr) {
+            EnterCriticalSection(&s->lock);
+            if (s->waiters) rc = 0;
+            else { s->addr = LWC_TOMBSTONE; rc = 1; }
+            LeaveCriticalSection(&s->lock);
+            break;
+        }
+        if (cur == 0) break;
+    }
+    ReleaseSRWLockExclusive(&g_lwc_tab);
+    return rc;
 }
 
 /* Wait on `s` as guest thread `tid`. `unlock` releases the paired lwmutex

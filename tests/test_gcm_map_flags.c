@@ -34,8 +34,17 @@ static void reject(u32 ea,u32 io,u32 size,u32 flags,s32 expected) {
 }
 int main(void) {
     vm_base=calloc(1,0x10000);assert(vm_base);reset_maps();
+    /* Guest-visible offset tables live in the injected GCM window. Keep it in
+     * this 64 KB fixture and opt into map/unmap publication. */
+    ppu_hle_inject_base=0x1000;
+    setenv("PS3RECOMP_GCM_OFFSET_SYNC","1",1);
     const u32 strict=2, page=0x100000;
     assert(cellGcmMapEaIoAddressWithFlags(0x44e00000,0x0e000000,2*page,strict)==CELL_OK);
+    /* No GetOffsetTable call in between: the map itself must reach the guest. */
+    assert(vm_read16(ppu_hle_inject_base+0x3000+0x44e*2)==0xe0);
+    assert(vm_read16(ppu_hle_inject_base+0x3000+0x44f*2)==0xe1);
+    assert(vm_read16(ppu_hle_inject_base+0x5000+0xe0*2)==0x44e);
+    assert(vm_read16(ppu_hle_inject_base+0x5000+0xe1*2)==0x44f);
     const u32 offsets[]={0,0xfffff,0x100000,0x1fffff};
     for(unsigned i=0;i<sizeof(offsets)/sizeof(offsets[0]);i++) {
         u32 delta=offsets[i];
@@ -45,7 +54,6 @@ int main(void) {
         assert(vm_read32(0x104)==0x44e00000+delta);
         assert(gcm_io2ea(0x0e000000+delta)==0x44e00000+delta);
     }
-    ppu_hle_inject_base=0x1000;
     assert(cellGcmGetOffsetTable((CellGcmOffsetTable*)(uintptr_t)0x200)==CELL_OK);
     assert(vm_read16(vm_read32(0x200)+0x44e*2)==0xe0);
     assert(vm_read16(vm_read32(0x204)+0xe1*2)==0x44f);
@@ -71,6 +79,8 @@ int main(void) {
     assert(cellGcmUnmapEaIoAddress(0x44e00000)==CELL_OK);
     assert(s_io_address_table[0x44e]==0xffff && s_io_address_table[0x44f]==0xffff);
     assert(s_ea_address_table[0xe0]==0xffff && s_ea_address_table[0xe1]==0xffff);
+    assert(vm_read16(ppu_hle_inject_base+0x3000+0x44e*2)==0xffff);
+    assert(vm_read16(ppu_hle_inject_base+0x5000+0xe0*2)==0xffff);
     assert(cellGcmMapEaIoAddressWithFlags(0x44e00000,0x0e000000,2*page,strict)==CELL_OK);
     reset_maps();
     for(unsigned i=0;i<CELL_GCM_MAX_IO_MAPPINGS;i++)

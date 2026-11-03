@@ -72,6 +72,7 @@ typedef struct {
     u32         maxContention;
     u32         readyCount;
     int         started;       /* its SPU program has been dispatched        */
+    int         shutting_down; /* PS3RECOMP_SPURS_TEARDOWN: no new dispatch  */
 } SpursWorkload;
 
 typedef struct {
@@ -510,6 +511,7 @@ static s32 spurs_scheduler_start(struct SpursInst* si);
 static s32 spurs_scheduler_stop(struct SpursInst* si, u32 ea);
 static void spurs_scheduler_retire(u32 ea);
 static void spurs_scheduler_forget(u32 wid);
+static int spurs_teardown_on(void);
 
 static struct SpursInst* spurs_inst_find(u32 ea)
 {
@@ -1441,6 +1443,7 @@ s32 cellSpursAddWorkload(CellSpurs* spurs, CellSpursWorkloadId* wid,
             s_workloads[i].minContention = minContention;
             s_workloads[i].maxContention = maxContention;
             s_workloads[i].readyCount = 0;
+            s_workloads[i].shutting_down = 0;
 
             if (priority_h)
                 memcpy(s_workloads[i].priority, priority_h, CELL_SPURS_MAX_SPU);
@@ -1673,9 +1676,17 @@ s32 cellSpursRemoveWorkload(CellSpurs* spurs, CellSpursWorkloadId wid)
     }
 
     if (si->active[wid] || spurs_policy_release_workload(si->ea, wid)) {
-        spurs_api_unlock(si); return CELL_SPURS_CORE_ERROR_BUSY;
+        /* Finding 2 + 3 are one switch: with the real drain on, the corrected
+         * core BUSY code (0x8041080A) lets the guest retry until Wait has
+         * drained. With it off, keep the old swapped code so the guest's
+         * equality test never matches and it does not hot-spin (the stub
+         * Shutdown/Wait would not make progress). */
+        const s32 busy = spurs_teardown_on() ? CELL_SPURS_CORE_ERROR_BUSY
+                                             : (s32)0x8041070A;
+        spurs_api_unlock(si); return busy;
     }
     s_workloads[wid].in_use = 0;
+    s_workloads[wid].shutting_down = 0;
     vm_write8(si->ea + SPURS_WKL_STATE1 + wid, 3);
     vm_write32(si->ea + SPURS_WKL_ENABLED,
                vm_read32(si->ea + SPURS_WKL_ENABLED) & ~(0x80000000u >> wid));
@@ -1812,7 +1823,7 @@ static int spurs_pm_fast_can_rerun(struct SpursInst* si, struct SpursPmSlot* slo
     u32 pm_size; const uint8_t* pm; u64 data;
     AcquireSRWLockExclusive(&s_workload_registry_lock);
     SpursWorkload* w = &s_workloads[wid];
-    int ok = w->in_use && w->spurs_ea == ea;
+    int ok = w->in_use && w->spurs_ea == ea && !w->shutting_down;
     pm_size = ok ? w->sizePm : 0;
     pm = ok ? vm_base + (u32)(uintptr_t)w->pm : NULL;
     ReleaseSRWLockExclusive(&s_workload_registry_lock);
@@ -1952,7 +1963,8 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
                 si->cursor = (wid + 1) & 15;
                 if (!(enabled & (0x80000000u >> wid)) ||
                     vm_read8(ea + SPURS_WKL_STATE1 + wid) != 2 ||
-                    !s_workloads[wid].in_use || s_workloads[wid].spurs_ea != ea)
+                    !s_workloads[wid].in_use || s_workloads[wid].spurs_ea != ea ||
+                    s_workloads[wid].shutting_down)
                     continue;
                 /* SPURS_LANE6=1 (ceiling probe): this title's MeshJobs0/1
                  * (wids 1 and 2) set priority[5]=0 and maxContention=5, which
@@ -3416,10 +3428,55 @@ s32 cellSpursGetWorkloadInfo(u64 spurs_ea, u32 wid, u64 info_ea)
     return CELL_OK;
 }
 
+/* PS3RECOMP_SPURS_TEARDOWN=1 (live key): Shutdown stops new dispatch and Wait
+ * drains the workload's in-flight policy runs before returning. Off by default;
+ * the old Shutdown/Wait were success stubs. Read per call so a fixture can set
+ * the environment after the translation unit is loaded. */
+static int spurs_teardown_on(void)
+{
+#ifdef SPURS_HAVE_LIVE_CTL
+    if (ps3_live_ctl_get) return ps3_live_ctl_get(PS3_LIVE_SPURS_TEARDOWN) != 0;
+#endif
+    const char* e = getenv("PS3RECOMP_SPURS_TEARDOWN");
+    return e && *e && *e != '0';
+}
+static u32 spurs_shutdown_timeout_ms(void)
+{
+    static u32 v;
+    if (!v) {
+        const char* e = getenv("SPURS_SHUTDOWN_MS");
+        long n = e ? atol(e) : 0;
+        v = (n > 0) ? (u32)n : 2000u;
+    }
+    return v;
+}
+
 s32 cellSpursShutdownWorkload(u64 spurs_ea, u32 wid)
 {
     static int _n = 0;
     if (PS3_LOG_FIRST(_n, 8)) printf("[cellSpurs] ShutdownWorkload(wid=%u)\n", wid);
+    if (!spurs_teardown_on()) return CELL_OK;
+    if (wid >= CELL_SPURS_MAX_WORKLOAD) return CELL_SPURS_CORE_ERROR_INVAL;
+
+    struct SpursInst* si;
+    s32 rc = spurs_api_lock((u32)spurs_ea, &si);
+    if (rc) return rc;
+    if (!s_workloads[wid].in_use || s_workloads[wid].spurs_ea != si->ea) {
+        spurs_api_unlock(si); return CELL_SPURS_CORE_ERROR_SRCH;
+    }
+
+    s_workloads[wid].shutting_down = 1;
+    /* Stop dispatch: no ready unit, no signal bit, not runnable, disabled. */
+    spu_lockline_lock();
+    vm_base[si->ea + SPURS_WKL_READY1 + wid] = 0;
+    ef_w16(si->ea + SPURS_WKL_SIGNAL1,
+           (u16)(vm_read16(si->ea + SPURS_WKL_SIGNAL1) & ~(0x8000u >> wid)));
+    ef_line_end(si->ea);
+    si->idle[wid] = 0;
+    vm_base[si->ea + SPURS_WKL_STATE1 + wid] = 3;
+    vm_write32(si->ea + SPURS_WKL_ENABLED,
+               vm_read32(si->ea + SPURS_WKL_ENABLED) & ~(0x80000000u >> wid));
+    spurs_api_unlock(si);
     return CELL_OK;
 }
 
@@ -3427,7 +3484,28 @@ s32 cellSpursWaitForWorkloadShutdown(u64 spurs_ea, u32 wid)
 {
     static int _n = 0;
     if (PS3_LOG_FIRST(_n, 8)) printf("[cellSpurs] WaitForWorkloadShutdown(wid=%u)\n", wid);
-    return CELL_OK;
+    if (!spurs_teardown_on()) return CELL_OK;
+    if (wid >= CELL_SPURS_MAX_WORKLOAD) return CELL_SPURS_CORE_ERROR_INVAL;
+
+    struct SpursInst* si;
+    s32 rc = spurs_api_lock((u32)spurs_ea, &si);
+    if (rc) return rc;
+    if (!s_workloads[wid].in_use || s_workloads[wid].spurs_ea != si->ea) {
+        spurs_api_unlock(si); return CELL_SPURS_CORE_ERROR_SRCH;
+    }
+    /* Drop the registry lock while waiting: a policy returning from its fast
+     * re-run loop takes si->lock and then the registry lock, and holding the
+     * registry here would deadlock that drain. */
+    ReleaseSRWLockExclusive(&s_workload_registry_lock);
+    const u32 timeout_ms = spurs_shutdown_timeout_ms();
+    const DWORD t0 = GetTickCount();
+    while (si->active[wid]) {
+        const DWORD elapsed = GetTickCount() - t0;
+        if (elapsed >= timeout_ms) { rc = CELL_SPURS_CORE_ERROR_BUSY; break; }
+        SleepConditionVariableSRW(&si->wake, &si->lock, timeout_ms - elapsed, 0);
+    }
+    ReleaseSRWLockExclusive(&si->lock);
+    return rc;
 }
 
 /* =========================================================================

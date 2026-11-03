@@ -86,6 +86,14 @@ static int io_pages_used(void)
     return n;
 }
 static u32 gcm_io_alloc(u32 size);
+/* The guest offset tables are opt-in (PS3RECOMP_GCM_OFFSET_SYNC); this fixture
+ * checks the host tables only, so the publish side is a no-op. */
+#define PS3_LIVE_GCM_OFFSET_SYNC 0
+#define GCM_OFFSET_TABLE_PAGES 1
+#define GCM_OFFSET_TABLE_IO_ADDR 0
+#define GCM_OFFSET_TABLE_EA_ADDR 0
+static int gcm_live_get(int key, const char* env) { (void)key; (void)env; return 0; }
+static void vm_write16(u32 a, u16 v) { (void)a; (void)v; }
 %s
 int main(void)
 {

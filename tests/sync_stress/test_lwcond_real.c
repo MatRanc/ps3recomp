@@ -367,8 +367,32 @@ static void phase_table(void)
     CHECK(lwc_signal(a, 1, 0) == 0);             /* nobody waiting: no-op */
 }
 
+/* ---- 6. destroy frees an idle slot, EBUSY while a waiter is parked ---- */
+static void phase_destroy(void)
+{
+    lwc_slot* a = lwc_slot_get(0x60000, 1);
+    CHECK(a != NULL);
+    CHECK(lwc_slot_free(0x60000) == 1);
+    CHECK(lwc_slot_get(0x60000, 0) == NULL);
+    CHECK(lwc_slot_get(0x60000, 1) != NULL);     /* tombstone reused */
+
+    memset((void*)sa.woke, 0, sizeof sa.woke); sa.n = 0;
+    tm_init(&sa.m);
+    sa.s = lwc_slot_get(0x60008, 1);
+    HANDLE h = spawn(sa_waiter, (void*)(uintptr_t)0);
+    CHECK(await_parked(sa.s, 1));
+    CHECK(lwc_slot_free(0x60008) == 0);          /* still parked -> EBUSY */
+    tm_lock(&sa.m);
+    CHECK(lwc_signal(sa.s, 1, 0) == 1);
+    tm_unlock(&sa.m);
+    join(h);
+    CHECK(lwc_slot_free(0x60008) == 1);
+    printf("  destroy: idle freed, parked returns EBUSY\n");
+}
+
 static const struct { const char* name; void (*fn)(void); } phases[] = {
     {"table", phase_table},
+    {"destroy", phase_destroy},
     {"prodcons", phase_prodcons},
     {"timeouts", phase_timeouts},
     {"signal", phase_signal},

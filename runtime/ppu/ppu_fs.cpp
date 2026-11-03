@@ -19,6 +19,8 @@
 #include "ps3emu/nid.h"      /* ps3_compute_nid */
 #include "ps3emu/guest_call.h" /* ps3_invoke_guest: AIO completion is a guest OPD */
 #include "ps3emu/guest_access.h"
+#include "ps3emu/fs_write_check.h"   /* shared short-write predicate */
+#include "../../libs/video/ps3_live_ctl.h"   /* PS3RECOMP_FS_WRITE_CHECK */
 #include "sdata_decrypt.h"   /* SDATA/EDAT (NPD) decryption for cellFsSdataOpen */
 #include <stdint.h>
 #include <stdio.h>
@@ -548,6 +550,14 @@ static void cellFsRead(ppu_context* ctx)
     ctx->gpr[3] = CELL_OK;
 }
 
+static int fs_write_check_on(void)
+{
+    if (ps3_live_ctl_get) return ps3_live_ctl_get(PS3_LIVE_FS_WRITE_CHECK) != 0;
+    static int v = -1;
+    if (v < 0) { const char* e = getenv("PS3RECOMP_FS_WRITE_CHECK"); v = (e && *e && *e != '0') ? 1 : 0; }
+    return v;
+}
+
 static void cellFsWrite(ppu_context* ctx)
 {
     int fd          = (int)(uint32_t)ctx->gpr[3];
@@ -559,6 +569,7 @@ static void cellFsWrite(ppu_context* ctx)
     fs_prefault(buf, nbytes);   /* kernel READS the buffer; same reserved-page trap */
     fs_set_dir(fd, f, 2);
     size_t n = fwrite(vm_base + buf, 1, (size_t)nbytes, f);
+    const int write_failed = ps3_fs_write_failed(n, nbytes, ferror(f));
     /* DIAGNOSTIC (PS3_FSLOG_BT=1): dump the guest back-chain when the game logs the
      * render-config failure, to locate setScreenRenderTargetInternal & the config obj. */
     if (getenv("PS3_FSLOG_BT") && buf && nbytes > 0 && nbytes < 4096 && vm_base) {
@@ -581,7 +592,8 @@ static void cellFsWrite(ppu_context* ctx)
         }
     }
     if (nwr_ptr) vm_write64(nwr_ptr, n);
-    ctx->gpr[3] = CELL_OK;
+    ctx->gpr[3] = (write_failed && fs_write_check_on())
+                  ? (uint64_t)(int64_t)CELL_FS_EIO : CELL_OK;
 }
 
 /* cellFsFGetBlockSize(int fd, u64* sector_size, u64* block_size)

@@ -15,7 +15,9 @@
 #include <errno.h>
 #include "../../runtime/ppu/ppu_memory.h"   /* GUEST_PTR, vm_write*: guest EA -> host */
 #include "ps3emu/log_first.h"
+#include "ps3emu/fs_write_check.h"
 #include "ps3emu/guest_access.h"    /* rendered bytes the kernel is about to read */
+#include "../video/ps3_live_ctl.h"  /* PS3RECOMP_FS_WRITE_CHECK */
 
 /* glibc's <sys/stat.h> exposes st_atime/st_mtime/st_ctime as macros that expand
  * to st_atim.tv_sec etc.  They collide with the identically named members of the
@@ -554,6 +556,14 @@ s32 cellFsRead(CellFsFd fd, void* buf, u64 nbytes, u64* nread)
     return CELL_OK;
 }
 
+static int fs_write_check_on(void)
+{
+    if (ps3_live_ctl_get) return ps3_live_ctl_get(PS3_LIVE_FS_WRITE_CHECK) != 0;
+    static int v = -1;
+    if (v < 0) { const char* e = getenv("PS3RECOMP_FS_WRITE_CHECK"); v = (e && *e && *e != '0') ? 1 : 0; }
+    return v;
+}
+
 /* NID: 0xECDCF2AB */
 s32 cellFsWrite(CellFsFd fd, const void* buf, u64 nbytes, u64* nwrite)
 {
@@ -564,6 +574,7 @@ s32 cellFsWrite(CellFsFd fd, const void* buf, u64 nbytes, u64* nwrite)
         return CELL_EFAULT;
 
     u64 bytes_written = 0;
+    int write_failed = 0;
 
     if (s_files[fd].host_fp) {
         /* fwrite can hand a large buffer straight to write(2), which fails
@@ -572,13 +583,15 @@ s32 cellFsWrite(CellFsFd fd, const void* buf, u64 nbytes, u64* nwrite)
          * faces to HeadFaceCacheFile). */
         ps3_guest_access(gptr((void*)buf), (size_t)nbytes);
         bytes_written = (u64)fwrite(gptr((void*)buf), 1, (size_t)nbytes, s_files[fd].host_fp);
+        write_failed = ps3_fs_write_failed((size_t)bytes_written, nbytes,
+                                           ferror(s_files[fd].host_fp));
         fflush(s_files[fd].host_fp);
     }
 
     if (nwrite)
         *(u64*)gptr(nwrite) = ps3_bswap64(bytes_written);
 
-    return CELL_OK;
+    return (write_failed && fs_write_check_on()) ? (s32)CELL_EIO : CELL_OK;
 }
 
 /* NID: 0xA397D042 */

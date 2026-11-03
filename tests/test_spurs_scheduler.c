@@ -134,6 +134,9 @@ static void register_pm(unsigned ea,unsigned byte,spu_lifted_entry_fn fn,int ima
 }
 int main(void)
 {
+    /* The corrected core BUSY code (0x8041080A) is what the SDK contract and
+     * the guest's retry loop use; it is armed with the teardown pair. */
+    setenv("PS3RECOMP_SPURS_TEARDOWN","1",1);
     vm_base=calloc(1,ppu_vm_size);assert(vm_base);
     register_pm(0x9000,0x11,consumer,77);register_pm(0x9100,0x22,producer,78);
     assert((u32)cellSpursInitialize((CellSpurs*)0x1000,7,0,0,0)==CELL_SPURS_CORE_ERROR_INVAL);

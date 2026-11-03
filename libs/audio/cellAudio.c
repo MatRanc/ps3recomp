@@ -14,6 +14,8 @@
 
 #include "../../runtime/memory/vm.h"   /* vm_commit */
 #include "cellAudio.h"
+#include "audio_pace.h"
+#include "../video/ps3_live_ctl.h"
 #include "../../runtime/ppu/ppu_memory.h"   /* vm_base, vm_read64, vm_write32 */
 #include <stdio.h>
 #include <string.h>
@@ -22,6 +24,9 @@
 #include <math.h>
 #include "ps3emu/log_first.h"
 #include "ps3emu/thread_name.h"
+#ifndef _WIN32
+#include <time.h>
+#endif
 
 /* Event-queue push/lookup (runtime/syscalls/sys_event.c). Forward-declared
  * rather than including sys_event.h to avoid pulling PPU context/syscall
@@ -649,22 +654,79 @@ static unsigned __stdcall audio_mix_thread_func(void* arg)
     return 0;
 }
 #else
+static int audio_pace_on(void)
+{
+    /* Live: PS3RECOMP_CTL flips PS3RECOMP_AUDIO_PACE mid-run. */
+    if (ps3_live_ctl_get) return ps3_live_ctl_get(PS3_LIVE_AUDIO_PACE) != 0;
+    static int v = -1;
+    if (v < 0) { const char* e = getenv("PS3RECOMP_AUDIO_PACE"); v = (e && *e && *e != '0') ? 1 : 0; }
+    return v;
+}
+static long long audio_now_ns(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (long long)ts.tv_sec * 1000000000ll + (long long)ts.tv_nsec;
+}
+static void audio_sleep_ns(long long ns)
+{
+    if (ns <= 0) return;
+    struct timespec ts;
+    ts.tv_sec = (time_t)(ns / 1000000000ll);
+    ts.tv_nsec = (long)(ns % 1000000000ll);
+    nanosleep(&ts, NULL);
+}
 static void* audio_mix_thread_func(void* arg)
 {
     (void)arg;
     printf("[cellAudio] Mixing thread started\n");
 
+    audio_pace pace;
+    audio_pace_start(&pace, audio_now_ns());
+
     while (s_mix_thread_running) {
+        if (audio_pace_on()) {
+            /* Use the backend's room when there is a device; the device clock
+             * is the real 5333 us period. With no device (or a backend that
+             * cannot report), pace the same period on CLOCK_MONOTONIC. */
+            const int room = audio_backend_room();
+            if (room >= 0) {
+                if (room < CELL_AUDIO_BLOCK_SAMPLES) { audio_backend_wait(); continue; }
+            } else {
+                long long sleep_ns = 0;
+                if (!audio_pace_ready(&pace, audio_now_ns(),
+                                      AUDIO_PACE_PERIOD_NS, &sleep_ns)) {
+                    audio_sleep_ns(sleep_ns);
+                    continue;
+                }
+                audio_pace_next(&pace);
+            }
+        }
+
         audio_mix_one_block();
         audio_backend_submit(s_mix_buffer, CELL_AUDIO_BLOCK_SAMPLES);
         audio_notify_event_queues();
 
-        u32 queued = audio_backend_queued_samples();
-        if (queued > CELL_AUDIO_BLOCK_SAMPLES * 4) {
-            usleep(5000);
-        } else {
-            usleep(2000);
+        if (!audio_pace_on()) {
+            u32 queued = audio_backend_queued_samples();
+            if (queued > CELL_AUDIO_BLOCK_SAMPLES * 4) {
+                usleep(5000);
+            } else {
+                usleep(2000);
+            }
         }
+
+        /* AUDIO_RATE=1: blocks mixed vs real time, like the WASAPI branch. */
+        { static int on = -1; if (on < 0) on = getenv("AUDIO_RATE") ? 1 : 0;
+          if (on) { static long long t0; static unsigned n, z;
+            long long now = audio_now_ns(); if (!t0) t0 = now; n++;
+            { int nz = 0; for (u32 i = 0; i < CELL_AUDIO_BLOCK_SAMPLES * 2; i++)
+                  if (s_mix_buffer[i] != 0.0f) { nz = 1; break; }
+              if (!nz) z++; }
+            if (now - t0 >= 5000000000ll) {
+                fprintf(stderr, "[audio-rate] %.1f blocks/s (real time 187.5), silent %.1f%%%c",
+                        n * 1e9 / (double)(now - t0), n ? 100.0 * z / n : 0.0, 10);
+                n = z = 0; t0 = now; } } }
     }
 
     printf("[cellAudio] Mixing thread stopped\n");

@@ -59,6 +59,11 @@ enum {
     PS3_LIVE_SPU_CODE_DMA_MEMO, /* SPU_CODE_DMA_MEMO: skip a code GET already resident byte-identical */
     PS3_LIVE_PREPARE_FLIP_RET,  /* cellGcmSetPrepareFlip returns the display buffer id */
     PS3_LIVE_FLIP_ON_DONE,      /* complete a flip when its present is queued, not on the display tick */
+    PS3_LIVE_LWCOND_REAL,       /* PS3_LWCOND_REAL: host condition variables with real timeouts */
+    PS3_LIVE_AUDIO_PACE,        /* PS3RECOMP_AUDIO_PACE: 5333 us audio period on the host clock */
+    PS3_LIVE_FS_WRITE_CHECK,    /* PS3RECOMP_FS_WRITE_CHECK: error on a short/failed cellFsWrite */
+    PS3_LIVE_SPURS_TEARDOWN,    /* PS3RECOMP_SPURS_TEARDOWN: real Shutdown/Wait drain */
+    PS3_LIVE_GCM_OFFSET_SYNC,   /* PS3RECOMP_GCM_OFFSET_SYNC: publish guest offset tables on map/unmap */
     PS3_LIVE_COUNT
 };
 

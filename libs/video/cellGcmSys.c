@@ -91,6 +91,7 @@ static u64 get_timestamp_ns(void)
 static int  s_gcm_initialized = 0;
 /* Defined with the other switch helpers below. */
 static int  gcm_live_get(int key, const char* env);
+static void gcm_publish_offset_tables(void);
 static u32  s_flip_mode   = CELL_GCM_DISPLAY_VSYNC;
 static u32  s_flip_status = CELL_GCM_FLIP_STATUS_DONE;
 /* Flip requests (each puts the status back to WAITING) and the request a
@@ -470,23 +471,37 @@ static void populate_offset_table(u32 ea, u32 io, u32 size)
     u32 pages = (size + 0xFFFFFu) >> 20;  /* number of 1MB pages, rounded up */
     u32 ea_page = ea >> 20;
     u32 io_page = io >> 20;
+    const int sync = gcm_live_get(PS3_LIVE_GCM_OFFSET_SYNC, "PS3RECOMP_GCM_OFFSET_SYNC");
 
     for (u32 i = 0; i < pages && (ea_page + i) < 65536 && (io_page + i) < 65536; i++) {
         s_io_address_table[ea_page + i] = (u16)(io_page + i);
         s_ea_address_table[io_page + i] = (u16)(ea_page + i);
+        /* The guest caches these guest-visible tables at GetOffsetTable, so a
+         * mapping made later must update them here, not only on a later call. */
+        if (sync && (ea_page + i) < GCM_OFFSET_TABLE_PAGES)
+            vm_write16(GCM_OFFSET_TABLE_IO_ADDR + (ea_page + i) * 2, (u16)(io_page + i));
+        if (sync && (io_page + i) < GCM_OFFSET_TABLE_PAGES)
+            vm_write16(GCM_OFFSET_TABLE_EA_ADDR + (io_page + i) * 2, (u16)(ea_page + i));
     }
 }
 
 /* Clear offset table entries for an IO mapping */
 static void clear_offset_table(u32 ea, u32 io, u32 size)
 {
-    u32 pages = size >> 20;
+    /* Round up exactly like populate_offset_table: a partial final page was
+     * mapped, so it must be unmapped too. */
+    u32 pages = (size + 0xFFFFFu) >> 20;
     u32 ea_page = ea >> 20;
     u32 io_page = io >> 20;
+    const int sync = gcm_live_get(PS3_LIVE_GCM_OFFSET_SYNC, "PS3RECOMP_GCM_OFFSET_SYNC");
 
     for (u32 i = 0; i < pages && (ea_page + i) < 65536 && (io_page + i) < 65536; i++) {
         s_io_address_table[ea_page + i] = 0xFFFF;
         s_ea_address_table[io_page + i] = 0xFFFF;
+        if (sync && (ea_page + i) < GCM_OFFSET_TABLE_PAGES)
+            vm_write16(GCM_OFFSET_TABLE_IO_ADDR + (ea_page + i) * 2, 0xFFFF);
+        if (sync && (io_page + i) < GCM_OFFSET_TABLE_PAGES)
+            vm_write16(GCM_OFFSET_TABLE_EA_ADDR + (io_page + i) * 2, 0xFFFF);
     }
 }
 
@@ -582,6 +597,9 @@ s32 cellGcmInit(u32 cmdSize, u32 ioSize, u32 ioAddress)
      * producing plausible-but-wrong offsets instead of a translation failure. */
     memset(s_io_address_table, 0xFF, sizeof(s_io_address_table));
     memset(s_ea_address_table, 0xFF, sizeof(s_ea_address_table));
+    /* A re-init must not leave entries from the previous table in guest memory. */
+    if (gcm_live_get(PS3_LIVE_GCM_OFFSET_SYNC, "PS3RECOMP_GCM_OFFSET_SYNC"))
+        gcm_publish_offset_tables();
     s_current_display_buffer_id = 0;
     s_flip_handler = NULL;
     s_vblank_handler = NULL;
@@ -4954,6 +4972,8 @@ void cellGcmTerminate(void)
      * producing plausible-but-wrong offsets instead of a translation failure. */
     memset(s_io_address_table, 0xFF, sizeof(s_io_address_table));
     memset(s_ea_address_table, 0xFF, sizeof(s_ea_address_table));
+    if (gcm_live_get(PS3_LIVE_GCM_OFFSET_SYNC, "PS3RECOMP_GCM_OFFSET_SYNC"))
+        gcm_publish_offset_tables();
     s_current_display_buffer_id = 0;
     s_last_flip_time = 0;
 }
