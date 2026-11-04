@@ -68,6 +68,46 @@ int main(void)
     for (u32 i = 0; i < N; i++) assert(rsx_vertex_remap_index(&remap, i) == want_big[i]);
 
     rsx_vertex_remap_destroy(&remap);
+
+    /* Incremental reference hash: folding each reference as it is appended
+     * must give exactly rsx_vertex_refs_hash() of the finished list (the draw
+     * engine uses the fold to skip a second pass over the list). Includes the
+     * empty list and lists whose length is not a multiple of the reference
+     * size's natural word count, plus a "restart cut" where the sentinel is
+     * never appended. */
+    {
+        rsx_vertex_ref list[257];
+        for (u32 n = 0; n <= 257; n += (n < 8 ? 1u : 37u)) {
+            for (u32 i = 0; i < n; i++) {
+                list[i].vertex_id = (i * 2654435761u) ^ (i << 7);
+                list[i].base_index = (i * 40503u) ^ (i >> 3);
+            }
+            u64 fold = RSX_VERTEX_REFS_HASH_BASIS;
+            for (u32 i = 0; i < n; i++)
+                fold = rsx_vertex_refs_hash_fold(fold, list[i].vertex_id,
+                                                 list[i].base_index);
+            /* The trailing count is byte-wise, like the engine's tail. */
+            for (u32 b = 0; b < sizeof n; b++)
+                fold = (fold ^ ((const u8*)&n)[b]) * 1099511628211ull;
+            assert(fold == rsx_vertex_refs_hash(list, n));
+        }
+        /* Restart sentinel: it is excluded from the list, so the hash must be
+         * the one a shorter list would produce. */
+        const u32 ids[6] = { 40, 41, 0xFFFFFFFFu, 42, 41, 43 };
+        u64 fold = RSX_VERTEX_REFS_HASH_BASIS;
+        u32 kept = 0;
+        for (u32 i = 0; i < 6; i++)
+            if (ids[i] != 0xFFFFFFFFu) {
+                list[kept].vertex_id = ids[i];
+                list[kept].base_index = 2;
+                fold = rsx_vertex_refs_hash_fold(fold, ids[i], 2);
+                kept++;
+            }
+        for (u32 b = 0; b < sizeof kept; b++)
+            fold = (fold ^ ((const u8*)&kept)[b]) * 1099511628211ull;
+        assert(fold == rsx_vertex_refs_hash(list, kept));
+    }
+
     puts("vertex remap: ok");
     return 0;
 }

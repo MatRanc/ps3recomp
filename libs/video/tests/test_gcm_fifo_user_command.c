@@ -61,6 +61,8 @@ void rsx_draw_engine_set_walker_fast(int on) { (void)on; }
 void rsx_draw_engine_set_fetch_memo(int on) { (void)on; }
 void rsx_draw_engine_set_pipe_memo(int on) { (void)on; }
 void rsx_draw_engine_set_remap_cache(int on) { (void)on; }
+void rsx_draw_engine_set_memo_index(int on) { (void)on; }
+void rsx_draw_engine_set_refs_hash_fast(int on) { (void)on; }
 void rsx_draw_engine_set_no_draw(int on) { (void)on; }
 void rsx_draw_engine_wcb_set_wake(void (*wake)(void)) { (void)wake; }
 void rsx_draw_engine_set_display_query(int (*fn)(u32 offset)) { (void)fn; }

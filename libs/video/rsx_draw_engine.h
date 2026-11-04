@@ -525,6 +525,8 @@ void rsx_draw_engine_set_walker_fast(int on);
 void rsx_draw_engine_set_fetch_memo(int on);
 void rsx_draw_engine_set_pipe_memo(int on);
 void rsx_draw_engine_set_remap_cache(int on);
+void rsx_draw_engine_set_memo_index(int on);
+void rsx_draw_engine_set_refs_hash_fast(int on);
 void rsx_draw_engine_set_no_draw(int on);
 
 /* Captured dispatcher state: enough to start a replay at the frame boundary

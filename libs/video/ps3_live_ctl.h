@@ -79,6 +79,8 @@ enum {
     PS3_LIVE_DUMP_FIFO_TRIGGER,         /* PS3RECOMP_DUMP_FIFO_TRIGGER: rising edge starts a FIFO dump (armed mode only) */
     PS3_LIVE_SPURS_PM_NATIVE_DISPATCH,  /* SPURS_PM_NATIVE_DISPATCH: wid bitmask for staged-job native re-dispatch */
     PS3_LIVE_FLIP_DEADLINE_US,          /* PS3RECOMP_FLIP_DEADLINE_US: cap the flip-done lwcond to the guest deadline (us) */
+    PS3_LIVE_MEMO_INDEX,                /* PS3RECOMP_MEMO_INDEX: probe fetch/remap/pipe memos through a direct-mapped index */
+    PS3_LIVE_REFS_HASH_FAST,            /* PS3RECOMP_REFS_HASH_FAST: fold the reference hash in while building the list */
     PS3_LIVE_COUNT
 };
 

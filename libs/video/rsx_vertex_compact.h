@@ -157,6 +157,15 @@ int rsx_vertex_fetch_many_stream(
  * it has somewhere to write it. */
 int rsx_vertex_fetch_plan_can_fail(const rsx_vertex_fetch_plan* plan);
 
+/* FNV-1a identity of a reference list, exactly as the draw engine's memo
+ * keys use it: one native 64-bit word per 8-byte reference, then the count
+ * byte-wise. rsx_vertex_refs_hash_fold() produces the same value while the
+ * list is being built (one reference at a time), so a renderer can avoid a
+ * second pass over a 100k-reference list. */
+u64 rsx_vertex_refs_hash(const rsx_vertex_ref* refs, u32 n);
+u64 rsx_vertex_refs_hash_fold(u64 h, u32 vertex_id, u32 base_index);
+#define RSX_VERTEX_REFS_HASH_BASIS 1469598103934665603ull
+
 /* Collapse repeated (vertex_id, base_index) references in first-use order.
  * refs is rewritten in place with the unique prefix.  The occurrence map
  * remains valid until the next call using the same remap object. */

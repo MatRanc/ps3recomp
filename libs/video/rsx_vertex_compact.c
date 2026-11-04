@@ -832,6 +832,34 @@ static int rsx_vertex_remap_fast_on(void)
     return s_remap_fast_env;
 }
 
+#define RSX_REFS_FNV_PRIME 1099511628211ull
+
+static u64 rsx_refs_hash_bytes(u64 h, const void* data, u32 n)
+{
+    const u8* p = (const u8*)data;
+    for (u32 i = 0; i < n; i++) { h ^= p[i]; h *= RSX_REFS_FNV_PRIME; }
+    return h;
+}
+
+u64 rsx_vertex_refs_hash(const rsx_vertex_ref* refs, u32 n)
+{
+    u64 h = RSX_VERTEX_REFS_HASH_BASIS;
+    if (refs && n && n <= 0xFFFFFFFFu / (u32)sizeof(*refs))
+        for (u32 i = 0; i < n; i++) {
+            u64 w;
+            memcpy(&w, &refs[i], sizeof w);
+            h = (h ^ w) * RSX_REFS_FNV_PRIME;
+        }
+    return rsx_refs_hash_bytes(h, &n, sizeof n);
+}
+
+u64 rsx_vertex_refs_hash_fold(u64 h, u32 vertex_id, u32 base_index)
+{
+    /* The 8-byte memory image of the reference on a little-endian host. */
+    const u64 w = (u64)vertex_id | ((u64)base_index << 32);
+    return (h ^ w) * RSX_REFS_FNV_PRIME;
+}
+
 int rsx_vertex_remap_build(
     rsx_vertex_remap* remap, rsx_vertex_ref* refs, u32 count,
     u32* unique_count)

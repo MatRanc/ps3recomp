@@ -275,6 +275,11 @@ static int s_ptrace = -1;
 #define ENG_FETCH_MEMO 1024
 #define ENG_PIPE_MEMO  512
 #define ENG_REMAP_MEMO 1024
+/* PS3RECOMP_MEMO_INDEX: the memo find used to be a linear scan of the whole
+ * table (1024/512 slots) on every draw. A direct-mapped index answers the
+ * common hit in one probe; a collision still falls back to the exact scan,
+ * so the answer is the same either way. */
+#define ENG_MEMO_INDEX 4096
 
 /* One prepared fetch plan and its remap, keyed by the attribute layout, the
  * decoded VTXFMT/default state and the reference set. No guest bytes are
@@ -339,6 +344,11 @@ static int s_pipe_memo;
 /* PS3RECOMP_REMAP_CACHE: memoize rsx_vertex_remap_build by the reference
  * list, independent of the fetch plan (plan item 1/4). */
 static int s_remap_cache;
+/* PS3RECOMP_MEMO_INDEX: probe the memo through a direct-mapped index before
+ * the exact linear scan. PS3RECOMP_REFS_HASH_FAST: fold the reference hash
+ * into the reference-building loop instead of hashing the whole list again. */
+static int s_memo_index;
+static int s_refs_hash_fast;
 /* EXP_NO_DRAW: live throwaway switch. When on, sink_end returns before any
  * fetch, pipeline, texture or Vulkan recording; the method stream (and so
  * fences, labels and flips) still dispatches exactly as before. */
@@ -353,12 +363,41 @@ static eng_pipe_memo s_pmemo[ENG_PIPE_MEMO];
 static u32 s_pmemo_next;
 static eng_remap_memo s_rmemo[ENG_REMAP_MEMO];
 static u32 s_rmemo_next;
+/* slot + 1 of the last entry stored under a bucket, 0 = none. */
+static u32 s_fmemo_index[ENG_MEMO_INDEX];
+static u32 s_pmemo_index[ENG_MEMO_INDEX];
+static u32 s_rmemo_index[ENG_MEMO_INDEX];
+
+static inline u32 eng_memo_bucket(u64 key)
+{
+    /* The keys are already well mixed (FNV-1a / a 64-bit fingerprint); the
+     * low bits are as good as any and the fold keeps a 64-bit key's high
+     * bits from vanishing on a table smaller than 2^32. */
+    return (u32)(key ^ (key >> 32)) & (ENG_MEMO_INDEX - 1u);
+}
+
+/* Remember where an entry was stored. A later collision only loses the
+ * shortcut (the find falls back to its exact scan), never an answer. */
+static inline void eng_memo_index_put(u32* index, u32 slot, u64 key)
+{
+    index[eng_memo_bucket(key)] = slot + 1u;
+}
+
+/* The direct-mapped shortcut: nonzero only when this exact entry is the one
+ * the bucket last named. */
+static inline u32 eng_memo_index_get(const u32* index, u64 key)
+{
+    return index[eng_memo_bucket(key)];
+}
 
 static void eng_fast_reset_caches(void)
 {
     for (u32 i = 0; i < ENG_FETCH_MEMO; i++) s_fmemo[i].used = 0;
     for (u32 i = 0; i < ENG_PIPE_MEMO; i++) s_pmemo[i].used = 0;
     for (u32 i = 0; i < ENG_REMAP_MEMO; i++) s_rmemo[i].used = 0;
+    memset(s_fmemo_index, 0, sizeof s_fmemo_index);
+    memset(s_pmemo_index, 0, sizeof s_pmemo_index);
+    memset(s_rmemo_index, 0, sizeof s_rmemo_index);
     s_fmemo_next = s_pmemo_next = s_rmemo_next = 0;
     s_fast_epoch = 1;
     s_fetch_hits = s_fetch_misses = 0;
@@ -427,6 +466,25 @@ void rsx_draw_engine_set_remap_cache(int on)
     }
 }
 
+void rsx_draw_engine_set_memo_index(int on)
+{
+    if (on == s_memo_index) return;
+    s_memo_index = on;
+    /* An entry cached while this was off was not indexed; the exact scan
+     * still finds it, so no flush is needed. Clear the stale index anyway so
+     * the first probe after enabling cannot name an unrelated generation. */
+    if (on) {
+        memset(s_fmemo_index, 0, sizeof s_fmemo_index);
+        memset(s_pmemo_index, 0, sizeof s_pmemo_index);
+        memset(s_rmemo_index, 0, sizeof s_rmemo_index);
+    }
+}
+
+void rsx_draw_engine_set_refs_hash_fast(int on)
+{
+    s_refs_hash_fast = on;
+}
+
 void rsx_draw_engine_set_no_draw(int on)
 {
     s_no_draw = on;
@@ -446,6 +504,9 @@ static struct {
 
     rsx_vertex_ref* refs;
     u32 n_refs, cap_refs, n_source_refs;
+    /* FNV-1a of the source reference bytes, folded in while the list is
+     * built. Equal to eng_refs_key()'s hash over the same refs. */
+    u64 refs_hash;
     int refs_remapped;
     rsx_vertex_remap ref_remap;
 
@@ -4285,6 +4346,15 @@ static u64 eng_pipe_fingerprint(const u8* vp, u32 vp_bytes,
 
 static eng_pipe_memo* eng_pipe_memo_find(u64 fingerprint)
 {
+    if (s_memo_index) {
+        const u32 s = eng_memo_index_get(s_pmemo_index, fingerprint);
+        if (s && s <= ENG_PIPE_MEMO) {
+            eng_pipe_memo* m = &s_pmemo[s - 1u];
+            if (m->used && m->epoch == s_fast_epoch &&
+                m->fingerprint == fingerprint)
+                return m;
+        }
+    }
     for (u32 i = 0; i < ENG_PIPE_MEMO; i++)
         if (s_pmemo[i].used && s_pmemo[i].epoch == s_fast_epoch &&
             s_pmemo[i].fingerprint == fingerprint)
@@ -4324,6 +4394,8 @@ static void eng_pipe_memo_save(u64 fingerprint, u32 handle, int fixed,
 {
     eng_pipe_memo* m = eng_pipe_memo_alloc();
     m->fingerprint = fingerprint;
+    if (s_memo_index)
+        eng_memo_index_put(s_pmemo_index, (u32)(m - s_pmemo), fingerprint);
     m->handle = handle;
     m->fixed = (u8)fixed;
     m->tex_used = (u16)tex_used;
@@ -4630,10 +4702,29 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
 
 /* ---- draw accumulation --------------------------------------------------- */
 
+/* The incremental reference hash reproduces eng_refs_key() byte for byte:
+ * rsx_vertex_ref is two host-endian u32s and eng_fnv1a reads their memory
+ * image. On a little-endian host that image is the low byte first; elsewhere
+ * keep the whole-list pass (the shortcut is a pure optimisation, never an
+ * answer). */
+#if defined(_M_X64) || defined(_M_IX86) || defined(__x86_64__) || defined(__i386__) || \
+    (defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__)
+#define ENG_HAVE_FAST_REFS_HASH 1
+#endif
+
+/* eng_refs_key() hashes the list through eng_fnv1a_words, i.e. one native
+ * u64 per 8-byte reference. rsx_vertex_ref is two u32s; on a little-endian
+ * host its word is vertex_id in the low half, base_index in the high. */
+static inline u64 eng_refs_hash_ref(u64 h, u32 vertex_id, u32 base_index)
+{
+    return rsx_vertex_refs_hash_fold(h, vertex_id, base_index);
+}
+
 static void dc_reset(void)
 {
     dc.n_arr = dc.n_idx = dc.n_packets = 0;
     dc.n_refs = dc.n_source_refs = dc.n_verts = dc.n_cuts = 0;
+    dc.refs_hash = 1469598103934665603ull;
     dc.refs_remapped = 0;
     dc.fetch_ok = 1;
     dc.fetch_deferred = 0;
@@ -4654,6 +4745,8 @@ static int dc_push_ref(u32 vertex_id, u32 base_index)
     }
     dc.refs[dc.n_refs].vertex_id = vertex_id;
     dc.refs[dc.n_refs].base_index = base_index;
+    if (s_refs_hash_fast)
+        dc.refs_hash = eng_refs_hash_ref(dc.refs_hash, vertex_id, base_index);
     dc.n_refs++;
     return 1;
 }
@@ -4684,6 +4777,8 @@ static int dc_push_index_run(const u8* run, u32 count, int is_u32, u32 base_inde
     if (!dc_reserve_refs(count)) return 0;
     rsx_vertex_ref* out = dc.refs;
     u32 n = dc.n_refs;
+    const int hash = s_refs_hash_fast;
+    u64 h = dc.refs_hash;
     if (is_u32) {
         for (u32 i = 0; i < count; i++) {
             const u8* p = run + (size_t)i * 4u;
@@ -4693,12 +4788,15 @@ static int dc_push_index_run(const u8* run, u32 count, int is_u32, u32 base_inde
                 if (!rsx_restart_cut_push(&dc.cuts, &dc.n_cuts, &dc.cap_cuts, n)) return 0;
                 continue;
             }
-            out[n].vertex_id = index; out[n].base_index = base_index; n++;
+            out[n].vertex_id = index; out[n].base_index = base_index;
+            if (hash) h = eng_refs_hash_ref(h, index, base_index);
+            n++;
         }
     } else if (!restart_en) {
         for (u32 i = 0; i < count; i++) {
-            out[n + i].vertex_id = (u32)((run[2u * i] << 8) | run[2u * i + 1u]);
-            out[n + i].base_index = base_index;
+            const u32 index = (u32)((run[2u * i] << 8) | run[2u * i + 1u]);
+            out[n + i].vertex_id = index; out[n + i].base_index = base_index;
+            if (hash) h = eng_refs_hash_ref(h, index, base_index);
         }
         n += count;
     } else {
@@ -4709,9 +4807,12 @@ static int dc_push_index_run(const u8* run, u32 count, int is_u32, u32 base_inde
                 if (!rsx_restart_cut_push(&dc.cuts, &dc.n_cuts, &dc.cap_cuts, n)) return 0;
                 continue;
             }
-            out[n].vertex_id = index; out[n].base_index = base_index; n++;
+            out[n].vertex_id = index; out[n].base_index = base_index;
+            if (hash) h = eng_refs_hash_ref(h, index, base_index);
+            n++;
         }
     }
+    dc.refs_hash = h;
     dc.n_refs = n;
     return 1;
 }
@@ -4813,15 +4914,22 @@ static u64 eng_fetch_key(const rsx_vertex_fetch_plan* p,
  * fetch and remap memos (the fetch key used to hash the same words again). */
 static u64 eng_refs_key(const rsx_vertex_ref* refs, u32 n)
 {
-    u64 h = 1469598103934665603ull;
-    if (n && n <= 0xFFFFFFFFu / (u32)sizeof(*refs))
-        h = eng_fnv1a_words(refs, n * (u32)sizeof(*refs), h);
-    h = eng_fnv1a(&n, sizeof n, h);
-    return h;
+    /* The same identity is available incrementally
+     * (rsx_vertex_refs_hash_fold) for the fast path; both live in the
+     * vertex-compaction unit so a fixture can check they agree. */
+    return rsx_vertex_refs_hash(refs, n);
 }
 
 static eng_remap_memo* eng_remap_memo_find(u64 key)
 {
+    if (s_memo_index) {
+        const u32 s = eng_memo_index_get(s_rmemo_index, key);
+        if (s && s <= ENG_REMAP_MEMO) {
+            eng_remap_memo* m = &s_rmemo[s - 1u];
+            if (m->used && m->epoch == s_fast_epoch && m->key == key)
+                return m;
+        }
+    }
     for (u32 i = 0; i < ENG_REMAP_MEMO; i++)
         if (s_rmemo[i].used && s_rmemo[i].epoch == s_fast_epoch &&
             s_rmemo[i].key == key)
@@ -4847,6 +4955,8 @@ static void eng_remap_memo_save(u64 key, const rsx_vertex_ref* refs,
 {
     eng_remap_memo* m = eng_remap_memo_alloc();
     m->key = key;
+    if (s_memo_index)
+        eng_memo_index_put(s_rmemo_index, (u32)(m - s_rmemo), key);
     m->n_source = n_source;
     m->n_unique = n_unique;
     m->remapped = remapped;
@@ -4871,6 +4981,14 @@ static void eng_remap_memo_save(u64 key, const rsx_vertex_ref* refs,
 
 static eng_fetch_memo* eng_fetch_memo_find(u64 key)
 {
+    if (s_memo_index) {
+        const u32 s = eng_memo_index_get(s_fmemo_index, key);
+        if (s && s <= ENG_FETCH_MEMO) {
+            eng_fetch_memo* m = &s_fmemo[s - 1u];
+            if (m->used && m->epoch == s_fast_epoch && m->key == key)
+                return m;
+        }
+    }
     for (u32 i = 0; i < ENG_FETCH_MEMO; i++)
         if (s_fmemo[i].used && s_fmemo[i].epoch == s_fast_epoch &&
             s_fmemo[i].key == key)
@@ -5049,8 +5167,17 @@ static void dc_fetch(const rsx_vertex_layout_plan* layout, int allow_remap)
     /* One pass over the source references feeds both memos; the fetch key
      * used to hash the same words a second time. */
     u64 refs_key = 0;
-    if (fast_cacheable || remap_cacheable)
+    if (fast_cacheable || remap_cacheable) {
+#ifdef ENG_HAVE_FAST_REFS_HASH
+        if (s_refs_hash_fast) {
+            /* Folded while the list was built; only eng_refs_key()'s tail
+             * (the count) is left. */
+            refs_key = eng_fnv1a(&dc.n_source_refs, sizeof dc.n_source_refs,
+                                 dc.refs_hash);
+        } else
+#endif
         refs_key = eng_refs_key(dc.refs, dc.n_source_refs);
+    }
     rsx_vertex_fetch_plan next_plan;
     u64 fetch_key = 0;
     eng_fetch_memo* fetch_hit = NULL;
@@ -5133,6 +5260,8 @@ static void dc_fetch(const rsx_vertex_layout_plan* layout, int allow_remap)
         if (fast_cacheable) {
             eng_fetch_memo* m = eng_fetch_memo_alloc();
             m->key = fetch_key;
+            if (s_memo_index)
+                eng_memo_index_put(s_fmemo_index, (u32)(m - s_fmemo), fetch_key);
             m->n_source = dc.n_source_refs;
             m->n_unique = dc.n_refs;
             m->remapped = dc.refs_remapped;
@@ -6929,6 +7058,10 @@ int rsx_draw_engine_init(u32 width, u32 height)
       if (e && *e) s_pipe_memo = strcmp(e, "0") != 0; }
     { const char* e = getenv("PS3RECOMP_REMAP_CACHE");
       s_remap_cache = e && *e && strcmp(e, "0") != 0; }
+    { const char* e = getenv("PS3RECOMP_MEMO_INDEX");
+      s_memo_index = e && *e && strcmp(e, "0") != 0; }
+    { const char* e = getenv("PS3RECOMP_REFS_HASH_FAST");
+      s_refs_hash_fast = e && *e && strcmp(e, "0") != 0; }
     { const char* e = getenv("EXP_NO_DRAW");
       s_no_draw = e && *e && strcmp(e, "0") != 0; }
     eng_fast_reset_caches();

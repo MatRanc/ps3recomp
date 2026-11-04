@@ -2929,6 +2929,10 @@ static void gcm_rsx_process_fifo_unlocked(void)
                  : walker_fast);
     rsx_draw_engine_set_remap_cache(gcm_live_get(PS3_LIVE_REMAP_CACHE,
                                                  "PS3RECOMP_REMAP_CACHE"));
+    rsx_draw_engine_set_memo_index(gcm_live_get(PS3_LIVE_MEMO_INDEX,
+                                                "PS3RECOMP_MEMO_INDEX"));
+    rsx_draw_engine_set_refs_hash_fast(gcm_live_get(PS3_LIVE_REFS_HASH_FAST,
+                                                    "PS3RECOMP_REFS_HASH_FAST"));
     rsx_draw_engine_set_no_draw(gcm_live_get(PS3_LIVE_EXP_NO_DRAW, "EXP_NO_DRAW"));
     const int wcap = rsx_wcap_begin_if_triggered();
     const int wdiag = gcm_word_diag(), wmirror = gcm_word_mirror_only();
