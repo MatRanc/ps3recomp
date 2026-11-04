@@ -61,6 +61,14 @@ static SPU_THREAD_LOCAL int t_save_image;
 static SPU_THREAD_LOCAL int t_union_mode;   /* 0 none, 1 union, 2 simple */
 static SPU_THREAD_LOCAL int t_union_depth;
 
+/* The native screen key's mode 2 selects this union driver with the native
+ * 0xD080 stage in place of the lifted one. */
+extern int c690_native_screen_mode(void) __attribute__((weak));
+static int native_screen_union(void)
+{
+    return c690_native_screen_mode && c690_native_screen_mode() == 2;
+}
+
 static int cull_live_get(int key, int fallback)
 {
 #ifdef C690_CULL_HAVE_LIVE_CTL
@@ -95,7 +103,7 @@ int c690_cull_fix_enabled(int family)
     cull_read_env();
     if (family == 2)
         return cull_live_get(PS3_LIVE_C690_CULL_FIX_2C, s_env_fix_2c);
-    return cull_live_get(PS3_LIVE_C690_CULL_FIX, s_env_fix);
+    return cull_live_get(PS3_LIVE_C690_CULL_FIX, s_env_fix) || native_screen_union();
 }
 
 /* MLB16_CULL_BYPASS: the generated c690 module calls this for every 0x25/0x26
@@ -120,6 +128,7 @@ int c690_cull_bypass_mode(void)
 int c690_cull_fix_maybe(void)
 {
     cull_read_env();
+    if (native_screen_union()) return 1;
     if (s_env_fix || s_env_fix_2c) return 1;
 #ifdef C690_CULL_HAVE_LIVE_CTL
     if (ps3_live_ctl_enabled) return ps3_live_ctl_enabled() != 0;

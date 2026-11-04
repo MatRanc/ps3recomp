@@ -70,6 +70,8 @@ enum {
     PS3_LIVE_REMAP_FAST,        /* PS3RECOMP_REMAP_FAST: recent-reference memo in the remap build */
     PS3_LIVE_TICK_IN_DRAIN,     /* PS3RECOMP_TICK_IN_DRAIN: complete a queued flip from inside the drain */
     PS3_LIVE_CULL_BYPASS,       /* MLB16_CULL_BYPASS: 1 both cull families, 2 0x2C, 3 0x25/0x26 */
+    PS3_LIVE_C690_NATIVE_SCREEN,        /* PS3RECOMP_C690_NATIVE_SCREEN: 1 exact, 2 sample-grid union */
+    PS3_LIVE_C690_NATIVE_SCREEN_SHADOW, /* PS3RECOMP_C690_NATIVE_SCREEN_SHADOW: run+compare both */
     PS3_LIVE_COUNT
 };
 
