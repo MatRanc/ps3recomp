@@ -89,7 +89,13 @@ enum {
     C69C_STAGE_IN  = 5,
     C69C_STAGE_OUT = 6,
     C69C_OPCODES   = 7,
-    C69C_JOB_END   = 8
+    C69C_JOB_END   = 8,
+    /* PS3RECOMP_C690_TAIL_CAPTURE: command-boundary stage pairs. IN is the
+     * local store + GPRs at the handler entry, OUT is the same at the next
+     * command handler (or the job end). The payload adds a tail meta block
+     * and a 16-byte-line write bitmap in front of the usual meta/LS/GPRs. */
+    C69C_TAIL_IN   = 9,
+    C69C_TAIL_OUT  = 10
 };
 
 typedef struct {
@@ -116,6 +122,63 @@ static int s_inited;
 static int s_on;
 static char s_dir[1024];
 static char s_trigger[1024];
+
+/* ---- PS3RECOMP_C690_TAIL_CAPTURE --------------------------------------- *
+ * Stage-level corpus for the GPU geometric tail. Off by default and separate
+ * from PS3RECOMP_C690_CORPUS so it can be enabled for one meter run without
+ * turning on the per-job DMA capture. It is driven from c690_stats'
+ * command-boundary hooks (indirect dispatch + SPU_DIRECT), so it needs no
+ * edit to the generated lifted module and it captures the whole command,
+ * including direct-call bodies such as the 0xBB80 path. */
+#define C690_TAIL_KEYS         64
+#define C690_TAIL_META_WORDS   24
+#define C690_TAIL_LINE_SHIFT   4
+#define C690_TAIL_LINES        (SPU_LS_SIZE >> C690_TAIL_LINE_SHIFT)
+#define C690_TAIL_BITMAP_BYTES (C690_TAIL_LINES >> 3)
+#define C690_TAIL_UNKNOWN_KEY  0xFFFFFFFFu
+
+typedef struct {
+    uint32_t key;
+    uint32_t used;
+    unsigned long long calls;
+    unsigned long long ns;
+    unsigned long long pairs;
+} c690_tail_key;
+
+static c690_tail_key s_tail_keys[C690_TAIL_KEYS];
+
+typedef struct {
+    int active;
+    int sampled;           /* snapshot taken; only sampled commands are kept */
+    int op;
+    uint32_t stage_lsa;
+    uint32_t entry_pc;
+    uint32_t key;
+    uint32_t key_lsa;
+    uint32_t seq;
+    uint32_t gpr3, gpr4, gpr5, gpr6;
+    uint32_t cmd[8];
+    uint64_t entry_ns;
+    uint8_t in_ls[SPU_LS_SIZE];
+    uint8_t in_gpr[C690_CORPUS_GPR_SIZE];
+    uint8_t bitmap[C690_TAIL_BITMAP_BYTES];
+} c690_tail_run;
+
+static SPU_THREAD_LOCAL c690_tail_run* t_tail;
+static SPU_THREAD_LOCAL FILE* t_tail_f;
+int g_c690_tail_on = 0;
+static int s_tail_on;
+static char s_tail_dir[1024];
+static char s_tail_trigger[1024];
+static int s_tail_trigger_seen;
+static uint64_t s_tail_trigger_last_ns;
+static uint64_t s_tail_hist_last_ns;
+static unsigned s_tail_pairs = 8;
+static unsigned s_tail_stride = 1;
+static unsigned long long s_tail_seq;
+static unsigned long long s_tail_files;
+static unsigned long long s_tail_entries;
+static unsigned long long s_tail_pairs_written;
 static unsigned s_max_jobs = 2000;
 static unsigned s_stage_jobs = 20;
 static unsigned s_stage_stride = 1;
@@ -172,6 +235,30 @@ static uint64_t c690_corpus_now_ns(void)
 static void c690_corpus_init(void)
 {
     if (__atomic_exchange_n(&s_inited, 1, __ATOMIC_RELAXED)) return;
+
+    /* Tail capture is its own trigger; it does not require the per-job corpus
+     * or the DMA spool. */
+    const char* td = getenv("PS3RECOMP_C690_TAIL_CAPTURE");
+    if (td && *td) {
+        snprintf(s_tail_dir, sizeof s_tail_dir, "%s", td);
+        const char* tn = getenv("PS3RECOMP_C690_TAIL_PAIRS");
+        if (tn && *tn) { long v = strtol(tn, NULL, 0); if (v > 0) s_tail_pairs = (unsigned)v; }
+        const char* ts = getenv("PS3RECOMP_C690_TAIL_STRIDE");
+        if (ts && *ts) { long v = strtol(ts, NULL, 0); if (v > 0) s_tail_stride = (unsigned)v; }
+        const char* tt = getenv("PS3RECOMP_C690_TAIL_TRIGGER");
+        if (tt && *tt) snprintf(s_tail_trigger, sizeof s_tail_trigger, "%s", tt);
+        s_tail_on = 1;
+        g_c690_tail_on = 1;
+#if defined(_WIN32)
+        _mkdir(s_tail_dir);
+#else
+        mkdir(s_tail_dir, 0777);
+#endif
+        fprintf(stderr, "[c690-tail] enabled dir=%s pairs_per_key=%u stride=%u\n",
+                s_tail_dir, s_tail_pairs, s_tail_stride);
+        fflush(stderr);
+    }
+
     const char* d = getenv("PS3RECOMP_C690_CORPUS");
     if (!d || !*d) return;
     snprintf(s_dir, sizeof s_dir, "%s", d);
@@ -526,6 +613,287 @@ void c690_corpus_cull_exit(const struct spu_context* ctx, uint32_t stage_lsa)
     c690_cull_spool_maybe_close();
 }
 
+/* ---- tail-stage capture (PS3RECOMP_C690_TAIL_CAPTURE) ------------------- */
+
+static uint32_t c690_tail_be32(const uint8_t* ls, uint32_t off)
+{
+    const uint32_t a = off & SPU_LS_MASK & ~3u;
+    return ((uint32_t)ls[a] << 24) | ((uint32_t)ls[a + 1] << 16) |
+           ((uint32_t)ls[a + 2] << 8) | (uint32_t)ls[a + 3];
+}
+
+static int c690_tail_is_stage_op(int op)
+{
+    return op == 0x21 || op == 0x25 || op == 0x26 || op == 0x2A;
+}
+
+/* The 0x13080 sub-selector targets. r6 at the target entry carries the
+ * selector in the low three bits and the A730/BB80 format bit in bit 4. */
+static int c690_tail_sel_lsa(uint32_t lsa)
+{
+    return lsa == 0x13178u || lsa == 0x13140u ||
+           lsa == 0x131A0u || lsa == 0x131F8u;
+}
+
+static c690_tail_key* c690_tail_key_slot(uint32_t key, int create)
+{
+    for (;;) {
+        for (unsigned i = 0; i < C690_TAIL_KEYS; i++) {
+            if (__atomic_load_n(&s_tail_keys[i].used, __ATOMIC_ACQUIRE) &&
+                __atomic_load_n(&s_tail_keys[i].key, __ATOMIC_RELAXED) == key)
+                return &s_tail_keys[i];
+        }
+        if (!create) return NULL;
+        for (unsigned i = 0; i < C690_TAIL_KEYS; i++) {
+            uint32_t zero = 0;
+            if (__atomic_load_n(&s_tail_keys[i].used, __ATOMIC_RELAXED))
+                continue;
+            if (__atomic_compare_exchange_n(&s_tail_keys[i].used, &zero, 1u, 0,
+                                            __ATOMIC_ACQ_REL, __ATOMIC_RELAXED)) {
+                __atomic_store_n(&s_tail_keys[i].key, key, __ATOMIC_RELAXED);
+                return &s_tail_keys[i];
+            }
+        }
+        return NULL;   /* key table full: count in the caller's fallback */
+    }
+}
+
+static FILE* c690_tail_spool_open(void)
+{
+    if (t_tail_f) return t_tail_f;
+    const unsigned long long id =
+        __atomic_fetch_add(&s_tail_files, 1ull, __ATOMIC_RELAXED);
+    char path[1200];
+    snprintf(path, sizeof path, "%s/tail_%03llu.bin", s_tail_dir, id);
+    FILE* f = fopen(path, "wb");
+    if (!f) return NULL;
+    char magic[8];
+    memcpy(magic, C690_STAGE_MAGIC, sizeof magic);
+    uint32_t ver = 1;
+    fwrite(magic, sizeof magic, 1, f);
+    fwrite(&ver, sizeof ver, 1, f);
+    t_tail_f = f;
+    return f;
+}
+
+static void c690_tail_write_image(FILE* f, uint32_t type,
+                                  const c690_tail_run* s,
+                                  const struct spu_context* ctx, uint64_t now)
+{
+    uint32_t meta[C690_TAIL_META_WORDS];
+    memset(meta, 0, sizeof meta);
+    meta[0] = SPU_LS_SIZE;
+    meta[1] = C690_CORPUS_GPR_SIZE;
+    meta[2] = (type == C69C_TAIL_IN) ? s->entry_pc : ctx->pc;
+    meta[3] = (uint32_t)ctx->image_id;
+    meta[4] = (uint32_t)s->op;
+    meta[5] = s->key;
+    meta[6] = s->key_lsa;
+    meta[7] = s->seq;
+    meta[8] = s->gpr3;
+    meta[9] = s->gpr4;
+    meta[10] = s->gpr5;
+    meta[11] = s->gpr6;
+    for (int i = 0; i < 8; i++) meta[12 + i] = s->cmd[i];
+    meta[20] = (uint32_t)s->entry_ns;
+    meta[21] = (uint32_t)(s->entry_ns >> 32);
+    meta[22] = (uint32_t)now;
+    meta[23] = (uint32_t)(now >> 32);
+
+    const uint32_t payload = (uint32_t)sizeof meta + C690_TAIL_BITMAP_BYTES +
+                             SPU_LS_SIZE + C690_CORPUS_GPR_SIZE;
+    const uint32_t frame = c690_frame_flips();
+    const uint64_t ea = ((uint64_t)s->seq << 32) | (frame & 0xFFFFFFFFu);
+    uint32_t hdr[6] = { type, payload, (uint32_t)ea, (uint32_t)(ea >> 32),
+                        s->stage_lsa, (uint32_t)ctx->spu_id };
+    fwrite(hdr, sizeof hdr, 1, f);
+    fwrite(meta, sizeof meta, 1, f);
+    fwrite(s->bitmap, 1, C690_TAIL_BITMAP_BYTES, f);
+    const uint8_t* img_ls = (type == C69C_TAIL_IN) ? s->in_ls : ctx->ls;
+    const uint8_t* img_gpr = (type == C69C_TAIL_IN) ? s->in_gpr
+                                                    : (const uint8_t*)ctx->gpr;
+    fwrite(img_ls, 1, SPU_LS_SIZE, f);
+    fwrite(img_gpr, 1, C690_CORPUS_GPR_SIZE, f);
+}
+
+/* A trigger file (PS3RECOMP_C690_TAIL_TRIGGER) turns the capture on when it
+ * appears, so a run can start collecting only once the pitch meter is up.
+ * Checked at most every 200 ms; once seen it stays armed. */
+static int c690_tail_armed(uint64_t now)
+{
+    if (!s_tail_trigger[0]) return 1;
+    if (__atomic_load_n(&s_tail_trigger_seen, __ATOMIC_RELAXED)) return 1;
+    const uint64_t last = __atomic_load_n(&s_tail_trigger_last_ns, __ATOMIC_RELAXED);
+    if (last && now - last < 200000000ull) return 0;
+    __atomic_store_n(&s_tail_trigger_last_ns, now, __ATOMIC_RELAXED);
+    if (c690_access(s_tail_trigger, F_OK) != 0) return 0;
+    __atomic_store_n(&s_tail_trigger_seen, 1, __ATOMIC_RELAXED);
+    fprintf(stderr, "[c690-tail] trigger seen; sampling\n");
+    fflush(stderr);
+    return 1;
+}
+
+static void c690_tail_write_hist(void)
+{
+    char path[1200];
+    snprintf(path, sizeof path, "%s/tail_hist.txt", s_tail_dir);
+    FILE* f = fopen(path, "w");
+    unsigned long long calls = 0, ns = 0;
+    for (unsigned i = 0; i < C690_TAIL_KEYS; i++) {
+        if (!__atomic_load_n(&s_tail_keys[i].used, __ATOMIC_RELAXED)) continue;
+        calls += __atomic_load_n(&s_tail_keys[i].calls, __ATOMIC_RELAXED);
+        ns += __atomic_load_n(&s_tail_keys[i].ns, __ATOMIC_RELAXED);
+    }
+    if (f) fprintf(f, "key calls ns pairs\n");
+    for (unsigned i = 0; i < C690_TAIL_KEYS; i++) {
+        if (!__atomic_load_n(&s_tail_keys[i].used, __ATOMIC_RELAXED)) continue;
+        const uint32_t key = __atomic_load_n(&s_tail_keys[i].key, __ATOMIC_RELAXED);
+        const unsigned long long c =
+            __atomic_load_n(&s_tail_keys[i].calls, __ATOMIC_RELAXED);
+        const unsigned long long n =
+            __atomic_load_n(&s_tail_keys[i].ns, __ATOMIC_RELAXED);
+        const unsigned long long p =
+            __atomic_load_n(&s_tail_keys[i].pairs, __ATOMIC_RELAXED);
+        if (f)
+            fprintf(f, "0x%08X %llu %llu %llu\n", key, c, n, p);
+    }
+    if (f) fclose(f);
+    if (calls)
+        fprintf(stderr, "[c690-tail] hist pairs=%llu calls=%llu time=%.3fms\n",
+                s_tail_pairs_written, calls, (double)ns / 1e6);
+    fflush(stderr);
+}
+
+static void c690_tail_maybe_hist(uint64_t now)
+{
+    const uint64_t last = __atomic_load_n(&s_tail_hist_last_ns, __ATOMIC_RELAXED);
+    if (last && now - last < 2000000000ull) return;
+    if (__atomic_exchange_n(&s_tail_hist_last_ns, now, __ATOMIC_RELAXED) == last)
+        c690_tail_write_hist();
+}
+
+static void c690_tail_close(const struct spu_context* ctx, uint64_t now)
+{
+    c690_tail_run* s = t_tail;
+    if (!s || !s->active) return;
+    s->active = 0;
+
+    const uint32_t key = s->key;
+    c690_tail_key* k = c690_tail_key_slot(key, 1);
+    if (k) {
+        __atomic_fetch_add(&k->calls, 1ull, __ATOMIC_RELAXED);
+        if (now > s->entry_ns)
+            __atomic_fetch_add(&k->ns, now - s->entry_ns, __ATOMIC_RELAXED);
+    }
+    c690_tail_maybe_hist(now);
+    if (!s->sampled) return;
+
+    unsigned long long pairs = k ? __atomic_load_n(&k->pairs, __ATOMIC_RELAXED)
+                                 : 0ull;
+    if (!k || pairs >= s_tail_pairs) return;
+    __atomic_fetch_add(&k->pairs, 1ull, __ATOMIC_RELAXED);
+
+    memset(s->bitmap, 0, sizeof s->bitmap);
+    for (uint32_t line = 0; line < C690_TAIL_LINES; line++) {
+        const uint8_t* a = s->in_ls + (line << C690_TAIL_LINE_SHIFT);
+        const uint8_t* b = ctx->ls + (line << C690_TAIL_LINE_SHIFT);
+        if (memcmp(a, b, 1u << C690_TAIL_LINE_SHIFT) != 0)
+            s->bitmap[line >> 3] |= (uint8_t)(1u << (line & 7u));
+    }
+    FILE* f = c690_tail_spool_open();
+    if (!f) return;
+    c690_tail_write_image(f, C69C_TAIL_IN, s, ctx, now);
+    c690_tail_write_image(f, C69C_TAIL_OUT, s, ctx, now);
+    fflush(f);
+    __atomic_fetch_add(&s_tail_pairs_written, 1ull, __ATOMIC_RELAXED);
+}
+
+static void c690_tail_open(const struct spu_context* ctx, uint32_t lsa,
+                           int op, uint64_t now)
+{
+    if (!t_tail) {
+        t_tail = (c690_tail_run*)calloc(1, sizeof *t_tail);
+        if (!t_tail) return;
+    }
+    c690_tail_run* s = t_tail;
+    s->active = 1;
+    s->op = op;
+    s->stage_lsa = lsa;
+    s->entry_pc = ctx->pc;
+    s->entry_ns = now;
+    s->seq = (uint32_t)__atomic_fetch_add(&s_tail_seq, 1ull, __ATOMIC_RELAXED);
+    s->gpr3 = ctx->gpr[3]._u32[0];
+    s->gpr4 = ctx->gpr[4]._u32[0];
+    s->gpr5 = ctx->gpr[5]._u32[0];
+    s->gpr6 = ctx->gpr[6]._u32[0];
+    for (int i = 0; i < 8; i++)
+        s->cmd[i] = c690_tail_be32(ctx->ls, s->gpr3 + 0x150u + (uint32_t)i * 4u);
+
+    /* Key: the sub-selector for 0x21 (filled in when it is entered), the
+     * opcode for the single-path stages. */
+    s->key = (op == 0x21) ? C690_TAIL_UNKNOWN_KEY : (uint32_t)op;
+    s->key_lsa = 0;
+
+    const unsigned long long entry =
+        __atomic_fetch_add(&s_tail_entries, 1ull, __ATOMIC_RELAXED);
+    s->sampled = (s_tail_stride <= 1u ||
+                  (entry % (unsigned long long)s_tail_stride) == 0);
+    if (!s->sampled) return;
+    memcpy(s->in_ls, ctx->ls, SPU_LS_SIZE);
+    memcpy(s->in_gpr, ctx->gpr, C690_CORPUS_GPR_SIZE);
+}
+
+void c690_corpus_tail_job_begin(const struct spu_context* ctx)
+{
+    if (!g_c690_tail_on) return;
+    if (!c690_tail_armed(c690_corpus_now_ns())) return;
+    if (t_tail && t_tail->active)
+        c690_tail_close(ctx, c690_corpus_now_ns());
+}
+
+void c690_corpus_tail_trace(const struct spu_context* ctx, uint32_t lsa,
+                            int op, uint64_t now)
+{
+    if (!g_c690_tail_on || !ctx) return;
+    if (!c690_tail_armed(now)) {
+        if (t_tail && t_tail->active) t_tail->active = 0;
+        return;
+    }
+    if (op >= 0) {
+        /* Top-level command boundary: the previous command has finished. */
+        if (t_tail && t_tail->active) c690_tail_close(ctx, now);
+        if (c690_tail_is_stage_op(op)) c690_tail_open(ctx, lsa, op, now);
+        return;
+    }
+    if (!t_tail || !t_tail->active) return;
+    if (t_tail->op == 0x21 && c690_tail_sel_lsa(lsa)) {
+        const uint32_t g6 = ctx->gpr[6]._u32[0];
+        t_tail->key = (g6 & 0x1Fu) | ((lsa & 0xFFFFFu) << 8);
+        t_tail->key_lsa = lsa;
+    }
+}
+
+static void c690_tail_report(void)
+{
+    if (!s_tail_on) return;
+    c690_tail_write_hist();
+    for (unsigned i = 0; i < C690_TAIL_KEYS; i++) {
+        if (!__atomic_load_n(&s_tail_keys[i].used, __ATOMIC_RELAXED)) continue;
+        const uint32_t key = __atomic_load_n(&s_tail_keys[i].key, __ATOMIC_RELAXED);
+        const unsigned long long c =
+            __atomic_load_n(&s_tail_keys[i].calls, __ATOMIC_RELAXED);
+        const unsigned long long n =
+            __atomic_load_n(&s_tail_keys[i].ns, __ATOMIC_RELAXED);
+        const unsigned long long p =
+            __atomic_load_n(&s_tail_keys[i].pairs, __ATOMIC_RELAXED);
+        fprintf(stderr, "[c690-tail] key=0x%08X calls=%llu time=%.3fms "
+                        "pairs=%llu\n", key, c, (double)n / 1e6, p);
+    }
+    if (t_tail_f) { fclose(t_tail_f); t_tail_f = NULL; }
+    if (t_tail) { free(t_tail); t_tail = NULL; }
+    fflush(stderr);
+}
+
 void c690_corpus_job_end(const struct spu_context* ctx)
 {
     (void)ctx;
@@ -551,11 +919,12 @@ __attribute__((constructor)) static void c690_corpus_ctor(void)
 }
 __attribute__((destructor)) static void c690_corpus_dtor(void)
 {
-    if (!s_on) return;
+    if (!s_on) { c690_tail_report(); return; }
     /* The spool files live across jobs; close them here before finish_tail
      * clears t_run. */
     if (t_run.stage_f) { fclose(t_run.stage_f); t_run.stage_f = NULL; }
     if (t_run.cull_f) { fclose(t_run.cull_f); t_run.cull_f = NULL; }
     c690_corpus_finish_tail();
+    c690_tail_report();
 }
 #endif

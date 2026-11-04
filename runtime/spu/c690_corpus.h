@@ -49,6 +49,22 @@ void c690_corpus_stage_exit(const struct spu_context* ctx, uint32_t stage_lsa);
 void c690_corpus_cull_enter(const struct spu_context* ctx, uint32_t stage_lsa);
 void c690_corpus_cull_exit(const struct spu_context* ctx, uint32_t stage_lsa);
 
+/* PS3RECOMP_C690_TAIL_CAPTURE=<dir>: stage-level corpus for the GPU tail.
+ * At each top-level c690 command boundary (0x21, 0x25, 0x26, 0x2A) it records
+ * the full local store + GPRs at handler entry (IN) and at the next command
+ * handler / job end (OUT), the command opcode, the 0x21 sub-selector key
+ * (selector + A730/BB80 bit) and the 128 command payload words it can reach.
+ * A 16-byte-line write bitmap is derived from the IN/OUT diff. N pairs per
+ * format key are kept (PS3RECOMP_C690_TAIL_PAIRS, default 8); every command
+ * is still counted per key so the run yields exact job/time shares.
+ * PS3RECOMP_C690_TAIL_TRIGGER=<path> starts sampling when that file appears
+ * (e.g. ab_live.sh's CAPTURE_PREFIX.trigger at the pitch meter).
+ * Off by default; when off the hooks are one predicted-not-taken load. */
+extern int g_c690_tail_on;
+void c690_corpus_tail_job_begin(const struct spu_context* ctx);
+void c690_corpus_tail_trace(const struct spu_context* ctx, uint32_t lsa,
+                            int op, uint64_t now_ns);
+
 #ifdef __cplusplus
 }
 #endif

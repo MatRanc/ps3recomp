@@ -691,6 +691,8 @@ void c690_stats_on_lookup(const struct spu_context* ctx, uint32_t lsa)
 
     if (t_run.job_active) {
         const int op_now = (lsa == C690_JOB_END_LS) ? 0 : c690_opcode_for_lsa(lsa);
+        if (__builtin_expect(g_c690_tail_on, 0))
+            c690_corpus_tail_trace(ctx, lsa, op_now, now);
         /* A 0x21 call ends at the next command handler (including the end
          * command). Every other lookup inside it is a sub-selector entry. */
         if (t_run.op21_active && (lsa == C690_JOB_END_LS || op_now >= 0))
@@ -786,6 +788,8 @@ void c690_stats_on_lookup(const struct spu_context* ctx, uint32_t lsa)
         t_run.tr_desc_ea = ctx->gpr[3]._u32[0];
         if (__builtin_expect(g_c690_corpus_on, 0))
             c690_corpus_job_begin(ctx, t_run.tr_desc_ea, c690_frame_flips());
+        if (__builtin_expect(g_c690_tail_on, 0))
+            c690_corpus_tail_job_begin(ctx);
         t_run.tr_t0 = ps3_trace_begin();
         __atomic_fetch_add(&s_active_jobs, 1u, __ATOMIC_RELAXED);
         if (s->spu_id == 0xFFFFFFFFu) s->spu_id = ctx->spu_id;
@@ -805,6 +809,8 @@ void c690_stats_on_direct(const struct spu_context* ctx, uint32_t lsa)
     if (!t_run.job_active || lsa == 0) return;
     const uint64_t now = c690_now_ns();
     c690_thread_stats* const s = c690_slot();
+    if (__builtin_expect(g_c690_tail_on, 0))
+        c690_corpus_tail_trace(ctx, lsa, -1, now);
     if (t_run.op21_active) c690_op21_note_entry(ctx, lsa, now);
     if (t_run.current_lsa) c690_charge(s, t_run.current_lsa, now - t_run.last_ns);
     t_run.current_lsa = lsa;
@@ -1309,11 +1315,14 @@ static void c690_stats_startup(void)
     const char* c = getenv("PS3RECOMP_C690_CORPUS");
     const char* g = getenv("PS3RECOMP_C690_GAP");
     const char* o = getenv("PS3RECOMP_C690_OP21");
+    const char* t = getenv("PS3RECOMP_C690_TAIL_CAPTURE");
     const int hash_stride = (h && *h) ? atoi(h) : 0;
     const int corpus_on = c && *c;
     const int gap_on = g && *g && strcmp(g, "0") != 0;
     const int op21_on = o && *o && strcmp(o, "0") != 0;
-    if ((!e || strcmp(e, "1") != 0) && hash_stride <= 0 && !corpus_on && !gap_on && !op21_on) return;
+    const int tail_on = t && *t;
+    if ((!e || strcmp(e, "1") != 0) && hash_stride <= 0 && !corpus_on &&
+        !gap_on && !op21_on && !tail_on) return;
     g_c690_stats = 1;                     /* job tracking also feeds the hash/corpus */
     g_c690_gap = gap_on;
     g_c690_op21 = op21_on;
