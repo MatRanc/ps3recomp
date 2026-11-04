@@ -78,6 +78,23 @@ CODE_END = {
 EXTRA_FUNCS = [a.strip() for a in
                os.environ.get("LBP_JOBMOD_EXTRA_FUNCS", "").split(",") if a.strip()]
 
+# Function entries reached only through a function-pointer table, keyed by the
+# module name (content hash + entry offset). These are not branch targets any
+# static walk can see: the title's job source carries a table of LS addresses,
+# the module loads one and branches through it, and the compiler's PIC call
+# stub (`brsl rT, next; ai rT, +8; bi rT`) hides the continuation from the
+# reachability pass. Without the seeds the lift stops at the first such call
+# (the MLBeat DXT kernel's `0x4030` dispatcher stopped at `0x600C`, leaving the
+# whole DXT encode/DMA body interpreted). The addresses are the interpreter
+# rejoin PCs observed on the captured job corpus (docs/dxt-native-step3.md);
+# they are exact entries, not a heuristic. A module not listed is unaffected.
+EXTRA_FUNCS_BY_NAME = {
+    "jobmod_647a2bf49000_e0030": [
+        0x4050, 0x5318, 0x6010, 0x603C, 0x607C, 0x60BC, 0x60FC, 0x613C,
+        0x6180, 0x61BC, 0x6734, 0x6748, 0x67D4,
+    ],
+}
+
 
 def manual_link_targets(raw, base=BASE):
     """Return targets built into the link register by hand:
@@ -212,6 +229,7 @@ def module_code_end(raw, name, base=BASE):
     hi = min(base + len(raw), CODE_END.get(name, base + len(raw)))
     seeds = {base + struct.unpack_from(">I", raw, 0x10)[0], base + 0x30}
     seeds |= {int(a, 0) for a in EXTRA_FUNCS}
+    seeds |= set(EXTRA_FUNCS_BY_NAME.get(name, []))
     derived = manual_link_sites(raw, base) + switch_table_sites(raw, base)
     while True:
         seen = reachable(raw, seeds, hi, base)
@@ -224,10 +242,12 @@ def module_code_end(raw, name, base=BASE):
     return max(seen) + 4
 
 
-def module_seeds(raw, base=BASE):
+def module_seeds(raw, base=BASE, name=None):
     """Extra function entries offered to the lifter for one module."""
     # Only offer addresses that fall inside THIS module's image.
     inside = [a for a in EXTRA_FUNCS if base <= int(a, 0) < base + len(raw)]
+    inside += [hex(a) for a in EXTRA_FUNCS_BY_NAME.get(name, [])
+               if base <= a < base + len(raw)]
     # The module's first function starts right after the 0x30-byte header
     # (`4 ila | entry | size | 0 | 0 | C0DEC0DE | 0 | 0 | n`). Usually it is
     # reached by a branch and found anyway, but in two modules it is a bare
@@ -270,7 +290,7 @@ def lift_module(raw, name, outdir, tmp_elf, merge_chunks, code_end=None,
     if merge_chunks:
         cmd += ["--merge-chunks"]
     cmd += LIFTER_FLAGS
-    inside = module_seeds(raw, base)
+    inside = module_seeds(raw, base, name)
     if code_end:
         inside = [a for a in inside if int(a, 0) < code_end]
     if inside:
@@ -312,21 +332,27 @@ def elf_load_segments(elf):
 
 def find_engine_modules(elf):
     """Job module images embedded in an engine ELF: a 16-byte aligned header
-    with C0DEC0DE at +0x20 and the load base (0x4000) at +0x28, entry offset
-    at +0x10 and image size at +0x14. Like extract_jobmods.py, the module is
-    the initialised image, imageSize - 32 (the rest is bss), so a module gets
-    the same name, and CODE_END fixup, from either source.
-    Returns [(ea, raw)] sorted by EA."""
+    with C0DEC0DE at +0x20, entry offset at +0x10 and image size at +0x14.
+    The header's link base (+0x28) is normally 0x4000, the job code buffer.
+    Some modules are linked at 0 (position-independent): their code computes
+    the real base from the entry's `brsl`/`sf` pair, so they are still lifted
+    at BASE, where the title streams them. A header base of 0 was previously
+    skipped. Like extract_jobmods.py, the module is the initialised image,
+    imageSize - 32 (the rest is bss), so a module gets the same name, and
+    CODE_END fixup, from either source.
+    Returns [(ea, raw, header_base)] sorted by EA."""
     out = []
     for vaddr, blob in elf_load_segments(elf):
         at = blob.find(b"\xc0\xde\xc0\xde")
         while at != -1:
             h = at - 0x20
-            if h >= 0 and h % 16 == 0 and struct.unpack_from(">I", blob, h + 0x28)[0] == BASE:
-                entry_off, image = struct.unpack_from(">II", blob, h + 0x10)
-                size = image - 32
-                if 0x30 <= entry_off < size and image <= 0x40000 - BASE and h + size <= len(blob):
-                    out.append((vaddr + h, bytes(blob[h:h + size])))
+            if h >= 0 and h % 16 == 0:
+                header_base = struct.unpack_from(">I", blob, h + 0x28)[0]
+                if header_base in (0, BASE):
+                    entry_off, image = struct.unpack_from(">II", blob, h + 0x10)
+                    size = image - 32
+                    if 0x30 <= entry_off < size and image <= 0x40000 - BASE and h + size <= len(blob):
+                        out.append((vaddr + h, bytes(blob[h:h + size]), header_base))
             at = blob.find(b"\xc0\xde\xc0\xde", at + 4)
     return sorted(out)
 
@@ -359,6 +385,23 @@ def main():
                     help="Pass --const-bi to spu_lifter.py.")
     ap.add_argument("--local-regs", action="store_true",
                     help="Pass --local-regs to spu_lifter.py.")
+    ap.add_argument("--only-ea", default=None, metavar="EA[,EA...]",
+                    help="--engine-elf only: lift just the module(s) whose source EA "
+                         "matches one of these (hex or decimal). Use this to add one "
+                         "module next to an existing, possibly hand-patched, lift.")
+    ap.add_argument("--image-base", type=lambda v: int(v, 0), default=None,
+                    metavar="N",
+                    help="First overlay image id for the registration TU (default 200). "
+                         "Keep a separately generated module clear of the ids already "
+                         "in use, e.g. 207 for the eighth MLBeat job module.")
+    ap.add_argument("--register-env", default=None, metavar="NAME",
+                    help="Generate a registration TU whose regions are registered but "
+                         "only dispatch when the environment variable NAME is not 0. "
+                         "The region is still installed so capture hooks can see the "
+                         "streamed code; an A/B run turns dispatch off with NAME=0.")
+    ap.add_argument("--register-func", default=None, metavar="NAME",
+                    help="C name of the registration entry point (default "
+                         "<symbol-prefix>_jobmods_register_all).")
     args = ap.parse_args()
     if args.ib_known_targets:
         LIFTER_FLAGS.append("--ib-known-targets")
@@ -373,6 +416,9 @@ def main():
 
     if EXTRA_FUNCS:
         print(f"  extra function entries: {', '.join(EXTRA_FUNCS)}")
+    if args.image_base is not None:
+        global JOBMOD_IMAGE_BASE
+        JOBMOD_IMAGE_BASE = args.image_base
     if args.engine_elf:
         return lift_engine_elf(args, register_c)
     JOBMODS = args.jobmods
@@ -405,13 +451,19 @@ def lift_engine_elf(args, register_c):
     copies at several EAs share one lift) with its code bounded at code_end,
     and register every EA as a verified streamed region."""
     found = find_engine_modules(open(args.engine_elf, "rb").read())
+    if args.only_ea:
+        want = {int(a, 0) for a in args.only_ea.split(",") if a.strip()}
+        found = [f for f in found if f[0] in want]
+        if not found:
+            sys.exit(f"no job module at EA {args.only_ea} in {args.engine_elf}")
     if not found:
         sys.exit(f"no job modules found in {args.engine_elf}")
-    by_name = {}
-    for ea, raw in found:
+    by_name, header_bases = {}, {}
+    for ea, raw, header_base in found:
         entry_off = struct.unpack_from(">I", raw, 0x10)[0]
         name = f"jobmod_{hashlib.sha1(raw).hexdigest()[:12]}_e{entry_off:04X}"
         by_name.setdefault(name, (raw, []))[1].append(ea)
+        header_bases[name] = header_base
     os.makedirs(args.out, exist_ok=True)
     manifest, code = [], {}
     tmp_elf = os.path.join(args.out, "_tmp.elf")
@@ -423,14 +475,16 @@ def lift_engine_elf(args, register_c):
         m = lift_module(raw, name, args.out, tmp_elf, args.merge_chunks, code_end)
         if not m:
             continue
-        m.update(ea=eas[0], eas=eas, code_end=code_end)
+        m.update(ea=eas[0], eas=eas, code_end=code_end,
+                 header_base=header_bases[name])
         code[name] = raw[0x30:code_end - BASE]
         manifest.append(m)
     if os.path.exists(tmp_elf):
         os.remove(tmp_elf)
     with open(os.path.join(args.out, "jobmods_manifest.json"), "w") as f:
         json.dump(manifest, f, indent=2)
-    emit_register_verified(manifest, code, register_c, args.symbol_prefix)
+    emit_register_verified(manifest, code, register_c, args.symbol_prefix,
+                           args.register_env, args.register_func)
     tot_unsup = sum(m["unsupported"] for m in manifest)
     print(f"\nLifted {len(manifest)} module(s), {tot_unsup} total unsupported instruction(s)")
     print(f"Manifest: {os.path.join(args.out, 'jobmods_manifest.json')}")
@@ -483,7 +537,8 @@ def emit_register(manifest, REGISTER_C, sym_prefix):
     print(f"Wrote {REGISTER_C} ({len(manifest)} modules, image ids "
           f"{JOBMOD_IMAGE_BASE}..{JOBMOD_IMAGE_BASE + len(manifest) - 1})")
 
-def emit_register_verified(manifest, code, REGISTER_C, sym_prefix):
+def emit_register_verified(manifest, code, REGISTER_C, sym_prefix,
+                           register_env=None, register_func=None):
     """Generate the registration TU for --engine-elf: register every job
     module's lifted functions under a distinct image id and each EA it is
     streamed from as a verified region (spu_overlay_register_verified_region).
@@ -496,7 +551,13 @@ def emit_register_verified(manifest, code, REGISTER_C, sym_prefix):
     resident owner, so a whole-image span sent every later indirect branch of
     the running job to the interpreter. A GET of another module into the
     buffer still overlaps the code span and clears it. The 0x30-byte header
-    holds no code and is not compared."""
+    holds no code and is not compared.
+
+    register_env: the region is always installed (so capture hooks can see the
+    streamed code) but dispatch is gated on the variable being non-zero. This
+    makes a lift outside the main seven an env-switchable A/B without changing
+    the code-match rule: a region whose code does not match is still rejected
+    by spu_overlay_resident_verified. register_func names the entry point."""
     L = []
     L.append("/* jobmods_register.c -- GENERATED by tools/lift_jobmods.py --engine-elf.")
     L.append(" * WWS SPU job-code modules embedded in the engine ELF. Every module streams")
@@ -507,6 +568,8 @@ def emit_register_verified(manifest, code, REGISTER_C, sym_prefix):
     L.append(" * title's code bytes, like the lifted C it registers. */")
     L.append("#include <stdint.h>")
     L.append("#include <stdio.h>")
+    if register_env:
+        L.append("#include <stdlib.h>")
     L.append('#include "spu_overlay_residency.h"')
     L.append("")
     L.append("extern void spu_begin_image(int image_id);")
@@ -521,8 +584,12 @@ def emit_register_verified(manifest, code, REGISTER_C, sym_prefix):
             L.append("    " + ",".join(f"0x{x:02X}" for x in b[k:k + 16]) + ",")
         L.append("};")
     L.append("")
-    L.append(f"void {sym_prefix}_jobmods_register_all(void)")
+    func = register_func or f"{sym_prefix}_jobmods_register_all"
+    L.append(f"void {func}(void)")
     L.append("{")
+    if register_env:
+        L.append(f"    const char* e = getenv(\"{register_env}\");")
+        L.append(f"    const int enabled = !(e && *e == '0' && !e[1]);")
     for i, m in enumerate(manifest):
         img = JOBMOD_IMAGE_BASE + i
         span = m["code_end"] - BASE
@@ -531,8 +598,13 @@ def emit_register_verified(manifest, code, REGISTER_C, sym_prefix):
         L.append(f"      spu_begin_image({img}); {m['prefix']}spu_recomp_register();   "
                  f"/* {m['name']} entry 0x{m['entry']:X} */")
         for ea in m["eas"]:
-            L.append(f"      if (!spu_overlay_register_verified_region(0x{ea:08X}u, 0x{BASE:X}u, "
-                     f"0x{span:X}u, {img}, &seg, 1))")
+            if register_env:
+                call = (f"spu_overlay_register_verified_region_gated(0x{ea:08X}u, 0x{BASE:X}u, "
+                        f"0x{span:X}u, {img}, &seg, 1, enabled)")
+            else:
+                call = (f"spu_overlay_register_verified_region(0x{ea:08X}u, 0x{BASE:X}u, "
+                        f"0x{span:X}u, {img}, &seg, 1)")
+            L.append(f"      if (!{call})")
             L.append(f'          fprintf(stderr, "[jobmods] image {img}: verified region '
                      f'0x{ea:08X} not registered, interpreted\\n");')
         L.append("    }")
@@ -541,7 +613,7 @@ def emit_register_verified(manifest, code, REGISTER_C, sym_prefix):
     L.append("")
     L.append(f"__attribute__((constructor)) static void {sym_prefix}_jobmods_register_ctor(void)")
     L.append("{")
-    L.append(f"    {sym_prefix}_jobmods_register_all();")
+    L.append(f"    {func}();")
     L.append("}")
     L.append("")
     os.makedirs(os.path.dirname(REGISTER_C) or ".", exist_ok=True)

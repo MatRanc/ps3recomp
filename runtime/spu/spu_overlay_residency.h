@@ -31,6 +31,15 @@ int spu_overlay_register_verified_region(uint32_t content_ea, uint32_t load_lsa,
     uint32_t span, int image_id, const spu_overlay_code_segment* code,
     unsigned count);
 
+/* As above, but the region only owns its span while `enabled` is nonzero.
+ * A disabled region is still installed and still tracks the streamed GET, so
+ * capture and residency diagnostics can see the module load; dispatch into
+ * the span falls through to the interpreter instead of the lifted functions.
+ * The generated registration TU uses this for an env-switchable lift. */
+int spu_overlay_register_verified_region_gated(uint32_t content_ea, uint32_t load_lsa,
+    uint32_t span, int image_id, const spu_overlay_code_segment* code,
+    unsigned count, int enabled);
+
 /* SPU_CODE_DMA_MEMO (spu_channels.c): a GET into a verified code span whose
  * source bytes already equal the local-store bytes changes nothing. Returns 1
  * when the transfer can be skipped; the span stays verified. */

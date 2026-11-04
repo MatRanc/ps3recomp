@@ -1923,6 +1923,7 @@ int spu_have_function(uint32_t addr)
  * through would execute stale code registered under another image. Task and
  * unbounded overlay misses retain their existing primary-image fallback. */
 static int spu_overlay_resident_verified(spu_context* ctx, unsigned slot);
+static int spu_overlay_source_enabled(unsigned index);
 static spu_lifted_fn spu_lifted_lookup_full(const spu_context* ctx, uint32_t lsa)
 {
     /* Every probe below goes through #436's per-thread memo rather than
@@ -1934,6 +1935,11 @@ static spu_lifted_fn spu_lifted_lookup_full(const spu_context* ctx, uint32_t lsa
         if (ctx->resident_code[slot].image_id &&
             lsa >= ctx->resident_code[slot].lsa &&
             lsa - ctx->resident_code[slot].lsa < ctx->resident_code[slot].size) {
+            /* A gated region can be installed but switched off for an A/B arm:
+             * its span must then fall through to the interpreter, not to some
+             * other image's stale functions. */
+            if (!spu_overlay_source_enabled(ctx->resident_code[slot].source_index))
+                continue;
             /* A region registered with its code bytes owns its span even when
              * unverified: other images' functions there would be stale. */
             if (ctx->resident_code[slot].verify_state &&
@@ -2107,6 +2113,18 @@ spu_lifted_fn spu_lifted_lookup(const spu_context* ctx, uint32_t lsa)
       if (s_fc) spu_fncap_capture(ctx, lsa); }
     { static int s_jc = -1; if (s_jc < 0) s_jc = getenv("SPU_JOB_LS_DUMP") ? 1 : 0;
       if (s_jc && lsa == 0x135B8) spu_jobcap_probe(ctx, lsa); }
+    /* DXT job entry capture (PS3RECOMP_DXT_CAPTURE_ENTRY): the wild-0 job body
+     * is dispatched at LS 0x4030 from the module streamed at EA 0x010A1700.
+     * The hook records the exact LS+GPR entry state for the offline lift gate;
+     * it is inert unless that variable is set. */
+    if (lsa == 0x4030u) {
+#if defined(__GNUC__) || defined(__clang__)
+        extern void dxt_capture_job_entry(const spu_context*) __attribute__((weak));
+#else
+        extern void dxt_capture_job_entry(const spu_context*);
+#endif
+        if (dxt_capture_job_entry) dxt_capture_job_entry(ctx);
+    }
     /* PS3RECOMP_C690_STATS: job entry/end, opcode histogram and exclusive
      * entry accounting, all at the one place indirect dispatch is resolved.
      * Predicted-not-taken and out of line when off. */
@@ -2162,7 +2180,8 @@ spu_lifted_fn spu_lifted_lookup(const spu_context* ctx, uint32_t lsa)
  * marks that overlay resident in the streaming context; dispatch retries a
  * primary-image miss against the resident overlay's registry. */
 typedef struct { uint32_t src_ea; int image_id; uint8_t sig[16]; int has_sig; uint32_t span;
-                 uint32_t load_lsa; unsigned code_count; spu_overlay_code_segment* code; } spu_ovl_src;
+                 uint32_t load_lsa; unsigned code_count; spu_overlay_code_segment* code;
+                 int enabled; } spu_ovl_src;
 /* 6 FMOD codec/DSP overlays + up to 89 WWS job-code modules (all stream into
  * the same job code buffer at LS 0x4000, dispatched by content signature). */
 #define SPU_OVL_SRC_MAX 128
@@ -2214,6 +2233,9 @@ void spu_overlay_register_source(uint32_t content_ea, int image_id)
         s_ovl_src[s_ovl_src_count].src_ea = content_ea;
         s_ovl_src[s_ovl_src_count].image_id = image_id;
         s_ovl_src[s_ovl_src_count].has_sig = 0;
+        /* Only gated verified regions may disable dispatch; every other source
+         * keeps the historical enabled behaviour. */
+        s_ovl_src[s_ovl_src_count].enabled = 1;
         __atomic_store_n(&s_ovl_src_count, s_ovl_src_count + 1, __ATOMIC_RELEASE);
     }
 }
@@ -2237,6 +2259,14 @@ enum { SPU_OVERLAY_PENDING = 1, SPU_OVERLAY_VERIFIED, SPU_OVERLAY_REJECTED };
 int spu_overlay_register_verified_region(uint32_t content_ea, uint32_t load_lsa,
     uint32_t span, int image_id, const spu_overlay_code_segment* code, unsigned count)
 {
+    return spu_overlay_register_verified_region_gated(content_ea, load_lsa, span,
+                                                       image_id, code, count, 1);
+}
+
+int spu_overlay_register_verified_region_gated(uint32_t content_ea, uint32_t load_lsa,
+    uint32_t span, int image_id, const spu_overlay_code_segment* code, unsigned count,
+    int enabled)
+{
     if (!span || load_lsa >= SPU_LS_SIZE || span > SPU_LS_SIZE - load_lsa || image_id <= 0 ||
         !code || !count || count > SPU_OVERLAY_CODE_SEGMENTS || s_ovl_src_count >= SPU_OVL_SRC_MAX)
         return 0;
@@ -2259,7 +2289,20 @@ int spu_overlay_register_verified_region(uint32_t content_ea, uint32_t load_lsa,
     spu_overlay_register_region(content_ea, span, image_id);
     spu_ovl_src* o = &s_ovl_src[s_ovl_src_count - 1];
     o->load_lsa = load_lsa; o->code = copy; o->code_count = count;
+    o->enabled = enabled != 0;
     return 1;
+}
+
+/* A verified region registered with a gate (the eighth WWS job module) still
+ * owns its streamed GET so capture and residency diagnostics see the load, but
+ * a disabled region must not dispatch: falling through to the primary image
+ * takes the interpreter rejoin, which is the unlifted behaviour the A/B arm
+ * wants. Only gated regions can be disabled; the original registration sets
+ * enabled = 1. */
+static int spu_overlay_source_enabled(unsigned index)
+{
+    if (index >= (unsigned)s_ovl_src_count) return 1;
+    return s_ovl_src[index].enabled;
 }
 
 /* SPU_CODE_DMA_MEMO: a streamed job module is re-DMA'd into the same local
@@ -3045,7 +3088,16 @@ static int spu_smc_microstep(spu_context* ctx)
          * no lifted entry, and a job's return would otherwise run on through
          * the caller's code (GH3's song-freeze; see drain_ret_pc). */
         const uint32_t return_pc = ctx->drain_ret_pc;
+        /* Attribute the in-context rejoin to spu.interp on the timeline. Only
+         * spu_run_interp_job emitted this event, so a job body that reaches the
+         * interpreter through the drain looked like "pure lifted compute" in a
+         * timeline with zero spu.interp. b carries the interpreted instruction
+         * count (g_spu_interp_steps, set by spu_interp_run_until) so the
+         * offline table can report time and steps together. */
+        const uint64_t tr_t0 = ps3_trace_begin();
         uint32_t result = spu_interp_run_until(ctx, pc, return_pc);
+        { extern uint64_t g_spu_interp_steps;
+          ps3_trace_end(tr_t0, PS3_TR_SPU_INTERP, pc, (uint32_t)g_spu_interp_steps); }
         /* A live interpreter rejoin is a transfer, not a host return. Nested
          * drains can repair an empty trampoline, but the top-level driver
          * otherwise ends the run before executing the lifted target.

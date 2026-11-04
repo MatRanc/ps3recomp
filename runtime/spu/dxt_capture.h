@@ -30,6 +30,13 @@ void dxt_capture_policy_end(const struct spu_context* ctx);
 void dxt_capture_dma(const struct spu_context* ctx, int is_put, uint32_t lsa,
                      uint64_t ea, uint32_t size, const uint8_t* data);
 
+/* Called once when the job body is about to be dispatched at LS 0x4030 while
+ * the module streamed from EA 0x010A1700 owns the code span. Records the full
+ * local store and all 128 GPRs (types 7 and 8) so the lifted kernel can be
+ * replayed offline from the exact entry state. Off unless
+ * PS3RECOMP_DXT_CAPTURE_ENTRY=1; inert otherwise. */
+void dxt_capture_job_entry(const struct spu_context* ctx);
+
 #ifdef __cplusplus
 }
 #endif

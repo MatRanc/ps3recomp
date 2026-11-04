@@ -235,18 +235,23 @@ int main(void)
         data.write_text("".join(
             f"const unsigned char {n}[] = {{{','.join(str(x) for x in raw)}}};\n"
             f"const unsigned {n}_len = {len(raw)};\n" for n, raw in (("mod_a", A), ("mod_b", B))))
-        sources = ["spu_channels.c", "c690_stats.c", "spu_drain.c", "spu_lockstep.c", "spu_coherency.c",
+        sources = ["spu_channels.c", "c690_stats.c", "c690_corpus.c", "dxt_capture.c",
+                   "spu_drain.c", "spu_lockstep.c", "spu_coherency.c",
                    "spu_workload.c", "spurs_policy.c", "spurs_job.c", "spu_tsp_weak.c",
                    "spu_vm_pagemap.c", "spurs_policy_blob_weak.c", "spu_interp.c"]
         lifted = [str(tmp / "out" / m["name"] / "spu_recomp.c") for m in manifest]
         binary = tmp / "residency"
-        subprocess.run([os.environ.get("CC", "cc"), "-std=gnu17", "-O1", "-UNDEBUG", "-w",
+        cc = subprocess.run([os.environ.get("CC", "cc"), "-std=gnu17", "-O1", "-UNDEBUG", "-w",
                         "-I" + str(ROOT / "include"), "-I" + str(spu),
                         "-I" + str(ROOT / "runtime/platform"),
                         str(driver), str(data), str(tmp / "out/jobmods_register.c"), *lifted,
                         *[str(spu / s) for s in sources],
                         str(ROOT / "runtime/platform/win32_compat.c"), "-pthread", "-lm",
-                        "-o", str(binary)], check=True)
+                        "-o", str(binary)], capture_output=True, text=True)
+        if cc.returncode:
+            print(cc.stdout[-2000:])
+            print(cc.stderr[-4000:])
+            raise SystemExit("lift_jobmods verified: residency harness did not link")
         r = subprocess.run([str(binary)], capture_output=True, text=True, timeout=10, cwd=tmp,
                            env={k: v for k, v in os.environ.items()
                                 if not k.startswith(("SPU_", "SPURS_", "YDKJ_", "LBP_"))})

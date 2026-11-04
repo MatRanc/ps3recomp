@@ -30,6 +30,10 @@
  *   6 PARAM      a 0x30-byte DXT parameter block found inside a GET payload;
  *                ea is the guest address of the block, lsa its local-store
  *                address, payload is the 0x30 bytes.
+ *   7 ENTRY_LS   full 256 KiB local store at the first dispatch of the job
+ *                body (LS 0x4030); ea = pc, lsa = lane. Only with
+ *                PS3RECOMP_DXT_CAPTURE_ENTRY=1.
+ *   8 ENTRY_GPR  all 128 GPRs (2048 bytes) at the same dispatch.
  *
  * The GET/PUT payloads are the raw transfer (guest byte order); the offline
  * report reconstructs the job parameters, the input/output block pairs and
@@ -81,7 +85,9 @@ enum {
     DXTC_PUT       = 3,
     DXTC_RUN_END   = 4,
     DXTC_CODE      = 5,
-    DXTC_PARAM     = 6
+    DXTC_PARAM     = 6,
+    DXTC_ENTRY_LS  = 7,
+    DXTC_ENTRY_GPR = 8
 };
 
 typedef struct {
@@ -102,6 +108,9 @@ typedef struct {
     int depth;
     uint32_t lane;
     unsigned long long begin_log, code_log, param_log;
+    int entry_logged;
+    int has_entry_hash;
+    uint64_t entry_hash;
     uint64_t bytes;
 } dxt_run;
 
@@ -112,6 +121,7 @@ static char s_dir[1024], s_trigger[1024];
 static unsigned s_max_runs = 4000;
 static unsigned s_stride = 1;
 static unsigned s_max_mb = 180;
+static int s_entry;
 static unsigned long long s_run_seq, s_runs, s_bytes, s_files;
 static unsigned long long s_codes, s_params;
 static int s_trigger_seen;
@@ -155,6 +165,7 @@ static void dxt_capture_init(void)
     if (s && *s) { long v = strtol(s, NULL, 0); if (v > 0) s_stride = (unsigned)v; }
     const char* m = getenv("PS3RECOMP_DXT_CAPTURE_MAX_MB");
     if (m && *m) { long v = strtol(m, NULL, 0); if (v > 0) s_max_mb = (unsigned)v; }
+    s_entry = getenv("PS3RECOMP_DXT_CAPTURE_ENTRY") != NULL;
     dxt_mkdir(s_dir);
     s_on = 1;
     g_dxt_capture_on = 1;
@@ -311,6 +322,9 @@ void dxt_capture_policy_begin(const struct spu_context* ctx, uint32_t wid,
     dxt_rec(&t_run, DXTC_RUN_BEGIN, 0, 0, 0, &b, (uint32_t)sizeof b);
     __atomic_fetch_add(&s_runs, 1ull, __ATOMIC_RELAXED);
     t_run.active = 1;
+    t_run.entry_logged = 0;
+    t_run.has_entry_hash = 0;
+    t_run.entry_hash = 0;
     if (t_run.begin_log++ < 8) {
         fprintf(stderr, "[dxt-capture] RUN lane=%u wkl=0x%llX image=%d pc=0x%05X "
                         "codeBase(LS1320)=0x%05X seq=%llu\n",
@@ -398,6 +412,42 @@ void dxt_capture_dma(const struct spu_context* ctx, int is_put, uint32_t lsa,
                 }
             }
         }
+    }
+}
+
+void dxt_capture_job_entry(const struct spu_context* ctx)
+{
+    if (!s_entry || !g_dxt_capture_on || !ctx) return;
+    if (!t_run.active || !t_run.f) return;
+    if (((uint32_t)ctx->pc & SPU_LS_MASK) != 0x4030u) return;
+    int dxt = 0;
+    for (unsigned slot = 0; slot < 4; ++slot)
+        if (ctx->resident_code[slot].image_id &&
+            ctx->resident_code[slot].source_ea == 0x010A1700u)
+            dxt = 1;
+    if (!dxt) return;
+    /* A policy run can dispatch the job body more than once (two work items
+     * in one quantum). Record every distinct entry, not just the first: the
+     * offline gate replays each entry and compares the PUTs before the next
+     * one. A repeated lookup at the same dispatch has the same LS+GPR, so a
+     * hash of both skips it. */
+    uint64_t h = 0xcbf29ce484222325ull;
+    for (uint32_t i = 0; i < SPU_LS_SIZE; ++i) { h ^= ctx->ls[i]; h *= 0x100000001b3ull; }
+    const uint8_t* gp = (const uint8_t*)ctx->gpr;
+    for (uint32_t i = 0; i < (uint32_t)sizeof ctx->gpr; ++i) { h ^= gp[i]; h *= 0x100000001b3ull; }
+    if (t_run.has_entry_hash && h == t_run.entry_hash) return;
+    t_run.has_entry_hash = 1;
+    t_run.entry_hash = h;
+    t_run.entry_logged = 1;
+    if (dxt_reserve(DXT_CAPTURE_REC_HDR + SPU_LS_SIZE)) {
+        dxt_rec(&t_run, DXTC_ENTRY_LS, (uint32_t)ctx->pc & SPU_LS_MASK, t_run.lane, 0,
+                ctx->ls, SPU_LS_SIZE);
+        fflush(t_run.f);
+    }
+    if (dxt_reserve(DXT_CAPTURE_REC_HDR + (uint64_t)sizeof ctx->gpr)) {
+        dxt_rec(&t_run, DXTC_ENTRY_GPR, (uint32_t)ctx->pc & SPU_LS_MASK, t_run.lane, 0,
+                ctx->gpr, (uint32_t)sizeof ctx->gpr);
+        fflush(t_run.f);
     }
 }
 
