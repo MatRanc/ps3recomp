@@ -418,6 +418,11 @@ static inline int mfc_do_transfer_fast(spu_context* spu, uint32_t lsa, uint64_t 
               extern void c690_corpus_dma(const spu_context*, int, uint32_t, uint64_t, uint32_t, const uint8_t*);
               c690_corpus_dma(spu, 0, lsa, ea, size, ea_ptr);
           } }
+        { extern int g_dxt_capture_on;
+          if (__builtin_expect(g_dxt_capture_on, 0)) {
+              extern void dxt_capture_dma(const spu_context*, int, uint32_t, uint64_t, uint32_t, const uint8_t*);
+              dxt_capture_dma(spu, 0, lsa, ea, size, ea_ptr);
+          } }
         { extern int spu_code_dma_memo_on(void);
           extern int spu_overlay_code_get_noop(spu_context*, uint32_t, uint32_t, uint32_t, const uint8_t*);
           if (__builtin_expect(spu_code_dma_memo_on(), 0) &&
@@ -438,6 +443,11 @@ static inline int mfc_do_transfer_fast(spu_context* spu, uint32_t lsa, uint64_t 
           if (__builtin_expect(g_c690_corpus_on, 0)) {
               extern void c690_corpus_dma(const spu_context*, int, uint32_t, uint64_t, uint32_t, const uint8_t*);
               c690_corpus_dma(spu, 1, lsa, ea, size, ls_ptr);
+          } }
+        { extern int g_dxt_capture_on;
+          if (__builtin_expect(g_dxt_capture_on, 0)) {
+              extern void dxt_capture_dma(const spu_context*, int, uint32_t, uint64_t, uint32_t, const uint8_t*);
+              dxt_capture_dma(spu, 1, lsa, ea, size, ls_ptr);
           } }
         ps3_guest_write(ea_ptr, size);
         mfc_put_coherent(spu, ea_ptr, ls_ptr, ea, size);
@@ -899,6 +909,11 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
               extern void c690_corpus_dma(const spu_context*, int, uint32_t, uint64_t, uint32_t, const uint8_t*);
               c690_corpus_dma(spu, 0, lsa, ea, size, ea_ptr);
           } }
+        { extern int g_dxt_capture_on;
+          if (__builtin_expect(g_dxt_capture_on, 0)) {
+              extern void dxt_capture_dma(const spu_context*, int, uint32_t, uint64_t, uint32_t, const uint8_t*);
+              dxt_capture_dma(spu, 0, lsa, ea, size, ea_ptr);
+          } }
         int _code_noop = 0;
         { extern int spu_code_dma_memo_on(void);
           extern int spu_overlay_code_get_noop(spu_context*, uint32_t, uint32_t, uint32_t, const uint8_t*);
@@ -959,6 +974,11 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
           if (__builtin_expect(g_c690_corpus_on, 0)) {
               extern void c690_corpus_dma(const spu_context*, int, uint32_t, uint64_t, uint32_t, const uint8_t*);
               c690_corpus_dma(spu, 1, lsa, ea, size, ls_ptr);
+          } }
+        { extern int g_dxt_capture_on;
+          if (__builtin_expect(g_dxt_capture_on, 0)) {
+              extern void dxt_capture_dma(const spu_context*, int, uint32_t, uint64_t, uint32_t, const uint8_t*);
+              dxt_capture_dma(spu, 1, lsa, ea, size, ls_ptr);
           } }
         ps3_guest_write(ea_ptr, size);
         mfc_put_coherent(spu, ea_ptr, (const uint8_t*)ls_ptr, ea, size);
