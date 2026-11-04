@@ -131,6 +131,7 @@ static unsigned long long s_stage_pairs;
 static uint64_t s_stage_last_ns;
 static unsigned long long s_stage_files;
 static unsigned long long s_cull_entries;
+static unsigned long long s_cull_started;
 static unsigned long long s_cull_pairs;
 static uint64_t s_cull_last_ns;
 static unsigned long long s_cull_files;
@@ -235,13 +236,26 @@ static void c690_corpus_rec(FILE* f, uint32_t type, uint64_t ea, uint32_t lsa,
 }
 
 
+static void c690_cull_spool_maybe_close(void);
+
 static void c690_corpus_finish_tail(void)
 {
     if (!t_run.f) return;
     c690_corpus_rec(t_run.f, C69C_JOB_END, t_run.end_ns, 0,
                     (uint32_t)t_run.bytes, NULL, 0);
     fclose(t_run.f);
+    c690_cull_spool_maybe_close();
+    /* Keep an open stage/cull spool across the memset: it is per lane and
+     * lives across jobs.  The pair sequences continue in the same file. */
+    FILE* keep_stage_f = t_run.stage_f;
+    FILE* keep_cull_f = t_run.cull_f;
+    const uint64_t keep_stage_seq = t_run.stage_pair_seq;
+    const uint64_t keep_cull_seq = t_run.cull_pair_seq;
     memset(&t_run, 0, sizeof t_run);
+    t_run.stage_f = keep_stage_f;
+    t_run.stage_pair_seq = keep_stage_seq;
+    t_run.cull_f = keep_cull_f;
+    t_run.cull_pair_seq = keep_cull_seq;
     if (__atomic_load_n(&s_captured, __ATOMIC_RELAXED) >= s_max_jobs &&
         !__atomic_load_n(&s_done_written, __ATOMIC_RELAXED) &&
         !__atomic_exchange_n(&s_done_written, 1, __ATOMIC_RELAXED)) {
@@ -435,6 +449,18 @@ void c690_corpus_stage_exit(const struct spu_context* ctx, uint32_t stage_lsa)
  * own trigger (PS3RECOMP_C690_CULL_PAIRS > 0) so it can run without the
  * 0xFDA0 spool; the entry image carries r4 (1 for 0x25, 0 for 0x26) and the
  * stage_lsa distinguishes the two families. */
+/* Close this lane's cull spool once the global capture cap is reserved out.
+ * The spool is per lane and otherwise lives across jobs; this is the
+ * deterministic close, and a lane that has gone idle is closed at its next
+ * job boundary. */
+static void c690_cull_spool_maybe_close(void)
+{
+    if (!t_run.cull_f) return;
+    if (__atomic_load_n(&s_cull_started, __ATOMIC_RELAXED) < s_cull_jobs) return;
+    fclose(t_run.cull_f);
+    t_run.cull_f = NULL;
+}
+
 static void c690_cull_spool_open(void)
 {
     if (t_run.cull_f) return;
@@ -458,7 +484,6 @@ void c690_corpus_cull_enter(const struct spu_context* ctx, uint32_t stage_lsa)
     if (!c690_corpus_triggered()) return;
     if (t_run.cull_depth++ != 0) return;
     t_run.cull_capture = 0;
-    if (__atomic_load_n(&s_cull_pairs, __ATOMIC_RELAXED) >= s_cull_jobs) return;
     const unsigned long long entry =
         __atomic_fetch_add(&s_cull_entries, 1ull, __ATOMIC_RELAXED);
     if (s_cull_stride > 1u && (entry % (unsigned long long)s_cull_stride) != 0)
@@ -469,6 +494,12 @@ void c690_corpus_cull_enter(const struct spu_context* ctx, uint32_t stage_lsa)
         if (last && now - last < (uint64_t)s_cull_gap_ms * 1000000ull) return;
         __atomic_store_n(&s_cull_last_ns, now, __ATOMIC_RELAXED);
     }
+    /* Reserve the slot at enter, not at exit: several lanes can be in the
+     * cull at once, and counting completed pairs let the cap overshoot by the
+     * lane count. */
+    const unsigned long long slot =
+        __atomic_fetch_add(&s_cull_started, 1ull, __ATOMIC_RELAXED);
+    if (slot >= s_cull_jobs) return;
     c690_cull_spool_open();
     if (!t_run.cull_f) return;
     const uint64_t seq = ++t_run.cull_pair_seq;
@@ -492,6 +523,7 @@ void c690_corpus_cull_exit(const struct spu_context* ctx, uint32_t stage_lsa)
                            (uint32_t)ctx->spu_id, (seq << 32) | (frame & 0xFFFFFFFFu),
                            ctx);
     __atomic_fetch_add(&s_cull_pairs, 1ull, __ATOMIC_RELAXED);
+    c690_cull_spool_maybe_close();
 }
 
 void c690_corpus_job_end(const struct spu_context* ctx)
@@ -519,6 +551,11 @@ __attribute__((constructor)) static void c690_corpus_ctor(void)
 }
 __attribute__((destructor)) static void c690_corpus_dtor(void)
 {
-    if (s_on) c690_corpus_finish_tail();
+    if (!s_on) return;
+    /* The spool files live across jobs; close them here before finish_tail
+     * clears t_run. */
+    if (t_run.stage_f) { fclose(t_run.stage_f); t_run.stage_f = NULL; }
+    if (t_run.cull_f) { fclose(t_run.cull_f); t_run.cull_f = NULL; }
+    c690_corpus_finish_tail();
 }
 #endif

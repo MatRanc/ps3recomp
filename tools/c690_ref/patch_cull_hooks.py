@@ -29,17 +29,29 @@ void {name}(spu_context* ctx) {{
         extern void c690_corpus_cull_enter(const spu_context*, uint32_t);
         extern void c690_corpus_cull_exit(const spu_context*, uint32_t);
         extern int c690_cull_fix_maybe(void);
-        extern int c690_cull_fix_enter(spu_context*, int);
+        extern int c690_cull_fix_begin(spu_context*, int);
+        extern void c690_cull_fix_mid(spu_context*);
+        extern void c690_cull_fix_end(spu_context*);
         extern void c690_cull_fix_leave(spu_context*);
         if (__builtin_expect(!g_c690_corpus_on && !c690_cull_fix_maybe(), 1)) {{
             {name}_body(ctx);
             return;
         }}
-        const int patched = c690_cull_fix_enter(ctx, {family});
+        /* Snapshot the game's real input before any transform patch. */
         if (g_c690_corpus_on) c690_corpus_cull_enter(ctx, 0x{lsa:05X}u);
-        {name}_body(ctx);
-        if (g_c690_corpus_on) c690_corpus_cull_exit(ctx, 0x{lsa:05X}u);
-        if (patched) c690_cull_fix_leave(ctx);
+        const int mode = c690_cull_fix_begin(ctx, {family});
+        if (mode == 1) {{
+            {name}_body(ctx);          /* sample-grid (2x) run */
+            c690_cull_fix_mid(ctx);    /* save list, restore real input */
+            {name}_body(ctx);          /* game run, unpatched */
+            /* Exit snapshot is the game's real output, before the union. */
+            if (g_c690_corpus_on) c690_corpus_cull_exit(ctx, 0x{lsa:05X}u);
+            c690_cull_fix_end(ctx);    /* append sample-grid-only triangles */
+        }} else {{
+            {name}_body(ctx);
+            if (mode == 2) c690_cull_fix_leave(ctx);
+            if (g_c690_corpus_on) c690_corpus_cull_exit(ctx, 0x{lsa:05X}u);
+        }}
 }}
 """
 
@@ -51,7 +63,11 @@ def patch(path):
     for lsa, family in TARGETS:
         name = PREFIX + f"{lsa:08X}"
         if f"void {name}(spu_context* ctx) {{\n        extern int g_c690_corpus_on;" in text:
-            continue
+            if "c690_cull_fix_begin" in text:
+                continue        # already the union wrapper
+            raise SystemExit(
+                f"{path}: {name} has the old single-grid wrapper; regenerate the "
+                f"module (or delete the wrapper) before applying the union wrapper")
         old = f"void {name}(spu_context* ctx) {{\n"
         if text.count(old) != 1:
             raise SystemExit(f"{path}: expected one definition of {name}, "
