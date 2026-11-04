@@ -81,7 +81,7 @@ int g_c690_op21 = 0;         /* PS3RECOMP_C690_OP21: 0x21 emit/ring breakdown */
 #define C690_IMAGE_ID        6
 #define C690_JOB_ENTRY_LS    0x135B8u
 #define C690_JOB_END_LS      0x12AB8u
-#define C690_HOT_N           62
+#define C690_HOT_N           83
 #define C690_FN_COUNT        (C690_HOT_N + 1)   /* last slot is "other" */
 #define C690_MAX_THREADS     64
 #define C690_WALL_BUCKETS    65536u             /* 1 us buckets, up to 65.5 ms */
@@ -123,7 +123,17 @@ int g_c690_op21 = 0;         /* PS3RECOMP_C690_OP21: 0x21 emit/ring breakdown */
     X(48, 0x12830u) X(49, 0x126D8u) X(50, 0x11790u) X(51, 0x13080u) \
     X(52, 0x11F58u) X(53, 0x11A60u) X(54, 0x12948u) X(55, 0x11DF0u) \
     X(56, 0x11BF8u) X(57, 0x05000u) X(58, 0x10758u) X(59, 0x5BC0u) \
-    X(60, 0xE750u) X(61, 0xE6B8u)
+    X(60, 0xE750u) X(61, 0xE6B8u) \
+    /* 0x13 ring-copy chain (0x11A60 -> 0x11990 ring/header -> 0x5680 copy) \
+     * and the 0x22 tree/cull continuation chain, named for the live map \
+     * check. The per-command table is the authority; these only split the \
+     * exclusive time when a target is entered at a dispatch boundary. */ \
+    X(62, 0x11990u) X(63, 0x5680u) \
+    X(64, 0x10190u) X(65, 0x10480u) X(66, 0x10488u) X(67, 0x1024Cu) \
+    X(68, 0x10250u) X(69, 0x10258u) X(70, 0x102DCu) X(71, 0x10300u) \
+    X(72, 0x1036Cu) X(73, 0x10390u) X(74, 0x103A0u) X(75, 0x10478u) \
+    X(76, 0x10498u) X(77, 0x104B0u) X(78, 0x104B8u) X(79, 0x10530u) \
+    X(80, 0x10538u) X(81, 0xE708u) X(82, 0xE734u)
 
 static const uint32_t s_hot_lsa[C690_HOT_N] = {
 #define C690_HOT_ENTRY(i, a) [i] = a,
