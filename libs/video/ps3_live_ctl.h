@@ -83,6 +83,7 @@ enum {
     PS3_LIVE_REFS_HASH_FAST,            /* PS3RECOMP_REFS_HASH_FAST: fold the reference hash in while building the list */
     PS3_LIVE_WCB_STREAM,                /* WCB: demand readbacks join the open draw batch (one submit+wait) */
     PS3_LIVE_WCB_PREFETCH,              /* WCB: queue+submit hot-target copies at a sync point, not at the read */
+    PS3_LIVE_REMAP_DIRECT,              /* PS3RECOMP_REMAP_DIRECT: dense constant-base index lists dedup by direct slot */
     PS3_LIVE_COUNT
 };
 

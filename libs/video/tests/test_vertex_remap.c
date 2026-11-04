@@ -69,6 +69,46 @@ int main(void)
 
     rsx_vertex_remap_destroy(&remap);
 
+    /* PS3RECOMP_REMAP_DIRECT: the direct-slot path must return exactly the
+     * same collapse as the hashing path. Dense single-base lists take the
+     * direct slots; a sparse list (span far above the table) must fall back. */
+    {
+        enum { DN = 600 };
+        rsx_vertex_ref src[DN], a[DN], b[DN];
+        rsx_vertex_remap ra, rb;
+        for (int sparse = 0; sparse < 2; sparse++) {
+            for (u32 i = 0; i < DN; i++) {
+                src[i].vertex_id = sparse
+                    ? ((i * 2654435761u) & 0xFFFFFu)
+                    : ((i * 17u + (i / 7u) * 3u) % 211u);
+                src[i].base_index = 5;
+            }
+            memcpy(a, src, sizeof a);
+            memcpy(b, src, sizeof b);
+            u32 ua = 0, ub = 0;
+            memset(&ra, 0, sizeof ra);
+            memset(&rb, 0, sizeof rb);
+            setenv("PS3RECOMP_REMAP_DIRECT", "0", 1);
+            rsx_vertex_remap_reload_env();
+            assert(rsx_vertex_remap_build(&ra, a, DN, &ua));
+            setenv("PS3RECOMP_REMAP_DIRECT", "1", 1);
+            rsx_vertex_remap_reload_env();
+            assert(rsx_vertex_remap_build(&rb, b, DN, &ub));
+            assert(ua == ub);
+            for (u32 i = 0; i < ua; i++) {
+                assert(a[i].vertex_id == b[i].vertex_id);
+                assert(a[i].base_index == b[i].base_index);
+            }
+            for (u32 i = 0; i < DN; i++)
+                assert(rsx_vertex_remap_index(&ra, i) ==
+                       rsx_vertex_remap_index(&rb, i));
+            rsx_vertex_remap_destroy(&ra);
+            rsx_vertex_remap_destroy(&rb);
+        }
+    }
+    setenv("PS3RECOMP_REMAP_DIRECT", "0", 1);
+    rsx_vertex_remap_reload_env();
+
     /* Incremental reference hash: folding each reference as it is appended
      * must give exactly rsx_vertex_refs_hash() of the finished list (the draw
      * engine uses the fold to skip a second pass over the list). Includes the

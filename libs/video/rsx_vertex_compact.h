@@ -178,6 +178,11 @@ u32 rsx_vertex_remap_index(
 
 void rsx_vertex_remap_destroy(rsx_vertex_remap* remap);
 
+/* Forget the cached PS3RECOMP_REMAP_FAST/REMAP_DIRECT environment answers.
+ * For fixtures only: they build the same list with a key on and off in one
+ * process. The live game reads the switches through ps3_live_ctl instead. */
+void rsx_vertex_remap_reload_env(void);
+
 /* Select the live renderer's triangle topology path.  A remapped triangle
  * list must use an index buffer to reconstruct duplicate occurrences, just
  * like converted strips, fans, and quads.  Returns zero for unsupported

@@ -203,11 +203,12 @@ void rsx_draw_engine_set_display_buffer(u32 id, u32 loc, u32 off, u32 w, u32 h, 
 /* Profiler/capture are real-engine features; this verification replay does
  * not use them. */
 int  rsx_wprof_enabled(void) { return 0; }
+int  rsx_wprof_drain_begin(void) { return 0; }
 unsigned long long rsx_wprof_now(void) { return 0; }
 void rsx_wprof_note_drain(unsigned long long ns) { (void)ns; }
 void rsx_wprof_note_dispatch(unsigned long long ns) { (void)ns; }
 void rsx_wprof_note_flip(void) {}
-void rsx_wprof_drain_end(void) {}
+void rsx_wprof_drain_end(int profiled) { (void)profiled; }
 int  rsx_wcap_begin_if_triggered(void) { return 0; }
 void rsx_wcap_word(u32 w) { (void)w; }
 void rsx_wcap_flip(u32 w) { (void)w; }

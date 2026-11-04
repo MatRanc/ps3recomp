@@ -567,6 +567,17 @@ void rsx_draw_engine_set_guest_memory(rsx_vertex_guest_ptr_fn reader, void* user
  * ======================================================================== */
 
 static int s_wprof = -1;
+/* Frame sampling. PS3RECOMP_WALKER_PROF=1 keeps [walker-prof] lines and the
+ * exact per-frame draw count, but fully instruments only every Nth frame
+ * (PS3RECOMP_WALKER_PROF_SAMPLE, default 8, 1 = every frame). The dispatch
+ * timestamps in the FIFO loop are per method, so sampling draws was not
+ * enough; a sampled frame times every drain, draw and method, and the report
+ * scales the phase sums by (frames since the last report / sampled frames)
+ * before dividing by flips. The cost analysis is in docs/walker-remap.md. */
+static int s_wprof_stride = -1;
+static int s_wprof_pass = 0;
+static unsigned long long s_wprof_frame_seq;
+static unsigned long long s_wp_frames_total, s_wp_frames_prof;
 static unsigned long long s_wp_ns[RSX_WPROF_PHASES];
 static unsigned long long s_wp_n[RSX_WPROF_PHASES];
 static unsigned long long s_wp_drain_ns;
@@ -661,6 +672,34 @@ int rsx_wprof_enabled(void)
     return s_wprof;
 }
 
+static int rsx_wprof_sample_stride(void)
+{
+    if (s_wprof_stride < 0) {
+        const char* e = getenv("PS3RECOMP_WALKER_PROF_SAMPLE");
+        int n = (e && *e) ? atoi(e) : 8;
+        if (n < 1) n = 1;
+        if (n > 4096) n = 4096;
+        s_wprof_stride = n;
+    }
+    return s_wprof_stride;
+}
+
+int rsx_wprof_drain_begin(void)
+{
+    if (rsx_wprof_enabled() <= 0) { s_wprof_pass = 0; return 0; }
+    /* WALKER_PROF2 has its own exact per-draw timers (not sampled); do not
+     * starve it of reports. */
+    if (rsx_wprof2_enabled() > 0) { s_wprof_pass = 1; return 1; }
+    /* Sample whole frames, not drains: the FIFO and the flip can be handled
+     * by different drains, and a per-drain decision would mix a sampled
+     * drain's timers with an unsampled one's draws. The frame sequence is
+     * advanced by rsx_wprof_note_flip(), so every drain of a frame agrees. */
+    const int stride = rsx_wprof_sample_stride();
+    s_wprof_pass = stride <= 1 ||
+        (s_wprof_frame_seq % (unsigned long long)stride) == 0;
+    return s_wprof_pass;
+}
+
 unsigned long long rsx_wprof_now(void)
 {
     struct timespec t;
@@ -685,6 +724,12 @@ void rsx_wprof_note_flip(void)
         if (!s_wp_t0_ms && ps3_ms_now) s_wp_t0_ms = ps3_ms_now();
         s_wp_flip = 1;
         s_wp_flips++;
+        s_wp_frames_total++;
+        if (rsx_wprof2_enabled() > 0 ||
+            rsx_wprof_sample_stride() <= 1 ||
+            (s_wprof_frame_seq % (unsigned long long)rsx_wprof_sample_stride()) == 0)
+            s_wp_frames_prof++;
+        s_wprof_frame_seq++;
     }
 }
 
@@ -695,20 +740,27 @@ void rsx_wprof_note_pipeline_create(unsigned long long ns)
 
 static void wprof_phase(int phase, unsigned long long ns)
 {
-    if (s_wprof > 0) { s_wp_ns[phase] += ns; s_wp_n[phase]++; }
+    if (s_wprof > 0 && s_wprof_pass) { s_wp_ns[phase] += ns; s_wp_n[phase]++; }
 }
 
-void rsx_wprof_drain_end(void)
+void rsx_wprof_drain_end(int profiled)
 {
-    if (s_wprof <= 0 || !s_wp_flip) return;
+    if (s_wprof <= 0 || !profiled || !s_wp_flip) return;
     /* A flip can land between two drain passes, so one report may cover
      * several flips. Divide by them: the printed values are per frame, and
      * the pitch window is many reports wide. */
     const double f = s_wp_flips ? (double)s_wp_flips : 1.0;
-    const double drain = (double)s_wp_drain_ns / 1e6 / f;
-    const double disp  = (double)s_wp_dispatch_ns / 1e6 / f;
+    /* Only every Nth drain is timed (per-method dispatch timestamps are the
+     * expensive part); scale its sums back to the whole interval so the
+     * printed per-frame values still describe every frame. The draw counts
+     * are accumulated on every drain and are not scaled. */
+    const double scale = s_wp_frames_prof
+        ? (double)s_wp_frames_total / (double)s_wp_frames_prof : 1.0;
+    const double drain = (double)s_wp_drain_ns / 1e6 / f * scale;
+    const double disp  = (double)s_wp_dispatch_ns / 1e6 / f * scale;
     double sum = 0.0;
-    for (int i = 0; i < RSX_WPROF_PHASES; i++) sum += (double)s_wp_ns[i] / 1e6 / f;
+    for (int i = 0; i < RSX_WPROF_PHASES; i++)
+        sum += (double)s_wp_ns[i] / 1e6 / f * scale;
     const double parse = drain > disp ? drain - disp : 0.0;
     const double other = disp > sum ? disp - sum : 0.0;
     /* Wall time since the previous report, per frame. The difference from the
@@ -733,19 +785,20 @@ void rsx_wprof_drain_end(void)
             "pipe=%.1f bind=%.1f draw=%.1f\n",
             at_ms, s_wp_frames, s_wp_flips, (double)s_wp_draws / f,
             drain, wait, disp, parse,
-            (double)s_wp_ns[RSX_WPROF_FETCH] / 1e6 / f,
-            (double)s_wp_ns[RSX_WPROF_TEX] / 1e6 / f,
-            (double)s_wp_ns[RSX_WPROF_PIPE] / 1e6 / f,
-            (double)s_wp_ns[RSX_WPROF_BIND] / 1e6 / f,
-            (double)s_wp_ns[RSX_WPROF_DRAW] / 1e6 / f, other,
+            (double)s_wp_ns[RSX_WPROF_FETCH] / 1e6 / f * scale,
+            (double)s_wp_ns[RSX_WPROF_TEX] / 1e6 / f * scale,
+            (double)s_wp_ns[RSX_WPROF_PIPE] / 1e6 / f * scale,
+            (double)s_wp_ns[RSX_WPROF_BIND] / 1e6 / f * scale,
+            (double)s_wp_ns[RSX_WPROF_DRAW] / 1e6 / f * scale, other,
             (double)s_wp_main_draws / f, (double)s_wp_mesh_draws / f,
-            (double)s_wp_main_ns / 1e6 / f, (double)s_wp_mesh_ns / 1e6 / f,
-            s_wp_pipe_create_n, (double)s_wp_pipe_create_ns / 1e6 / f,
-            (double)s_wp_n[RSX_WPROF_FETCH] / f,
-            (double)s_wp_n[RSX_WPROF_TEX] / f,
-            (double)s_wp_n[RSX_WPROF_PIPE] / f,
-            (double)s_wp_n[RSX_WPROF_BIND] / f,
-            (double)s_wp_n[RSX_WPROF_DRAW] / f);
+            (double)s_wp_main_ns / 1e6 / f * scale,
+            (double)s_wp_mesh_ns / 1e6 / f * scale,
+            s_wp_pipe_create_n, (double)s_wp_pipe_create_ns / 1e6 / f * scale,
+            (double)s_wp_n[RSX_WPROF_FETCH] / f * scale,
+            (double)s_wp_n[RSX_WPROF_TEX] / f * scale,
+            (double)s_wp_n[RSX_WPROF_PIPE] / f * scale,
+            (double)s_wp_n[RSX_WPROF_BIND] / f * scale,
+            (double)s_wp_n[RSX_WPROF_DRAW] / f * scale);
     if (s_wp2 < 0) rsx_wprof2_enabled();
     if (s_wp2 > 0) {
         fprintf(stderr,
@@ -807,6 +860,7 @@ void rsx_wprof_drain_end(void)
     s_wp_main_draws = s_wp_mesh_draws = 0;
     s_wp_main_ns = s_wp_mesh_ns = 0;
     s_wp_pipe_create_ns = s_wp_pipe_create_n = 0;
+    s_wp_frames_total = s_wp_frames_prof = 0;
     s_wp_flip = 0;
     s_wp_frames++;
 }
@@ -6449,9 +6503,9 @@ static void eng_check_gpu_vertex_offload(rsx_vtx_gpu_desc* desc, u32 uploaded)
 static void sink_end_work(void* user, const rsx_dispatch* r)
 {
     (void)user; (void)r;
-    const int wp = s_wprof > 0;
+    const int wp = s_wprof > 0 && s_wprof_pass;
     unsigned long long wp_t0 = wp ? rsx_wprof_now() : 0;
-    if (wp) s_wp_draws++;
+    if (s_wprof > 0) s_wp_draws++;   /* exact even when drains are sampled */
     if (s_wp2 > 0) s_wp2_draw_groups++;
     /* EXP_NO_DRAW ceiling: the draw's own work is gone (fetch plan, texture
      * decode, pipeline lookup/create, and every backend/Vulkan recording).
@@ -6794,17 +6848,18 @@ static int dc_source_is_mesh(void)
 static void sink_end(void* user, const rsx_dispatch* r)
 {
     if (s_wprof <= 0) { sink_end_work(user, r); return; }
-    const unsigned long long t0 = rsx_wprof_now();
+    const int timed = s_wprof_pass;
+    const unsigned long long t0 = timed ? rsx_wprof_now() : 0;
     sink_end_work(user, r);
-    const unsigned long long ns = rsx_wprof_now() - t0;
     if (s_no_draw) return;   /* no plan was prepared; the previous one is stale */
-    if (dc_source_is_mesh()) {
-        s_wp_mesh_ns += ns;
-        s_wp_mesh_draws += dc.n_packets;
-    } else {
-        s_wp_main_ns += ns;
-        s_wp_main_draws += dc.n_packets;
+    const int mesh = dc_source_is_mesh();
+    if (timed) {
+        const unsigned long long ns = rsx_wprof_now() - t0;
+        if (mesh) s_wp_mesh_ns += ns;
+        else s_wp_main_ns += ns;
     }
+    if (mesh) s_wp_mesh_draws += dc.n_packets;
+    else s_wp_main_draws += dc.n_packets;
 }
 
 static void sink_clear(void* user, const rsx_dispatch* r, u32 mask)

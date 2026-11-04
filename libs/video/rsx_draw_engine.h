@@ -507,6 +507,10 @@ enum {
 
 /* Cached PS3RECOMP_WALKER_PROF. Cheap (one static compare) when off. */
 int  rsx_wprof_enabled(void);
+/* Start of a drain pass: decides (PS3RECOMP_WALKER_PROF_SAMPLE, default 8)
+ * whether this pass is timed. cellGcmSys uses the return value to gate every
+ * per-method timestamp, so a skipped pass costs one counter. */
+int  rsx_wprof_drain_begin(void);
 unsigned long long rsx_wprof_now(void);
 /* cellGcmSys.c: one drain pass, and the part of it spent inside the engine. */
 void rsx_wprof_note_drain(unsigned long long ns);
@@ -515,8 +519,11 @@ void rsx_wprof_note_dispatch(unsigned long long ns);
 void rsx_wprof_note_flip(void);
 /* vkCreate*Pipelines time, reported as `pipecrt`/`pipems` in the next report. */
 void rsx_wprof_note_pipeline_create(unsigned long long ns);
-/* Log and reset the frame counters if a flip was seen in this pass. */
-void rsx_wprof_drain_end(void);
+/* Log and reset the frame counters if a flip was seen in this pass.
+ * `profiled` is the value rsx_wprof_drain_begin() returned for the same
+ * pass, so a skipped pass never reports (the two drain threads used to share
+ * one global). */
+void rsx_wprof_drain_end(int profiled);
 
 /* Replay only: a replayed capture has no display buffer, so eng_present()
  * never reaches its frame tick. Advance g.frames by one after each replayed

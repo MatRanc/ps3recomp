@@ -832,6 +832,31 @@ static int rsx_vertex_remap_fast_on(void)
     return s_remap_fast_env;
 }
 
+/* PS3RECOMP_REMAP_DIRECT (live key PS3_LIVE_REMAP_DIRECT): when every reference
+ * in a draw shares one base_index and the vertex ids fit in the table the
+ * remap already allocates, dedup through a direct slot ((id - min) & mask)
+ * instead of hashing and probing. That mapping is one-to-one inside the span,
+ * so a live slot can only be the same reference; the answer is identical.
+ * Sparse lists (span > table) keep the open-addressing path. Default off. */
+static int s_remap_direct_env = -1;
+static int rsx_vertex_remap_direct_on(void)
+{
+#if defined(__GNUC__) && !defined(_WIN32)
+    if (ps3_live_ctl_get) return ps3_live_ctl_get(PS3_LIVE_REMAP_DIRECT);
+#endif
+    if (s_remap_direct_env < 0) {
+        const char* e = getenv("PS3RECOMP_REMAP_DIRECT");
+        s_remap_direct_env = e && *e && strcmp(e, "0") != 0 ? 1 : 0;
+    }
+    return s_remap_direct_env;
+}
+
+void rsx_vertex_remap_reload_env(void)
+{
+    s_remap_fast_env = -1;
+    s_remap_direct_env = -1;
+}
+
 #define RSX_REFS_FNV_PRIME 1099511628211ull
 
 static u64 rsx_refs_hash_bytes(u64 h, const void* data, u32 n)
@@ -890,6 +915,30 @@ int rsx_vertex_remap_build(
         remap->occurrence_capacity = count;
     }
 
+    /* Direct mode is chosen before the table is sized: one base_index and a
+     * span of at most 256K ids make (id - min) & mask injective, so no key
+     * comparison or hash is needed. Longer spans keep the hash path. */
+    u32 direct_first = 0;
+    u32 direct_span = 0;
+    int direct = 0;
+    if (rsx_vertex_remap_direct_on() && count >= 8) {
+        const u32 b0 = refs[0].base_index;
+        u32 vmin = refs[0].vertex_id, vmax = vmin;
+        int same_base = 1;
+        for (u32 i = 1; i < count; i++) {
+            if (refs[i].base_index != b0) { same_base = 0; break; }
+            const u32 v = refs[i].vertex_id;
+            if (v < vmin) vmin = v;
+            else if (v > vmax) vmax = v;
+        }
+        const u64 span = (u64)vmax - (u64)vmin + 1ull;
+        if (same_base && span <= (1ull << 18)) {
+            direct = 1;
+            direct_first = vmin;
+            direct_span = (u32)span;
+        }
+    }
+
     if (count > UINT_MAX / 2u)
         return 0;
     /* Probe only the smallest power-of-two table that holds this draw, even
@@ -897,8 +946,10 @@ int rsx_vertex_remap_build(
      * generation tag makes any stale slot outside this window irrelevant, and
      * a small window keeps the working set in cache on mixed-size scenes. */
     u32 logical_capacity = 16u;
-    const u32 required_slots = count * 2u;
-    while (logical_capacity < required_slots) {
+    u64 required_slots = (u64)count * 2u;
+    if (direct && (u64)direct_span > required_slots)
+        required_slots = direct_span;
+    while ((u64)logical_capacity < required_slots) {
         if (logical_capacity > UINT_MAX / 2u)
             return 0;
         logical_capacity *= 2u;
@@ -922,7 +973,11 @@ int rsx_vertex_remap_build(
         }
     }
 
-    const int fast = rsx_vertex_remap_fast_on();
+    const u32 mask = logical_capacity - 1u;
+    /* Direct mode replaces the whole hash path, so the small recent-repeat
+     * memo is redundant there (and costs a second lookup on a miss). Lists
+     * that cannot use direct slots keep the memo. */
+    const int fast = !direct && rsx_vertex_remap_fast_on();
     if (fast) {
         remap->micro_generation++;
         if (!remap->micro_generation) {
@@ -932,9 +987,24 @@ int rsx_vertex_remap_build(
     }
 
     u32 unique = 0;
-    const u32 mask = logical_capacity - 1u;
     for (u32 occurrence = 0; occurrence < count; occurrence++) {
         const rsx_vertex_ref ref = refs[occurrence];
+        if (direct) {
+            rsx_vertex_remap_slot* slot =
+                &remap->slots[(ref.vertex_id - direct_first) & mask];
+            u32 value;
+            if (slot->generation != remap->generation) {
+                slot->value = unique;
+                slot->generation = remap->generation;
+                if (unique != occurrence)
+                    refs[unique] = ref;
+                value = unique++;
+            } else {
+                value = slot->value;
+            }
+            remap->occurrence_to_unique[occurrence] = value;
+            continue;
+        }
         const u64 key = ((u64)ref.base_index << 32) | ref.vertex_id;
         if (fast) {
             const u32 mi = (u32)((((u32)key ^ (u32)(key >> 32)) *

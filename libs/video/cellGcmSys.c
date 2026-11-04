@@ -2903,7 +2903,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
      * by s_gcm_ctx_out_ea, which stays 0 on that path. */
     if (!s_gcm_context_ea && !s_gcm_syscall_mode) return;
     if (!s_inited) { rsx_state_init(&s_state); s_inited = 1; }
-    const int wprof = rsx_wprof_enabled();
+    const int wprof = rsx_wprof_drain_begin();
     const unsigned long long wprof_t0 = wprof ? rsx_wprof_now() : 0;
     /* PS3RECOMP_CTL: the walker thread is the one that notices a changed
      * control file, at most once per drain pass (>= once per flip). The
@@ -3912,7 +3912,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
     ReleaseSRWLockExclusive(&s_ref_pub_lock);
 
     if (wprof) rsx_wprof_note_drain(rsx_wprof_now() - wprof_t0);
-    rsx_wprof_drain_end();
+    rsx_wprof_drain_end(wprof);
     rsx_wcap_drain_end();
 }
 

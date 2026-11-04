@@ -49,10 +49,11 @@ void rsx_draw_engine_guest_read_done(void) {}
 /* The walker's profiling/capture hooks and on-demand wake: no-ops here. */
 unsigned long long rsx_wprof_now(void) { return 0; }
 int  rsx_wprof_enabled(void) { return 0; }
+int  rsx_wprof_drain_begin(void) { return 0; }
 void rsx_wprof_note_flip(void) {}
 void rsx_wprof_note_drain(unsigned long long ns) { (void)ns; }
 void rsx_wprof_note_dispatch(unsigned long long ns) { (void)ns; }
-void rsx_wprof_drain_end(void) {}
+void rsx_wprof_drain_end(int profiled) { (void)profiled; }
 void rsx_wcap_drain_end(void) {}
 int  rsx_wcap_begin_if_triggered(void) { return 0; }
 void rsx_wcap_word(u32 w) { (void)w; }

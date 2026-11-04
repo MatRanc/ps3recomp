@@ -53,7 +53,7 @@ void rsx_draw_engine_guest_read_done(void) {}
 unsigned long long rsx_wprof_now(void) { return 0; }
 void rsx_wprof_note_drain(unsigned long long ns) { (void)ns; }
 void rsx_wprof_note_dispatch(unsigned long long ns) { (void)ns; }
-void rsx_wprof_drain_end(void) {}
+void rsx_wprof_drain_end(int profiled) { (void)profiled; }
 void rsx_wcap_drain_end(void) {}
 void rsx_draw_engine_wcb_set_wake(void (*wake)(void)) { (void)wake; }
 void rsx_draw_engine_set_display_query(int (*fn)(u32 offset)) { (void)fn; }
