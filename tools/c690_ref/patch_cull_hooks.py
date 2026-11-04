@@ -102,6 +102,24 @@ void {name}(spu_context* ctx) {{
 
 TARGETS_21 = [0x13140, 0x131A0]   # 0x21 sub-selector bodies (sel1 / sel7)
 
+# 0xA730 heavy-body leaf (A730 sel1 path).  The sub-selector and the
+# 0xA410/0xA798 trampolines are prefixes; the per-vertex transform/normalize
+# leaf is LS 0xB830.  The wrapper is a capture probe only (op key 0xA7).
+WRAPPER_A730 = """void {name}_body(spu_context* ctx);
+void {name}(spu_context* ctx) {{
+        extern int g_c690_tail_on;
+        extern void c690_corpus_tail_cmd_enter(const spu_context*, uint32_t, uint32_t);
+        extern void c690_corpus_tail_cmd_exit(const spu_context*);
+        if (__builtin_expect(g_c690_tail_on, 0))
+            c690_corpus_tail_cmd_enter(ctx, 0x{lsa:05X}u, 0xA7u);
+        {name}_body(ctx);
+        if (__builtin_expect(g_c690_tail_on, 0))
+            c690_corpus_tail_cmd_exit(ctx);
+}}
+"""
+
+TARGETS_A730 = [0xB830]   # A730 heavy leaf (reached via 0xA410 -> 0xA730 -> 0xA798)
+
 # The bypass helper and the three dispatch sites. The switch lives in the
 # generated tree, so a fresh lift has neither; this makes it reproducible.
 # The runtime function owns the live key and the environment fallback.
@@ -231,6 +249,20 @@ def patch(path):
             raise SystemExit(f"{path}: expected one definition of {name}, "
                              f"found {text.count(old)}")
         wrapper = WRAPPER_2A.format(name=name)
+        text = text.replace(old, wrapper + body)
+        changed = True
+    for lsa in TARGETS_A730:
+        name = PREFIX + f"{lsa:08X}"
+        old = f"void {name}(spu_context* ctx) {{\n"
+        body = f"void {name}_body(spu_context* ctx) {{\n"
+        wrapped = ("void {name}(spu_context* ctx) {{\n"
+                   "        extern int g_c690_tail_on;\n").format(name=name)
+        if wrapped in text:
+            continue        # already the A730 body capture wrapper
+        if text.count(old) != 1:
+            raise SystemExit(f"{path}: expected one definition of {name}, "
+                             f"found {text.count(old)}")
+        wrapper = WRAPPER_A730.format(name=name, lsa=lsa)
         text = text.replace(old, wrapper + body)
         changed = True
     if changed:

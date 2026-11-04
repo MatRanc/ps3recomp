@@ -176,6 +176,23 @@ def main():
         hist = (cap / 'tail_hist.txt').read_text()
         assert '0x0000002A 2 ' in hist, hist
 
+        # A730 heavy-body leaf (0xB830) through its own capture wrapper.
+        cap = tmp / 'a730'
+        run(binary, 'a730', {
+            'PS3RECOMP_C690_TAIL_CAPTURE': str(cap),
+            'PS3RECOMP_C690_TAIL_PAIRS': '1',
+            'PS3RECOMP_C690_TAIL_STRIDE': '1',
+        })
+        pairs = parse_spool(sorted(cap.glob('tail_*.bin'))[0])
+        assert len(pairs) == 1, pairs
+        p = list(pairs.values())[0]
+        assert p['in']['op'] == 0xA7 and p['in']['lsa'] == 0xB830, p['in']
+        assert p['in']['key'] == 0xA7, hex(p['in']['key'])
+        assert changed_lines(p['in']['bitmap']) == [0x2F83], p['in']
+        assert p['out']['ls'][0x2F83 * 16] == 0x66, p['out']
+        hist = (cap / 'tail_hist.txt').read_text()
+        assert '0x000000A7 1 ' in hist, hist
+
         # Stride 2 samples the 1st and 3rd stage opens, not the 2nd.
         cap = tmp / 'stride'
         run(binary, 'basic', {
@@ -187,7 +204,7 @@ def main():
         assert sorted(x['in']['op'] for x in pairs.values()) == [0x21, 0x2A], pairs
 
     print('PASS: c690 tail capture IN/OUT pairs, format key, bitmap, cap, '
-          'stride, 0x2A function exit, non-consuming trigger, off')
+          'stride, 0x2A function exit, A730 leaf, non-consuming trigger, off')
     return 0
 
 

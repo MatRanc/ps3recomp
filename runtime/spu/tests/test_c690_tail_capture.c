@@ -88,6 +88,17 @@ int main(int argc, char** argv)
         run_2a(&ctx, 0x2F88, 0x55, 2000);
         c690_corpus_tail_trace(&ctx, 0x12AB8, 0, 3000);   /* job end */
         c690_corpus_tail_job_begin(&ctx);
+    } else if (!strcmp(mode, "a730")) {
+        fill_ctx(&ctx, 0x13140);
+        c690_corpus_tail_job_begin(&ctx);
+        /* A730 heavy-body leaf 0xB830 through its capture wrapper. */
+        ctx.pc = 0xB830;
+        c690_corpus_tail_cmd_enter(&ctx, 0xB830, 0xA7);
+        write_line(&ctx, 0x2F83, 0x66);
+        ctx.pc = ctx.gpr[0]._u32[0];
+        c690_corpus_tail_cmd_exit(&ctx);
+        c690_corpus_tail_trace(&ctx, 0x12AB8, 0, 5000);
+        c690_corpus_tail_job_begin(&ctx);
     } else {
         fill_ctx(&ctx, 0x13140);
         c690_corpus_tail_job_begin(&ctx);
