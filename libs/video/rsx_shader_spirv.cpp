@@ -324,6 +324,14 @@ bool tmp_older_than_hour(const std::string& path, time_t now)
 /* A store writes <file>.<pid>.<serial>.tmp then renames it. A process killed
  * mid-write leaves the temporary behind; sweep those at open, but leave a
  * recent one (another live process may be writing it). */
+/* Only our own temp names (<16hex>_<stage>.spv.<pid>.<serial>.tmp): the cache dir may be user-supplied. */
+bool own_tmp_name(const char* name)
+{
+    for (int i = 0; i < 16; ++i) if (!isxdigit((unsigned char)name[i])) return false;
+    const size_t len = strlen(name);
+    return name[16] == '_' && strstr(name, ".spv.") && len > 4 && strcmp(name + len - 4, ".tmp") == 0;
+}
+
 void disk_sweep_tmp(const std::string& dir)
 {
     const time_t now = time(NULL);
@@ -333,6 +341,7 @@ void disk_sweep_tmp(const std::string& dir)
     HANDLE h = FindFirstFileA(pattern.c_str(), &fd);
     if (h == INVALID_HANDLE_VALUE) return;
     do {
+        if (!own_tmp_name(fd.cFileName)) continue;
         const std::string path = dir + "/" + fd.cFileName;
         if (tmp_older_than_hour(path, now)) remove(path.c_str());
     } while (FindNextFileA(h, &fd));
@@ -343,8 +352,7 @@ void disk_sweep_tmp(const std::string& dir)
     struct dirent* e;
     while ((e = readdir(d))) {
         const char* name = e->d_name;
-        const size_t len = strlen(name);
-        if (len < 4 || strcmp(name + len - 4, ".tmp") != 0) continue;
+        if (!own_tmp_name(name)) continue;
         const std::string path = dir + "/" + name;
         if (tmp_older_than_hour(path, now)) remove(path.c_str());
     }

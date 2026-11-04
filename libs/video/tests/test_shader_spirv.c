@@ -266,22 +266,28 @@ int main(void)
     /* Orphaned .tmp files older than an hour are swept at cache open; a
      * recent one (another live store) is left alone. */
     {
-        char oldtmp[1200], newtmp[1200];
-        snprintf(oldtmp, sizeof oldtmp, "%s/orphan-old.tmp", kdir);
-        snprintf(newtmp, sizeof newtmp, "%s/orphan-new.tmp", kdir);
+        char oldtmp[1200], newtmp[1200], foreign[1200];
+        snprintf(oldtmp, sizeof oldtmp, "%s/00000000deadbeef_0.spv.1.1.tmp", kdir);
+        snprintf(newtmp, sizeof newtmp, "%s/00000000deadbeef_0.spv.1.2.tmp", kdir);
+        snprintf(foreign, sizeof foreign, "%s/not-ours.tmp", kdir);
         FILE* f = fopen(oldtmp, "wb");
         if (f) { fputs("partial", f); fclose(f); }
         f = fopen(newtmp, "wb");
         if (f) { fputs("partial", f); fclose(f); }
+        f = fopen(foreign, "wb");
+        if (f) { fputs("user data", f); fclose(f); }
         struct utimbuf tb;
         tb.actime = tb.modtime = time(NULL) - 7200;
         utime(oldtmp, &tb);
+        utime(foreign, &tb);
         rsx_hlsl_to_spirv_disk_reset();
         check("keyed: open sweeps an old .tmp",
               translate_keyed(0x1234u, kVS, RSX_SHADER_STAGE_VERTEX, g_b, &nb) == 0);
         check("keyed: ... old gone, recent kept",
               access(oldtmp, F_OK) != 0 && access(newtmp, F_OK) == 0);
+        check("keyed: ... an old .tmp that is not ours is kept", access(foreign, F_OK) == 0);
         remove(newtmp);
+        remove(foreign);
     }
 
     /* A translator version bump must invalidate every file. */
