@@ -19,7 +19,13 @@ known-target dispatch, so the command-boundary capture cannot see two
 back-to-back assembler commands. Run it once after `tools/lift_spu.sh` touched
 the module; it is idempotent.
 
-Usage: patch_cull_hooks.py [path/to/spu_recomp.c]
+The 0x2A / 0x21 / 0xA730 (0xB830 leaf) capture wrappers are capture-only:
+they are applied with `--capture` and stripped otherwise.  A play build keeps
+them out (the 0xB830 wrapper costs ~0.9-1.3% of that leaf's call with capture
+off, and the leaf runs ~127k times/s).  The cull wrapper also carries the
+sample-grid fix/bypass, so it is always applied.
+
+Usage: patch_cull_hooks.py [--capture|--strip] [path/to/spu_recomp.c]
 """
 import sys
 import os
@@ -194,10 +200,41 @@ def patch_bypass(text, path):
     return text, changed
 
 
-def patch(path):
+CAPTURE_LSAS = [0x10F78, 0x13140, 0x131A0, 0xB830]
+
+
+def strip_capture(text, path):
+    """Remove the capture-only wrappers, leaving the original body in place."""
+    changed = False
+    for lsa in CAPTURE_LSAS:
+        name = PREFIX + f"{lsa:08X}"
+        decl = f"void {name}_body(spu_context* ctx);\n"
+        if decl in text:
+            text = text.replace(decl, "", 1)
+            changed = True
+        old = f"void {name}(spu_context* ctx) {{\n"
+        body_def = f"void {name}_body(spu_context* ctx) {{\n"
+        start = text.find(old)
+        if start < 0:
+            continue
+        if not text.startswith("        extern int g_c690_tail_on;",
+                               start + len(old)):
+            continue        # already unwrapped
+        body_start = text.find(body_def, start)
+        if body_start < 0:
+            raise SystemExit(f"{path}: {name} has no _body definition to restore")
+        text = text[:start] + old + text[body_start + len(body_def):]
+        changed = True
+    return text, changed
+
+
+def patch(path, capture=False):
     with open(path, "r", encoding="utf-8") as f:
         text = f.read()
     text, changed = patch_bypass(text, path)
+    if not capture:
+        text, stripped = strip_capture(text, path)
+        changed = changed or stripped
     for lsa, family in TARGETS:
         name = PREFIX + f"{lsa:08X}"
         old = f"void {name}(spu_context* ctx) {{\n"
@@ -225,46 +262,47 @@ def patch(path):
                              f"found {text.count(old)}")
         text = text.replace(old, wrapper + body)
         changed = True
-    for lsa in TARGETS_21:
-        name = PREFIX + f"{lsa:08X}"
-        old = f"void {name}(spu_context* ctx) {{\n"
-        body = f"void {name}_body(spu_context* ctx) {{\n"
-        if old + "        extern int g_c690_tail_on;" in text:
-            continue        # already the 0x21 capture wrapper
-        if text.count(old) != 1:
-            raise SystemExit(f"{path}: expected one definition of {name}, "
-                             f"found {text.count(old)}")
-        wrapper = WRAPPER_21.format(name=name, lsa=lsa)
-        text = text.replace(old, wrapper + body)
-        changed = True
-    for lsa in TARGETS_2A:
-        name = PREFIX + f"{lsa:08X}"
-        old = f"void {name}(spu_context* ctx) {{\n"
-        body = f"void {name}_body(spu_context* ctx) {{\n"
-        wrapped = ("void {name}(spu_context* ctx) {{\n"
-                   "        extern int g_c690_tail_on;\n").format(name=name)
-        if wrapped in text:
-            continue        # already the 0x2A capture wrapper
-        if text.count(old) != 1:
-            raise SystemExit(f"{path}: expected one definition of {name}, "
-                             f"found {text.count(old)}")
-        wrapper = WRAPPER_2A.format(name=name)
-        text = text.replace(old, wrapper + body)
-        changed = True
-    for lsa in TARGETS_A730:
-        name = PREFIX + f"{lsa:08X}"
-        old = f"void {name}(spu_context* ctx) {{\n"
-        body = f"void {name}_body(spu_context* ctx) {{\n"
-        wrapped = ("void {name}(spu_context* ctx) {{\n"
-                   "        extern int g_c690_tail_on;\n").format(name=name)
-        if wrapped in text:
-            continue        # already the A730 body capture wrapper
-        if text.count(old) != 1:
-            raise SystemExit(f"{path}: expected one definition of {name}, "
-                             f"found {text.count(old)}")
-        wrapper = WRAPPER_A730.format(name=name, lsa=lsa)
-        text = text.replace(old, wrapper + body)
-        changed = True
+    if capture:
+        for lsa in TARGETS_21:
+            name = PREFIX + f"{lsa:08X}"
+            old = f"void {name}(spu_context* ctx) {{\n"
+            body = f"void {name}_body(spu_context* ctx) {{\n"
+            if old + "        extern int g_c690_tail_on;" in text:
+                continue        # already the 0x21 capture wrapper
+            if text.count(old) != 1:
+                raise SystemExit(f"{path}: expected one definition of {name}, "
+                                 f"found {text.count(old)}")
+            wrapper = WRAPPER_21.format(name=name, lsa=lsa)
+            text = text.replace(old, wrapper + body)
+            changed = True
+        for lsa in TARGETS_2A:
+            name = PREFIX + f"{lsa:08X}"
+            old = f"void {name}(spu_context* ctx) {{\n"
+            body = f"void {name}_body(spu_context* ctx) {{\n"
+            wrapped = ("void {name}(spu_context* ctx) {{\n"
+                       "        extern int g_c690_tail_on;\n").format(name=name)
+            if wrapped in text:
+                continue        # already the 0x2A capture wrapper
+            if text.count(old) != 1:
+                raise SystemExit(f"{path}: expected one definition of {name}, "
+                                 f"found {text.count(old)}")
+            wrapper = WRAPPER_2A.format(name=name)
+            text = text.replace(old, wrapper + body)
+            changed = True
+        for lsa in TARGETS_A730:
+            name = PREFIX + f"{lsa:08X}"
+            old = f"void {name}(spu_context* ctx) {{\n"
+            body = f"void {name}_body(spu_context* ctx) {{\n"
+            wrapped = ("void {name}(spu_context* ctx) {{\n"
+                       "        extern int g_c690_tail_on;\n").format(name=name)
+            if wrapped in text:
+                continue        # already the A730 body capture wrapper
+            if text.count(old) != 1:
+                raise SystemExit(f"{path}: expected one definition of {name}, "
+                                 f"found {text.count(old)}")
+            wrapper = WRAPPER_A730.format(name=name, lsa=lsa)
+            text = text.replace(old, wrapper + body)
+            changed = True
     if changed:
         with open(path, "w", encoding="utf-8") as f:
             f.write(text)
@@ -272,15 +310,19 @@ def patch(path):
 
 
 def main():
-    if len(sys.argv) > 1:
-        path = sys.argv[1]
+    args = [a for a in sys.argv[1:] if not a.startswith("--")]
+    capture = "--capture" in sys.argv[1:]
+    if "--strip" in sys.argv[1:]:
+        capture = False
+    if args:
+        path = args[0]
     else:
         here = os.path.dirname(os.path.abspath(__file__))
         root = os.path.abspath(os.path.join(here, "..", "..", ".."))
         path = os.path.join(root, "recomp-work", "spu_lifted",
                             "jobmod_c690c2f7b09a_eF5B8", "spu_recomp.c")
-    if patch(path):
-        print(f"patched {path}")
+    if patch(path, capture):
+        print(f"patched {path} (capture wrappers {'on' if capture else 'off'})")
     else:
         print(f"already patched {path}")
 
