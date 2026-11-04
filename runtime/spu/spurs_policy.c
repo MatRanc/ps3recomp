@@ -153,6 +153,98 @@ void spurs_policy_release_instance(uint32_t ea)
     ReleaseSRWLockExclusive(&s_pm_directory_lock);
 }
 
+/* SPURS_PM_NATIVE_DISPATCH: the wwsjob PM's persistent local store keeps its
+ * job pipeline at 0x12C0..0x12FF. A loaded job that has not been stored is
+ * ready to run on this lane without a kernel dispatch. All four values are
+ * big-endian u32; 0xFFFFFFFF means "empty". The module writes them as the
+ * preferred word of a 16-byte LS slot, so the scalar is the first 4 bytes. */
+int spurs_policy_pm_pipeline_staged(const uint8_t* ls)
+{
+    if (!ls) return 0;
+#define SPURS_LS_BE32(o) ((uint32_t)ls[(o)] << 24 | (uint32_t)ls[(o)+1] << 16 | \
+                          (uint32_t)ls[(o)+2] << 8 | (uint32_t)ls[(o)+3])
+    const uint32_t next  = SPURS_LS_BE32(0x12C0);
+    const uint32_t load  = SPURS_LS_BE32(0x12D0);
+    const uint32_t run   = SPURS_LS_BE32(0x12E0);
+    const uint32_t store = SPURS_LS_BE32(0x12F0);
+#undef SPURS_LS_BE32
+    /* A loaded job that has not been stored. */
+    if (load != 0xFFFFFFFFu && load != store &&
+        (run == 0xFFFFFFFFu || run == load))
+        return 1;
+    /* The module may also leave the next job loaded but not yet moved into
+     * loadJobNum; nextLoad is then at least two ahead of the last stored. */
+    if (next != 0xFFFFFFFFu && store != 0xFFFFFFFFu && next > store + 1)
+        return 1;
+    return 0;
+}
+
+/* Diagnostic snapshot of the four pipeline words (next/load/run/store). */
+int spurs_policy_pm_pipeline_words(uint32_t spurs_ea, uint32_t wid,
+                                   uint32_t spu_num, uint32_t out[4])
+{
+    if (!out || wid >= 16 || spu_num >= 6) return 0;
+    struct PmInstance* pi = NULL;
+    struct PmSlot* slot = NULL;
+    AcquireSRWLockExclusive(&s_pm_directory_lock);
+    for (unsigned i = 0; i < SPURS_PM_INSTANCES; i++) {
+        struct PmInstance* p = &s_pm_instances[i];
+        if (!p->used || p->ea != spurs_ea) continue;
+        if (!p->retiring) {
+            struct PmSlot* s = &p->slots[wid][spu_num];
+            if (s->ctx) { pi = p; slot = s; p->users++; }
+        }
+        break;
+    }
+    ReleaseSRWLockExclusive(&s_pm_directory_lock);
+    if (!slot) return 0;
+    AcquireSRWLockExclusive(&slot->lock);
+    const uint8_t* ls = slot->ctx->ls;
+    for (unsigned k = 0; k < 4; k++) {
+        const uint32_t o = 0x12C0u + k * 0x10u;
+        out[k] = ((uint32_t)ls[o] << 24) | ((uint32_t)ls[o+1] << 16) |
+                 ((uint32_t)ls[o+2] << 8) | (uint32_t)ls[o+3];
+    }
+    ReleaseSRWLockExclusive(&slot->lock);
+    AcquireSRWLockExclusive(&s_pm_directory_lock);
+    pi->users--;
+    WakeAllConditionVariable(&s_pm_directory_wake);
+    ReleaseSRWLockExclusive(&s_pm_directory_lock);
+    return 1;
+}
+
+/* Live lookup for the scheduler worker. The worker owns this (workload, lane)
+ * slot, but the instance may retire concurrently, so hold a user reference
+ * while reading the resident context (same discipline as policy_slot). */
+int spurs_policy_pm_staged_pending(uint32_t spurs_ea, uint32_t wid,
+                                   uint32_t spu_num)
+{
+    if (wid >= 16 || spu_num >= 6) return 0;
+    struct PmInstance* pi = NULL;
+    struct PmSlot* slot = NULL;
+    AcquireSRWLockExclusive(&s_pm_directory_lock);
+    for (unsigned i = 0; i < SPURS_PM_INSTANCES; i++) {
+        struct PmInstance* p = &s_pm_instances[i];
+        if (!p->used || p->ea != spurs_ea) continue;
+        if (!p->retiring) {
+            struct PmSlot* s = &p->slots[wid][spu_num];
+            if (s->ctx) { pi = p; slot = s; p->users++; }
+        }
+        break;
+    }
+    ReleaseSRWLockExclusive(&s_pm_directory_lock);
+    if (!slot) return 0;
+    int staged;
+    AcquireSRWLockExclusive(&slot->lock);
+    staged = spurs_policy_pm_pipeline_staged(slot->ctx->ls);
+    ReleaseSRWLockExclusive(&slot->lock);
+    AcquireSRWLockExclusive(&s_pm_directory_lock);
+    pi->users--;
+    WakeAllConditionVariable(&s_pm_directory_wake);
+    ReleaseSRWLockExclusive(&s_pm_directory_lock);
+    return staged;
+}
+
 int spu_run_policy_module(spu_lifted_entry_fn entry, int image_id,
                           const uint8_t* pm_host, uint32_t pm_size,
                           uint64_t wkl_data, uint32_t wid, uint32_t spurs_ea,

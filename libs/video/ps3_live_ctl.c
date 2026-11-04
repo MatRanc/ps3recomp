@@ -76,6 +76,7 @@ static const char* const K_NAME[PS3_LIVE_COUNT] = {
     "SPURS_PM_FAST_GEN",
     "PS3RECOMP_FLIP_FENCE_DONE",
     "PS3RECOMP_DUMP_FIFO_TRIGGER",
+    "SPURS_PM_NATIVE_DISPATCH",
 };
 
 static _Atomic int s_val[PS3_LIVE_COUNT];

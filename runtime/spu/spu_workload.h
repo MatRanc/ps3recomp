@@ -99,6 +99,16 @@ int spu_run_policy_module(spu_lifted_entry_fn entry, int image_id,
                           uint64_t wkl_data, uint32_t wid, uint32_t spurs_ea,
                           uint32_t spu_num);
 
+/* SPURS_PM_NATIVE_DISPATCH: does the resident policy context's persistent
+ * local store hold a job that has been loaded but not yet stored?
+ * LS 0x12D0/0x12E0/0x12F0 are loadJobNum/runJobNum/storeJobNum (BE u32,
+ * 0xFFFFFFFF = empty). Pure so the scheduler fixture can drive it with a
+ * synthetic local store. spurs_policy_pm_staged_pending() is the live lookup
+ * (declared weak by cellSpurs.c so fixtures without spurs_policy.c fall back). */
+int spurs_policy_pm_pipeline_staged(const uint8_t* ls);
+int spurs_policy_pm_pipeline_words(uint32_t spurs_ea, uint32_t wid,
+                                   uint32_t spu_num, uint32_t out[4]);
+
 /* Stage and enter one SPURS jobchain job (spurs_job.c). Unlike a policy module
  * or a task, a job binary is a raw image built by the SDK's job_elf-to-bin and
  * linked against Sony's job_start_w_crt.o, whose entry contract is

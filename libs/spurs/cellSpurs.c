@@ -96,7 +96,10 @@ static uint32_t s_workload_epoch = 1;
 /* Diagnostic counters for SPURS_SCHED_TRACE (never read by a dispatch path):
  * how often a policy quantum was rerun in the same worker vs admitted by the
  * coordinator. They show whether the fast path is actually firing. */
-static unsigned long s_pm_fast_reruns, s_pm_coord_dispatches;
+static unsigned long s_pm_fast_reruns, s_pm_native_reruns, s_pm_coord_dispatches;
+static unsigned long s_pm_native_calls, s_pm_native_staged, s_pm_native_noready,
+                     s_pm_native_other;
+static unsigned long s_pm_native_diag[16];
 static SpursTask     s_tasks[CELL_SPURS_MAX_TASK];
 static u32           s_next_task_id = 0;
 
@@ -1866,6 +1869,57 @@ static int spurs_pm_fast_gen_key(void)
 #endif
 }
 
+/* SPURS_PM_NATIVE_DISPATCH: a wid bitmask (0 = off). For a named workload the
+ * lane may keep working without returning to the coordinator when either
+ *   (a) the policy module has ALREADY staged the next job in its persistent
+ *       local store (loadJobNum != -1 && loadJobNum != storeJobNum), or
+ *   (b) the guest still publishes ready work / a signal for this workload
+ *       and no OTHER enabled workload has ready work for this lane.
+ * The first case is the purest native dispatch: the job was already claimed,
+ * so the ready count is left untouched. The second is a fairness-gated
+ * FAST_RESCHED without the 8/64 rerun cap; the coordinator is still the
+ * arbitration point whenever another workload wants the lane. */
+static int spurs_pm_native_wids(void)
+{
+    int n = 0;
+#ifdef SPURS_HAVE_LIVE_CTL
+    if (ps3_live_ctl_get) n = ps3_live_ctl_get(PS3_LIVE_SPURS_PM_NATIVE_DISPATCH);
+    else
+#endif
+    {
+        /* Read every time: the standalone fixture flips the key between
+         * cases in one process, and the production path uses the live file. */
+        const char* e = getenv("SPURS_PM_NATIVE_DISPATCH");
+        n = (e && *e) ? atoi(e) : 0;
+    }
+    if (n < 0) n = 0;
+    return n & 0xFFFF;
+}
+
+static int spurs_pm_native_wid_ok(u32 wid)
+{
+    return wid < 16 && ((spurs_pm_native_wids() >> wid) & 1) != 0;
+}
+
+/* The policy module's persistent local store exposes its job pipeline at
+ * LS 0x12C0..0x12FF: nextLoadJobNum, loadJobNum, runJobNum, storeJobNum
+ * (big-endian u32, -1 = empty). A job is staged for this lane when it has
+ * been loaded but not yet stored. spurs_policy.c owns the resident context
+ * and exports this check; a fixture without it links the weak symbol as NULL
+ * and keeps the emulated path. */
+#if defined(__GNUC__) && !defined(_WIN32)
+extern int spurs_policy_pm_staged_pending(uint32_t spurs_ea, uint32_t wid,
+                                          uint32_t spu_num) __attribute__((weak));
+extern int spurs_policy_pm_pipeline_words(uint32_t spurs_ea, uint32_t wid,
+                                          uint32_t spu_num,
+                                          uint32_t out[4]) __attribute__((weak));
+#else
+extern int spurs_policy_pm_staged_pending(uint32_t spurs_ea, uint32_t wid,
+                                          uint32_t spu_num);
+extern int spurs_policy_pm_pipeline_words(uint32_t spurs_ea, uint32_t wid,
+                                          uint32_t spu_num, uint32_t out[4]);
+#endif
+
 /* SPURS_LANE6: the title's MeshJobs0/1 (wids 1 and 2) publish priority[5]=0
  * and maxContention=5, which is what keeps the c690 workload off the sixth
  * physical lane. The key overrides both for those two workload ids only, in
@@ -1887,7 +1941,8 @@ static int spurs_lane6_for(u32 wid, u32 sn)
  * registry lock is skipped while its epoch is unchanged: the coordinator
  * snapshotted pm/size/ea/data under that lock at dispatch and every mutation
  * of those fields bumps the epoch under the same lock. */
-static int spurs_pm_fast_static_ok(struct SpursInst* si, struct SpursPmSlot* slot)
+static int spurs_pm_static_ok(struct SpursInst* si, struct SpursPmSlot* slot,
+                              int allow_active)
 {
     if (si->stopping) return 0;
     const u32 wid = slot->wid, ea = slot->ea;
@@ -1936,13 +1991,21 @@ static int spurs_pm_fast_static_ok(struct SpursInst* si, struct SpursPmSlot* slo
      * rerun at the steady state active == maxContention (which is exactly what
      * kept the c690 fast path from ever firing). The rerun adds no lane; it is
      * only refused when the guest has lowered its demand below the active set.
-     * Same for the ready-level test in spurs_pm_fast_ready_ok below. */
-    if (spurs_pm_fast_active_key()) {
+     * Same for the ready-level test in spurs_pm_ready_ok below. The native
+     * staged-job path always passes allow_active: the job is already loaded
+     * for this lane, so running it adds no lane and claims nothing new. */
+    if (allow_active) {
         if ((int)si->active[wid] > (int)maxcont) return 0;
     } else if (si->active[wid] >= maxcont) {
         return 0;
     }
     return 1;
+}
+
+/* SPURS_PM_FAST_ACTIVE: the FAST_RESCHED admission test. */
+static int spurs_pm_fast_static_ok(struct SpursInst* si, struct SpursPmSlot* slot)
+{
+    return spurs_pm_static_ok(si, slot, spurs_pm_fast_active_key());
 }
 
 /* Is an already-active lane still inside the guest's ready-level demand?
@@ -1960,16 +2023,23 @@ static int spurs_pm_fast_lane_within_level(int active, u32 ready, u32 idle,
 }
 
 /* The ready/signal half, under the lock-line lock. */
-static int spurs_pm_fast_ready_ok(struct SpursInst* si, struct SpursPmSlot* slot,
-                                  u32 ready, u32 signal, u32 idle)
+static int spurs_pm_ready_ok(struct SpursInst* si, struct SpursPmSlot* slot,
+                             u32 ready, u32 signal, u32 idle, int allow_active)
 {
     const u32 wid = slot->wid;
     if (!ready && !(signal & (0x8000u >> wid))) return 0;
     if (spurs_ready_level() &&
         !spurs_pm_fast_lane_within_level((int)si->active[wid], ready, idle,
-                                         spurs_pm_fast_active_key()))
+                                         allow_active))
         return 0;
     return 1;
+}
+
+static int spurs_pm_fast_ready_ok(struct SpursInst* si, struct SpursPmSlot* slot,
+                                  u32 ready, u32 signal, u32 idle)
+{
+    return spurs_pm_ready_ok(si, slot, ready, signal, idle,
+                             spurs_pm_fast_active_key());
 }
 
 /* Called with si->lock held, after a policy run returned. Returns 1 when the
@@ -2039,6 +2109,107 @@ static void spurs_pm_fast_consume(struct SpursInst* si, struct SpursPmSlot* slot
                       slot->spu_num | ((ready & 0xFFu) << 8));
 }
 
+/* Fairness at the arbitration point: if another enabled workload has ready
+ * work or a signal for a lane this physical SPU is eligible for, yield to the
+ * coordinator instead of keeping the lane. This is the condition the
+ * dispatch-cuts A/B identified as the one FAST_ACTIVE ignored: the coordinator
+ * round trip is where a contended lane is handed to DXT/Crowd/synth/MP3. */
+static int spurs_pm_native_other_ready(struct SpursInst* si, u32 wid, u32 sn)
+{
+    const u32 ea = si->ea;
+    int other = 0;
+    AcquireSRWLockExclusive(&s_workload_registry_lock);
+    const u32 enabled = vm_read32(ea + SPURS_WKL_ENABLED);
+    const u32 signal = vm_read16(ea + SPURS_WKL_SIGNAL1);
+    for (u32 w = 0; w < 16; w++) {
+        if (w == wid) continue;
+        if (!(enabled & (0x80000000u >> w))) continue;
+        if (vm_read8(ea + SPURS_WKL_STATE1 + w) != 2) continue;
+        const SpursWorkload* wl = &s_workloads[w];
+        if (!wl->in_use || wl->spurs_ea != ea || wl->shutting_down) continue;
+        if (!vm_read8(ea + SPURS_WKL_INFO1 + w * SPURS_WKL_INFO_SZ + 0x18 + sn))
+            continue;                 /* priority 0: not eligible on this lane */
+        const u32 maxcont = vm_read8(ea + SPURS_WKL_MAXCONT + w);
+        if (!maxcont || si->active[w] >= maxcont) continue;
+        if (vm_read8(ea + SPURS_WKL_READY1 + w) || (signal & (0x8000u >> w))) {
+            other = 1;
+            break;
+        }
+    }
+    ReleaseSRWLockExclusive(&s_workload_registry_lock);
+    return other;
+}
+
+/* SPURS_PM_NATIVE_DISPATCH: keep a named c690 workload on this lane when it
+ * has a job already staged in the policy module's persistent local store, or
+ * when the guest still has ready work for it and no other workload wants the
+ * lane. The PM's own job-list protocol still claims, orders, runs and stores
+ * every job, so job order, completion counters, labels/signals and the
+ * workload state the PPU reads are exactly the emulated path's. Only the host
+ * round trip is skipped. Falls back to the coordinator for an unrecognised
+ * workload, no work, or a competing workload. */
+static int spurs_pm_native_try_rerun(struct SpursInst* si, struct SpursPmSlot* slot)
+{
+    const u32 wid = slot->wid, ea = slot->ea;
+    if (!spurs_pm_native_wid_ok(wid)) return 0;
+    if (!slot->data) return 0;                 /* no job list: not c690 */
+    if (vm_read8(ea + SPURS_WKL_MAXCONT + wid) != 5) return 0;
+    if (!spurs_pm_static_ok(si, slot, 1)) return 0;
+    __atomic_fetch_add(&s_pm_native_calls, 1, __ATOMIC_RELAXED);
+    const int staged = spurs_policy_pm_staged_pending &&
+        spurs_policy_pm_staged_pending(ea, wid, slot->spu_num);
+    if (staged) __atomic_fetch_add(&s_pm_native_staged, 1, __ATOMIC_RELAXED);
+
+    /* First few exits of each c690 lane: say whether the PM left a staged
+     * job and what the four pipeline words were. Cheap and bounded. */
+    if (__atomic_fetch_add(&s_pm_native_diag[wid & 15], 1, __ATOMIC_RELAXED) < 4) {
+        uint32_t w[4] = {0, 0, 0, 0};
+        int have = spurs_policy_pm_pipeline_words &&
+            spurs_policy_pm_pipeline_words(ea, wid, slot->spu_num, w);
+        fprintf(stderr, "[spurs-native] wid=%u sn=%u staged=%d ready=%u sig=%u "
+                "pipe=%08X,%08X,%08X,%08X have=%d\n",
+                wid, slot->spu_num, staged,
+                vm_read8(ea + SPURS_WKL_READY1 + wid),
+                (vm_read16(ea + SPURS_WKL_SIGNAL1) >> (15 - wid)) & 1u,
+                w[0], w[1], w[2], w[3], have);
+    }
+
+    /* Fairness before the lock line: a competing workload yields to the
+     * coordinator (the arbitration point dispatch-cuts identified). */
+    if (spurs_pm_native_other_ready(si, wid, slot->spu_num)) {
+        __atomic_fetch_add(&s_pm_native_other, 1, __ATOMIC_RELAXED);
+        return 0;
+    }
+
+    /* One lock-line critical section: check ready/signal and consume. A
+     * staged job was already claimed under an earlier ready unit, so it may
+     * run even when the guest has not published a new one; the ready count is
+     * then left untouched, exactly as the coordinator would leave it. */
+    const u32 bit = 0x8000u >> wid;
+    spu_lockline_lock();
+    const u32 ready = vm_read8(ea + SPURS_WKL_READY1 + wid);
+    const u32 signal = vm_read16(ea + SPURS_WKL_SIGNAL1);
+    const u32 idle = vm_read8(ea + SPURS_WKL_IDLE2 + wid);
+    const int ready_ok = spurs_pm_ready_ok(si, slot, ready, signal, idle, 1);
+    if (!staged && !ready_ok) {
+        spu_lockline_unlock();
+        __atomic_fetch_add(&s_pm_native_noready, 1, __ATOMIC_RELAXED);
+        return 0;
+    }
+    if (ready_ok) {
+        if (!spurs_ready_level() && ready)
+            vm_base[ea + SPURS_WKL_READY1 + wid] = (u8)(ready - 1);
+        if (signal & bit)
+            ef_w16(ea + SPURS_WKL_SIGNAL1, (u16)(signal & ~bit));
+    }
+    vm_base[ea + SPURS_WKL_CURCONT + wid] = si->active[wid];
+    ef_line_end(ea);                 /* notify if reserved, then unlock */
+    si->idle[wid] = 0;
+    ps3_trace_instant(PS3_TR_SPURS_KICK, wid,
+                      slot->spu_num | ((ready & 0xFFu) << 8));
+    return 1;
+}
+
 /* One persistent worker for each configured virtual SPU. A waiting policy
  * occupies only its own slot; a later runnable producer can use another slot.
  * Admission and lifecycle state are serialized per instance. Guest execution
@@ -2062,6 +2233,7 @@ static DWORD WINAPI spurs_pm_worker(LPVOID p)
         if (si->stopping && !slot->busy) break;
         int fast_limit = spurs_pm_fast_resched_limit();
         int fast_runs = 0;
+        int native_runs = 0;
         for (;;) {
             ReleaseSRWLockExclusive(&si->lock);
             const uint64_t ft_t0 = PS3_FT_ON() ? ps3_ft_now() : 0;
@@ -2072,6 +2244,11 @@ static DWORD WINAPI spurs_pm_worker(LPVOID p)
             if (ft_t0)   /* PS3_FTRACE: SPURS SPUs never block on a channel, so their busy time is the module run */
                 ps3_ft_span(PS3_FT_SPU_BUSY, slot->spu_num, (uint32_t)slot->image_id, slot->wid, ft_t0, ps3_ft_now());
             AcquireSRWLockExclusive(&si->lock);
+            if (native_runs < 256 && spurs_pm_native_try_rerun(si, slot)) {
+                __atomic_fetch_add(&s_pm_native_reruns, 1, __ATOMIC_RELAXED);
+                native_runs++;
+                continue;
+            }
             if (fast_runs < fast_limit) {
                 int rerun;
                 if (spurs_pm_fast_one_lock_key()) {
@@ -2168,10 +2345,16 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
                     if (st < 0) st = getenv("SPURS_SCHED_TRACE") ? 1 : 0;
                     if (st && (++n_seen % 4096) == 0)
                         fprintf(stderr, "[spurs-sched] wid %u ready %u idle %u maxcont %u active %u signal %u sn %u "
-                                "fast=%lu coord=%lu busy:%u%u%u%u%u%u\n",
+                                "fast=%lu native=%lu coord=%lu ncall=%lu nstage=%lu "
+                                "nready=%lu nother=%lu busy:%u%u%u%u%u%u\n",
                                 wid, ready, vm_read8(ea + SPURS_WKL_IDLE2 + wid), maxcont, si->active[wid], (signal >> (15 - wid)) & 1u, sn,
                                 __atomic_load_n(&s_pm_fast_reruns, __ATOMIC_RELAXED),
+                                __atomic_load_n(&s_pm_native_reruns, __ATOMIC_RELAXED),
                                 __atomic_load_n(&s_pm_coord_dispatches, __ATOMIC_RELAXED),
+                                __atomic_load_n(&s_pm_native_calls, __ATOMIC_RELAXED),
+                                __atomic_load_n(&s_pm_native_staged, __ATOMIC_RELAXED),
+                                __atomic_load_n(&s_pm_native_noready, __ATOMIC_RELAXED),
+                                __atomic_load_n(&s_pm_native_other, __ATOMIC_RELAXED),
                                 si->slots[0].busy, si->nspus > 1 && si->slots[1].busy, si->nspus > 2 && si->slots[2].busy,
                                 si->nspus > 3 && si->slots[3].busy, si->nspus > 4 && si->slots[4].busy,
                                 si->nspus > 5 && si->slots[5].busy);

@@ -87,6 +87,24 @@ static void fast_policy(spu_context* c)
     atomic_fetch_add(&fast_visits,1);
     c->pc=SPURS_PM_EXIT_TO_KERNEL_LS;spu_indirect_branch(c);
 }
+static atomic_uint native_runs;
+static void native_policy(spu_context* c)
+{
+    unsigned n = atomic_fetch_add(&native_runs, 1) + 1;
+    if (n == 1) {
+        /* A job is loaded and not yet stored: the worker may keep the lane. */
+        spu_ls_write32(c, 0x12D0, 0);
+        spu_ls_write32(c, 0x12E0, 0xFFFFFFFFu);
+        spu_ls_write32(c, 0x12F0, 0xFFFFFFFFu);
+        c->pc = SPURS_PM_EXIT_TO_KERNEL_LS; spu_indirect_branch(c);
+    } else {
+        /* The rerun stored it; retire the workload so the coordinator stops. */
+        spu_ls_write32(c, 0x12D0, 0xFFFFFFFFu);
+        spu_ls_write32(c, 0x12E0, 0xFFFFFFFFu);
+        spu_ls_write32(c, 0x12F0, 0);
+        finish(c);
+    }
+}
 static void late_policy(spu_context* c) { atomic_store(&late_seen,1);finish(c); }
 static void stopped_policy(spu_context* c)
 {
@@ -513,6 +531,60 @@ int main(void)
         s_workloads[0].in_use = 1;
         setenv("SPURS_PM_FAST_GEN", "0", 1);
         puts("SPURS fast rerun skips the registry lock only while its epoch holds PASS");
+
+
+        /* SPURS_PM_NATIVE_DISPATCH: the pure staged-job predicate reads the
+         * wwsjob PM's persistent pipeline words. Cover every shape so the
+         * worker cannot keep a lane for an already-stored or empty slot. */
+        {
+            uint8_t ls[0x1300];
+            memset(ls, 0, sizeof ls);
+            #define LS32(o, v) do { uint32_t _v = (v); ls[(o)] = _v >> 24;                 ls[(o)+1] = _v >> 16; ls[(o)+2] = _v >> 8; ls[(o)+3] = _v; } while (0)
+            LS32(0x12D0, 0xFFFFFFFFu); LS32(0x12E0, 0xFFFFFFFFu); LS32(0x12F0, 0xFFFFFFFFu);
+            assert(spurs_policy_pm_pipeline_staged(ls) == 0);   /* empty */
+            LS32(0x12D0, 3); LS32(0x12E0, 0xFFFFFFFFu); LS32(0x12F0, 2);
+            assert(spurs_policy_pm_pipeline_staged(ls) == 1);   /* staged */
+            LS32(0x12E0, 3);
+            assert(spurs_policy_pm_pipeline_staged(ls) == 1);   /* running */
+            LS32(0x12E0, 0xFFFFFFFFu); LS32(0x12F0, 3);
+            assert(spurs_policy_pm_pipeline_staged(ls) == 0);   /* stored */
+            LS32(0x12E0, 2); LS32(0x12F0, 2);
+            assert(spurs_policy_pm_pipeline_staged(ls) == 0);   /* inconsistent */
+            assert(spurs_policy_pm_pipeline_staged(NULL) == 0);
+            #undef LS32
+            puts("SPURS native staged-job predicate covers empty/staged/stored PASS");
+        }
+
+        /* End-to-end: a manufactured policy leaves a job staged, and the
+         * worker runs it again in the same residency (no coordinator
+         * dispatch) when the native wid mask names the workload. The second
+         * run clears the staged state and retires the workload. */
+        {
+            memset(&s_workloads[0], 0, sizeof s_workloads[0]);
+            const unsigned long coord_before =
+                __atomic_load_n(&s_pm_coord_dispatches, __ATOMIC_RELAXED);
+            const unsigned long native_before =
+                __atomic_load_n(&s_pm_native_reruns, __ATOMIC_RELAXED);
+            setenv("SPURS_PM_NATIVE_DISPATCH", "1", 1);
+            setenv("SPURS_PM_FAST_RESCHED", "0", 1);
+            setenv("SPURS_PM_FAST_ACTIVE", "0", 1);
+            register_pm(0x9800, 0x88, native_policy, 85);
+            assert(cellSpursInitialize((CellSpurs*)0x1000, 1, 0, 0, 0) == 0);
+            assert(cellSpursAddWorkload((CellSpurs*)0x1000, (u32*)0x8000,
+                                        (void*)0x9800, 16, 0x1234, NULL, 1, 5) == 0);
+            assert(cellSpursReadyCountStore((CellSpurs*)0x1000, 0, 5) == 0);
+            wait_for(&native_runs, 2, "native staged-job rerun");
+            Sleep(20);
+            assert(atomic_load(&native_runs) == 2);
+            assert(vm_read8(0x1000 + SPURS_WKL_READY1) == 3);  /* 5 - dispatch - native */
+            assert(__atomic_load_n(&s_pm_coord_dispatches, __ATOMIC_RELAXED) -
+                   coord_before == 1);   /* the rerun did not go through the coordinator */
+            assert(__atomic_load_n(&s_pm_native_reruns, __ATOMIC_RELAXED) -
+                   native_before == 1);
+            finalize(0x1000);
+            setenv("SPURS_PM_NATIVE_DISPATCH", "0", 1);
+            puts("SPURS native dispatch runs a staged job without the coordinator PASS");
+        }
 
         memset(&s_workloads[0], 0, sizeof s_workloads[0]);
     }

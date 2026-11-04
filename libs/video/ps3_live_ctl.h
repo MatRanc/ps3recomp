@@ -77,6 +77,7 @@ enum {
     PS3_LIVE_SPURS_PM_FAST_GEN,         /* SPURS_PM_FAST_GEN: skip the workload-registry lock when unchanged */
     PS3_LIVE_FLIP_FENCE_DONE,           /* PS3RECOMP_FLIP_FENCE_DONE: complete a presented flip when the next frame's fence publishes */
     PS3_LIVE_DUMP_FIFO_TRIGGER,         /* PS3RECOMP_DUMP_FIFO_TRIGGER: rising edge starts a FIFO dump (armed mode only) */
+    PS3_LIVE_SPURS_PM_NATIVE_DISPATCH,  /* SPURS_PM_NATIVE_DISPATCH: wid bitmask for staged-job native re-dispatch */
     PS3_LIVE_COUNT
 };
 
