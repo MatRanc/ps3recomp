@@ -1089,6 +1089,15 @@ void spu_direct_init(void);
     } while (0)
 #endif
 
+/* spu_lifter.py --inline-direct: the fast-path test of SPU_DIRECT, exposed so
+ * a source-inlined tail target can keep the same interrupt/step/trampoline
+ * gate while the transfer itself becomes straight-line code. Touches no
+ * ctx->gpr, so the generated line stays in the --local-regs "pure" class. */
+#define SPU_DIRECT_INLINE_OK(ctx, PC)                                        \
+    (g_spu_direct > 0 && ((uint32_t)(PC) & SPU_LS_MASK) && (ctx)->steps &&    \
+     !g_spu_stack_reset_hint[((uint32_t)(PC) >> 2) & 1023u] &&                \
+     !((ctx)->int_enable && ((ctx)->event_status & (ctx)->event_mask)))
+
 /* spu_lifter.py --ib-known-targets: a computed branch (bi/biz/...) whose target
  * register holds PC, one of the few lifted entries the code loads as constants
  * nearby, takes SPU_DIRECT (or a goto) instead of a resolver pass -- a guest

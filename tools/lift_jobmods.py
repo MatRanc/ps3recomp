@@ -385,6 +385,9 @@ def main():
                     help="Pass --const-bi to spu_lifter.py.")
     ap.add_argument("--local-regs", action="store_true",
                     help="Pass --local-regs to spu_lifter.py.")
+    ap.add_argument("--inline-direct", action="store_true",
+                    help="Pass --inline-direct to spu_lifter.py: fold acyclic "
+                         "direct callees into their caller before --local-regs.")
     ap.add_argument("--only-ea", default=None, metavar="EA[,EA...]",
                     help="--engine-elf only: lift just the module(s) whose source EA "
                          "matches one of these (hex or decimal). Use this to add one "
@@ -411,6 +414,8 @@ def main():
         LIFTER_FLAGS.append("--const-bi")
     if args.local_regs:
         LIFTER_FLAGS.append("--local-regs")
+    if args.inline_direct:
+        LIFTER_FLAGS.append("--inline-direct")
     OUTDIR  = args.out
     register_c = args.register or os.path.join(OUTDIR, "jobmods_register.c")
 
