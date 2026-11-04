@@ -1939,7 +1939,7 @@ static spu_lifted_fn spu_lifted_lookup_full(const spu_context* ctx, uint32_t lsa
              * its span must then fall through to the interpreter, not to some
              * other image's stale functions. */
             if (!spu_overlay_source_enabled(ctx->resident_code[slot].source_index))
-                continue;
+                return NULL;
             /* A region registered with its code bytes owns its span even when
              * unverified: other images' functions there would be stale. */
             if (ctx->resident_code[slot].verify_state &&
@@ -2576,6 +2576,7 @@ void spu_overlay_register_sig(const uint8_t sig[16], int image_id)
         s_ovl_src[s_ovl_src_count].image_id = image_id;
         memcpy(s_ovl_src[s_ovl_src_count].sig, sig, 16);
         s_ovl_src[s_ovl_src_count].has_sig = 1;
+        s_ovl_src[s_ovl_src_count].enabled = 1;
         s_ovl_src_count++;
     }
 }
