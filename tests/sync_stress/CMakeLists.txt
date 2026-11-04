@@ -161,3 +161,14 @@ foreach(phase table prodcons timeouts signal pingpong)
     set_tests_properties(lwcond_real_${phase} PROPERTIES
         LABELS "stress;runtime;sync" TIMEOUT 120)
 endforeach()
+
+# The flip-done deadline cap (runtime/ppu/flip_deadline.h): pure state machine.
+add_executable(test_flip_deadline test_flip_deadline.c)
+if(MSVC)
+    target_compile_options(test_flip_deadline PRIVATE /W3)
+    target_compile_definitions(test_flip_deadline PRIVATE _CRT_SECURE_NO_WARNINGS)
+else()
+    target_compile_options(test_flip_deadline PRIVATE -Wall -Wextra)
+endif()
+add_test(NAME flip_deadline COMMAND test_flip_deadline)
+set_tests_properties(flip_deadline PROPERTIES LABELS "runtime;sync" TIMEOUT 10)

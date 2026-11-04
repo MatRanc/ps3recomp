@@ -22,6 +22,7 @@
 #include "../platform/win32_compat.h"
 #include "../memory/vm.h"   /* VM_HLE_INJECT_BASE -- not platform-specific */
 #include "lwcond_real.h"    /* PS3_LWCOND_REAL: host condition variable per lwcond */
+#include "flip_deadline.h"  /* PS3RECOMP_FLIP_DEADLINE_US: honor the guest's 2-vblank deadline */
 #ifndef _WIN32
 /* sys_timer.h: not included, its lv2 headers redefine ppu_context. */
 extern "C" uint64_t host_monotonic_ns(void);
@@ -568,11 +569,28 @@ static void sys_lwcond_wait_real(ppu_context* ctx, struct LwmSlot* sl, lwc_slot*
     }
     vm_write32(lwmutex + LWM_RECUR, 0);
     vm_write32(lwmutex + LWM_OWNER, 0);
-    ppu_thread_note_block(ctx->thread_id);
     const uint32_t lwc_ea = (uint32_t)ctx->gpr[3];
+    /* PS3RECOMP_FLIP_DEADLINE_US (default 0): the title waits for its flip
+     * with two Cond_Wait(17000) rounds and gives up at 2 x 16683 us. Two full
+     * host timeouts reach 34.1 ms, so cap the second wait to the guest's
+     * deadline. Off by default; only the flip-done lwcond is affected. */
+    static flip_deadline_state s_flip_deadline;
+    long long wait_us = (long long)timeout_us;
+    int force_timeout = 0;
+    const int deadline_us = lwc_ea == LWCOND_FLIP_DONE_EA
+        ? ps3_live_ctl_get(PS3_LIVE_FLIP_DEADLINE_US) : 0;
+    if (deadline_us > 0 && timeout_us == 17000) {
+        wait_us = flip_deadline_timeout_us(&s_flip_deadline, lwc_now_us(),
+                                           wait_us, deadline_us, &force_timeout);
+    }
+    if (!force_timeout) ppu_thread_note_block(ctx->thread_id);
     const int tr_exit = ps3_trace_on() && lwc_ea == LWCOND_FLIP_DONE_EA;
     const long long wt0 = tr_exit ? lwc_now_us() : 0;
-    int r = lwc_wait(s, self, timeout_us, lwc_fallback_ms(), lwc_unlock_lwm, lwc_relock_lwm, sl);
+    int r = force_timeout ? LWC_TIMEDOUT
+                          : lwc_wait(s, self, (uint64_t)wait_us, lwc_fallback_ms(),
+                                     lwc_unlock_lwm, lwc_relock_lwm, sl);
+    if (deadline_us > 0 && timeout_us == 17000)
+        flip_deadline_wait_result(&s_flip_deadline, r == LWC_TIMEDOUT);
     if (tr_exit) {
         const long long el = lwc_now_us() - wt0;
         ps3_trace_instant(PS3_TR_FLIP_WAIT_EXIT, (uint32_t)r,
