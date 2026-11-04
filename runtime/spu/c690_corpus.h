@@ -43,6 +43,12 @@ void c690_corpus_note_op(const struct spu_context* ctx, unsigned op);
 void c690_corpus_stage_enter(const struct spu_context* ctx, uint32_t stage_lsa);
 void c690_corpus_stage_exit(const struct spu_context* ctx, uint32_t stage_lsa);
 
+/* Cull stage boundaries (0x25/0x26 -> 0x132E0, 0x2C -> 0x12C08), captured to
+ * cull_NNN.bin when PS3RECOMP_C690_CULL_PAIRS is set. Same pair format as the
+ * tree stage; the entry GPRs carry r4 and stage_lsa identifies the family. */
+void c690_corpus_cull_enter(const struct spu_context* ctx, uint32_t stage_lsa);
+void c690_corpus_cull_exit(const struct spu_context* ctx, uint32_t stage_lsa);
+
 #ifdef __cplusplus
 }
 #endif

@@ -65,6 +65,8 @@ enum {
     PS3_LIVE_SPURS_TEARDOWN,    /* PS3RECOMP_SPURS_TEARDOWN: real Shutdown/Wait drain */
     PS3_LIVE_GCM_OFFSET_SYNC,   /* PS3RECOMP_GCM_OFFSET_SYNC: publish guest offset tables on map/unmap */
     PS3_LIVE_PREPARE_FLIP_KEEP_STATUS, /* cellGcmSetPrepareFlip must not complete the outstanding flip */
+    PS3_LIVE_C690_CULL_FIX,     /* PS3RECOMP_C690_CULL_FIX: 0x25/0x26 cull screen grid in samples */
+    PS3_LIVE_C690_CULL_FIX_2C,  /* PS3RECOMP_C690_CULL_FIX_2C: 0x2C cull screen grid in samples */
     PS3_LIVE_COUNT
 };
 

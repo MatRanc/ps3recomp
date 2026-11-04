@@ -98,6 +98,10 @@ typedef struct {
     uint64_t stage_pair_seq;
     int stage_capture;
     int stage_depth;
+    FILE* cull_f;          /* 0x25/0x26 and 0x2C cull stage spool */
+    uint64_t cull_pair_seq;
+    int cull_capture;
+    int cull_depth;
     int active;            /* job body running */
     int tail;              /* job body done, file open for the submit epilogue */
     uint32_t job_index;
@@ -116,6 +120,9 @@ static unsigned s_max_jobs = 2000;
 static unsigned s_stage_jobs = 20;
 static unsigned s_stage_stride = 1;
 static unsigned s_stage_gap_ms = 0;
+static unsigned s_cull_jobs = 0;      /* 0 = cull capture off */
+static unsigned s_cull_stride = 1;
+static unsigned s_cull_gap_ms = 0;
 static unsigned s_stride = 1;
 static unsigned long long s_job_seq;
 static unsigned long long s_captured;
@@ -123,6 +130,10 @@ static unsigned long long s_stage_entries;
 static unsigned long long s_stage_pairs;
 static uint64_t s_stage_last_ns;
 static unsigned long long s_stage_files;
+static unsigned long long s_cull_entries;
+static unsigned long long s_cull_pairs;
+static uint64_t s_cull_last_ns;
+static unsigned long long s_cull_files;
 static int s_trigger_seen;
 static int s_done_written;
 static int s_stop;
@@ -175,6 +186,12 @@ static void c690_corpus_init(void)
     if (sg && *sg) { long v = strtol(sg, NULL, 0); if (v >= 0) s_stage_gap_ms = (unsigned)v; }
     const char* sd = getenv("PS3RECOMP_C690_CORPUS_STRIDE");
     if (sd && *sd) { long v = strtol(sd, NULL, 0); if (v > 0) s_stride = (unsigned)v; }
+    const char* cj = getenv("PS3RECOMP_C690_CULL_PAIRS");
+    if (cj && *cj) { long v = strtol(cj, NULL, 0); if (v > 0) s_cull_jobs = (unsigned)v; }
+    const char* cs = getenv("PS3RECOMP_C690_CULL_STRIDE");
+    if (cs && *cs) { long v = strtol(cs, NULL, 0); if (v > 0) s_cull_stride = (unsigned)v; }
+    const char* cg = getenv("PS3RECOMP_C690_CULL_GAP_MS");
+    if (cg && *cg) { long v = strtol(cg, NULL, 0); if (v >= 0) s_cull_gap_ms = (unsigned)v; }
     s_on = 1;
     g_c690_corpus_on = 1;
 #if defined(_WIN32)
@@ -183,9 +200,11 @@ static void c690_corpus_init(void)
     mkdir(s_dir, 0777);
 #endif
     fprintf(stderr, "[c690-corpus] enabled dir=%s jobs=%u stage_pairs=%u "
-                    "stage_stride=%u stage_gap=%ums stride=%u trigger=%s\n",
+                    "stage_stride=%u stage_gap=%ums cull_pairs=%u "
+                    "cull_stride=%u cull_gap=%ums stride=%u trigger=%s\n",
             s_dir, s_max_jobs, s_stage_jobs, s_stage_stride, s_stage_gap_ms,
-            s_stride, s_trigger[0] ? s_trigger : "(none)");
+            s_cull_jobs, s_cull_stride, s_cull_gap_ms, s_stride,
+            s_trigger[0] ? s_trigger : "(none)");
     fflush(stderr);
 }
 
@@ -278,12 +297,22 @@ void c690_corpus_job_begin(const struct spu_context* ctx, uint32_t desc_ea,
     fwrite(hdr, sizeof hdr, 1, f);
     fwrite(&start, sizeof start, 1, f);
 
+    /* The stage and cull spools are per-lane and independent of job sampling;
+     * do not close or forget them when a sampled job starts on this lane. */
+    FILE* keep_stage_f = t_run.stage_f;
+    uint64_t keep_stage_seq = t_run.stage_pair_seq;
+    FILE* keep_cull_f = t_run.cull_f;
+    uint64_t keep_cull_seq = t_run.cull_pair_seq;
     memset(&t_run, 0, sizeof t_run);
     t_run.f = f;
     t_run.active = 1;
     t_run.tail = 0;
     t_run.stage_capture = 0;
     t_run.stage_depth = 0;
+    t_run.stage_f = keep_stage_f;
+    t_run.stage_pair_seq = keep_stage_seq;
+    t_run.cull_f = keep_cull_f;
+    t_run.cull_pair_seq = keep_cull_seq;
     t_run.job_index = (uint32_t)seq;
 
     c690_corpus_rec(f, C69C_JOB_GPR, 0, 0, ctx->pc, ctx->gpr, C690_CORPUS_GPR_SIZE);
@@ -399,6 +428,70 @@ void c690_corpus_stage_exit(const struct spu_context* ctx, uint32_t stage_lsa)
                            (uint32_t)ctx->spu_id, (seq << 32) | (frame & 0xFFFFFFFFu),
                            ctx);
     __atomic_fetch_add(&s_stage_pairs, 1ull, __ATOMIC_RELAXED);
+}
+
+/* ---- cull stage spool (0x25/0x26 -> 0x132E0, 0x2C -> 0x12C08) ----------- *
+ * Same on-disk pairs as the tree stage, in cull_NNN.bin. The capture is its
+ * own trigger (PS3RECOMP_C690_CULL_PAIRS > 0) so it can run without the
+ * 0xFDA0 spool; the entry image carries r4 (1 for 0x25, 0 for 0x26) and the
+ * stage_lsa distinguishes the two families. */
+static void c690_cull_spool_open(void)
+{
+    if (t_run.cull_f) return;
+    const unsigned long long id =
+        __atomic_fetch_add(&s_cull_files, 1ull, __ATOMIC_RELAXED);
+    char path[1200];
+    snprintf(path, sizeof path, "%s/cull_%03llu.bin", s_dir, id);
+    FILE* f = fopen(path, "wb");
+    if (!f) return;
+    char magic[8];
+    memcpy(magic, C690_STAGE_MAGIC, sizeof magic);
+    uint32_t ver = 1;
+    fwrite(magic, sizeof magic, 1, f);
+    fwrite(&ver, sizeof ver, 1, f);
+    t_run.cull_f = f;
+}
+
+void c690_corpus_cull_enter(const struct spu_context* ctx, uint32_t stage_lsa)
+{
+    if (!s_on || !g_c690_corpus_on || !ctx || !s_cull_jobs) return;
+    if (!c690_corpus_triggered()) return;
+    if (t_run.cull_depth++ != 0) return;
+    t_run.cull_capture = 0;
+    if (__atomic_load_n(&s_cull_pairs, __ATOMIC_RELAXED) >= s_cull_jobs) return;
+    const unsigned long long entry =
+        __atomic_fetch_add(&s_cull_entries, 1ull, __ATOMIC_RELAXED);
+    if (s_cull_stride > 1u && (entry % (unsigned long long)s_cull_stride) != 0)
+        return;
+    const uint64_t now = c690_corpus_now_ns();
+    if (s_cull_gap_ms) {
+        const uint64_t last = __atomic_load_n(&s_cull_last_ns, __ATOMIC_RELAXED);
+        if (last && now - last < (uint64_t)s_cull_gap_ms * 1000000ull) return;
+        __atomic_store_n(&s_cull_last_ns, now, __ATOMIC_RELAXED);
+    }
+    c690_cull_spool_open();
+    if (!t_run.cull_f) return;
+    const uint64_t seq = ++t_run.cull_pair_seq;
+    const uint64_t frame = (uint64_t)c690_frame_flips();
+    t_run.cull_capture = 1;
+    c690_stage_spool_image(t_run.cull_f, C69C_STAGE_IN, stage_lsa,
+                           (uint32_t)ctx->spu_id, (seq << 32) | (frame & 0xFFFFFFFFu),
+                           ctx);
+}
+
+void c690_corpus_cull_exit(const struct spu_context* ctx, uint32_t stage_lsa)
+{
+    if (!g_c690_corpus_on) return;
+    if (t_run.cull_depth == 0 || --t_run.cull_depth != 0) return;
+    if (!t_run.cull_capture) return;
+    t_run.cull_capture = 0;
+    if (!t_run.cull_f) return;
+    const uint64_t seq = t_run.cull_pair_seq;
+    const uint64_t frame = (uint64_t)c690_frame_flips();
+    c690_stage_spool_image(t_run.cull_f, C69C_STAGE_OUT, stage_lsa,
+                           (uint32_t)ctx->spu_id, (seq << 32) | (frame & 0xFFFFFFFFu),
+                           ctx);
+    __atomic_fetch_add(&s_cull_pairs, 1ull, __ATOMIC_RELAXED);
 }
 
 void c690_corpus_job_end(const struct spu_context* ctx)

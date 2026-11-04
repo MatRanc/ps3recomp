@@ -97,7 +97,7 @@ int c690_native_cull_enabled(void)
     if (cull || shadow) {
         const unsigned long long t =
             __atomic_fetch_add(&s_enable_tick, 1ull, __ATOMIC_RELAXED) + 1ull;
-        if ((t & 0xFFFFull) == 0ull) c690_native_report("progress");
+        if ((t & 0xFFull) == 0ull) c690_native_report("progress");
     }
     return cull || shadow;
 }
@@ -171,12 +171,20 @@ static int c690_shadow_alloc(void)
  * its arithmetic under that mode; the body can leave a truncate mode behind
  * (the SPU's own mode), which must not leak into the replacement. */
 static void c690_native_run(spu_context* ctx, unsigned entry_mxcsr,
-                            unsigned long long* calls)
+                            unsigned long long* calls, int live)
 {
     const unsigned cur = _mm_getcsr();
     _mm_setcsr(entry_mxcsr | 0x8040u);   /* entry rounding | FTZ | DAZ */
     c690_native_stage(ctx);
     _mm_setcsr(cur);
+    /* The flattened kernel keeps the final register file but, unlike the
+     * lifted body's terminal SPU_RET, it must publish the return PC itself.
+     * The corpus test compared LS+GPR only, which is why this was missed. */
+    if (live) {
+        ctx->pc = ctx->gpr[0]._u32[0];
+        if (ctx->host_depth == 0)
+            g_spu_trampoline_fn = spu_indirect_branch;
+    }
     if (calls) __atomic_fetch_add(calls, 1ull, __ATOMIC_RELAXED);
 }
 
@@ -190,6 +198,14 @@ int c690_native_cull_enter(spu_context* ctx)
     const int live = c690_native_live_get(PS3_LIVE_C690_NATIVE_CULL, s_env_cull);
     const int shadow = c690_native_live_get(PS3_LIVE_C690_NATIVE_SHADOW, s_env_shadow);
     if (!live && !shadow) return 0;   /* outer lifted stage; leave() closes */
+    if (shadow) {
+        static int once;
+        if (!once) {
+            once = 1;
+            fprintf(stderr, "[c690-native] shadow active (first outer entry)\n");
+            fflush(stderr);
+        }
+    }
 
     if (!shadow) {
         /* Live: the native call replaces the whole body, so there is no
@@ -198,7 +214,8 @@ int c690_native_cull_enter(spu_context* ctx)
             __atomic_fetch_add(&s_fallbacks, 1ull, __ATOMIC_RELAXED);
             return 0;
         }
-        c690_native_run(ctx, _mm_getcsr(), &s_native_calls);
+        c690_native_run(ctx, _mm_getcsr(), &s_native_calls, 1);
+        if ((s_native_calls & 0xFFull) == 0ull) c690_native_report("native-progress");
         t_depth = 0;
         return 1;
     }
@@ -231,8 +248,10 @@ void c690_native_cull_leave(spu_context* ctx)
     t_nat->pc = ctx->pc;
     t_nat->int_enable = ctx->int_enable;
     t_nat->event_status = ctx->event_status;
-    c690_native_run(t_nat, t_entry_mxcsr, NULL);
-    __atomic_fetch_add(&s_shadow_calls, 1ull, __ATOMIC_RELAXED);
+    c690_native_run(t_nat, t_entry_mxcsr, NULL, 0);
+    const unsigned long long shadow_n =
+        __atomic_fetch_add(&s_shadow_calls, 1ull, __ATOMIC_RELAXED) + 1ull;
+    if ((shadow_n & 0xFFull) == 0ull) c690_native_report("shadow-progress");
 
     size_t ls_bad = 0, first = (size_t)-1;
     for (size_t i = 0; i < SPU_LS_SIZE; i++) {
@@ -248,7 +267,11 @@ void c690_native_cull_leave(spu_context* ctx)
             gpr_bad++;
         }
     }
-    if (ls_bad || gpr_bad) {
+    /* The lifted terminal SPU_RET publishes gpr[0] as pc; the native kernel
+     * must agree on it even though the corpus gate compared GPRs only. */
+    const unsigned nat_pc = t_nat->gpr[0]._u32[0];
+    const unsigned pc_bad = (nat_pc != ctx->pc) ? 1u : 0u;
+    if (ls_bad || gpr_bad || pc_bad) {
         __atomic_fetch_add(&s_shadow_mismatches, 1ull, __ATOMIC_RELAXED);
         __atomic_fetch_add(&s_shadow_ls_bad, (unsigned long long)ls_bad, __ATOMIC_RELAXED);
         __atomic_fetch_add(&s_shadow_gpr_bad, (unsigned long long)gpr_bad, __ATOMIC_RELAXED);
@@ -274,7 +297,8 @@ void c690_native_cull_leave(spu_context* ctx)
                 fprintf(stderr, "[c690-native]  dumped entry/lifted/native to %s\n", dump);
             }
             fprintf(stderr, "[c690-native] SHADOW MISMATCH ls_bytes=%zu first=0x%05zX "
-                            "gprs=%u first=r%u\n", ls_bad, first, gpr_bad, first_gpr);
+                            "gprs=%u first=r%u pc_native=0x%05X pc_lifted=0x%05X\n",
+                    ls_bad, first, gpr_bad, first_gpr, nat_pc, ctx->pc);
             if (first != (size_t)-1) {
                 const size_t base = first & ~(size_t)15;
                 fprintf(stderr, "[c690-native]  LS 0x%05zX native ", base);
