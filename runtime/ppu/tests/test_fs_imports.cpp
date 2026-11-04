@@ -20,6 +20,8 @@
 extern "C" {
 uint8_t* vm_base = nullptr;
 uint32_t ppu_vm_size = 0;
+void (*volatile g_ps3_guest_access_hook)(const void* host, size_t len) = nullptr;
+void (*volatile g_ps3_guest_write_hook)(const void* host, size_t len) = nullptr;
 void vm_write32(uint64_t a, uint32_t v) { uint32_t be = __builtin_bswap32(v); memcpy(vm_base + a, &be, 4); }
 void vm_write64(uint64_t a, uint64_t v) { uint64_t be = __builtin_bswap64(v); memcpy(vm_base + a, &be, 8); }
 void ppu_guest_caller(char* out, size_t n) { if (n) out[0] = 0; }

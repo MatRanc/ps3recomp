@@ -556,14 +556,6 @@ s32 cellFsRead(CellFsFd fd, void* buf, u64 nbytes, u64* nread)
     return CELL_OK;
 }
 
-static int fs_write_check_on(void)
-{
-    if (ps3_live_ctl_get) return ps3_live_ctl_get(PS3_LIVE_FS_WRITE_CHECK) != 0;
-    static int v = -1;
-    if (v < 0) { const char* e = getenv("PS3RECOMP_FS_WRITE_CHECK"); v = (e && *e && *e != '0') ? 1 : 0; }
-    return v;
-}
-
 /* NID: 0xECDCF2AB */
 s32 cellFsWrite(CellFsFd fd, const void* buf, u64 nbytes, u64* nwrite)
 {
@@ -582,6 +574,7 @@ s32 cellFsWrite(CellFsFd fd, const void* buf, u64 nbytes, u64* nwrite)
          * faulting: make it coherent first (MLB 16 writes its generated
          * faces to HeadFaceCacheFile). */
         ps3_guest_access(gptr((void*)buf), (size_t)nbytes);
+        ps3_fs_write_begin(s_files[fd].host_fp);   /* ferror() is sticky */
         bytes_written = (u64)fwrite(gptr((void*)buf), 1, (size_t)nbytes, s_files[fd].host_fp);
         write_failed = ps3_fs_write_failed((size_t)bytes_written, nbytes,
                                            ferror(s_files[fd].host_fp));

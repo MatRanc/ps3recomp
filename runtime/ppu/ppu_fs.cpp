@@ -556,14 +556,6 @@ static void cellFsRead(ppu_context* ctx)
     ctx->gpr[3] = CELL_OK;
 }
 
-static int fs_write_check_on(void)
-{
-    if (ps3_live_ctl_get) return ps3_live_ctl_get(PS3_LIVE_FS_WRITE_CHECK) != 0;
-    static int v = -1;
-    if (v < 0) { const char* e = getenv("PS3RECOMP_FS_WRITE_CHECK"); v = (e && *e && *e != '0') ? 1 : 0; }
-    return v;
-}
-
 static void cellFsWrite(ppu_context* ctx)
 {
     int fd          = (int)(uint32_t)ctx->gpr[3];
@@ -574,6 +566,7 @@ static void cellFsWrite(ppu_context* ctx)
     if (!f) { ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EIO; return; }
     fs_prefault(buf, nbytes);   /* kernel READS the buffer; same reserved-page trap */
     fs_set_dir(fd, f, 2);
+    ps3_fs_write_begin(f);      /* ferror() is sticky: an old failure would look like this one */
     size_t n = fwrite(vm_base + buf, 1, (size_t)nbytes, f);
     const int write_failed = ps3_fs_write_failed(n, nbytes, ferror(f));
     /* DIAGNOSTIC (PS3_FSLOG_BT=1): dump the guest back-chain when the game logs the

@@ -32,12 +32,15 @@
 #include <string.h>
 #include <errno.h>
 #include <sys/stat.h>
+#include <time.h>
 #ifdef _WIN32
 #  include <direct.h>
 #  include <process.h>
+#  include <windows.h>
 #  define MKDIR(p) _mkdir(p)
 #  define strcasecmp _stricmp
 #else
+#  include <dirent.h>
 #  include <strings.h>
 #  include <unistd.h>
 #  define MKDIR(p) mkdir((p), 0777)
@@ -310,6 +313,45 @@ void disk_atexit()
             (unsigned)c.version);
 }
 
+bool tmp_older_than_hour(const std::string& path, time_t now)
+{
+    struct stat st;
+    return stat(path.c_str(), &st) == 0 &&
+           (st.st_mode & S_IFMT) == S_IFREG &&
+           st.st_mtime < now - 3600;
+}
+
+/* A store writes <file>.<pid>.<serial>.tmp then renames it. A process killed
+ * mid-write leaves the temporary behind; sweep those at open, but leave a
+ * recent one (another live process may be writing it). */
+void disk_sweep_tmp(const std::string& dir)
+{
+    const time_t now = time(NULL);
+#ifdef _WIN32
+    WIN32_FIND_DATAA fd;
+    const std::string pattern = dir + "/*.tmp";
+    HANDLE h = FindFirstFileA(pattern.c_str(), &fd);
+    if (h == INVALID_HANDLE_VALUE) return;
+    do {
+        const std::string path = dir + "/" + fd.cFileName;
+        if (tmp_older_than_hour(path, now)) remove(path.c_str());
+    } while (FindNextFileA(h, &fd));
+    FindClose(h);
+#else
+    DIR* d = opendir(dir.c_str());
+    if (!d) return;
+    struct dirent* e;
+    while ((e = readdir(d))) {
+        const char* name = e->d_name;
+        const size_t len = strlen(name);
+        if (len < 4 || strcmp(name + len - 4, ".tmp") != 0) continue;
+        const std::string path = dir + "/" + name;
+        if (tmp_older_than_hour(path, now)) remove(path.c_str());
+    }
+    closedir(d);
+#endif
+}
+
 /* Reads the switch once. A value that is not an on-word is the directory. */
 void disk_env(DiskCache& c)
 {
@@ -332,6 +374,7 @@ void disk_env(DiskCache& c)
         c.dir.clear();
         return;
     }
+    disk_sweep_tmp(c.dir);
     c.on = true;
     static bool registered = false;
     if (!registered) { registered = true; atexit(disk_atexit); }
@@ -371,37 +414,49 @@ void disk_header(u32 hdr[kDiskHeaderWords], u32 version, int stage, u64 key,
 bool disk_load(DiskCache& c, u64 key, int stage, const char* hlsl,
                u32* words, u32 max_words, u32* out_words)
 {
-    std::lock_guard<std::mutex> guard(c.lock);
-    disk_env(c);
-    if (!c.on) return false;
-
-    const std::string path = disk_path(c, key, stage);
     const u64 hash = hlsl_hash(hlsl);
     const size_t hlen = strlen(hlsl);
+    std::string path;
+    u32 want[kDiskHeaderWords];
+    {
+        std::lock_guard<std::mutex> guard(c.lock);
+        disk_env(c);
+        if (!c.on) return false;
+        path = disk_path(c, key, stage);
+        disk_header(want, c.version, stage, key, hash, hlen, 0, 0);
+    }
+
+    /* File I/O runs outside the cache lock: a load must not serialise another
+     * thread's store or load on a slow disk. */
     FILE* f = fopen(path.c_str(), "rb");
-    if (!f) { c.stats.misses++; return false; }
+    if (!f) {
+        std::lock_guard<std::mutex> guard(c.lock);
+        c.stats.misses++;
+        return false;
+    }
 
     u32 hdr[kDiskHeaderWords];
-    u32 want[kDiskHeaderWords];
-    disk_header(want, c.version, stage, key, hash, hlen, 0, 0);
     bool ok = fread(hdr, sizeof hdr, 1, f) == 1 &&
               memcmp(hdr, want, 12 * sizeof(u32)) == 0 &&
               hdr[12] != 0 && hdr[12] <= max_words &&
               hdr[12] <= (1u << 24);
     if (ok) {
-        u64 sum = 0xcbf29ce484222325ull;
-        std::vector<unsigned int> tmp(hdr[12]);
-        ok = fread(tmp.data(), sizeof(u32), tmp.size(), f) == tmp.size();
+        ok = fread(words, sizeof(u32), hdr[12], f) == hdr[12];
         if (ok) {
-            sum = fnv1a64(tmp.data(), tmp.size() * sizeof(u32), sum);
+            const u64 sum = fnv1a64(words, (size_t)hdr[12] * sizeof(u32),
+                                    0xcbf29ce484222325ull);
             ok = (u32)sum == hdr[13] && (u32)(sum >> 32) == hdr[14];
         }
+        /* A file with bytes past the declared words is not this header's. */
         if (ok) {
-            memcpy(words, tmp.data(), tmp.size() * sizeof(u32));
-            *out_words = (u32)tmp.size();
+            const int extra = fgetc(f);
+            ok = extra == EOF && !ferror(f);
         }
+        if (ok) *out_words = hdr[12];
     }
     fclose(f);
+
+    std::lock_guard<std::mutex> guard(c.lock);
     if (!ok) {
         c.stats.rejected++;
         c.stats.misses++;

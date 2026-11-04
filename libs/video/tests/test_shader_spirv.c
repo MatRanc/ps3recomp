@@ -20,7 +20,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <dirent.h>
+#include <time.h>
 #include <unistd.h>
+#include <utime.h>
 
 static int g_pass = 0, g_fail = 0;
 
@@ -246,6 +248,40 @@ int main(void)
         check("keyed: ... as a rejected miss", ds.hits == 0 && ds.rejected == 1);
     } else {
         check("keyed: truncate", 0);
+    }
+
+    /* A file with bytes past the words its header declares is not ours. */
+    {
+        FILE* f = fopen(kpath, "ab");
+        if (f) { fputc(0x5A, f); fclose(f); }
+        else check("keyed: open for trailing bytes", 0);
+    }
+    rsx_hlsl_to_spirv_disk_reset();
+    check("keyed: trailing bytes still succeed",
+          translate_keyed(0x1234u, kVS, RSX_SHADER_STAGE_VERTEX, g_b, &nb) == 0);
+    ds = disk_stats();
+    check("keyed: ... as a rejected miss, then stored", ds.hits == 0 &&
+          ds.misses == 1 && ds.rejected == 1 && ds.stores == 1);
+
+    /* Orphaned .tmp files older than an hour are swept at cache open; a
+     * recent one (another live store) is left alone. */
+    {
+        char oldtmp[1200], newtmp[1200];
+        snprintf(oldtmp, sizeof oldtmp, "%s/orphan-old.tmp", kdir);
+        snprintf(newtmp, sizeof newtmp, "%s/orphan-new.tmp", kdir);
+        FILE* f = fopen(oldtmp, "wb");
+        if (f) { fputs("partial", f); fclose(f); }
+        f = fopen(newtmp, "wb");
+        if (f) { fputs("partial", f); fclose(f); }
+        struct utimbuf tb;
+        tb.actime = tb.modtime = time(NULL) - 7200;
+        utime(oldtmp, &tb);
+        rsx_hlsl_to_spirv_disk_reset();
+        check("keyed: open sweeps an old .tmp",
+              translate_keyed(0x1234u, kVS, RSX_SHADER_STAGE_VERTEX, g_b, &nb) == 0);
+        check("keyed: ... old gone, recent kept",
+              access(oldtmp, F_OK) != 0 && access(newtmp, F_OK) == 0);
+        remove(newtmp);
     }
 
     /* A translator version bump must invalidate every file. */

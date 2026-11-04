@@ -23,7 +23,8 @@ PY="${PYTHON:-$(command -v python3 || command -v python)}"
 # hooks from spu_channels.c that these tests cannot link (they define their own
 # spu_rdch/spu_wrch).
 SUPPORT="$HERE/test_runtime_stubs.c $RUNTIME_SPU/spu_coherency.c $RUNTIME_SPU/spu_vm_pagemap.c
- $RUNTIME_SPU/spu_drain.c $REPO/runtime/platform/win32_compat.c $REPO/runtime/host/host_stubs.c"
+ $RUNTIME_SPU/spu_drain.c $RUNTIME_SPU/c690_stats.c $RUNTIME_SPU/c690_corpus.c
+ $REPO/runtime/platform/win32_compat.c $REPO/runtime/host/host_stubs.c"
 
 pass=0
 fail=0

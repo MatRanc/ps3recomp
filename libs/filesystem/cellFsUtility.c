@@ -89,8 +89,7 @@ s32 cellFsUtilWriteFile(const char* path, const void* buf, u64 size, u64* bytesW
     fclose(f);
 
     if (bytesWritten) vm_write64((u32)(uintptr_t)bytesWritten, (u64)n);
-    { const char* e = getenv("PS3RECOMP_FS_WRITE_CHECK");
-      if (failed && e && *e && *e != '0') return (s32)CELL_FS_UTIL_ERROR_IO; }
+    if (failed && fs_write_check_on()) return (s32)CELL_FS_UTIL_ERROR_IO;
     return CELL_OK;
 }
 

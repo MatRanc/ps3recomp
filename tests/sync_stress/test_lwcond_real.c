@@ -365,6 +365,17 @@ static void phase_table(void)
     CHECK(a && lwc_slot_get(0x50000, 0) == a && lwc_slot_get(0x50000, 1) == a);
     CHECK(lwc_slot_get(0x50008, 1) != a);
     CHECK(lwc_signal(a, 1, 0) == 0);             /* nobody waiting: no-op */
+
+    /* The tombstone is (long)-1, which casts to the guest address 0xFFFFFFFF.
+     * A freed slot the probe chain for that address crosses must not look like
+     * a live lwcond there. The freed address has the same hash bucket. */
+    lwc_slot* x = lwc_slot_get(0xFFFFEFFF, 1);
+    CHECK(x && lwc_slot_get(0xFFFFEFFF, 0) == x);
+    CHECK(lwc_slot_free(0xFFFFEFFF) == 1);
+    CHECK(lwc_slot_get(0xFFFFFFFF, 0) == NULL);
+    lwc_slot* f = lwc_slot_get(0xFFFFFFFF, 1);
+    CHECK(f != NULL && lwc_slot_get(0xFFFFFFFF, 0) == f);
+    CHECK(lwc_slot_free(0xFFFFFFFF) == 1);
 }
 
 /* ---- 6. destroy frees an idle slot, EBUSY while a waiter is parked ---- */

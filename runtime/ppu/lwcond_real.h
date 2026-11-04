@@ -95,7 +95,7 @@ static inline lwc_slot* lwc_slot_get(uint32_t addr, int create)
     for (uint32_t i = 0; i < LWC_HASH; i++) {
         lwc_slot* s = &g_lwc[(h + i) & (LWC_HASH - 1)];
         const long cur = s->addr;
-        if ((uint32_t)cur == addr) { r = s; break; }
+        if (cur != LWC_TOMBSTONE && (uint32_t)cur == addr) { r = s; break; }
         if (cur == 0) {
             if (create) {
                 lwc_slot* use = tomb ? tomb : s;
@@ -125,7 +125,7 @@ static inline int lwc_slot_free(uint32_t addr)
     for (uint32_t i = 0; i < LWC_HASH; i++) {
         lwc_slot* s = &g_lwc[(h + i) & (LWC_HASH - 1)];
         const long cur = s->addr;
-        if ((uint32_t)cur == addr) {
+        if (cur != LWC_TOMBSTONE && (uint32_t)cur == addr) {
             EnterCriticalSection(&s->lock);
             if (s->waiters) rc = 0;
             else { s->addr = LWC_TOMBSTONE; rc = 1; }
