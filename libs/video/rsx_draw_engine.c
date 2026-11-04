@@ -1245,6 +1245,20 @@ static int eng_wcb_batch_on(void)
 { return eng_wcb_cut_on(PS3_LIVE_WCB_BATCH, "PS3RECOMP_RSX_WCB_BATCH"); }
 static int eng_wcb_skip_on(void)
 { return eng_wcb_cut_on(PS3_LIVE_WCB_SKIP, "PS3RECOMP_RSX_WCB_SKIP"); }
+/* PS3RECOMP_RSX_WCB_STREAM: record a demand readback's image->buffer copy at
+ * the end of the open draw batch and wait once, instead of flushing and
+ * waiting for the batch and then submitting the copy on its own. The bytes
+ * are the same (the copy is ordered after every draw before it); the cost
+ * goes from two GPU round trips per readback to one. */
+static int eng_wcb_stream_on(void)
+{ return eng_wcb_cut_on(PS3_LIVE_WCB_STREAM, "PS3RECOMP_RSX_WCB_STREAM"); }
+/* PS3RECOMP_RSX_WCB_PREFETCH: at a sync point, queue copies of the targets
+ * the guest has been reading and submit the batch without waiting, so the GPU
+ * runs them while the walker records the rest of the frame. The guest's read
+ * then collects a copy that is already in flight instead of forcing the
+ * accumulated batch to complete. */
+static int eng_wcb_prefetch_on(void)
+{ return eng_wcb_cut_on(PS3_LIVE_WCB_PREFETCH, "PS3RECOMP_RSX_WCB_PREFETCH"); }
 
 static void eng_wcb_retire_surface(u32 slot);
 static void eng_wcb_retire_zdepth(u32 slot);
@@ -2136,15 +2150,30 @@ void rsx_draw_engine_guest_read(u32 location, u32 offset, u32 pitch, u32 w, u32 
     u8* rows = eng_coherence_buffer(n * bpp * h);
     if (!rows) return;
     const unsigned long long t0 = eng_wcb_now_ns();
-    g.be->submit_and_wait(g.be->user, RSX_BE_FLUSH_GUEST_REFERENCE);
-    g.be->readback(g.be->user, s->handle, x, y, n, h, rows, n * bpp);
+    int streamed = 0;
+    if (eng_wcb_stream_on() && g.be->readback_async && g.be->readback_async_fetch) {
+        const u32 t = g.be->readback_async(g.be->user, s->handle, x, y, n, h);
+        if (t) {
+            WCB_COUNT(async_issued, 1);
+            if (g.be->readback_async_fetch(g.be->user, t, rows, n * bpp) == 0) {
+                streamed = 1;
+                WCB_COUNT(async_fetched, 1);
+            } else {
+                WCB_COUNT(async_discarded, 1);
+            }
+        }
+    }
+    if (!streamed) {
+        g.be->submit_and_wait(g.be->user, RSX_BE_FLUSH_GUEST_REFERENCE);
+        g.be->readback(g.be->user, s->handle, x, y, n, h, rows, n * bpp);
+    }
     if (eng_coherence_log())
         fprintf(stderr, "[rsx engine] guest_read %u:0x%08X %ux%u <- surface 0x%08X (%u bpp) at %u,%u:"
                         " %u non-zero pixels\n", location, offset, w, h, s->offset, bpp, x, y,
                 eng_nonzero_pixels(rows, n * h, bpp));
     eng_color_rows_store(bpp, location, offset, pitch, rows, n, h, skip, bytes, 0);
     eng_guest_valid_set(s, x, y, n, h);
-    eng_light_probe_log(slot, s, x, y, n, h, "direct", rows, n,
+    eng_light_probe_log(slot, s, x, y, n, h, streamed ? "stream" : "direct", rows, n,
                         probe_stored, probe_covers, 0);
     /* The copy is now what guest memory holds. A rectangle that did not cover
      * the target leaves the rest stale, so the pages must be armed again
@@ -3485,6 +3514,7 @@ static int eng_wcb_copy_surface(u32 slot, int use_ticket)
     u8* rows = eng_coherence_buffer(rw * bpp * rh);
     if (!rows) return 0;
     int from_ticket = 0;
+    int streamed = 0;
     if (use_ticket && full && s->wcb_ticket && g.be->readback_async_fetch) {
         const u32 t = s->wcb_ticket;
         s->wcb_ticket = 0;
@@ -3494,7 +3524,25 @@ static int eng_wcb_copy_surface(u32 slot, int use_ticket)
             WCB_COUNT(async_discarded, 1);  /* fetch frees the ticket either way */
         }
     }
-    if (!from_ticket) {
+    if (!from_ticket && !use_ticket && eng_wcb_stream_on() &&
+        g.be->readback_async && g.be->readback_async_fetch) {
+        /* PWCB stream: queue the copy at the end of the open draw batch, then
+         * flush that batch and wait on it once. The copy is ordered after the
+         * draws recorded before it by vk_cmd_after_everything, so the bytes
+         * are the ones the old flush-then-copy path produced. */
+        eng_wcb_drop_ticket(s);
+        const u32 t = g.be->readback_async(g.be->user, s->handle, rx, ry, rw, rh);
+        if (t) {
+            WCB_COUNT(async_issued, 1);
+            if (g.be->readback_async_fetch(g.be->user, t, rows, rw * bpp) == 0) {
+                streamed = 1;
+                WCB_COUNT(async_fetched, 1);
+            } else {
+                WCB_COUNT(async_discarded, 1);
+            }
+        }
+    }
+    if (!from_ticket && !streamed) {
         eng_wcb_drop_ticket(s);
         if (!g.be->readback) return 0;
         g.be->submit_and_wait(g.be->user, RSX_BE_FLUSH_GUEST_REFERENCE);
@@ -3512,6 +3560,7 @@ static int eng_wcb_copy_surface(u32 slot, int use_ticket)
     eng_textures_touch(s->location, s->offset, s->pitch * s->h);
     eng_light_probe_log(slot, s, rx, ry, rw, rh,
                         full ? (from_ticket ? "ticket" :
+                                streamed ? "stream" :
                                 use_ticket ? "guestreq" : "copy") : "rect",
                         rows, rw, probe_stored, probe_covers, probe_ticket);
     WCB_COUNT(copied, 1);
@@ -3577,6 +3626,7 @@ static int eng_wcb_job_queue(u32 slot)
         if (g.be->readback_async_release) g.be->readback_async_release(g.be->user, t);
         return 0;
     }
+    WCB_COUNT(async_issued, 1);
     s_bjobs[s_nbjobs].slot = slot; s_bjobs[s_nbjobs].ticket = t;
     s_bjobs[s_nbjobs].x = rx; s_bjobs[s_nbjobs].y = ry;
     s_bjobs[s_nbjobs].w = rw; s_bjobs[s_nbjobs].h = rh;
@@ -3595,6 +3645,7 @@ static void eng_wcb_job_store(const eng_wcb_bjob* j)
     u8* rows = eng_coherence_buffer(j->w * bpp * j->h);
     if (!rows) { g.be->readback_async_release(g.be->user, j->ticket); return; }
     if (g.be->readback_async_fetch(g.be->user, j->ticket, rows, j->w * bpp) != 0) return;
+    WCB_COUNT(async_fetched, 1);
     eng_color_rows_store(bpp, s->location, s->offset + j->y * s->pitch + j->x * bpp,
                          s->pitch, rows, j->w, j->h, 0, j->w * bpp, 1);
     const int full = j->x == 0 && j->y == 0 && j->w == s->w && j->h == s->h;
@@ -3711,9 +3762,9 @@ static void eng_wcb_resolve(void* user, u32 cookie, int reason)
                     : reason == RSX_WCB_REASON_EXPLICIT ? saved_trig : ENG_WCB_TRIG_OTHER;
     /* PWCB cut 2: every request this pass is waiting for goes to the GPU as
      * one batch (one submission, one wait) instead of one submit_and_wait
-     * each. */
+     * each. The stream cut uses the same grouping. */
     if ((reason == RSX_WCB_REASON_REQUEST || reason == RSX_WCB_REASON_FAULT) &&
-        !s_wcb.batching && eng_wcb_batch_on()) {
+        !s_wcb.batching && (eng_wcb_batch_on() || eng_wcb_stream_on())) {
         eng_wcb_batch_resolve(cookie, is_read);
         s_wcb_trigger = saved_trig;
         return;
@@ -3779,6 +3830,8 @@ static int eng_is_display_offset(u32 location, u32 offset);
 static void eng_wcb_sync_point(int mode)
 {
     eng_wcb_module_up();
+    const int prefetch = eng_wcb_prefetch_on() && g.be->readback_async && g.be->submit_async;
+    u32 queued = 0;
     for (u32 i = 0; i < g.n_surfaces; i++) {
         eng_surface* s = &g.surfaces[i];
         /* A wait that timed out had the module open the pages without a
@@ -3801,7 +3854,7 @@ static void eng_wcb_sync_point(int mode)
                 continue;
             }
         }
-        if (mode == RSX_WCB_ASYNC && g.be->readback_async && eng_wcb_hot(s) &&
+        if ((mode == RSX_WCB_ASYNC || prefetch) && g.be->readback_async && eng_wcb_hot(s) &&
             (!s->wcb_ticket || s->wcb_ticket_serial != s->color_serial)) {
             eng_wcb_drop_ticket(s);
             const u32 t = g.be->readback_async(g.be->user, s->handle, 0, 0, s->w, s->h);
@@ -3809,11 +3862,11 @@ static void eng_wcb_sync_point(int mode)
                 s->wcb_ticket = t;
                 s->wcb_ticket_serial = s->color_serial;
                 WCB_COUNT(async_issued, 1);
+                queued++;
             }
         }
     }
-    if (!g.be->depth_readback) return;
-    for (u32 i = 0; i < g.n_zdepths; i++) {
+    if (g.be->depth_readback) for (u32 i = 0; i < g.n_zdepths; i++) {
         eng_zdepth* z = &g.zdepths[i];
         if (z->wcb_pending && !rsx_wcb_is_pending(WCB_COOKIE_DEPTH | i)) z->wcb_pending = 0;
         if (!z->handle || !z->guest_dirty || z->wcb_pending) continue;
@@ -3828,6 +3881,10 @@ static void eng_wcb_sync_point(int mode)
             WCB_COUNT(sync_copies, 1);
         }
     }
+    /* Start the queued copies now, so the GPU works through them while the
+     * walker records the rest of the frame. With frame pipelining the submit
+     * does not wait; without it the backend leaves the batch open. */
+    if (prefetch && queued) g.be->submit_async(g.be->user);
 }
 
 void rsx_draw_engine_wcb_service(void)

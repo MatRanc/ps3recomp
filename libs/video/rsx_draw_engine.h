@@ -388,6 +388,12 @@ typedef struct rsx_draw_backend {
     u32  (*readback_async)(void* user, u32 surface, u32 x, u32 y, u32 w, u32 h);
     int  (*readback_async_fetch)(void* user, u32 ticket, void* out, u32 out_pitch);
     void (*readback_async_release)(void* user, u32 ticket);
+    /* Optional. Start the recorded work on the GPU without waiting and
+     * continue recording into a fresh set (the present path's submit). Used
+     * by PS3RECOMP_RSX_WCB_PREFETCH to let a copy queued at a sync point run
+     * while the walker records the rest of the frame. NULL when the backend
+     * cannot submit asynchronously; the engine then leaves the batch open. */
+    void (*submit_async)(void* user);
 
 } rsx_draw_backend;
 

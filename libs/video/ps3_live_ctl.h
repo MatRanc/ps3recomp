@@ -81,6 +81,8 @@ enum {
     PS3_LIVE_FLIP_DEADLINE_US,          /* PS3RECOMP_FLIP_DEADLINE_US: cap the flip-done lwcond to the guest deadline (us) */
     PS3_LIVE_MEMO_INDEX,                /* PS3RECOMP_MEMO_INDEX: probe fetch/remap/pipe memos through a direct-mapped index */
     PS3_LIVE_REFS_HASH_FAST,            /* PS3RECOMP_REFS_HASH_FAST: fold the reference hash in while building the list */
+    PS3_LIVE_WCB_STREAM,                /* WCB: demand readbacks join the open draw batch (one submit+wait) */
+    PS3_LIVE_WCB_PREFETCH,              /* WCB: queue+submit hot-target copies at a sync point, not at the read */
     PS3_LIVE_COUNT
 };
 

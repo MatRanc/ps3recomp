@@ -3375,6 +3375,16 @@ static void vk_eng_readback_release(void* user, u32 ticket)
     if (ticket && ticket <= VK_RB_TICKETS) s_rbt[ticket - 1u].used = 0;
 }
 
+/* PS3RECOMP_RSX_WCB_PREFETCH: submit the open batch and keep recording in the
+ * other set. No-op without frame pipelining, where a flush would wait -- the
+ * sync point must not turn into a GPU stall. */
+static void vk_eng_submit_async(void* user)
+{
+    (void)user;
+    if (!s_ebs_on || !s_eb_pending) return;
+    vk_eng_flush_async();
+}
+
 static void vk_eng_readback_tickets_drain(void)
 {
     for (u32 i = 0; i < VK_RB_TICKETS; i++) {
@@ -5331,6 +5341,7 @@ static const rsx_draw_backend s_vk_engine_backend = {
     .readback_async       = vk_eng_readback_async,
     .readback_async_fetch = vk_eng_readback_fetch,
     .readback_async_release = vk_eng_readback_release,
+    .submit_async         = vk_eng_submit_async,
     .depth_readback       = vk_eng_depth_readback,
     .color_target_write   = vk_eng_color_target_write,
     /* Every draw and every upload submits and waits, so an upload runs after

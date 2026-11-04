@@ -80,6 +80,8 @@ static const char* const K_NAME[PS3_LIVE_COUNT] = {
     "PS3RECOMP_FLIP_DEADLINE_US",
     "PS3RECOMP_MEMO_INDEX",
     "PS3RECOMP_REFS_HASH_FAST",
+    "PS3RECOMP_RSX_WCB_STREAM",
+    "PS3RECOMP_RSX_WCB_PREFETCH",
 };
 
 static _Atomic int s_val[PS3_LIVE_COUNT];

@@ -34,6 +34,7 @@ static unsigned checks, failures;
 static u8  s_pixel[4] = { 0x11, 0x22, 0x33, 0x44 };
 static u32 s_readback_calls, s_last_readback_surface;
 static u32 s_async_issued, s_async_fetched, s_async_released;
+static u32 s_submit_async_calls;
 static struct { int used; u8 px[4]; u32 w, h; } s_tickets[8];
 
 static void fill(void* out, u32 w, u32 h, u32 pitch, const u8 px[4])
@@ -81,6 +82,8 @@ static void test_async_release(void* u, u32 t)
     if (t && t <= 8) s_tickets[t - 1].used = 0;
     s_async_released++;
 }
+
+static void test_submit_async(void* u) { (void)u; s_submit_async_calls++; }
 
 /* ---- guest memory and a reader thread ----------------------------------- */
 
@@ -156,6 +159,7 @@ static rsx_draw_backend wcb_backend(int async)
         be.readback_async = test_async;
         be.readback_async_fetch = test_async_fetch;
         be.readback_async_release = test_async_release;
+        be.submit_async = test_submit_async;
     }
     return be;
 }
@@ -163,6 +167,7 @@ static rsx_draw_backend wcb_backend(int async)
 static void reset_counts(void)
 {
     s_readback_calls = s_async_issued = s_async_fetched = s_async_released = 0;
+    s_submit_async_calls = 0;
     memset(s_tickets, 0, sizeof s_tickets);
 }
 
@@ -488,7 +493,95 @@ static void test_async_mode(void)
     T(!leaked, "async: shutdown released every ticket");
 }
 
-/* ---- 4. off: nothing at all --------------------------------------------- */
+/* ---- 4. stream: one submission for a demand readback -------------------- */
+
+/* PS3RECOMP_RSX_WCB_STREAM: a demand copy joins the open draw batch and is
+ * waited on once, instead of flushing the batch, waiting, then submitting the
+ * copy on its own. The guest must see exactly the same bytes and the backend
+ * must not take the synchronous readback path. */
+static void test_stream_mode(void)
+{
+    reset_counts();
+    setenv("PS3RECOMP_RSX_WCB_STREAM", "1", 1);
+    rsx_draw_engine_wcb_set_mode(RSX_WCB_ONDEMAND);
+    rsx_draw_backend be = wcb_backend(1);
+    engine_up_with(&be);
+
+    const u32 off = 0x40000u;
+    const rsx_draw_engine_wcb_stats st0 = stats();
+    set_px(0xA1, 0xB2, 0xC3, 0xD4);
+    bind_target(off, 256, 256);
+    draw_triangle();
+    const u32 slot = eng_current_surface();
+    rsx_draw_engine_flush_dirty_to_guest();
+    T(s_readback_calls == 0 && s_async_issued == 0 && g.surfaces[slot].wcb_pending,
+      "stream: the sync point still only arms");
+
+    reader r;
+    T(read_on_other_thread(&r, guest(off), 1024u * 256u), "stream: reader thread finished");
+    T(s_readback_calls == 0, "stream: no separate synchronous readback");
+    T(s_async_issued == 1 && s_async_fetched == 1, "stream: the copy was queued and fetched once");
+    T(is_guest_px(r.first, s_pixel) && is_guest_px(r.last, s_pixel) && r.uniform,
+      "stream: the reader saw the rendered bytes over the whole target");
+    T(!g.surfaces[slot].wcb_pending && g.surfaces[slot].guest_dirty == 0,
+      "stream: target clean and its pages open after the copy");
+    T(stats().copied - st0.copied == 1 && stats().async_fetched - st0.async_fetched == 1,
+      "stream: engine stats report the copy");
+    engine_down();
+    unsetenv("PS3RECOMP_RSX_WCB_STREAM");
+}
+
+/* ---- 5. prefetch: the copy is queued and submitted at the sync point ---- */
+
+/* PS3RECOMP_RSX_WCB_PREFETCH: a target the guest read recently gets its copy
+ * queued and the batch submitted at the sync point; the later read collects
+ * that copy (the sync point's bytes) instead of forcing the batch to finish
+ * at the read. */
+static void test_prefetch_mode(void)
+{
+    reset_counts();
+    setenv("PS3RECOMP_RSX_WCB_PREFETCH", "1", 1);
+    rsx_draw_engine_wcb_set_mode(RSX_WCB_ONDEMAND);
+    rsx_draw_backend be = wcb_backend(1);
+    engine_up_with(&be);
+
+    const u32 off = 0x40000u;
+    set_px(0x11, 0x22, 0x33, 0x44);
+    bind_target(off, 256, 256);
+    draw_triangle();
+    const u32 slot = eng_current_surface();
+    rsx_draw_engine_flush_dirty_to_guest();      /* arms; never read yet */
+    reader r;
+    T(read_on_other_thread(&r, guest(off), 1024u * 256u), "prefetch: first read finished");
+    T(s_async_issued == 0 && s_submit_async_calls == 0,
+      "prefetch: a target with no read history is not prefetched");
+
+    /* Drawn again: the next sync point queues and submits the copy. */
+    set_px(0x51, 0x62, 0x73, 0x84);
+    draw_triangle();
+    const u32 issued = s_async_issued;
+    rsx_draw_engine_flush_dirty_to_guest();
+    T(s_async_issued == issued + 1 && s_submit_async_calls == 1,
+      "prefetch: the sync point queued a copy and submitted the batch");
+    T(g.surfaces[slot].wcb_ticket && g.surfaces[slot].wcb_pending,
+      "prefetch: the pages stay armed until the read collects the copy");
+
+    /* The target is drawn again before the guest reads it: the ticket holds
+     * the sync point's bytes, and the guest must see those (not the newer
+     * ones, and not a synchronous readback). */
+    const u8 old_px[4] = { 0x51, 0x62, 0x73, 0x84 };
+    set_px(0x91, 0xA2, 0xB3, 0xC4);
+    draw_triangle();
+    const u32 rb = s_readback_calls;
+    T(read_on_other_thread(&r, guest(off), 1024u * 256u), "prefetch: second read finished");
+    T(s_readback_calls == rb, "prefetch: served from the queued copy, no synchronous readback");
+    T(is_guest_px(r.first, old_px) && is_guest_px(r.last, old_px) && r.uniform,
+      "prefetch: the reader saw the sync point's bytes over the whole target");
+    engine_down();
+    unsetenv("PS3RECOMP_RSX_WCB_PREFETCH");
+}
+
+/* ---- 6. off: nothing at all --------------------------------------------- */
 
 static void test_off_mode(void)
 {
@@ -519,6 +612,9 @@ int main(void)
     test_ondemand_mode();
     memset(vm_base, 0, GUEST_BYTES);
     test_async_mode();
+    test_stream_mode();
+    memset(vm_base, 0, GUEST_BYTES);
+    test_prefetch_mode();
 
     printf("test_color_readback_guest: checks=%u failures=%u (forced store: %s)\n", checks, failures,
            rsx_wcb_forced_store() ? "yes" : "no");
