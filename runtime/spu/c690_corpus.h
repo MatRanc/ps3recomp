@@ -57,13 +57,27 @@ void c690_corpus_cull_exit(const struct spu_context* ctx, uint32_t stage_lsa);
  * A 16-byte-line write bitmap is derived from the IN/OUT diff. N pairs per
  * format key are kept (PS3RECOMP_C690_TAIL_PAIRS, default 8); every command
  * is still counted per key so the run yields exact job/time shares.
- * PS3RECOMP_C690_TAIL_TRIGGER=<path> starts sampling when that file appears
- * (e.g. ab_live.sh's CAPTURE_PREFIX.trigger at the pitch meter).
+ * PS3RECOMP_C690_TAIL_TRIGGER=<path> starts sampling when that file appears.
+ * It is a dedicated file: ab_live.sh's walker capture consumes and deletes
+ * CAPTURE_PREFIX.trigger, so the two must never share a path. The tail hook
+ * only tests for the file and never removes it.
  * Off by default; when off the hooks are one predicted-not-taken load. */
 extern int g_c690_tail_on;
 void c690_corpus_tail_job_begin(const struct spu_context* ctx);
 void c690_corpus_tail_trace(const struct spu_context* ctx, uint32_t lsa,
                             int op, uint64_t now_ns);
+/* 0x2A (LS 0x10F78) function entry/exit wrapper. The generated lifted module
+ * calls these from the wrapper installed by tools/c690_ref/patch_cull_hooks.py,
+ * so two back-to-back assembler commands each close one pair even when the
+ * second is a direct dispatch. */
+void c690_corpus_tail_2a_enter(const struct spu_context* ctx);
+void c690_corpus_tail_2a_exit(const struct spu_context* ctx);
+/* Generic function-entry/exit capture for the other tail commands: 0x21 at
+ * the sub-selector bodies 0x13140/0x131A0 (key from r6 there) and 0x25/0x26
+ * at the cull body 0x132E0. */
+void c690_corpus_tail_cmd_enter(const struct spu_context* ctx, uint32_t lsa,
+                                uint32_t op);
+void c690_corpus_tail_cmd_exit(const struct spu_context* ctx);
 
 #ifdef __cplusplus
 }

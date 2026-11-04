@@ -10,10 +10,14 @@ the hand-written hooks reproducible after a relift:
   * c690_cull_bypass     the MLB16_CULL_BYPASS dispatch helper, routed through
                          the runtime's live key (PS3_LIVE_CULL_BYPASS) instead
                          of a one-time getenv
+  * c690_corpus_tail_2a_*  the 0x2A assembler function-entry/exit capture
 
-It renames the generated 0x132E0 (0x25/0x26) and 0x12C08 (0x2C) bodies to
-`*_body` and inserts the wrapper in front of them. Run it once after
-`tools/lift_spu.sh` touched the module; it is idempotent.
+It renames the generated 0x132E0 (0x25/0x26), 0x12C08 (0x2C) and 0x10F78
+(0x2A) bodies to `*_body` and inserts the wrapper in front of them. The 0x2A
+wrapper is needed because that handler can also be reached by a direct
+known-target dispatch, so the command-boundary capture cannot see two
+back-to-back assembler commands. Run it once after `tools/lift_spu.sh` touched
+the module; it is idempotent.
 
 Usage: patch_cull_hooks.py [path/to/spu_recomp.c]
 """
@@ -36,8 +40,13 @@ void {name}(spu_context* ctx) {{
         extern void c690_cull_fix_mid(spu_context*);
         extern void c690_cull_fix_end(spu_context*);
         extern void c690_cull_fix_leave(spu_context*);
+        extern int g_c690_tail_on;
+        extern void c690_corpus_tail_cmd_enter(const spu_context*, uint32_t, uint32_t);
+        extern void c690_corpus_tail_cmd_exit(const spu_context*);
+        {tail_enter}
         if (__builtin_expect(!g_c690_corpus_on && !c690_cull_fix_maybe(), 1)) {{
             {name}_body(ctx);
+            {tail_exit}
             return;
         }}
         /* Snapshot the game's real input before any transform patch. */
@@ -55,8 +64,43 @@ void {name}(spu_context* ctx) {{
             if (mode == 2) c690_cull_fix_leave(ctx);
             if (g_c690_corpus_on) c690_corpus_cull_exit(ctx, 0x{lsa:05X}u);
         }}
+        {tail_exit}
 }}
 """
+
+# 0x2A (LS 0x10F78): function-entry/exit capture. It must be a wrapper, not a
+# command-boundary hook: the parser can reach the assembler through a direct
+# known-target dispatch, so two 0x2A commands back to back are not both visible
+# at the resolver and the first pair's OUT would include the second's work.
+WRAPPER_2A = """void {name}_body(spu_context* ctx);
+void {name}(spu_context* ctx) {{
+        extern int g_c690_tail_on;
+        extern void c690_corpus_tail_2a_enter(const spu_context*);
+        extern void c690_corpus_tail_2a_exit(const spu_context*);
+        if (__builtin_expect(g_c690_tail_on, 0))
+            c690_corpus_tail_2a_enter(ctx);
+        {name}_body(ctx);
+        if (__builtin_expect(g_c690_tail_on, 0))
+            c690_corpus_tail_2a_exit(ctx);
+}}
+"""
+
+TARGETS_2A = [0x10F78]   # 0x2A vertex assembler
+
+WRAPPER_21 = """void {name}_body(spu_context* ctx);
+void {name}(spu_context* ctx) {{
+        extern int g_c690_tail_on;
+        extern void c690_corpus_tail_cmd_enter(const spu_context*, uint32_t, uint32_t);
+        extern void c690_corpus_tail_cmd_exit(const spu_context*);
+        if (__builtin_expect(g_c690_tail_on, 0))
+            c690_corpus_tail_cmd_enter(ctx, 0x{lsa:05X}u, 0x21u);
+        {name}_body(ctx);
+        if (__builtin_expect(g_c690_tail_on, 0))
+            c690_corpus_tail_cmd_exit(ctx);
+}}
+"""
+
+TARGETS_21 = [0x13140, 0x131A0]   # 0x21 sub-selector bodies (sel1 / sel7)
 
 # The bypass helper and the three dispatch sites. The switch lives in the
 # generated tree, so a fresh lift has neither; this makes it reproducible.
@@ -140,23 +184,53 @@ def patch(path):
         name = PREFIX + f"{lsa:08X}"
         old = f"void {name}(spu_context* ctx) {{\n"
         body = f"void {name}_body(spu_context* ctx) {{\n"
+        if lsa == 0x132E0:
+            tail_enter = ("const uint32_t tail_op = (ctx->gpr[4]._u32[0] & 1u) ? 0x26u : 0x25u;\n"
+                          "        if (__builtin_expect(g_c690_tail_on, 0))\n"
+                          "            c690_corpus_tail_cmd_enter(ctx, 0x132E0u, tail_op);")
+            tail_exit = ("if (__builtin_expect(g_c690_tail_on, 0))\n"
+                         "            c690_corpus_tail_cmd_exit(ctx);")
+        else:
+            tail_enter = tail_exit = ""
+        wrapper = WRAPPER.format(name=name, family=family, lsa=lsa,
+                                 tail_enter=tail_enter, tail_exit=tail_exit)
         if old + "        extern int g_c690_corpus_on;" in text:
-            if "c690_cull_fix_begin" in text:
-                continue        # already the union wrapper
-            # Migrate the old single-grid wrapper: drop it and give the body
-            # its original definition back, then insert the union wrapper.
+            # Already wrapped (possibly by an older wrapper): replace the
+            # wrapper body but keep the generated `_body` definition after it.
             start = text.index(old)
-            bstart = text.find(body, start)
-            if bstart < 0:
-                raise SystemExit(f"{path}: old {name} wrapper without a body")
-            text = text[:start] + text[bstart:]
-            if text.count(body) != 1:
-                raise SystemExit(f"{path}: expected one body for {name}")
-            text = text.replace(body, old, 1)
+            end = _brace_end(text, text.index('{', start))
+            text = text[:start] + wrapper + text[end:]
+            changed = True
+            continue
         if text.count(old) != 1:
             raise SystemExit(f"{path}: expected one definition of {name}, "
                              f"found {text.count(old)}")
-        wrapper = WRAPPER.format(name=name, family=family, lsa=lsa)
+        text = text.replace(old, wrapper + body)
+        changed = True
+    for lsa in TARGETS_21:
+        name = PREFIX + f"{lsa:08X}"
+        old = f"void {name}(spu_context* ctx) {{\n"
+        body = f"void {name}_body(spu_context* ctx) {{\n"
+        if old + "        extern int g_c690_tail_on;" in text:
+            continue        # already the 0x21 capture wrapper
+        if text.count(old) != 1:
+            raise SystemExit(f"{path}: expected one definition of {name}, "
+                             f"found {text.count(old)}")
+        wrapper = WRAPPER_21.format(name=name, lsa=lsa)
+        text = text.replace(old, wrapper + body)
+        changed = True
+    for lsa in TARGETS_2A:
+        name = PREFIX + f"{lsa:08X}"
+        old = f"void {name}(spu_context* ctx) {{\n"
+        body = f"void {name}_body(spu_context* ctx) {{\n"
+        wrapped = ("void {name}(spu_context* ctx) {{\n"
+                   "        extern int g_c690_tail_on;\n").format(name=name)
+        if wrapped in text:
+            continue        # already the 0x2A capture wrapper
+        if text.count(old) != 1:
+            raise SystemExit(f"{path}: expected one definition of {name}, "
+                             f"found {text.count(old)}")
+        wrapper = WRAPPER_2A.format(name=name)
         text = text.replace(old, wrapper + body)
         changed = True
     if changed:

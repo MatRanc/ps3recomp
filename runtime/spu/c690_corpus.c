@@ -158,6 +158,7 @@ typedef struct {
     uint32_t seq;
     uint32_t gpr3, gpr4, gpr5, gpr6;
     uint32_t cmd[8];
+    uint32_t ret_pc;       /* 0x2A: caller link; close only on the real return */
     uint64_t entry_ns;
     uint8_t in_ls[SPU_LS_SIZE];
     uint8_t in_gpr[C690_CORPUS_GPR_SIZE];
@@ -624,7 +625,13 @@ static uint32_t c690_tail_be32(const uint8_t* ls, uint32_t off)
 
 static int c690_tail_is_stage_op(int op)
 {
-    return op == 0x21 || op == 0x25 || op == 0x26 || op == 0x2A;
+    /* Every tail command is captured by its own function-entry/exit wrapper,
+     * not at the command boundary. The parser can reach a handler through a
+     * direct known-target dispatch the resolver never sees, and the boundary
+     * OUT also carries parser bookkeeping (the +2 count word at 0x1F0F0), so
+     * a boundary pair is not always one command's own input/output. */
+    (void)op;
+    return 0;
 }
 
 /* The 0x13080 sub-selector targets. r6 at the target entry carries the
@@ -826,6 +833,7 @@ static void c690_tail_open(const struct spu_context* ctx, uint32_t lsa,
     s->gpr4 = ctx->gpr[4]._u32[0];
     s->gpr5 = ctx->gpr[5]._u32[0];
     s->gpr6 = ctx->gpr[6]._u32[0];
+    s->ret_pc = (op == 0x2A) ? (ctx->gpr[0]._u32[0] & SPU_LS_MASK) : 0;
     for (int i = 0; i < 8; i++)
         s->cmd[i] = c690_tail_be32(ctx->ls, s->gpr3 + 0x150u + (uint32_t)i * 4u);
 
@@ -871,6 +879,48 @@ void c690_corpus_tail_trace(const struct spu_context* ctx, uint32_t lsa,
         t_tail->key = (g6 & 0x1Fu) | ((lsa & 0xFFFFFu) << 8);
         t_tail->key_lsa = lsa;
     }
+}
+
+/* Tail commands are wrapped at the function body so each pair is exactly one
+ * command, even when the entry is a direct known-target dispatch the resolver
+ * cannot see. The entry closes any open command (its true exit is this entry).
+ * The exit closes the pair only when the handler really returned to its
+ * caller: an interrupt trampoline return resumes inside the body, so the pair
+ * stays open and the next command boundary closes it at the real exit. */
+void c690_corpus_tail_cmd_enter(const struct spu_context* ctx, uint32_t lsa,
+                                uint32_t op)
+{
+    if (!g_c690_tail_on || !ctx) return;
+    const uint64_t now = c690_corpus_now_ns();
+    if (!c690_tail_armed(now)) return;
+    if (t_tail && t_tail->active) c690_tail_close(ctx, now);
+    c690_tail_open(ctx, lsa, op, now);
+    if (op == 0x21) {
+        const uint32_t g6 = ctx->gpr[6]._u32[0];
+        t_tail->key = (g6 & 0x1Fu) | ((lsa & 0xFFFFFu) << 8);
+        t_tail->key_lsa = lsa;
+    }
+}
+
+void c690_corpus_tail_cmd_exit(const struct spu_context* ctx)
+{
+    if (!g_c690_tail_on || !ctx) return;
+    if (!t_tail || !t_tail->active) return;
+    if (t_tail->ret_pc && (ctx->pc & SPU_LS_MASK) != t_tail->ret_pc) return;
+    c690_tail_close(ctx, c690_corpus_now_ns());
+}
+
+/* 0x2A (LS 0x10F78) function entry/exit. */
+void c690_corpus_tail_2a_enter(const struct spu_context* ctx)
+{
+    c690_corpus_tail_cmd_enter(ctx, 0x10F78u, 0x2Au);
+}
+
+void c690_corpus_tail_2a_exit(const struct spu_context* ctx)
+{
+    if (!g_c690_tail_on || !ctx) return;
+    if (!t_tail || !t_tail->active || t_tail->op != 0x2A) return;
+    c690_corpus_tail_cmd_exit(ctx);
 }
 
 static void c690_tail_report(void)

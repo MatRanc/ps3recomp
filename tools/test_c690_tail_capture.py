@@ -100,16 +100,15 @@ def main():
         assert len(pairs) == 3, pairs
         p = [pairs[i] for i in sorted(pairs)]
         assert [x['in']['op'] for x in p] == [0x21, 0x25, 0x2A], p
-        assert [x['in']['lsa'] for x in p] == [0x13080, 0x13520, 0x10F78], p
+        assert [x['in']['lsa'] for x in p] == [0x13140, 0x132E0, 0x10F78], p
         # 0x21: selector 1, target 0x13140 -> key = (sel | lsa<<8).
         assert p[0]['in']['key'] == 1 | (0x13140 << 8), hex(p[0]['in']['key'])
         assert p[0]['in']['key_lsa'] == 0x13140
         assert p[1]['in']['key'] == 0x25
         assert p[2]['in']['key'] == 0x2A
-        # IN has the pre-command GPR, OUT the post-command one.
-        g6_in = struct.unpack_from('<I', p[0]['in']['gpr'], 6 * 16)[0]
-        g6_out = struct.unpack_from('<I', p[0]['out']['gpr'], 6 * 16)[0]
-        assert g6_in != 1 and g6_out == 1, (hex(g6_in), hex(g6_out))
+        # The 0x21 key comes from r6 at the sub-selector body entry.
+        g6 = struct.unpack_from('<I', p[0]['in']['gpr'], 6 * 16)[0]
+        assert g6 == 1, hex(g6)
         # Each stage changed exactly its own 16-byte line, recorded in both.
         for pair, line, byte in ((p[0], 0x1F750 // 16, 0x22),
                                  (p[1], 0x204C0 // 16, 0x33),
@@ -152,6 +151,30 @@ def main():
             'PS3RECOMP_C690_TAIL_TRIGGER': str(trig),
         })
         assert len(parse_spool(sorted(cap.glob('tail_*.bin'))[0])) == 3
+        # The tail hook only polls the trigger; it never consumes or deletes
+        # it, so a second waiter (the walker capture) cannot race it away.
+        assert trig.exists(), 'tail capture deleted its own trigger'
+
+        # Two 0x2A commands back to back: the function wrapper closes each
+        # one at its own return, so neither pair contains the other's write.
+        cap = tmp / 'exit'
+        run(binary, 'exit', {
+            'PS3RECOMP_C690_TAIL_CAPTURE': str(cap),
+            'PS3RECOMP_C690_TAIL_PAIRS': '8',
+            'PS3RECOMP_C690_TAIL_STRIDE': '1',
+        })
+        pairs = parse_spool(sorted(cap.glob('tail_*.bin'))[0])
+        assert len(pairs) == 2, pairs
+        p = [pairs[i] for i in sorted(pairs)]
+        assert [x['in']['op'] for x in p] == [0x2A, 0x2A], p
+        assert [x['in']['lsa'] for x in p] == [0x10F78, 0x10F78], p
+        assert [x['in']['key'] for x in p] == [0x2A, 0x2A], p
+        assert changed_lines(p[0]['in']['bitmap']) == [0x2F87], p[0]
+        assert changed_lines(p[1]['in']['bitmap']) == [0x2F88], p[1]
+        assert p[0]['out']['ls'][0x2F87 * 16] == 0x44, p[0]
+        assert p[1]['out']['ls'][0x2F88 * 16] == 0x55, p[1]
+        hist = (cap / 'tail_hist.txt').read_text()
+        assert '0x0000002A 2 ' in hist, hist
 
         # Stride 2 samples the 1st and 3rd stage opens, not the 2nd.
         cap = tmp / 'stride'
@@ -163,7 +186,8 @@ def main():
         pairs = parse_spool(sorted(cap.glob('tail_*.bin'))[0])
         assert sorted(x['in']['op'] for x in pairs.values()) == [0x21, 0x2A], pairs
 
-    print('PASS: c690 tail capture IN/OUT pairs, format key, bitmap, cap, stride, off')
+    print('PASS: c690 tail capture IN/OUT pairs, format key, bitmap, cap, '
+          'stride, 0x2A function exit, non-consuming trigger, off')
     return 0
 
 
