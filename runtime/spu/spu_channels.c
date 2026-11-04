@@ -898,6 +898,10 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
           if (__builtin_expect(g_c690_gap, 0)) {
               extern void c690_gap_on_atomic(const spu_context*, int, int);
               c690_gap_on_atomic(ctx, 0, 1); } }
+        { extern int g_c690_op21;
+          if (__builtin_expect(g_c690_op21, 0)) {
+              extern void c690_op21_on_atomic(const spu_context*, int, int);
+              c690_op21_on_atomic(ctx, 0, 1); } }
         /* A GETLLAR re-issued millions of times on one line is an SPU spin-wait
          * that nobody is releasing (a ticket lock, a counter barrier). Say so
          * once per line with the line's head, so the stuck word is visible
@@ -1070,6 +1074,10 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
           if (__builtin_expect(g_c690_gap, 0)) {
               extern void c690_gap_on_atomic(const spu_context*, int, int);
               c690_gap_on_atomic(ctx, 1, ctx->atomic_stat == 0); } }
+        { extern int g_c690_op21;
+          if (__builtin_expect(g_c690_op21, 0)) {
+              extern void c690_op21_on_atomic(const spu_context*, int, int);
+              c690_op21_on_atomic(ctx, 1, ctx->atomic_stat == 0); } }
         if (ps3_trace_on()) spu_tr_putllc(ea, ctx->atomic_stat == 0);
         if (ctx->atomic_stat == 0) {
             spu_taskset_line_committed(ea & ~127u);
@@ -1487,6 +1495,10 @@ u128 spu_rdch(spu_context* ctx, uint32_t channel)
      * Wraparound on subtract is deliberate -- it is what hardware does, and the
      * `cgti > 0` test above is written to tolerate it. */
     case SPU_RdDec: {
+        { extern int g_c690_op21;
+          if (__builtin_expect(g_c690_op21, 0)) {
+              extern void c690_op21_on_dec(const spu_context*);
+              c690_op21_on_dec(ctx); } }
         /* Never armed by a WrDec: stamp the base on first read rather than
          * measuring from epoch 0, which would subtract the host's entire
          * uptime and hand back a wild value to code that has every right to

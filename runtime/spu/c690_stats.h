@@ -38,6 +38,21 @@ void c690_gap_on_dma(const struct spu_context* ctx, int is_put, uint32_t lsa,
 void c690_gap_on_atomic(const struct spu_context* ctx, int kind, int ok);
 void c690_gap_on_overlay(int kind, int ok);
 
+/* PS3RECOMP_C690_OP21=1: measure the 0x21 emit/ring command only
+ * (handler LS 0x13080). Per call it splits the inclusive time across the
+ * handler's sub-selector targets (0x13178/0x13140/0x131A0/0x131F8/0x13240/
+ * 0x13248/0x13250/0x13288), and counts the DMA bytes and time, GETLLAR/PUTLLC,
+ * tag-status reads, decrementer reads and trampoline steps made while the
+ * command is current. Measurement only; off by default. */
+extern int g_c690_op21;
+void c690_op21_dma_begin(const struct spu_context* ctx, int is_put, uint32_t size);
+void c690_op21_dma_end(const struct spu_context* ctx);
+void c690_op21_on_slow(const struct spu_context* ctx, int is_put, uint32_t size);
+void c690_op21_on_atomic(const struct spu_context* ctx, int kind, int ok);
+void c690_op21_on_tagstat(const struct spu_context* ctx);
+void c690_op21_on_dec(const struct spu_context* ctx);
+void c690_op21_on_rchatom(const struct spu_context* ctx, int stat);
+
 /* PS3RECOMP_C690_HASH=<stride>: sample every stride-th c690 job and fold the
  * bytes of its DMA GETs (input) and PUTs (output) into FNV-1a hashes. Zero
  * when off; the DMA fast path tests it with one predicted-not-taken branch

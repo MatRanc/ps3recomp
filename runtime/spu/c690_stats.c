@@ -76,6 +76,7 @@ extern uint8_t* vm_base;
 int g_c690_stats = 0;
 int g_c690_hash_on = 0;      /* PS3RECOMP_C690_HASH: sample stride, 0 = off */
 int g_c690_gap = 0;          /* PS3RECOMP_C690_GAP: inter-job turnover breakdown */
+int g_c690_op21 = 0;         /* PS3RECOMP_C690_OP21: 0x21 emit/ring breakdown */
 
 #define C690_IMAGE_ID        6
 #define C690_JOB_ENTRY_LS    0x135B8u
@@ -85,6 +86,20 @@ int g_c690_gap = 0;          /* PS3RECOMP_C690_GAP: inter-job turnover breakdown
 #define C690_MAX_THREADS     64
 #define C690_WALL_BUCKETS    65536u             /* 1 us buckets, up to 65.5 ms */
 #define C690_REPORT_PERIOD_NS 2000000000ull     /* 2 s between periodic reports */
+
+/* PS3RECOMP_C690_OP21: the 0x21 emit/ring handler (LS 0x13080) is a
+ * sub-selector dispatcher. The table at LS 0x1311C has eight targets:
+ *   0 0x13178  write one word and return
+ *   1 0x13140 -> 0xBB80 (0xBBB0/0xBCB4 chain, issues MFC GET/PUT)
+ *   2 0x13198  stop
+ *   3 0x131F8 -> 0xA3E0 (0xA410 chain, no MFC)
+ *   4..6 0x13198 stop
+ *   7 0x131A0 -> 0xBB98 / 0xA3E0 / 0xA3F8
+ * plus the 0x13240/0x13248/0x13250/0x13288 continuations. Count the runtime
+ * work while the command is current so the inclusive time can be split into
+ * host compute, synchronous MFC memcpy and real blocking waits. */
+#define C690_OP21_SUB_N      10
+#define C690_OP21_HIST       4096u              /* 1 us buckets, up to 4 ms */
 
 /* The hot set, in report order (index 0. C690_HOT_N is "other"). The meter's
  * 0x0A command path (handler 0x12478 -> 0x10B88 -> pack/gather family) is the
@@ -184,6 +199,15 @@ typedef struct {
     unsigned gap_fn_n;
     unsigned long long gap_fn_other_ns, gap_fn_other_n;
     c690_gap_fn_ent gap_fn[C690_GAP_FN_MAX];
+    /* PS3RECOMP_C690_OP21 */
+    unsigned long long op21_calls, op21_ns, op21_max_ns;
+    unsigned long long op21_sub_n[C690_OP21_SUB_N];
+    unsigned long long op21_sub_ns[C690_OP21_SUB_N];
+    unsigned long long op21_get_n, op21_get_b, op21_put_n, op21_put_b;
+    unsigned long long op21_dma_ns, op21_slow_n, op21_slow_b;
+    unsigned long long op21_getllar, op21_putllc, op21_putllc_fail;
+    unsigned long long op21_tagstat, op21_atomstat, op21_dec;
+    unsigned long long op21_steps;
 } c690_thread_stats;
 
 static c690_thread_stats s_threads[C690_MAX_THREADS];
@@ -224,6 +248,12 @@ static SPU_THREAD_LOCAL struct {
     int gap_cur_img;
     uint32_t gap_cur_lsa;
     unsigned gap_entries;
+    /* PS3RECOMP_C690_OP21: one 0x21 command in flight. */
+    unsigned op21_active;
+    unsigned op21_sub;
+    unsigned op21_dma_depth;
+    uint64_t op21_start, op21_last, op21_dma_t0;
+    uint32_t op21_steps0;
 } t_run;
 
 /* ---- PS3RECOMP_C690_HASH: do repeated jobs produce identical bytes? ----
@@ -480,6 +510,151 @@ static c690_thread_stats* c690_slot(void)
     return t_slot;
 }
 
+/* ---- PS3RECOMP_C690_OP21: 0x21 emit/ring sub-selector accounting -------- */
+static unsigned s_op21_hist[C690_OP21_HIST];
+
+static int c690_op21_sub_index(uint32_t lsa)
+{
+    switch (lsa) {
+    case 0x13178u: return 1;
+    case 0x13140u: return 2;
+    case 0x131A0u: return 3;
+    case 0x131F8u: return 4;
+    case 0x13240u: return 5;
+    case 0x13248u: return 6;
+    case 0x13250u: return 7;
+    case 0x13288u: return 8;
+    case 0x13198u:
+    case 0x132D8u: return 9;
+    default:       return -1;
+    }
+}
+
+static void c690_op21_begin(const struct spu_context* ctx, uint64_t now,
+                            c690_thread_stats* s)
+{
+    t_run.op21_active = 1;
+    t_run.op21_start = now;
+    t_run.op21_last = now;
+    t_run.op21_sub = 0;
+    t_run.op21_steps0 = ctx ? ctx->steps : 0;
+    s->op21_calls++;
+    s->op21_sub_n[0]++;
+}
+
+static void c690_op21_charge(c690_thread_stats* s, uint64_t now)
+{
+    if (now > t_run.op21_last)
+        s->op21_sub_ns[t_run.op21_sub] += now - t_run.op21_last;
+    t_run.op21_last = now;
+}
+
+static void c690_op21_note_entry(const struct spu_context* ctx, uint32_t lsa,
+                                 uint64_t now)
+{
+    (void)ctx;
+    if (!t_run.op21_active) return;
+    c690_thread_stats* const s = c690_slot();
+    c690_op21_charge(s, now);
+    const int idx = c690_op21_sub_index(lsa);
+    if (idx >= 0) {
+        t_run.op21_sub = (unsigned)idx;
+        s->op21_sub_n[idx]++;
+    }
+}
+
+static void c690_op21_close(const struct spu_context* ctx, uint64_t now)
+{
+    if (!t_run.op21_active) return;
+    c690_thread_stats* const s = c690_slot();
+    c690_op21_charge(s, now);
+    const uint64_t wall = now - t_run.op21_start;
+    s->op21_ns += wall;
+    if (wall > s->op21_max_ns) s->op21_max_ns = wall;
+    unsigned us = (unsigned)(wall / 1000u);
+    if (us >= C690_OP21_HIST) us = C690_OP21_HIST - 1u;
+    __atomic_fetch_add(&s_op21_hist[us], 1u, __ATOMIC_RELAXED);
+    if (ctx) s->op21_steps += (uint32_t)(ctx->steps - t_run.op21_steps0);
+    t_run.op21_active = 0;
+}
+
+void c690_op21_dma_begin(const struct spu_context* ctx, int is_put, uint32_t size)
+{
+    (void)ctx;
+    if (!g_c690_op21 || !t_run.op21_active) return;
+    c690_thread_stats* const s = c690_slot();
+    if (is_put) { s->op21_put_n++; s->op21_put_b += size; }
+    else        { s->op21_get_n++; s->op21_get_b += size; }
+    if (t_run.op21_dma_depth++ == 0) t_run.op21_dma_t0 = c690_now_ns();
+}
+
+void c690_op21_dma_end(const struct spu_context* ctx)
+{
+    (void)ctx;
+    if (!g_c690_op21 || !t_run.op21_active) return;
+    if (t_run.op21_dma_depth && --t_run.op21_dma_depth == 0) {
+        c690_thread_stats* const s = c690_slot();
+        s->op21_dma_ns += c690_now_ns() - t_run.op21_dma_t0;
+    }
+}
+
+void c690_op21_on_slow(const struct spu_context* ctx, int is_put, uint32_t size)
+{
+    (void)ctx; (void)is_put;
+    if (!g_c690_op21 || !t_run.op21_active) return;
+    c690_thread_stats* const s = c690_slot();
+    s->op21_slow_n++;
+    s->op21_slow_b += size;
+}
+
+void c690_op21_on_atomic(const struct spu_context* ctx, int kind, int ok)
+{
+    (void)ctx;
+    if (!g_c690_op21 || !t_run.op21_active) return;
+    c690_thread_stats* const s = c690_slot();
+    if (kind == 0) s->op21_getllar++;
+    else {
+        s->op21_putllc++;
+        if (!ok) s->op21_putllc_fail++;
+    }
+}
+
+void c690_op21_on_tagstat(const struct spu_context* ctx)
+{
+    (void)ctx;
+    if (!g_c690_op21 || !t_run.op21_active) return;
+    c690_slot()->op21_tagstat++;
+}
+
+void c690_op21_on_dec(const struct spu_context* ctx)
+{
+    (void)ctx;
+    if (!g_c690_op21 || !t_run.op21_active) return;
+    c690_slot()->op21_dec++;
+}
+
+void c690_op21_on_rchatom(const struct spu_context* ctx, int stat)
+{
+    (void)ctx;
+    (void)stat;
+    if (!g_c690_op21 || !t_run.op21_active) return;
+    c690_slot()->op21_atomstat++;
+}
+
+static unsigned c690_op21_percentile(unsigned pct)
+{
+    unsigned long long total = 0, cum = 0, target;
+    for (unsigned i = 0; i < C690_OP21_HIST; i++)
+        total += __atomic_load_n(&s_op21_hist[i], __ATOMIC_RELAXED);
+    if (!total) return 0;
+    target = (total * pct + 99u) / 100u;
+    for (unsigned i = 0; i < C690_OP21_HIST; i++) {
+        cum += __atomic_load_n(&s_op21_hist[i], __ATOMIC_RELAXED);
+        if (cum >= target) return i;
+    }
+    return C690_OP21_HIST - 1u;
+}
+
 static void c690_charge(c690_thread_stats* s, uint32_t lsa, uint64_t dt)
 {
     const int i = c690_hot_index(lsa);
@@ -515,6 +690,12 @@ void c690_stats_on_lookup(const struct spu_context* ctx, uint32_t lsa)
     c690_thread_stats* const s = c690_slot();
 
     if (t_run.job_active) {
+        const int op_now = (lsa == C690_JOB_END_LS) ? 0 : c690_opcode_for_lsa(lsa);
+        /* A 0x21 call ends at the next command handler (including the end
+         * command). Every other lookup inside it is a sub-selector entry. */
+        if (t_run.op21_active && (lsa == C690_JOB_END_LS || op_now >= 0))
+            c690_op21_close(ctx, now);
+        if (t_run.op21_active) c690_op21_note_entry(ctx, lsa, now);
         if (lsa == C690_JOB_END_LS) {
             if (t_run.cmd_op >= 0) s->op_ns[t_run.cmd_op] += now - t_run.cmd_start_ns;
             else                   s->op_ns[256] += now - t_run.cmd_start_ns;
@@ -558,6 +739,7 @@ void c690_stats_on_lookup(const struct spu_context* ctx, uint32_t lsa)
             t_run.cmd_op = op;
             t_run.cmd_start_ns = now;
             c690_opcode_inc(s, (unsigned)op);
+            if (op == 0x21) c690_op21_begin(ctx, now, s);
             if (__builtin_expect(g_c690_corpus_on, 0))
                 c690_corpus_note_op(ctx, (unsigned)op);
         }
@@ -574,6 +756,8 @@ void c690_stats_on_lookup(const struct spu_context* ctx, uint32_t lsa)
         }
         t_run.hash_active = 0;   /* a body with no tail is discarded */
         t_run.job_active = 1;
+        t_run.op21_active = 0;
+        t_run.op21_dma_depth = 0;
         t_run.job_start_ns = now;
         t_run.cmd_op = -1;
         t_run.cmd_start_ns = now;
@@ -621,6 +805,7 @@ void c690_stats_on_direct(const struct spu_context* ctx, uint32_t lsa)
     if (!t_run.job_active || lsa == 0) return;
     const uint64_t now = c690_now_ns();
     c690_thread_stats* const s = c690_slot();
+    if (t_run.op21_active) c690_op21_note_entry(ctx, lsa, now);
     if (t_run.current_lsa) c690_charge(s, t_run.current_lsa, now - t_run.last_ns);
     t_run.current_lsa = lsa;
     t_run.last_ns = now;
@@ -680,6 +865,27 @@ static void c690_aggregate(c690_thread_stats* dst, const c690_thread_stats* src,
     }
     for (unsigned i = 0; i < 256u; i++) dst->opcode[i] += src->opcode[i];
     for (unsigned i = 0; i < 257u; i++) dst->op_ns[i] += src->op_ns[i];
+    dst->op21_calls += src->op21_calls;
+    dst->op21_ns += src->op21_ns;
+    if (src->op21_max_ns > dst->op21_max_ns) dst->op21_max_ns = src->op21_max_ns;
+    for (unsigned i = 0; i < C690_OP21_SUB_N; i++) {
+        dst->op21_sub_n[i] += src->op21_sub_n[i];
+        dst->op21_sub_ns[i] += src->op21_sub_ns[i];
+    }
+    dst->op21_get_n += src->op21_get_n;
+    dst->op21_get_b += src->op21_get_b;
+    dst->op21_put_n += src->op21_put_n;
+    dst->op21_put_b += src->op21_put_b;
+    dst->op21_dma_ns += src->op21_dma_ns;
+    dst->op21_slow_n += src->op21_slow_n;
+    dst->op21_slow_b += src->op21_slow_b;
+    dst->op21_getllar += src->op21_getllar;
+    dst->op21_putllc += src->op21_putllc;
+    dst->op21_putllc_fail += src->op21_putllc_fail;
+    dst->op21_tagstat += src->op21_tagstat;
+    dst->op21_atomstat += src->op21_atomstat;
+    dst->op21_dec += src->op21_dec;
+    dst->op21_steps += src->op21_steps;
     per_thread_jobs[idx] = src->jobs;
     per_thread_spu[idx] = src->spu_id;
 }
@@ -844,6 +1050,78 @@ static void c690_gap_window_report(unsigned long long jobs, unsigned long long w
             d_wall + d_gt ? (double)d_wall / (double)(d_wall + d_gt) : 0.0);
 }
 
+static const char* const s_op21_sub_name[C690_OP21_SUB_N] = {
+    "dispatch/other", "0x13178 store", "0x13140->0xBB80", "0x131A0->0xBB98/A3E0",
+    "0x131F8->0xA3E0", "0x13240", "0x13248", "0x13250->0xA3C0",
+    "0x13288->0xA3F8", "stop(0x13198/0x132D8)"
+};
+
+static void c690_op21_report(const c690_thread_stats* t)
+{
+    if (!g_c690_op21 || !t->op21_calls) return;
+    const unsigned long long calls = t->op21_calls;
+    const unsigned long long wall = t->op21_ns;
+    fprintf(stderr,
+            "[c690-op21] calls=%llu wall_us=%llu mean=%.2f p50=%u p90=%u p99=%u "
+            "max_us=%llu steps/call=%.1f\n",
+            calls, wall / 1000ull, (double)wall / (double)calls / 1000.0,
+            c690_op21_percentile(50), c690_op21_percentile(90),
+            c690_op21_percentile(99), t->op21_max_ns / 1000ull,
+            (double)t->op21_steps / (double)calls);
+    for (unsigned i = 0; i < C690_OP21_SUB_N; i++) {
+        if (!t->op21_sub_n[i]) continue;
+        const unsigned p = c690_pct_tenths(t->op21_sub_ns[i], wall);
+        fprintf(stderr,
+                "[c690-op21]   sub %-22s n=%llu  %11llu us  %u.%u%%  avg=%.2f us\n",
+                s_op21_sub_name[i], t->op21_sub_n[i], t->op21_sub_ns[i] / 1000ull,
+                p / 10u, p % 10u,
+                (double)t->op21_sub_ns[i] / (double)t->op21_sub_n[i] / 1000.0);
+    }
+    fprintf(stderr,
+            "[c690-op21] dma get=%llu (%.2f MiB) put=%llu (%.2f MiB) "
+            "dma_us=%llu (%.1f%% of wall) slow=%llu (%.2f MiB) "
+            "getllar=%llu putllc=%llu fail=%llu\n",
+            t->op21_get_n, (double)t->op21_get_b / 1048576.0,
+            t->op21_put_n, (double)t->op21_put_b / 1048576.0,
+            t->op21_dma_ns / 1000ull,
+            wall ? 100.0 * (double)t->op21_dma_ns / (double)wall : 0.0,
+            t->op21_slow_n, (double)t->op21_slow_b / 1048576.0,
+            t->op21_getllar, t->op21_putllc, t->op21_putllc_fail);
+    fprintf(stderr,
+            "[c690-op21] tagstat=%llu atomstat=%llu dec=%llu (per call: "
+            "tag=%.3f atom=%.3f dec=%.3f)\n",
+            t->op21_tagstat, t->op21_atomstat, t->op21_dec,
+            (double)t->op21_tagstat / (double)calls,
+            (double)t->op21_atomstat / (double)calls,
+            (double)t->op21_dec / (double)calls);
+}
+
+static void c690_op21_window_report(const c690_thread_stats* t)
+{
+    if (!g_c690_op21) return;
+    static unsigned long long p_calls, p_ns, p_dma_ns, p_atom, p_fail;
+    static int init;
+    if (!init) {
+        init = 1;
+        p_calls = t->op21_calls; p_ns = t->op21_ns; p_dma_ns = t->op21_dma_ns;
+        p_atom = t->op21_getllar + t->op21_putllc; p_fail = t->op21_putllc_fail;
+        return;
+    }
+    const unsigned long long dc = t->op21_calls - p_calls;
+    const unsigned long long dn = t->op21_ns - p_ns;
+    const unsigned long long dd = t->op21_dma_ns - p_dma_ns;
+    const unsigned long long da = (t->op21_getllar + t->op21_putllc) - p_atom;
+    const unsigned long long df = t->op21_putllc_fail - p_fail;
+    p_calls = t->op21_calls; p_ns = t->op21_ns; p_dma_ns = t->op21_dma_ns;
+    p_atom = t->op21_getllar + t->op21_putllc; p_fail = t->op21_putllc_fail;
+    if (!dc) return;
+    fprintf(stderr,
+            "[c690-op21-window] calls=%llu wall_us=%llu mean=%.2f dma_us=%llu "
+            "atomics=%llu fail=%llu\n",
+            dc, dn / 1000ull, (double)dn / (double)dc / 1000.0,
+            dd / 1000ull, da, df);
+}
+
 static void c690_report_common(const char* tag, uint64_t now_ns)
 {
     c690_thread_stats total;
@@ -928,6 +1206,8 @@ static void c690_report_common(const char* tag, uint64_t now_ns)
 
     c690_gap_report();
     c690_gap_window_report(jobs, wall_ns);
+    c690_op21_report(&total);
+    c690_op21_window_report(&total);
 
     unsigned long long cmd_total = 0;
     for (unsigned i = 0; i < 256u; i++) cmd_total += total.opcode[i];
@@ -1028,12 +1308,15 @@ static void c690_stats_startup(void)
     const char* h = getenv("PS3RECOMP_C690_HASH");
     const char* c = getenv("PS3RECOMP_C690_CORPUS");
     const char* g = getenv("PS3RECOMP_C690_GAP");
+    const char* o = getenv("PS3RECOMP_C690_OP21");
     const int hash_stride = (h && *h) ? atoi(h) : 0;
     const int corpus_on = c && *c;
     const int gap_on = g && *g && strcmp(g, "0") != 0;
-    if ((!e || strcmp(e, "1") != 0) && hash_stride <= 0 && !corpus_on && !gap_on) return;
+    const int op21_on = o && *o && strcmp(o, "0") != 0;
+    if ((!e || strcmp(e, "1") != 0) && hash_stride <= 0 && !corpus_on && !gap_on && !op21_on) return;
     g_c690_stats = 1;                     /* job tracking also feeds the hash/corpus */
     g_c690_gap = gap_on;
+    g_c690_op21 = op21_on;
     g_c690_hash_on = hash_stride > 0 ? hash_stride : 0;
     s_t0_ns = c690_now_ns();
     s_last_report_ns = s_t0_ns;

@@ -407,6 +407,10 @@ static inline int mfc_do_transfer_fast(spu_context* spu, uint32_t lsa, uint64_t 
     { extern int g_cri_video_dma;
       if (spu->image_id == 22 && mfc_is_get(cmd) && size > 0x100)
           g_cri_video_dma = 1; }
+    { extern int g_c690_op21;
+      if (__builtin_expect(g_c690_op21, 0)) {
+          extern void c690_op21_dma_begin(const spu_context*, int, uint32_t);
+          c690_op21_dma_begin(spu, mfc_is_put(cmd), size); } }
     if (mfc_is_get(cmd)) {
         { extern int g_c690_hash_on;
           if (__builtin_expect(g_c690_hash_on, 0)) {
@@ -457,6 +461,10 @@ static inline int mfc_do_transfer_fast(spu_context* spu, uint32_t lsa, uint64_t 
         if (e < 0x40005000u && e + size > 0x40003000u)
             mfc_put_poison_note(spu, e, size, lsa, ls_ptr);
     }
+    { extern int g_c690_op21;
+      if (__builtin_expect(g_c690_op21, 0)) {
+          extern void c690_op21_dma_end(const spu_context*);
+          c690_op21_dma_end(spu); } }
     return 0;
 }
 
@@ -485,6 +493,10 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
     jobcap_dma(spu, cmd, lsa, ea, size);
     if (__builtin_expect(mfc_transfer_fast_ok(cmd), 1))
         return mfc_do_transfer_fast(spu, lsa, ea, size, cmd);
+    { extern int g_c690_op21;
+      if (__builtin_expect(g_c690_op21, 0)) {
+          extern void c690_op21_on_slow(const spu_context*, int, uint32_t);
+          c690_op21_on_slow(spu, mfc_is_put(cmd), size); } }
     /* Upper16 command-channel bits carry replacement/transfer class IDs. */
     if ((cmd & 0xFFFFu) == MFC_SDCRZ_CMD) {
         /* CBEA 1.02 section 7.7.3: SDCRZ writes zeros in EA space, without an
@@ -2043,6 +2055,10 @@ static inline uint32_t mfc_channel_read(mfc_engine* mfc, spu_context* spu,
 {
     switch (channel) {
     case MFC_RdTagStat:
+        { extern int g_c690_op21;
+          if (__builtin_expect(g_c690_op21, 0)) {
+              extern void c690_op21_on_tagstat(const spu_context*);
+              c690_op21_on_tagstat(spu); } }
         return spu->mfc_tag_status;
     case MFC_RdTagMask:
         return spu->mfc_tag_mask;
@@ -2059,6 +2075,10 @@ static inline uint32_t mfc_channel_read(mfc_engine* mfc, spu_context* spu,
          * spu_mfc_atomic(): 0 = PUTLLC_SUCCESS, 1 = PUTLLC_FAILURE (line moved,
          * SPU must retry). Honoring this is what keeps the SPURS lock-free queue
          * consistent across concurrent SPU kernel threads. */
+        { extern int g_c690_op21;
+          if (__builtin_expect(g_c690_op21, 0)) {
+              extern void c690_op21_on_rchatom(const spu_context*, int);
+              c690_op21_on_rchatom(spu, spu->atomic_stat); } }
         return spu->atomic_stat;
     default:
         return 0;
