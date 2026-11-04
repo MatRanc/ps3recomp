@@ -70,3 +70,11 @@ WEAK void c690_gap_on_dma(const spu_context* c, int p, uint32_t lsa, uint32_t n)
 WEAK int g_c690_stats;
 WEAK void c690_stats_on_direct(const spu_context* c, uint32_t lsa) { (void)c; (void)lsa; }
 WEAK void c690_stats_on_lookup(const spu_context* c, uint32_t lsa) { (void)c; (void)lsa; }
+WEAK int g_dxt_capture_on;
+WEAK void dxt_capture_dma(const spu_context* c, int p, uint32_t lsa, uint64_t ea,
+                          uint32_t n, const uint8_t* b)
+{ (void)c; (void)p; (void)lsa; (void)ea; (void)n; (void)b; }
+WEAK void dxt_capture_policy_begin(const spu_context* c, uint32_t wid,
+                                   uint64_t wkl_data, uint32_t spu_num)
+{ (void)c; (void)wid; (void)wkl_data; (void)spu_num; }
+WEAK void dxt_capture_policy_end(const spu_context* c) { (void)c; }
