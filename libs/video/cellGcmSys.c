@@ -2744,6 +2744,13 @@ static void gcm_3d_method(rsx_state* st, u32 m, u32 v, int legacy_state_live)
 static FILE* s_fifo_dump_fp = NULL;
 static int s_fifo_dump_frames_left = -1;
 static int s_fifo_dump_skip = -1;
+static int s_fifo_dump_init_done = 0;
+static int s_fifo_dump_armed = 0;
+static int s_fifo_dump_start_pending = 0;
+static int s_fifo_dump_trigger_last = 0;
+static int s_fifo_dump_frames = 100;
+static int s_fifo_dump_skip_frames = 0;
+static char s_fifo_dump_path[512];
 static u64 s_fifo_dump_words = 0;
 
 static void gcm_fifo_dump_close(void)
@@ -2757,27 +2764,72 @@ static void gcm_fifo_dump_close(void)
     }
 }
 
+static void gcm_fifo_dump_open(void)
+{
+    s_fifo_dump_frames_left = s_fifo_dump_frames;
+    s_fifo_dump_skip = s_fifo_dump_skip_frames;
+    s_fifo_dump_words = 0;
+    s_fifo_dump_fp = fopen(s_fifo_dump_path, "wb");
+    if (s_fifo_dump_fp) {
+        atexit(gcm_fifo_dump_close);
+        fprintf(stderr, "[cellGcmSys] FIFO dump started -> %s (frames=%d, skip=%d)\n",
+                s_fifo_dump_path, s_fifo_dump_frames_left, s_fifo_dump_skip);
+    } else {
+        fprintf(stderr, "[cellGcmSys] Failed to create FIFO dump: %s\n", s_fifo_dump_path);
+        s_fifo_dump_frames_left = 0;
+    }
+}
+
+/* PS3RECOMP_DUMP_FIFO_ARM=1 (default off) delays the dump until a live switch
+ * is raised instead of starting at the first drain, so a scene the user
+ * navigates to can be captured without knowing its frame number. The trigger
+ * is PS3RECOMP_DUMP_FIFO_TRIGGER in the PS3RECOMP_CTL file (or its
+ * environment value); the first flip after the rising edge starts the dump,
+ * so the file begins on a frame boundary. Without ARM the old boot-time
+ * behaviour is unchanged. */
 static void gcm_fifo_dump_init(void)
 {
-    if (s_fifo_dump_frames_left >= 0) return;
+    if (s_fifo_dump_init_done) return;
+    s_fifo_dump_init_done = 1;
     const char* path = getenv("PS3RECOMP_DUMP_FIFO");
     if (!path || !path[0]) {
         s_fifo_dump_frames_left = 0;
         return;
     }
+    snprintf(s_fifo_dump_path, sizeof s_fifo_dump_path, "%s", path);
     const char* f_env = getenv("PS3RECOMP_DUMP_FIFO_FRAMES");
-    s_fifo_dump_frames_left = (f_env && atoi(f_env) > 0) ? atoi(f_env) : 100;
+    s_fifo_dump_frames = (f_env && atoi(f_env) > 0) ? atoi(f_env) : 100;
     const char* s_env = getenv("PS3RECOMP_DUMP_FIFO_SKIP");
-    s_fifo_dump_skip = (s_env && atoi(s_env) > 0) ? atoi(s_env) : 0;
-    s_fifo_dump_fp = fopen(path, "wb");
-    if (s_fifo_dump_fp) {
-        atexit(gcm_fifo_dump_close);
-        fprintf(stderr, "[cellGcmSys] FIFO dump started -> %s (frames=%d, skip=%d)\n",
-                path, s_fifo_dump_frames_left, s_fifo_dump_skip);
-    } else {
-        fprintf(stderr, "[cellGcmSys] Failed to create FIFO dump: %s\n", path);
-        s_fifo_dump_frames_left = 0;
+    s_fifo_dump_skip_frames = (s_env && atoi(s_env) > 0) ? atoi(s_env) : 0;
+    const char* a_env = getenv("PS3RECOMP_DUMP_FIFO_ARM");
+    if (a_env && *a_env && strcmp(a_env, "0") != 0) {
+        s_fifo_dump_armed = 1;
+        fprintf(stderr, "[cellGcmSys] FIFO dump armed -> %s (frames=%d, waiting for PS3RECOMP_DUMP_FIFO_TRIGGER)\n",
+                s_fifo_dump_path, s_fifo_dump_frames);
+        return;
     }
+    gcm_fifo_dump_open();
+}
+
+static int gcm_fifo_dump_trigger_now(void)
+{
+    if (ps3_live_ctl_get) return ps3_live_ctl_get(PS3_LIVE_DUMP_FIFO_TRIGGER) != 0;
+    const char* e = getenv("PS3RECOMP_DUMP_FIFO_TRIGGER");
+    return e && *e && strcmp(e, "0") != 0;
+}
+
+/* Called right after ps3_live_ctl_poll(), so a control-file write is seen in
+ * the same drain. A dump already running, or one waiting for its flip
+ * boundary, only keeps the edge level up to date. */
+static void gcm_fifo_dump_poll(void)
+{
+    const int t = gcm_fifo_dump_trigger_now();
+    if (s_fifo_dump_armed && !s_fifo_dump_fp && !s_fifo_dump_start_pending &&
+        t && !s_fifo_dump_trigger_last) {
+        s_fifo_dump_start_pending = 1;
+        fprintf(stderr, "[cellGcmSys] FIFO dump trigger seen; starting at the next flip boundary\n");
+    }
+    s_fifo_dump_trigger_last = t;
 }
 
 static inline void gcm_fifo_dump_word(u32 w)
@@ -2791,6 +2843,11 @@ static inline void gcm_fifo_dump_word(u32 w)
 
 static void gcm_fifo_dump_flip(u32 w)
 {
+    if (s_fifo_dump_start_pending) {
+        s_fifo_dump_start_pending = 0;
+        gcm_fifo_dump_open();
+        return;   /* this flip ends the frame before the capture */
+    }
     if (!s_fifo_dump_fp) return;
     if (s_fifo_dump_skip > 0) {
         s_fifo_dump_skip--;
@@ -2850,6 +2907,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
      * control file, at most once per drain pass (>= once per flip). The
      * draw engine then refreshes its own cached switch values from it. */
     if (ps3_live_ctl_poll) ps3_live_ctl_poll(cellGcm_flip_request_count());
+    gcm_fifo_dump_poll();
 #if defined(__GNUC__) && !defined(_WIN32)
     if (ps3_thread_pin_poll) ps3_thread_pin_poll();
 #endif
