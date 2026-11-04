@@ -12,10 +12,15 @@
 
 #include <assert.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 int main(void)
 {
+    /* PS3RECOMP_REMAP_FAST is read once (the env fallback is cached); enable it
+     * for the whole fixture so every case below also proves the memo exact. */
+    setenv("PS3RECOMP_REMAP_FAST", "1", 1);
+
     rsx_vertex_remap remap;
     memset(&remap, 0, sizeof remap);
     rsx_vertex_ref refs[8];
@@ -37,6 +42,30 @@ int main(void)
     const u32 want[6] = { 0, 1, 2, 2, 1, 3 };
     for (u32 i = 0; i < 6; i++) assert(rsx_vertex_remap_index(&remap, i) == want[i]);
     for (u32 i = 0; i < 4; i++) assert(refs[i].vertex_id == i);
+
+    /* A longer list with local and distant repeats, two base indices, and a
+     * non-monotonic order: the micro memo must not change any answer. The
+     * expected map is the obvious O(n^2) first-use collapse. */
+    enum { N = 400 };
+    rsx_vertex_ref big[N], orig[N];
+    u32 want_big[N], want_unique = 0;
+    for (u32 i = 0; i < N; i++) {
+        big[i].vertex_id = (i * 37u + (i / 11u) * 5u) % 97u;
+        big[i].base_index = (i % 13u) < 9u ? 3u : 4u;
+        want_big[i] = 0;
+        u32 j;
+        for (j = 0; j < i; j++)
+            if (big[j].vertex_id == big[i].vertex_id &&
+                big[j].base_index == big[i].base_index) { want_big[i] = want_big[j]; break; }
+        if (j == i) want_big[i] = want_unique++;
+    }
+    memcpy(orig, big, sizeof orig);   /* the build compacts refs in place */
+    assert(rsx_vertex_remap_build(&remap, big, N, &unique) && unique == want_unique);
+    for (u32 i = 0; i < N; i++) assert(rsx_vertex_remap_index(&remap, i) == want_big[i]);
+    /* Rebuilding the same list on the same object (a new draw) is identical. */
+    memcpy(big, orig, sizeof big);
+    assert(rsx_vertex_remap_build(&remap, big, N, &unique) && unique == want_unique);
+    for (u32 i = 0; i < N; i++) assert(rsx_vertex_remap_index(&remap, i) == want_big[i]);
 
     rsx_vertex_remap_destroy(&remap);
     puts("vertex remap: ok");

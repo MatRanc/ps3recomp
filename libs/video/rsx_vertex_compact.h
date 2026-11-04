@@ -38,12 +38,27 @@ typedef struct rsx_vertex_remap_slot {
     u32 generation;
 } rsx_vertex_remap_slot;
 
+/* PS3RECOMP_REMAP_FAST: a small, per-draw memo of the references seen most
+ * recently. An indexed mesh repeats vertices within a few triangles, so most
+ * duplicates can be answered without probing the (larger, cache-cold) open
+ * addressing table. Direct-mapped; a collision only costs a big-table probe,
+ * so the answer is identical with the memo on or off. */
+#define RSX_VERTEX_REMAP_MICRO_BITS 10
+#define RSX_VERTEX_REMAP_MICRO (1u << RSX_VERTEX_REMAP_MICRO_BITS)
+typedef struct rsx_vertex_remap_micro_slot {
+    u64 key;
+    u32 value;
+    u32 generation;
+} rsx_vertex_remap_micro_slot;
+
 typedef struct rsx_vertex_remap {
     u32* occurrence_to_unique;
     u32 occurrence_capacity;
     rsx_vertex_remap_slot* slots;
     u32 slot_capacity;
     u32 generation;
+    rsx_vertex_remap_micro_slot micro[RSX_VERTEX_REMAP_MICRO];
+    u32 micro_generation;
 } rsx_vertex_remap;
 
 typedef struct rsx_vertex_fetch_attr {

@@ -1,6 +1,7 @@
 #include "rsx_vertex_compact.h"
 #include "rsx_commands.h"
 #include "rsx_vertex_formats.h"
+#include "ps3_live_ctl.h"
 
 #include <limits.h>
 #include <stdint.h>
@@ -816,6 +817,21 @@ static u64 rsx_vertex_remap_hash(u64 value)
     return value;
 }
 
+/* PS3RECOMP_REMAP_FAST (live key PS3_LIVE_REMAP_FAST): answer a nearby
+ * duplicate from the small memo instead of the open-addressing table. */
+static int s_remap_fast_env = -1;
+static int rsx_vertex_remap_fast_on(void)
+{
+#if defined(__GNUC__) && !defined(_WIN32)
+    if (ps3_live_ctl_get) return ps3_live_ctl_get(PS3_LIVE_REMAP_FAST);
+#endif
+    if (s_remap_fast_env < 0) {
+        const char* e = getenv("PS3RECOMP_REMAP_FAST");
+        s_remap_fast_env = e && *e && strcmp(e, "0") != 0 ? 1 : 0;
+    }
+    return s_remap_fast_env;
+}
+
 int rsx_vertex_remap_build(
     rsx_vertex_remap* remap, rsx_vertex_ref* refs, u32 count,
     u32* unique_count)
@@ -878,11 +894,30 @@ int rsx_vertex_remap_build(
         }
     }
 
+    const int fast = rsx_vertex_remap_fast_on();
+    if (fast) {
+        remap->micro_generation++;
+        if (!remap->micro_generation) {
+            memset(remap->micro, 0, sizeof remap->micro);
+            remap->micro_generation = 1u;
+        }
+    }
+
     u32 unique = 0;
     const u32 mask = logical_capacity - 1u;
     for (u32 occurrence = 0; occurrence < count; occurrence++) {
         const rsx_vertex_ref ref = refs[occurrence];
         const u64 key = ((u64)ref.base_index << 32) | ref.vertex_id;
+        if (fast) {
+            const u32 mi = (u32)((((u32)key ^ (u32)(key >> 32)) *
+                                  2654435761u) >> (32 - RSX_VERTEX_REMAP_MICRO_BITS));
+            rsx_vertex_remap_micro_slot* ms = &remap->micro[mi];
+            if (ms->generation == remap->micro_generation && ms->key == key) {
+                remap->occurrence_to_unique[occurrence] = ms->value;
+                continue;
+            }
+        }
+        u32 value;
         u32 slot_index = (u32)rsx_vertex_remap_hash(key) & mask;
         for (;;) {
             rsx_vertex_remap_slot* slot = &remap->slots[slot_index];
@@ -894,15 +929,23 @@ int rsx_vertex_remap_build(
                  * this reference (unique == occurrence). */
                 if (unique != occurrence)
                     refs[unique] = ref;
-                remap->occurrence_to_unique[occurrence] = unique;
-                unique++;
+                value = unique++;
                 break;
             }
             if (slot->key == key) {
-                remap->occurrence_to_unique[occurrence] = slot->value;
+                value = slot->value;
                 break;
             }
             slot_index = (slot_index + 1u) & mask;
+        }
+        remap->occurrence_to_unique[occurrence] = value;
+        if (fast) {
+            const u32 mi = (u32)((((u32)key ^ (u32)(key >> 32)) *
+                                  2654435761u) >> (32 - RSX_VERTEX_REMAP_MICRO_BITS));
+            rsx_vertex_remap_micro_slot* ms = &remap->micro[mi];
+            ms->key = key;
+            ms->value = value;
+            ms->generation = remap->micro_generation;
         }
     }
     *unique_count = unique;

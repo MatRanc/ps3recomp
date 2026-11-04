@@ -156,6 +156,11 @@ static u32 s_current_display_buffer_id = 0;
  * presenting on a raw flip-count change raced the drain and showed empty or
  * mixed batches (wave: black flashes, layout flicker). */
 static volatile int s_flip_pending = 0;
+/* PS3RECOMP_TICK_IN_DRAIN: the request sequence whose image has actually been
+ * queued by the present path. The drain checkpoint below only completes a
+ * flip whose image is on its way to the screen, never one that is merely
+ * requested. Guarded by FLIP_LOCK. */
+static u32 s_flip_presented_seq = 0;
 /* A flip _cellGcmSetFlipCommand queued in the FIFO: | bufferId, bit 8 = ours. */
 #define GCM_FLIP_MARKER 0xFEAD0100u
 /* Flips queued into the command stream by gcm_flip_into_fifo, and how many of
@@ -196,6 +201,7 @@ int cellGcm_take_flip_pending(void)
 {
     int v = s_flip_pending;
     s_flip_pending = 0;
+    if (v) { FLIP_LOCK(); s_flip_presented_seq = s_flip_req_seq; FLIP_UNLOCK(); }
     return v;
 }
 
@@ -1034,6 +1040,32 @@ void cellGcmTickFlip(void)
     }
 }
 
+/* PS3RECOMP_TICK_IN_DRAIN: the display tick and the FIFO drain share the
+ * walker thread, so a drain longer than the guest's 2 x 16683 us flip deadline
+ * leaves a flip that is already on screen incomplete until the next 16 ms
+ * beat. This checkpoint runs at the top of every drain pass: if the flip's
+ * commands have been executed AND the image has been queued by the present
+ * path, mark the completion now. Completing before the present is queued is
+ * the FLIP_ON_DONE failure (the guest advances and blocks on the next buffer's
+ * ref hand-off); the presented-sequence guard is what avoids it. The handler
+ * still runs on the GCM interrupt thread, so this only moves the edge. */
+void cellGcmFlipTickCheckpoint(void)
+{
+    if (!gcm_live_get(PS3_LIVE_TICK_IN_DRAIN, "PS3RECOMP_TICK_IN_DRAIN"))
+        return;
+    FLIP_LOCK();
+    const int waiting = s_flip_status == CELL_GCM_FLIP_STATUS_WAITING &&
+                        s_flip_presented_seq == s_flip_req_seq &&
+                        gcm_flip_executed_take();
+    if (waiting) s_flip_tick_seq = s_flip_req_seq;
+    FLIP_UNLOCK();
+    if (waiting) GCM_PENDING_SET(2);
+    if (waiting && ps3_trace_on()) {
+        ps3_trace_instant(PS3_TR_GCM_FLIP_DONE, s_flip_tick_seq, 0);
+        ps3_trace_note(PS3_TR_NOTE_FLIP_DONE, s_flip_tick_seq);
+    }
+}
+
 /* PS3RECOMP_FLIP_ON_DONE, called by the runner after a present has been
  * queued. The title (like the console's cellGcmSetFlipImmediate) flips as soon
  * as the RSX executes the frame; nothing in the contract makes completion wait
@@ -1754,6 +1786,7 @@ int cellGcm_take_flip_pending_synced(void)
     u32 get = vm_read32(GCM_CONTROL_GUEST_ADDR + 4);
     if (get != put) return 0;   /* frame not fully drained yet */
     s_flip_pending = 0;
+    FLIP_LOCK(); s_flip_presented_seq = s_flip_req_seq; FLIP_UNLOCK();
     return 1;
 }
 
@@ -2700,6 +2733,10 @@ static void gcm_fifo_dump_flip(u32 w)
  * RSX-thread profiles, so each is read once and cached, like the other knobs. */
 static void gcm_rsx_process_fifo_unlocked(void)
 {
+    /* A flip whose commands the last pass executed and whose image the present
+     * path has queued is complete now, even if this drain runs long past the
+     * next display tick (PS3RECOMP_TICK_IN_DRAIN). */
+    cellGcmFlipTickCheckpoint();
     gcm_fifo_dump_init();
     /* A pass that parks publishes the word it is waiting on; the next pass
      * clears it before touching `get`, so a PUT wakes only a live park. */

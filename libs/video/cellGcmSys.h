@@ -291,6 +291,11 @@ void cellGcmSetVBlankHandler(CellGcmVBlankHandler handler);
  * title-screen state machine from the VBlank handler. */
 void cellGcmTickVBlank(void);
 void cellGcmTickFlip(void);
+/* PS3RECOMP_TICK_IN_DRAIN: complete a flip whose commands the drain has
+ * already executed and whose image the present path has queued, without
+ * waiting for the next 16 ms display tick. Called at the top of every drain
+ * pass; a no-op while the switch is off. */
+void cellGcmFlipTickCheckpoint(void);
 /* PS3RECOMP_FLIP_ON_DONE: the runner tells cellGcmSys whether a present path
  * exists (cellGcmSetFlipPresentPath) and calls cellGcmFlipOnPresent right
  * after a present has been queued, so the flip completes there instead of on

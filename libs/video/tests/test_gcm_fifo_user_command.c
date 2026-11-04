@@ -58,6 +58,9 @@ int  rsx_wcap_begin_if_triggered(void) { return 0; }
 void rsx_wcap_word(u32 w) { (void)w; }
 void rsx_wcap_flip(u32 w) { (void)w; }
 void rsx_draw_engine_set_walker_fast(int on) { (void)on; }
+void rsx_draw_engine_set_fetch_memo(int on) { (void)on; }
+void rsx_draw_engine_set_pipe_memo(int on) { (void)on; }
+void rsx_draw_engine_set_remap_cache(int on) { (void)on; }
 void rsx_draw_engine_set_no_draw(int on) { (void)on; }
 void rsx_draw_engine_wcb_set_wake(void (*wake)(void)) { (void)wake; }
 void rsx_draw_engine_set_display_query(int (*fn)(u32 offset)) { (void)fn; }
