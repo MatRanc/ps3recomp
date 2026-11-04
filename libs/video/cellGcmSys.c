@@ -2823,10 +2823,12 @@ static int gcm_fifo_dump_trigger_now(void)
  * boundary, only keeps the edge level up to date. */
 static void gcm_fifo_dump_poll(void)
 {
+    if (!s_fifo_dump_armed) return;   /* off: no live-ctl read on every drain */
     const int t = gcm_fifo_dump_trigger_now();
-    if (s_fifo_dump_armed && !s_fifo_dump_fp && !s_fifo_dump_start_pending &&
+    if (!s_fifo_dump_fp && !s_fifo_dump_start_pending &&
         t && !s_fifo_dump_trigger_last) {
         s_fifo_dump_start_pending = 1;
+        s_fifo_dump_armed = 0;        /* one shot: a second trigger must not overwrite the capture */
         fprintf(stderr, "[cellGcmSys] FIFO dump trigger seen; starting at the next flip boundary\n");
     }
     s_fifo_dump_trigger_last = t;
