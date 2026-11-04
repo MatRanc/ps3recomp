@@ -17,6 +17,14 @@ uint32_t g_spu_image_src_ea,g_spu_image_ls_start,g_spu_image_span;
 unsigned long long ps3_ms_now(void) { LARGE_INTEGER n,f; QueryPerformanceCounter(&n); QueryPerformanceFrequency(&f); return n.QuadPart*1000/f.QuadPart; }
 void ppu_resv_break_store(uint64_t ea) {(void)ea;}
 void ps3_ww_report_inline(uint32_t a,uint64_t v,int w){(void)a;(void)v;(void)w;}
+/* dxt_capture.c is not part of this fixture; spurs_policy.c calls its policy
+ * hooks unconditionally. The counters are off, so these are no-ops. */
+int g_dxt_capture_on;
+void dxt_capture_dma(const spu_context* c,int put,uint32_t lsa,uint64_t ea,uint32_t n,const uint8_t* b)
+{ (void)c;(void)put;(void)lsa;(void)ea;(void)n;(void)b; }
+void dxt_capture_policy_begin(const spu_context* c,uint32_t wid,uint64_t d,uint32_t sn)
+{ (void)c;(void)wid;(void)d;(void)sn; }
+void dxt_capture_policy_end(const spu_context* c) { (void)c; }
 static atomic_uint canceled_queues;
 void sys_event_queue_cancel_by_id(u32 id) { assert(id==3 || id==4);atomic_fetch_or(&canceled_queues,1u<<id); }
 void sys_event_queue_uncancel_by_id(u32 id) {(void)id;}
@@ -368,8 +376,145 @@ int main(void)
         r = spurs_pm_fast_can_rerun(&si, slot);
         spu_lockline_lock(); spu_lockline_unlock();
         assert(r == 1);
-        memset(&s_workloads[0], 0, sizeof s_workloads[0]);
         puts("SPURS fast can_rerun early returns leave the lock line unlocked PASS");
+
+        /* SPURS_PM_FAST_ACTIVE: the worker is already one of si->active[wid].
+         * The coordinator's admission test (active >= maxContention) rejects
+         * a rerun at the c690 steady state (5 of 5 lanes); the fixed test
+         * only rejects a demand the guest has lowered below the active set. */
+        s_workloads[0].in_use = 1;
+        s_workloads[0].spurs_ea = ea;
+        s_workloads[0].pm = (void*)(uintptr_t)0x1D000;
+        s_workloads[0].sizePm = 16;
+        s_workloads[0].shutting_down = 0;
+        slot->pm = vm_base + 0x1D000;
+        slot->pm_size = 16;
+        slot->data = 0;
+        slot->reg_epoch = __atomic_load_n(&s_workload_epoch, __ATOMIC_ACQUIRE);
+        vm_write32(ea + SPURS_WKL_ENABLED, 0x80000000u);
+        vm_write8(ea + SPURS_WKL_STATE1, 2);
+        vm_write8(ea + SPURS_WKL_INFO1 + 0x18 + 0, 1);
+        vm_write8(ea + SPURS_WKL_MAXCONT, 5);
+        vm_write8(ea + SPURS_WKL_READY1, 8);
+        vm_write8(ea + SPURS_WKL_IDLE2, 0);
+        ef_w16(ea + SPURS_WKL_SIGNAL1, 0x8000);
+        vm_write64(ea + SPURS_WKL_INFO1 + 8, 0);
+        si.active[0] = 5;
+        setenv("SPURS_PM_FAST_ACTIVE", "0", 1);
+        r = spurs_pm_fast_can_rerun(&si, slot);
+        spu_lockline_lock(); spu_lockline_unlock();
+        assert(r == 0);          /* today: a lane at maxContention never reruns */
+        setenv("SPURS_PM_FAST_ACTIVE", "1", 1);
+        r = spurs_pm_fast_can_rerun(&si, slot);
+        spu_lockline_lock(); spu_lockline_unlock();
+        assert(r == 1);          /* fixed: rerunning adds no lane */
+        assert(spurs_pm_fast_lane_within_level(5, 5, 0, 0) == 0);
+        assert(spurs_pm_fast_lane_within_level(5, 5, 0, 1) == 1);
+        assert(spurs_pm_fast_lane_within_level(5, 3, 0, 1) == 0);
+        assert(spurs_pm_fast_lane_within_level(5, 3, 2, 1) == 1);
+        assert(spurs_pm_fast_lane_within_level(5, 0, 0, 1) == 1);
+        puts("SPURS fast rerun keeps an already-active lane at maxContention PASS");
+
+        /* SPURS_PM_FAST_ONE_LOCK: check and consume under one lock-line
+         * acquisition. Re-acquire the line after each call, exactly like the
+         * split-path test above, so a missing or duplicate unlock fails. */
+        setenv("SPURS_PM_FAST_ONE_LOCK", "1", 1);
+        vm_write8(ea + SPURS_WKL_READY1, 8);
+        ef_w16(ea + SPURS_WKL_SIGNAL1, 0x8000);
+        si.idle[0] = 3;
+        r = spurs_pm_fast_try_rerun(&si, slot);
+        spu_lockline_lock(); spu_lockline_unlock();
+        assert(r == 1);
+        assert(vm_read8(ea + SPURS_WKL_READY1) == 7);
+        assert(!(ef_r16(ea + SPURS_WKL_SIGNAL1) & 0x8000u));
+        assert(si.idle[0] == 0);
+        assert(vm_read8(ea + SPURS_WKL_CURCONT) == 5);
+        vm_write8(ea + SPURS_WKL_READY1, 0);
+        ef_w16(ea + SPURS_WKL_SIGNAL1, 0);
+        r = spurs_pm_fast_try_rerun(&si, slot);
+        spu_lockline_lock(); spu_lockline_unlock();
+        assert(r == 0);
+        puts("SPURS fast rerun checks and consumes under one lock line PASS");
+
+        /* SPURS_LANE6: only the title's mesh workloads (wids 1 and 2) get the
+         * sixth physical lane, and only lane 5. The guest publishes
+         * priority[5] = 0 and maxContention = 5 for them, so the key must
+         * relax both checks; every other wid/lane keeps the guest's policy. */
+        {
+            const u32 e1 = ea;
+            memset(&s_workloads[1], 0, sizeof s_workloads[1]);
+            s_workloads[1].in_use = 1;
+            s_workloads[1].spurs_ea = e1;
+            s_workloads[1].pm = (void*)(uintptr_t)0x1D000;
+            s_workloads[1].sizePm = 16;
+            slot->wid = 1;
+            slot->spu_num = 5;
+            slot->pm = vm_base + 0x1D000;
+            slot->pm_size = 16;
+            slot->data = 0;
+            si.active[1] = 5;
+            vm_write32(e1 + SPURS_WKL_ENABLED, 0x80000000u | 0x40000000u);
+            vm_write8(e1 + SPURS_WKL_STATE1 + 1, 2);
+            vm_write8(e1 + SPURS_WKL_INFO1 + 1 * SPURS_WKL_INFO_SZ + 0x18 + 5, 0);
+            vm_write8(e1 + SPURS_WKL_INFO1 + 1 * SPURS_WKL_INFO_SZ + 0x18 + 4, 1);
+            vm_write8(e1 + SPURS_WKL_MAXCONT + 1, 5);
+            vm_write8(e1 + SPURS_WKL_READY1 + 1, 8);
+            vm_write8(e1 + SPURS_WKL_IDLE2 + 1, 0);
+            ef_w16(e1 + SPURS_WKL_SIGNAL1, 0x4000);
+            vm_write64(e1 + SPURS_WKL_INFO1 + 1 * SPURS_WKL_INFO_SZ + 8, 0);
+            setenv("SPURS_PM_FAST_ACTIVE", "0", 1);
+            setenv("SPURS_LANE6", "0", 1);
+            r = spurs_pm_fast_can_rerun(&si, slot);
+            spu_lockline_lock(); spu_lockline_unlock();
+            assert(r == 0);          /* priority[5] = 0 keeps MeshJobs off lane 5 */
+            setenv("SPURS_LANE6", "1", 1);
+            r = spurs_pm_fast_can_rerun(&si, slot);
+            spu_lockline_lock(); spu_lockline_unlock();
+            assert(r == 1);          /* the key relaxes priority and the cap */
+            si.active[1] = 4;
+            slot->spu_num = 4;       /* only lane 5 is overridden */
+            r = spurs_pm_fast_can_rerun(&si, slot);
+            spu_lockline_lock(); spu_lockline_unlock();
+            assert(r == 1);          /* lane 4 priority 1, below the guest cap */
+            vm_write8(e1 + SPURS_WKL_INFO1 + 1 * SPURS_WKL_INFO_SZ + 0x18 + 4, 0);
+            r = spurs_pm_fast_can_rerun(&si, slot);
+            spu_lockline_lock(); spu_lockline_unlock();
+            assert(r == 0);          /* lane 4 priority 0 is not a lane-6 case */
+            slot->spu_num = 5;
+            si.active[1] = 5;
+            slot->wid = 0;           /* wid 0 (DXT) keeps the guest policy */
+            r = spurs_pm_fast_can_rerun(&si, slot);
+            spu_lockline_lock(); spu_lockline_unlock();
+            assert(r == 0);
+            slot->wid = 1;
+            setenv("SPURS_LANE6", "0", 1);
+            memset(&s_workloads[1], 0, sizeof s_workloads[1]);
+            slot->wid = 0;           /* restore the FAST_ACTIVE/GEN fixture */
+            slot->spu_num = 0;
+            setenv("SPURS_PM_FAST_ACTIVE", "1", 1);
+        }
+        puts("SPURS lane 6 override only relaxes the mesh workloads' lane 5 PASS");
+
+        /* SPURS_PM_FAST_GEN: the slot's dispatch-time snapshot is trusted
+         * while the registry epoch is unchanged, and refreshed (which then
+         * sees the removal) as soon as a mutator bumps it. */
+        setenv("SPURS_PM_FAST_GEN", "1", 1);
+        slot->reg_epoch = __atomic_load_n(&s_workload_epoch, __ATOMIC_ACQUIRE);
+        vm_write8(ea + SPURS_WKL_READY1, 8);
+        ef_w16(ea + SPURS_WKL_SIGNAL1, 0x8000);
+        s_workloads[0].in_use = 0;   /* mutation without the epoch bump */
+        r = spurs_pm_fast_can_rerun(&si, slot);
+        spu_lockline_lock(); spu_lockline_unlock();
+        assert(r == 1);              /* cached snapshot still matches */
+        __atomic_fetch_add(&s_workload_epoch, 1, __ATOMIC_RELEASE);
+        r = spurs_pm_fast_can_rerun(&si, slot);
+        spu_lockline_lock(); spu_lockline_unlock();
+        assert(r == 0);              /* refreshed: the workload is gone */
+        s_workloads[0].in_use = 1;
+        setenv("SPURS_PM_FAST_GEN", "0", 1);
+        puts("SPURS fast rerun skips the registry lock only while its epoch holds PASS");
+
+        memset(&s_workloads[0], 0, sizeof s_workloads[0]);
     }
     free(vm_base);return 0;
 }

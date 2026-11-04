@@ -13,6 +13,14 @@ uint32_t g_spu_image_src_ea,g_spu_image_ls_start,g_spu_image_span;
 unsigned long long ps3_ms_now(void) { LARGE_INTEGER n,f; QueryPerformanceCounter(&n); QueryPerformanceFrequency(&f); return n.QuadPart*1000/f.QuadPart; }
 void ppu_resv_break_store(uint64_t ea) {(void)ea;}
 void ps3_ww_report_inline(uint32_t a,uint64_t v,int w){(void)a;(void)v;(void)w;}
+/* dxt_capture.c is not part of this fixture; spurs_policy.c and spu_dma.h call
+ * its hooks unconditionally and the capture counter is off, so no-ops bind. */
+int g_dxt_capture_on;
+void dxt_capture_dma(const spu_context* c,int put,uint32_t lsa,uint64_t ea,uint32_t n,const uint8_t* b)
+{ (void)c;(void)put;(void)lsa;(void)ea;(void)n;(void)b; }
+void dxt_capture_policy_begin(const spu_context* c,uint32_t wid,uint64_t d,uint32_t sn)
+{ (void)c;(void)wid;(void)d;(void)sn; }
+void dxt_capture_policy_end(const spu_context* c) { (void)c; }
 void sys_event_queue_cancel_by_id(u32 id) {(void)id;}
 void sys_event_queue_uncancel_by_id(u32 id) {(void)id;}
 

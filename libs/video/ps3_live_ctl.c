@@ -71,6 +71,9 @@ static const char* const K_NAME[PS3_LIVE_COUNT] = {
     "MLB16_CULL_BYPASS",
     "PS3RECOMP_C690_NATIVE_SCREEN",
     "PS3RECOMP_C690_NATIVE_SCREEN_SHADOW",
+    "SPURS_PM_FAST_ACTIVE",
+    "SPURS_PM_FAST_ONE_LOCK",
+    "SPURS_PM_FAST_GEN",
 };
 
 static _Atomic int s_val[PS3_LIVE_COUNT];

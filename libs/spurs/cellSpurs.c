@@ -87,6 +87,16 @@ typedef struct {
 
 /* Global workload table (per-SPURS instance in a real system, simplified) */
 static SpursWorkload s_workloads[CELL_SPURS_MAX_WORKLOAD];
+/* SPURS_PM_FAST_GEN: increments whenever the registry fields a fast rerun
+ * caches (in_use / pm / sizePm / spurs_ea / shutting_down) change. Add/remove,
+ * teardown and finalize bump it under s_workload_registry_lock, so a worker
+ * that sees the same epoch can use the slot's dispatch-time snapshot without
+ * taking that contended lock again. */
+static uint32_t s_workload_epoch = 1;
+/* Diagnostic counters for SPURS_SCHED_TRACE (never read by a dispatch path):
+ * how often a policy quantum was rerun in the same worker vs admitted by the
+ * coordinator. They show whether the fast path is actually firing. */
+static unsigned long s_pm_fast_reruns, s_pm_coord_dispatches;
 static SpursTask     s_tasks[CELL_SPURS_MAX_TASK];
 static u32           s_next_task_id = 0;
 
@@ -459,6 +469,7 @@ struct SpursPmSlot {
     int image_id, busy;
     const uint8_t* pm;
     u64 data;
+    u32 reg_epoch;      /* SPURS_PM_FAST_GEN: workload-registry epoch at dispatch */
     HANDLE thread;
 };
 static struct SpursInst {
@@ -1444,6 +1455,7 @@ s32 cellSpursAddWorkload(CellSpurs* spurs, CellSpursWorkloadId* wid,
             s_workloads[i].maxContention = maxContention;
             s_workloads[i].readyCount = 0;
             s_workloads[i].shutting_down = 0;
+            __atomic_fetch_add(&s_workload_epoch, 1, __ATOMIC_RELEASE);
 
             if (priority_h)
                 memcpy(s_workloads[i].priority, priority_h, CELL_SPURS_MAX_SPU);
@@ -1688,6 +1700,7 @@ s32 cellSpursRemoveWorkload(CellSpurs* spurs, CellSpursWorkloadId wid)
     }
     s_workloads[wid].in_use = 0;
     s_workloads[wid].shutting_down = 0;
+    __atomic_fetch_add(&s_workload_epoch, 1, __ATOMIC_RELEASE);
     vm_write8(si->ea + SPURS_WKL_STATE1 + wid, 3);
     vm_write32(si->ea + SPURS_WKL_ENABLED,
                vm_read32(si->ea + SPURS_WKL_ENABLED) & ~(0x80000000u >> wid));
@@ -1811,6 +1824,154 @@ static int spurs_pm_fast_resched_limit(void)
     return n;
 }
 
+/* Off-by-default live keys for the three dispatch-turnover cuts. Each reads
+ * the live control file when the game links it and falls back to its own
+ * environment variable in the standalone scheduler fixture (where the live
+ * control symbol is absent), so the fixture can flip a key between calls. */
+static int spurs_pm_fast_key(int live_key, const char* env)
+{
+#ifdef SPURS_HAVE_LIVE_CTL
+    if (ps3_live_ctl_get) return ps3_live_ctl_get(live_key) != 0;
+#else
+    (void)live_key;
+#endif
+    const char* e = getenv(env);
+    return e && *e && strcmp(e, "0") != 0;
+}
+
+static int spurs_pm_fast_active_key(void)
+{
+#ifdef SPURS_HAVE_LIVE_CTL
+    return spurs_pm_fast_key(PS3_LIVE_SPURS_PM_FAST_ACTIVE, "SPURS_PM_FAST_ACTIVE");
+#else
+    return spurs_pm_fast_key(0, "SPURS_PM_FAST_ACTIVE");
+#endif
+}
+
+static int spurs_pm_fast_one_lock_key(void)
+{
+#ifdef SPURS_HAVE_LIVE_CTL
+    return spurs_pm_fast_key(PS3_LIVE_SPURS_PM_FAST_ONE_LOCK, "SPURS_PM_FAST_ONE_LOCK");
+#else
+    return spurs_pm_fast_key(0, "SPURS_PM_FAST_ONE_LOCK");
+#endif
+}
+
+static int spurs_pm_fast_gen_key(void)
+{
+#ifdef SPURS_HAVE_LIVE_CTL
+    return spurs_pm_fast_key(PS3_LIVE_SPURS_PM_FAST_GEN, "SPURS_PM_FAST_GEN");
+#else
+    return spurs_pm_fast_key(0, "SPURS_PM_FAST_GEN");
+#endif
+}
+
+/* SPURS_LANE6: the title's MeshJobs0/1 (wids 1 and 2) publish priority[5]=0
+ * and maxContention=5, which is what keeps the c690 workload off the sixth
+ * physical lane. The key overrides both for those two workload ids only, in
+ * both the coordinator and the worker fast path. */
+static int spurs_lane6_for(u32 wid, u32 sn)
+{
+    if ((wid != 1 && wid != 2) || sn != 5) return 0;
+#ifdef SPURS_HAVE_LIVE_CTL
+    if (ps3_live_ctl_get)
+        return ps3_live_ctl_get(PS3_LIVE_SPURS_LANE6) != 0;
+#endif
+    const char* e = getenv("SPURS_LANE6");
+    return e && *e && strcmp(e, "0") != 0;
+}
+
+/* Everything a fast rerun must check except the ready/signal condition. The
+ * caller holds si->lock. Returns 1 when the slot's workload, image, data,
+ * state, lane priority and contention limit still match. With FAST_GEN the
+ * registry lock is skipped while its epoch is unchanged: the coordinator
+ * snapshotted pm/size/ea/data under that lock at dispatch and every mutation
+ * of those fields bumps the epoch under the same lock. */
+static int spurs_pm_fast_static_ok(struct SpursInst* si, struct SpursPmSlot* slot)
+{
+    if (si->stopping) return 0;
+    const u32 wid = slot->wid, ea = slot->ea;
+    if (wid >= 16 || !ea) return 0;
+
+    u32 pm_size; const uint8_t* pm;
+    if (spurs_pm_fast_gen_key()) {
+        const u32 epoch = __atomic_load_n(&s_workload_epoch, __ATOMIC_ACQUIRE);
+        if (epoch == slot->reg_epoch && slot->pm && slot->pm_size) {
+            pm = slot->pm; pm_size = slot->pm_size;
+        } else {
+            AcquireSRWLockExclusive(&s_workload_registry_lock);
+            SpursWorkload* w = &s_workloads[wid];
+            int ok = w->in_use && w->spurs_ea == ea && !w->shutting_down;
+            pm_size = ok ? w->sizePm : 0;
+            pm = ok ? vm_base + (u32)(uintptr_t)w->pm : NULL;
+            if (ok) slot->reg_epoch = __atomic_load_n(&s_workload_epoch, __ATOMIC_ACQUIRE);
+            ReleaseSRWLockExclusive(&s_workload_registry_lock);
+            if (!ok) return 0;
+        }
+    } else {
+        AcquireSRWLockExclusive(&s_workload_registry_lock);
+        SpursWorkload* w = &s_workloads[wid];
+        int ok = w->in_use && w->spurs_ea == ea && !w->shutting_down;
+        pm_size = ok ? w->sizePm : 0;
+        pm = ok ? vm_base + (u32)(uintptr_t)w->pm : NULL;
+        ReleaseSRWLockExclusive(&s_workload_registry_lock);
+        if (!ok) return 0;
+    }
+    if (pm != slot->pm || pm_size != slot->pm_size) return 0;
+
+    const u64 data = vm_read64(ea + SPURS_WKL_INFO1 + wid * SPURS_WKL_INFO_SZ + 8);
+    if (data != slot->data) return 0;
+
+    if (!(vm_read32(ea + SPURS_WKL_ENABLED) & (0x80000000u >> wid))) return 0;
+    if (vm_read8(ea + SPURS_WKL_STATE1 + wid) != 2) return 0;
+    const int lane6 = spurs_lane6_for(wid, slot->spu_num);
+    if (!lane6 &&
+        !vm_read8(ea + SPURS_WKL_INFO1 + wid * SPURS_WKL_INFO_SZ + 0x18 + slot->spu_num))
+        return 0;
+    u32 maxcont = vm_read8(ea + SPURS_WKL_MAXCONT + wid);
+    if (lane6 && maxcont < 6) maxcont = 6;
+    if (!maxcont) return 0;
+    /* SPURS_PM_FAST_ACTIVE: this worker is already one of si->active[wid], so
+     * the coordinator's "another lane may be admitted" test must not reject a
+     * rerun at the steady state active == maxContention (which is exactly what
+     * kept the c690 fast path from ever firing). The rerun adds no lane; it is
+     * only refused when the guest has lowered its demand below the active set.
+     * Same for the ready-level test in spurs_pm_fast_ready_ok below. */
+    if (spurs_pm_fast_active_key()) {
+        if ((int)si->active[wid] > (int)maxcont) return 0;
+    } else if (si->active[wid] >= maxcont) {
+        return 0;
+    }
+    return 1;
+}
+
+/* Is an already-active lane still inside the guest's ready-level demand?
+ * Without FAST_ACTIVE this keeps the coordinator's strict admission boundary
+ * (active must be below ready+idle); with it, the lane is already counted, so
+ * the boundary itself is allowed (the guest lowered its demand only when the
+ * active set is strictly larger). Pure so the fixture can cover the arithmetic
+ * without depending on the environment-cached ready-level mode. */
+static int spurs_pm_fast_lane_within_level(int active, u32 ready, u32 idle,
+                                           int active_key)
+{
+    if (!ready) return 1;
+    const int limit = (int)ready + (int)idle;
+    return active_key ? (active <= limit) : (active < limit);
+}
+
+/* The ready/signal half, under the lock-line lock. */
+static int spurs_pm_fast_ready_ok(struct SpursInst* si, struct SpursPmSlot* slot,
+                                  u32 ready, u32 signal, u32 idle)
+{
+    const u32 wid = slot->wid;
+    if (!ready && !(signal & (0x8000u >> wid))) return 0;
+    if (spurs_ready_level() &&
+        !spurs_pm_fast_lane_within_level((int)si->active[wid], ready, idle,
+                                         spurs_pm_fast_active_key()))
+        return 0;
+    return 1;
+}
+
 /* Called with si->lock held, after a policy run returned. Returns 1 when the
  * same workload is still eligible on this lane and the coordinator would have
  * dispatched it again. Anything that could have changed the dispatch -- a
@@ -1818,35 +1979,42 @@ static int spurs_pm_fast_resched_limit(void)
  * the normal coordinator path. */
 static int spurs_pm_fast_can_rerun(struct SpursInst* si, struct SpursPmSlot* slot)
 {
-    if (si->stopping) return 0;
+    if (!spurs_pm_fast_static_ok(si, slot)) return 0;
     const u32 wid = slot->wid, ea = slot->ea;
-    if (wid >= 16 || !ea) return 0;
-
-    u32 pm_size; const uint8_t* pm; u64 data;
-    AcquireSRWLockExclusive(&s_workload_registry_lock);
-    SpursWorkload* w = &s_workloads[wid];
-    int ok = w->in_use && w->spurs_ea == ea && !w->shutting_down;
-    pm_size = ok ? w->sizePm : 0;
-    pm = ok ? vm_base + (u32)(uintptr_t)w->pm : NULL;
-    ReleaseSRWLockExclusive(&s_workload_registry_lock);
-    if (!ok || pm != slot->pm || pm_size != slot->pm_size) return 0;
-    data = vm_read64(ea + SPURS_WKL_INFO1 + wid * SPURS_WKL_INFO_SZ + 8);
-    if (data != slot->data) return 0;
-
-    if (!(vm_read32(ea + SPURS_WKL_ENABLED) & (0x80000000u >> wid))) return 0;
-    if (vm_read8(ea + SPURS_WKL_STATE1 + wid) != 2) return 0;
-    if (!vm_read8(ea + SPURS_WKL_INFO1 + wid * SPURS_WKL_INFO_SZ + 0x18 + slot->spu_num))
-        return 0;
-    const u32 maxcont = vm_read8(ea + SPURS_WKL_MAXCONT + wid);
-    if (!maxcont || si->active[wid] >= maxcont) return 0;
-
     spu_lockline_lock();
     const u32 ready = vm_read8(ea + SPURS_WKL_READY1 + wid);
     const u32 signal = vm_read16(ea + SPURS_WKL_SIGNAL1);
     const u32 idle = vm_read8(ea + SPURS_WKL_IDLE2 + wid);
     spu_lockline_unlock();
-    if (!ready && !(signal & (0x8000u >> wid))) return 0;
-    if (spurs_ready_level() && ready && si->active[wid] >= ready + idle) return 0;
+    return spurs_pm_fast_ready_ok(si, slot, ready, signal, idle);
+}
+
+/* SPURS_PM_FAST_ONE_LOCK: the split path reads ready/signal/idle under the
+ * lock line, unlocks, then takes it again to consume. Check and consume in one
+ * critical section, exactly like the coordinator does, so a rerun costs one
+ * lock-line acquisition instead of two and cannot see a half-updated claim. */
+static int spurs_pm_fast_try_rerun(struct SpursInst* si, struct SpursPmSlot* slot)
+{
+    if (!spurs_pm_fast_static_ok(si, slot)) return 0;
+    const u32 wid = slot->wid, ea = slot->ea;
+    const u32 bit = 0x8000u >> wid;
+    spu_lockline_lock();
+    const u32 ready = vm_read8(ea + SPURS_WKL_READY1 + wid);
+    const u32 signal = vm_read16(ea + SPURS_WKL_SIGNAL1);
+    const u32 idle = vm_read8(ea + SPURS_WKL_IDLE2 + wid);
+    if (!spurs_pm_fast_ready_ok(si, slot, ready, signal, idle)) {
+        spu_lockline_unlock();
+        return 0;
+    }
+    if (!spurs_ready_level() && ready)
+        vm_base[ea + SPURS_WKL_READY1 + wid] = (u8)(ready - 1);
+    if (signal & bit)
+        ef_w16(ea + SPURS_WKL_SIGNAL1, (u16)(signal & ~bit));
+    vm_base[ea + SPURS_WKL_CURCONT + wid] = si->active[wid];
+    ef_line_end(ea);                 /* notify if reserved, then unlock */
+    si->idle[wid] = 0;
+    ps3_trace_instant(PS3_TR_SPURS_KICK, wid,
+                      slot->spu_num | ((ready & 0xFFu) << 8));
     return 1;
 }
 
@@ -1904,10 +2072,21 @@ static DWORD WINAPI spurs_pm_worker(LPVOID p)
             if (ft_t0)   /* PS3_FTRACE: SPURS SPUs never block on a channel, so their busy time is the module run */
                 ps3_ft_span(PS3_FT_SPU_BUSY, slot->spu_num, (uint32_t)slot->image_id, slot->wid, ft_t0, ps3_ft_now());
             AcquireSRWLockExclusive(&si->lock);
-            if (fast_runs < fast_limit && spurs_pm_fast_can_rerun(si, slot)) {
-                spurs_pm_fast_consume(si, slot);
-                fast_runs++;
-                continue;
+            if (fast_runs < fast_limit) {
+                int rerun;
+                if (spurs_pm_fast_one_lock_key()) {
+                    rerun = spurs_pm_fast_try_rerun(si, slot);
+                } else if (spurs_pm_fast_can_rerun(si, slot)) {
+                    spurs_pm_fast_consume(si, slot);
+                    rerun = 1;
+                } else {
+                    rerun = 0;
+                }
+                if (rerun) {
+                    __atomic_fetch_add(&s_pm_fast_reruns, 1, __ATOMIC_RELAXED);
+                    fast_runs++;
+                    continue;
+                }
             }
             break;
         }
@@ -1968,18 +2147,13 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
                     !s_workloads[wid].in_use || s_workloads[wid].spurs_ea != ea ||
                     s_workloads[wid].shutting_down)
                     continue;
-                /* SPURS_LANE6=1 (ceiling probe): this title's MeshJobs0/1
-                 * (wids 1 and 2) set priority[5]=0 and maxContention=5, which
-                 * is what keeps c690 on five physical lanes. Override both so
-                 * the job can use the sixth lane. Throwaway experiment; the
-                 * guest's own SPURS config is the reason lane 5 is idle. */
-                int lane6 = 0;
-#ifdef SPURS_HAVE_LIVE_CTL
-                if ((wid == 1 || wid == 2) && ps3_live_ctl_get)
-                    lane6 = ps3_live_ctl_get(PS3_LIVE_SPURS_LANE6) != 0;
-#endif
+                /* SPURS_LANE6=1: this title's MeshJobs0/1 (wids 1 and 2) set
+                 * priority[5]=0 and maxContention=5, which is what keeps
+                 * c690 on five physical lanes. Override both so the job can
+                 * use the sixth lane. */
+                const int lane6 = spurs_lane6_for(wid, sn);
                 if (!vm_read8(ea + SPURS_WKL_INFO1 + wid * SPURS_WKL_INFO_SZ + 0x18 + sn) &&
-                    !(lane6 && sn == 5))
+                    !lane6)
                     continue; /* priority zero makes this physical lane ineligible */
                 u32 maxcont = vm_read8(ea + SPURS_WKL_MAXCONT + wid);
                 if (lane6 && maxcont < 6) maxcont = 6;
@@ -1993,8 +2167,11 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
                     static int st = -1; static unsigned long long n_seen;
                     if (st < 0) st = getenv("SPURS_SCHED_TRACE") ? 1 : 0;
                     if (st && (++n_seen % 4096) == 0)
-                        fprintf(stderr, "[spurs-sched] wid %u ready %u idle %u maxcont %u active %u signal %u sn %u busy:%u%u%u%u%u%u\n",
+                        fprintf(stderr, "[spurs-sched] wid %u ready %u idle %u maxcont %u active %u signal %u sn %u "
+                                "fast=%lu coord=%lu busy:%u%u%u%u%u%u\n",
                                 wid, ready, vm_read8(ea + SPURS_WKL_IDLE2 + wid), maxcont, si->active[wid], (signal >> (15 - wid)) & 1u, sn,
+                                __atomic_load_n(&s_pm_fast_reruns, __ATOMIC_RELAXED),
+                                __atomic_load_n(&s_pm_coord_dispatches, __ATOMIC_RELAXED),
                                 si->slots[0].busy, si->nspus > 1 && si->slots[1].busy, si->nspus > 2 && si->slots[2].busy,
                                 si->nspus > 3 && si->slots[3].busy, si->nspus > 4 && si->slots[4].busy,
                                 si->nspus > 5 && si->slots[5].busy);
@@ -2025,6 +2202,8 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
                 slot->pm_size = s_workloads[wid].sizePm;
                 slot->data = vm_read64(ea + SPURS_WKL_INFO1 + wid * SPURS_WKL_INFO_SZ + 8);
                 slot->wid = wid; slot->ea = ea;
+                slot->reg_epoch = __atomic_load_n(&s_workload_epoch, __ATOMIC_ACQUIRE);
+                __atomic_fetch_add(&s_pm_coord_dispatches, 1, __ATOMIC_RELAXED);
                 si->active[wid]++;
                 spu_lockline_lock();
                 vm_base[ea + SPURS_WKL_CURCONT + wid] = si->active[wid];
@@ -2112,6 +2291,7 @@ static void spurs_scheduler_retire(u32 ea)
         if (s_workloads[wid].in_use && s_workloads[wid].spurs_ea == ea) {
             memset(&s_workloads[wid], 0, sizeof(s_workloads[wid]));
             spurs_scheduler_forget(wid);
+            __atomic_fetch_add(&s_workload_epoch, 1, __ATOMIC_RELEASE);
         }
     ReleaseSRWLockExclusive(&s_workload_registry_lock);
 }
@@ -3468,6 +3648,7 @@ s32 cellSpursShutdownWorkload(u64 spurs_ea, u32 wid)
     }
 
     s_workloads[wid].shutting_down = 1;
+    __atomic_fetch_add(&s_workload_epoch, 1, __ATOMIC_RELEASE);
     /* Stop dispatch: no ready unit, no signal bit, not runnable, disabled. */
     spu_lockline_lock();
     vm_base[si->ea + SPURS_WKL_READY1 + wid] = 0;
