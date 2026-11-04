@@ -421,6 +421,18 @@ if(PS3RECOMP_BUILD_TESTS)
                 $<TARGET_FILE:test_frame_trace>)
         set_tests_properties(frame_trace PROPERTIES TIMEOUT 120)
     endif()
+    # The SPSC draw-record ring: order, wrap, refusal when full, sync/drain.
+    add_executable(test_draw_queue
+        libs/video/tests/test_draw_queue.c
+        libs/video/rsx_draw_queue.c
+    )
+    target_include_directories(test_draw_queue PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/libs/video")
+    if(TARGET Threads::Threads)
+        target_link_libraries(test_draw_queue PRIVATE Threads::Threads)
+    endif()
+    add_test(NAME draw_queue COMMAND test_draw_queue)
+
     # PS3_LOG_FIRST, the saturating counter behind the "first n times" log lines.
     add_executable(test_log_first tests/test_log_first.c)
     target_include_directories(test_log_first PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
@@ -449,6 +461,7 @@ if(PS3RECOMP_BUILD_TESTS)
         tools/replay_rsx_engine_core.c
         tools/replay_null_draw_backend.c
         libs/video/rsx_draw_engine.c
+        libs/video/rsx_draw_queue.c
         libs/video/rsx_dispatch.c
         libs/video/rsx_vertex_fetch.c
         libs/video/rsx_vertex_compact.c

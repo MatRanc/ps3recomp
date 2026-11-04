@@ -262,6 +262,7 @@ fail:
 int rsx_engine_replay_run_frame(rsx_engine_replay* r, rsx_engine_replay_stats* out)
 {
     if (!r) return -1;
+    rsx_draw_engine_mt_sync();
     rsx_draw_engine_state_restore(&r->state);
     replay_null_reset();
     r->hits = r->misses = 0;
@@ -280,6 +281,7 @@ int rsx_engine_replay_run_frame(rsx_engine_replay* r, rsx_engine_replay_stats* o
 
     while (s_ref_qhead != s_ref_qtail) s_ref_qhead++;
 
+    rsx_draw_engine_mt_sync();
     rsx_draw_engine_replay_advance_frame();
     if (out) {
         out->draws = replay_null_draws();

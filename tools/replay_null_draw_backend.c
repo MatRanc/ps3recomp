@@ -262,6 +262,21 @@ static void nb_bind_vs(void* u, const void* d, u32 n)
     rg_tag("bind_vs_constants"); rg_u32(n);
     if (d && n) rg_bytes(d, n);
 }
+/* Opt-in (REPLAY_NULL_VSRANGE=1): the ranged VS-constant call the Vulkan
+ * backend uses. The engine's packet path hands the worker only rows
+ * [first, first + count); the backend reads them at `first` into the block,
+ * so a wrong packet offset shows up here as a different digest. Off by
+ * default: the historical gates hash the full-block call. */
+static void nb_bind_vs_range(void* u, const void* rows, u32 first, u32 count,
+                             const void* tail, u32 tail_bytes, u32 total)
+{
+    (void)u;
+    rg_tag("bind_vs_constants_range");
+    rg_u32(first); rg_u32(count); rg_u32(total);
+    if (rows && count) rg_bytes((const u8*)rows + first * 16u, count * 16u);
+    if (tail && tail_bytes) rg_bytes(tail, tail_bytes);
+}
+
 static void nb_bind_ps(void* u, const void* d, u32 n)
 {
     (void)u;
@@ -462,7 +477,17 @@ static const rsx_draw_backend s_backend = {
     .texture_upload_ordered = 0,
 };
 
-const rsx_draw_backend* replay_null_backend(void) { return &s_backend; }
+const rsx_draw_backend* replay_null_backend(void)
+{
+    static rsx_draw_backend sel;
+    static int init;
+    if (!init) {
+        sel = s_backend;
+        if (getenv("REPLAY_NULL_VSRANGE")) sel.bind_vs_constants_range = nb_bind_vs_range;
+        init = 1;
+    }
+    return &sel;
+}
 unsigned long long replay_null_draws(void) { return s_draws; }
 unsigned long long replay_null_draw_vertices(void) { return s_vertices; }
 unsigned long long replay_null_hash(void) { return s_hash; }

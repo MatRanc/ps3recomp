@@ -36,12 +36,12 @@ if os.name == 'nt':
 V = 'libs/video/'
 # the draw engine, command processor and decompilers
 ENGINE = [V + s for s in (
-    'rsx_commands.c', 'rsx_dispatch.c', 'rsx_draw_engine.c', 'rsx_texture_layout.c',
+    'rsx_commands.c', 'rsx_dispatch.c', 'rsx_draw_engine.c', 'rsx_draw_queue.c', 'rsx_texture_layout.c',
     'rsx_vertex_compact.c', 'rsx_vertex_fetch.c', 'rsx_vp_decompiler.c',
     'rsx_fp_decompiler.c', 'rsx_null_backend.c', 'rsx_live_draw_config.c')]
 # fixtures that #include rsx_draw_engine.c themselves
 DISPATCH = [V + s for s in (
-    'rsx_dispatch.c', 'rsx_vertex_compact.c', 'rsx_texture_layout.c',
+    'rsx_dispatch.c', 'rsx_draw_queue.c', 'rsx_vertex_compact.c', 'rsx_texture_layout.c',
     'rsx_vp_decompiler.c', 'rsx_fp_decompiler.c')]
 # cellGcmSys.c is #included; its pump thread uses the CreateThread shim
 GCM = ['runtime/platform/win32_compat.c']

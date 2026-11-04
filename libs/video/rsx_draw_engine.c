@@ -24,6 +24,7 @@
 #include "rsx_wcb.c"
 #include "rsx_tex_miss.h"
 #include "rsx_tex_miss.c"
+#include "rsx_draw_queue.h"
 #include "ps3_live_ctl.h"
 #include "ps3emu/ps3_trace.h"   /* PS3RECOMP_TIMELINE: readback done */
 
@@ -34,6 +35,9 @@
 #include <time.h>
 #include "ps3emu/log_first.h"
 #include "../../runtime/memory/vm.h"   /* vm_commit: the capture images pages */
+
+/* Draw-record worker barriers (defined with the packet code below). */
+static void eng_mt_sync(void);
 
 /* Guest memory and the RSX offset resolvers, declared the way every backend
  * that reads guest data declares them (rsx_vertex_fetch.h). */
@@ -1781,6 +1785,7 @@ static u32 eng_surface_get(u32 location, u32 offset, u32 want_w, u32 want_h,
         }
     }
 
+    eng_mt_sync();
     u32 seed_row = 0;
     const uint64_t _tr = ps3_trace_begin();
     const void* seed = eng_surface_seed(location, offset, want_w, want_h,
@@ -2143,6 +2148,7 @@ static void eng_color_rows_store(u32 bpp, u32 location, u32 offset, u32 pitch, u
 
 void rsx_draw_engine_guest_read(u32 location, u32 offset, u32 pitch, u32 w, u32 h)
 {
+    eng_mt_sync();
     if (!g.ready || !g.be->readback || !pitch || !w || !h) return;
     u32 xb = 0, y = 0;
     const u32 slot = eng_surface_at(location, offset, pitch, &xb, &y);
@@ -2277,6 +2283,7 @@ void rsx_draw_engine_guest_read_done(void)
 
 void rsx_draw_engine_guest_wrote(u32 location, u32 offset, u32 pitch, u32 w, u32 h)
 {
+    eng_mt_sync();
     if (!g.ready || !g.be->color_target_write || !pitch || !w || !h) return;
     u32 x = 0, y = 0;
     const u32 slot = eng_surface_at(location, offset, pitch, &x, &y);
@@ -2369,6 +2376,7 @@ static u32 eng_zdepth_get(u32 location, u32 offset, u32 rt_w, u32 rt_h)
         }
     }
 
+    eng_mt_sync();
     const u32 handle = g.be->depth_target_create(g.be->user, want_w, want_h);
     if (!handle)
         return (!evicted && slot < g.n_zdepths && g.zdepths[slot].handle) ? slot : ENG_INVALID;
@@ -2405,6 +2413,7 @@ static u32 eng_zdepth_get(u32 location, u32 offset, u32 rt_w, u32 rt_h)
  * memory instead (rsx_live_draw.c:6016-6018, 6265-6269). */
 static u32 eng_zdepth_snapshot(u32 slot, u32 tex_w, u32 tex_h)
 {
+    eng_mt_sync();
     eng_zdepth* z = &g.zdepths[slot];
     if (!z->handle || !z->had_write) return 0;
     /* The texture covers the top-left tex_w x tex_h of the zeta. The host
@@ -2459,6 +2468,7 @@ static int s_depth_via_guest;
  * up to 2 MB. Returns the view, or 0 for the store through guest memory. */
 static u32 eng_zdepth_as_color(u32 slot, const rsx_dsp_texture* t)
 {
+    eng_mt_sync();
     eng_zdepth* z = &g.zdepths[slot];
     const u32 base_fmt = t->format & RSX_TEX_FMT_BASE_MASK & ~(u32)RSX_TEX_FMT_UNNORM;
     const int z16 = z->zfmt == 1u;      /* SURFACE_FORMAT Z16 */
@@ -2636,6 +2646,7 @@ static u32 eng_texture_upload_work(u32 location, u32 offset, u32 fmt, u32 w, u32
      * first slice and sampled in 2D it darkened whole boxes round every prop. */
     if (!into && depth > 1 && !cube && g.be->texture_create_3d && g.be->texture_upload_3d &&
         !lv[0].tl.compressed && lv[0].tl.bytes_per_texel) {
+        eng_mt_sync();
         const u32 span = eng_texture_span_3d(fmt, w, h, depth, levels, pitch);
         const u8* src = eng_guest_ptr(NULL, location, offset, span);
         if (!src) { s_tex_miss_reason = RSX_TEX_MISS_ADDRESS; return 0; }
@@ -2679,6 +2690,7 @@ static u32 eng_texture_upload_work(u32 location, u32 offset, u32 fmt, u32 w, u32
     const u8* src = eng_guest_ptr(NULL, location, offset, span);
     if (!src) { s_tex_miss_reason = RSX_TEX_MISS_ADDRESS; return 0; }
 
+    eng_mt_sync();
     const u32 handle = into ? into
         : g.be->texture_create(g.be->user, eng_texfmt(lv[0].tl.fmt), w, h, nlv, faces, remap, fmt);
     if (!handle) { s_tex_miss_reason = RSX_TEX_MISS_OTHER; return 0; }
@@ -2762,6 +2774,7 @@ static u32 eng_surface_at_exact(u32 location, u32 offset)
  * stacked target with the faces in rows (or columns). */
 static int eng_cube_collect(const rsx_dsp_texture* t, eng_cube_desc* d)
 {
+    eng_mt_sync();
     memset(d, 0, sizeof *d);
     const u32 base = eng_surface_at_exact(t->location, t->offset);
     if (base == ENG_INVALID) return 0;
@@ -3088,6 +3101,7 @@ static u32 eng_texture_slot_work(u32 location, u32 offset, u32 fmt, u32 w, u32 h
                                                          levels, pitch, cube, remap, depth, into);
                     if (fresh && !into) {
                         s_tex_gen++;
+                        eng_mt_sync();
                         g.be->texture_release(g.be->user, e->handle);
                         e->handle = fresh;
                         if (e->levels != levels) {
@@ -3147,6 +3161,7 @@ static u32 eng_texture_slot_work(u32 location, u32 offset, u32 fmt, u32 w, u32 h
                                                          levels, pitch, cube, remap, depth, into);
                     if (fresh && !into) {
                         s_tex_gen++;
+                        eng_mt_sync();
                         g.be->texture_release(g.be->user, e->handle);
                         e->handle = fresh;
                         e->levels = levels;
@@ -3233,7 +3248,7 @@ static u32 eng_texture_slot_work(u32 location, u32 offset, u32 fmt, u32 w, u32 h
         e.handle = eng_texture_upload(location, offset, fmt, w, h, levels, pitch,
                                       cube, remap, depth, 0u);
     }
-    if (e.handle && evicted) { g.be->texture_release(g.be->user, evicted); s_tex_gen++; }
+    if (e.handle && evicted) { eng_mt_sync(); g.be->texture_release(g.be->user, evicted); s_tex_gen++; }
     if (e.handle || !evicted) g.textures[index] = e;
     if (e.handle) s_tslot_last = index;
     return e.handle;
@@ -3364,6 +3379,7 @@ static int eng_zdepth_span(const eng_zdepth* z, u32* w, u32* h, u32* bpp)
 /* `forced`: an on-demand resolve, whose destination is still protected. */
 static int eng_zdepth_store(u32 slot, int forced)
 {
+    eng_mt_sync();
     eng_zdepth* z = &g.zdepths[slot];
     if (!g.be->depth_readback || !z->handle) return 0;
     u32 w, h, bpp;
@@ -3804,6 +3820,7 @@ static void eng_wcb_batch_resolve(u32 cookie, int is_read);
 static void eng_wcb_resolve(void* user, u32 cookie, int reason)
 {
     (void)user;
+    eng_mt_sync();
     /* A read in command-stream order -- the walker's own transfers, a texture
      * upload, an eviction -- wants the target as it is now. A guest thread
      * that saw the sync point's label wants it as of that label: the queued
@@ -3883,6 +3900,7 @@ static int eng_is_display_offset(u32 location, u32 offset);
  * the hot ones. Nothing here waits for the GPU. */
 static void eng_wcb_sync_point(int mode)
 {
+    eng_mt_sync();
     eng_wcb_module_up();
     const int prefetch = eng_wcb_prefetch_on() && g.be->readback_async && g.be->submit_async;
     u32 queued = 0;
@@ -4731,6 +4749,7 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
     if (vi > 0 && fi > 0) {
         wp2_add(WPROF2_PIPE_DECOMPILE, wp2_decompile);
         const unsigned long long wp2_create = wp2_t0();
+        eng_mt_sync();
         if (g.be->set_pipeline_key) g.be->set_pipeline_key(g.be->user, key);
         handle = g.be->pipeline_create(g.be->user, s_vs_hlsl, s_ps_hlsl, rs,
                                        layout, layout->stride, rt_fmt, rt_count);
@@ -5814,12 +5833,14 @@ static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
             while (k < n_targets && target_slots[k] != (u32)surface_at) k++;
             if (k == n_targets) return eng_color_feedback_failure(u, s, &t);
             if (!feedback[k]) {
+                eng_mt_sync();
                 const u32 copy = g.be->color_snapshot(g.be->user, s->handle);
                 if (!copy) return eng_color_feedback_failure(u, s, &t);
                 if (s->feedback) g.be->texture_release(g.be->user, s->feedback);
                 s->feedback = feedback[k] = copy;
             }
             if (g.be->surface_view) {
+                eng_mt_sync();
                 textures[u] = g.be->surface_view(g.be->user, feedback[k],
                                                t.remap & 0xffffu, t.format);
                 if (!textures[u]) return eng_color_feedback_failure(u, s, &t);
@@ -5861,8 +5882,8 @@ static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
         }
         if (sampled >= 0) {
             const u32 view = g.be->surface_view
-                ? g.be->surface_view(g.be->user, g.surfaces[sampled].handle,
-                                     t.remap & 0xFFFFu, t.format)
+                ? (eng_mt_sync(), g.be->surface_view(g.be->user, g.surfaces[sampled].handle,
+                                     t.remap & 0xFFFFu, t.format))
                 : 0;
             textures[u] = view ? view : g.surfaces[sampled].handle;
             if (t.cubemap) eng_tex_miss_note_reason(u, &t, RSX_TEX_MISS_SURFACE);
@@ -6019,6 +6040,7 @@ static u8 pd_unit(float v)
 /* One colour surface to a binary PPM, alpha dropped, floats clamped to [0,1]. */
 static void pd_write_surface(u32 slot, const char* path)
 {
+    eng_mt_sync();
     const eng_surface* s = &g.surfaces[slot];
     u32 bpp;
     switch (s->fmt) {
@@ -6068,6 +6090,7 @@ static void pd_write_surface(u32 slot, const char* path)
  * largest value so a shallow range still shows; the range goes to the index. */
 static void pd_write_depth(u32 zslot, const char* path, float* lo_out, float* hi_out)
 {
+    eng_mt_sync();
     const eng_zdepth* z = &g.zdepths[zslot];
     *lo_out = *hi_out = -1.0f;
     if (!g.be->depth_readback || !z->handle) return;
@@ -6500,6 +6523,480 @@ static void eng_check_gpu_vertex_offload(rsx_vtx_gpu_desc* desc, u32 uploaded)
     else s_eng_eligible_m3++;
 }
 
+/* ---- multi-threaded draw packets (PS3RECOMP_WALKER_MT) ------------------
+ *
+ * The walker stays the state thread: it decodes the FIFO, resolves surfaces,
+ * textures and pipelines, and builds an immutable packet per draw. In the
+ * serial packet path (WORKERS=0) the packet is committed on the walker at
+ * once. With one record worker (WORKERS=1) the packet and every byte it
+ * borrowed are copied into an SPSC ring and the worker replays the backend
+ * calls in draw order. Synchronous backend calls (creates, snapshots,
+ * readbacks, present, WCB) drain the ring first, so the backend sees the same
+ * sequence on one thread at a time.
+ *
+ * Packet/copied-payload/drain shape derived from the MIT inFAMOUS 2 port
+ * (rsx_be_thread.c, bq_direct_begin): Portions derived from inFAMOUS 2 recomp
+ * (c) 2026 the infamous2-recomp contributors, MIT.
+ */
+
+#define ENG_MT_PKT_MAGIC 0x4d545044u   /* "MTDP" */
+
+typedef struct {
+    rsx_dsp_vertex_attr desc;
+    u32 elem_size;
+    u32 stride;
+    float def[4];
+    u32 has_span;
+    u32 span_off;
+    u32 stable_first;
+    u32 stable_last;
+} eng_pkt_attr;
+
+typedef struct {
+    u32 magic;
+    u32 total_bytes;
+    u64 seq;
+
+    u32 topology;
+    u32 indexed;
+    u32 n_draw;
+    u32 uploaded;
+    u32 stride;
+    u32 deferred;
+    u32 snapshot_ok;
+
+    u32 n_targets;
+    u32 targets[RSX_BE_MAX_COLOR_TARGETS];      /* backend handles */
+    u32 track_targets[RSX_BE_MAX_COLOR_TARGETS]; /* engine slots */
+    u32 depth_handle;
+    u32 zslot;
+    u32 do_clear_depth;
+    u32 clear_depth_handle;
+    u32 pipeline;
+
+    u32 vpc_range;
+    u32 vpc_lo;
+    u32 vpc_n;
+    u32 vpc_total;
+    u32 fp_bytes;
+    u32 tex_mask;
+    u32 vtex_mask;
+    u32 textures[RSX_BE_MAX_TEXTURES];
+    rsx_be_sampler_desc samplers[RSX_BE_MAX_TEXTURES];
+    u32 vtextures[RSX_BE_MAX_VERTEX_TEXTURES];
+    rsx_be_sampler_desc vsamplers[RSX_BE_MAX_VERTEX_TEXTURES];
+    float W, H;
+    u32 sc[4];
+    u32 stencil;
+    u32 has_bounds, has_bias, bias_bits;
+    float bounds[2], bias[2];
+
+    /* Payload, as 16-byte-aligned offsets from the packet start (0 = absent).
+     * The same offsets are valid after the packet is copied into the ring. */
+    u32 off_rows, rows_bytes;
+    u32 off_tail, tail_bytes;
+    u32 off_vp_full, vp_full_bytes;
+    u32 off_fp;
+    u32 off_verts;
+    u32 off_idx;
+    u32 off_refs, n_refs;
+    u32 off_raw, raw_bytes;
+    u32 off_remap, n_remap;
+    u32 off_inline, inline_bytes;
+
+    /* Vertex plan snapshot (pointers replaced by span offsets). */
+    rsx_vertex_layout_plan plan_layout;
+    u32 plan_base_offset, plan_divider_mask;
+    u32 plan_inline_stride;
+    u32 plan_inline_off[RSX_DSP_NUM_VERTEX_ATTR];
+    eng_pkt_attr plan_attr[RSX_DSP_NUM_VERTEX_ATTR];
+    rsx_vtx_gpu_desc gpu_desc;
+
+    /* Engine bookkeeping, applied on the state thread in worker mode. */
+    u32 track_color_mask;
+    u32 track_depth_write;
+    rsx_dsp_surface track_sf;
+} eng_draw_pkt;
+
+static struct {
+    int inited;
+    int on;
+    int workers;
+    rsx_record_queue* q;
+    u8* scratch;
+    u32 cap, used;
+    u64 seq, enqueued, inline_fallbacks, syncs, snapshots, snapshot_fail;
+} s_mt;
+
+static void eng_mt_record_exec(void* ctx, const void* rec, u32 size);
+
+static int eng_mt_env_int(const char* name, int def)
+{
+    const char* e = getenv(name);
+    if (!e || !*e) return def;
+    return (int)strtol(e, NULL, 0);
+}
+
+static int eng_mt_on(void)
+{
+    if (ps3_live_ctl_get) return ps3_live_ctl_get(PS3_LIVE_WALKER_MT) != 0;
+    return eng_mt_env_int("PS3RECOMP_WALKER_MT", 0) != 0;
+}
+
+static int eng_mt_workers(void)
+{
+    int n = ps3_live_ctl_get ? ps3_live_ctl_get(PS3_LIVE_WALKER_MT_WORKERS)
+                             : eng_mt_env_int("PS3RECOMP_WALKER_MT_WORKERS", 0);
+    if (n < 0) n = 0;
+    if (n > 1) n = 1;    /* M2: one record worker */
+    return n;
+}
+
+static void eng_mt_reset(void)
+{
+    if (s_mt.q) rsx_record_queue_destroy(s_mt.q);
+    free(s_mt.scratch);
+    memset(&s_mt, 0, sizeof s_mt);
+}
+
+/* Make sure the scratch packet arena and (if asked) the record worker exist. */
+static int eng_mt_ensure(void)
+{
+    const int on = eng_mt_on();
+    if (!on) {
+        /* A live switch back to the old path must not leave records the old
+         * path would overtake. */
+        if (s_mt.q) eng_mt_sync();
+        s_mt.on = 0;
+        return 0;
+    }
+    s_mt.on = 1;
+    if (s_mt.inited) return 1;
+    s_mt.inited = 1;
+    s_mt.workers = eng_mt_workers();
+    /* The packet arena never reallocates while a packet is being built: every
+     * offset in the packet is relative to this one block, and the record
+     * worker reads it after the walker has moved on. A draw that does not fit
+     * falls back to the inline packet path. */
+    s_mt.cap = 64u * 1024u * 1024u;
+    s_mt.scratch = (u8*)malloc(s_mt.cap);
+    if (!s_mt.scratch) {
+        s_mt.cap = 0;
+        s_mt.on = 0;
+        return 0;
+    }
+    if (s_mt.workers > 0) {
+        const int mb = eng_mt_env_int("PS3RECOMP_WALKER_MT_QUEUE_MB", 16);
+        s_mt.q = rsx_record_queue_new((u32)(mb > 0 ? mb : 16) * 1024u * 1024u);
+        if (!s_mt.q || rsx_record_queue_start(s_mt.q, eng_mt_record_exec, NULL) != 0) {
+            if (s_mt.q) rsx_record_queue_destroy(s_mt.q);
+            s_mt.q = NULL;
+            s_mt.workers = 0;
+            fprintf(stderr, "[walker-mt] record worker did not start; serial packet path\n");
+        } else {
+            fprintf(stderr, "[walker-mt] record worker up (queue %d MB)\n", mb > 0 ? mb : 16);
+        }
+    }
+    return 1;
+}
+
+static u32 eng_mt_alloc(u32 bytes)
+{
+    bytes = (bytes + 15u) & ~15u;
+    const u32 need = s_mt.used + bytes;
+    if (need < s_mt.used || need > s_mt.cap) return 0;
+    const u32 off = s_mt.used;
+    s_mt.used = need;
+    return off;
+}
+
+/* Drain every published record. Called before any backend call the state
+ * thread makes itself, and at every guest-visible sync point. */
+static void eng_mt_sync(void)
+{
+    if (!s_mt.q) return;
+    rsx_record_queue_sync(s_mt.q);
+    s_mt.syncs++;
+}
+
+void rsx_draw_engine_mt_sync(void)
+{
+    eng_mt_sync();
+}
+
+/* The packet's fill callback: identical conversion to dc_fill_verts, but from
+ * the packet-owned plan and reference list. */
+typedef struct {
+    rsx_vtx_gpu_desc gpu;          /* must stay first: the backend reads it */
+    rsx_vertex_fetch_plan plan;
+    const rsx_vertex_ref* refs;
+    u32 n;
+} eng_pkt_fill_ctx;
+
+static int eng_pkt_fill(void* ctx, void* dst)
+{
+    const eng_pkt_fill_ctx* c = (const eng_pkt_fill_ctx*)ctx;
+    return rsx_vertex_fetch_many_stream(&c->plan, c->refs, c->n, (u8*)dst);
+}
+
+static void eng_pkt_binds(const eng_draw_pkt* p)
+{
+    if (p->do_clear_depth)
+        g.be->clear_depth_stencil(g.be->user, p->clear_depth_handle,
+                                  RSX_BE_CLEAR_DEPTH | RSX_BE_CLEAR_STENCIL,
+                                  1.0f, 0);
+}
+
+/* Execute a packet from the walker, with the draw payload still in dc /
+ * g.indices (the serial packet path). */
+static void eng_pkt_commit_live(eng_draw_pkt* p)
+{
+    eng_pkt_binds(p);
+    g.be->bind_targets(g.be->user, p->targets, p->n_targets, p->depth_handle);
+    g.be->bind_pipeline(g.be->user, p->pipeline);
+    /* The live path keeps the walker's constant block; the packet owns a copy
+     * of the same rows for the worker. */
+    if (p->vpc_range) {
+        g.be->bind_vs_constants_range(g.be->user, g.rsx.constants, p->vpc_lo,
+                                      p->vpc_n, s_mt.scratch + p->off_tail,
+                                      p->tail_bytes, p->vpc_total);
+    } else {
+        g.be->bind_vs_constants(g.be->user, g.vp_cb, p->vp_full_bytes);
+    }
+    g.be->bind_ps_constants(g.be->user, s_mt.scratch + p->off_fp, p->fp_bytes);
+    g.be->bind_textures(g.be->user, p->textures, p->samplers, p->tex_mask);
+    g.be->bind_vertex_textures(g.be->user, p->vtextures, p->vsamplers,
+                               p->vtex_mask);
+    g.be->set_viewport(g.be->user, 0.0f, 0.0f, p->W, p->H);
+    g.be->set_scissor(g.be->user, p->sc[0], p->sc[1], p->sc[2], p->sc[3]);
+    g.be->set_stencil_ref(g.be->user, p->stencil);
+    if (g.be->set_depth_bounds && p->has_bounds)
+        g.be->set_depth_bounds(g.be->user, p->bounds[0], p->bounds[1]);
+    if (g.be->set_depth_bias && p->has_bias)
+        g.be->set_depth_bias(g.be->user, p->bias[0], p->bias[1], p->bias_bits);
+
+    if (p->deferred) {
+        s_fill_ok = -1;
+        rsx_vtx_gpu_desc gpu_desc;
+        { const unsigned long long w2 = wp2_t0();
+          eng_check_gpu_vertex_offload(&gpu_desc, p->uploaded);
+          wp2_add(WPROF2_VTXOFF, w2); }
+        const int drew = g.be->draw_fill(g.be->user, (rsx_topology)p->topology,
+                            dc_fill_verts, &gpu_desc, p->uploaded, p->stride,
+                            p->indexed ? g.indices : NULL,
+                            p->indexed ? p->n_draw : 0);
+        if (!drew) {
+            if (!dc_convert_verts()) return;
+            g.be->draw(g.be->user, (rsx_topology)p->topology, dc.verts,
+                       p->uploaded, p->stride, p->indexed ? g.indices : NULL,
+                       p->indexed ? p->n_draw : 0);
+        }
+    } else {
+        g.be->draw(g.be->user, (rsx_topology)p->topology, dc.verts, p->uploaded,
+                   p->stride, p->indexed ? g.indices : NULL,
+                   p->indexed ? p->n_draw : 0);
+    }
+}
+
+/* Execute a packet copied into the ring, with packet-owned payload. */
+static void eng_pkt_commit_snapshot(const u8* base, const eng_draw_pkt* p)
+{
+    eng_pkt_binds(p);
+    g.be->bind_targets(g.be->user, p->targets, p->n_targets, p->depth_handle);
+    g.be->bind_pipeline(g.be->user, p->pipeline);
+    if (p->vpc_range)
+        g.be->bind_vs_constants_range(g.be->user, base + p->off_rows, p->vpc_lo,
+                                      p->vpc_n, base + p->off_tail, p->tail_bytes,
+                                      p->vpc_total);
+    else
+        g.be->bind_vs_constants(g.be->user, base + p->off_vp_full,
+                                p->vp_full_bytes);
+    g.be->bind_ps_constants(g.be->user, base + p->off_fp, p->fp_bytes);
+    g.be->bind_textures(g.be->user, p->textures, p->samplers, p->tex_mask);
+    g.be->bind_vertex_textures(g.be->user, p->vtextures, p->vsamplers,
+                               p->vtex_mask);
+    g.be->set_viewport(g.be->user, 0.0f, 0.0f, p->W, p->H);
+    g.be->set_scissor(g.be->user, p->sc[0], p->sc[1], p->sc[2], p->sc[3]);
+    g.be->set_stencil_ref(g.be->user, p->stencil);
+    if (g.be->set_depth_bounds && p->has_bounds)
+        g.be->set_depth_bounds(g.be->user, p->bounds[0], p->bounds[1]);
+    if (g.be->set_depth_bias && p->has_bias)
+        g.be->set_depth_bias(g.be->user, p->bias[0], p->bias[1], p->bias_bits);
+
+    const u32* idx = p->off_idx ? (const u32*)(base + p->off_idx) : NULL;
+    if (p->deferred) {
+        eng_pkt_fill_ctx ctx;
+        memset(&ctx, 0, sizeof ctx);
+        ctx.gpu = p->gpu_desc;
+        ctx.gpu.raw_data = p->off_raw ? base + p->off_raw : NULL;
+        ctx.gpu.remap_indices = p->off_remap
+            ? (const u32*)(base + p->off_remap) : NULL;
+        ctx.plan.layout = p->plan_layout;
+        ctx.plan.base_offset = p->plan_base_offset;
+        ctx.plan.divider_mask = p->plan_divider_mask;
+        ctx.plan.inline_stride = p->plan_inline_stride;
+        memcpy(ctx.plan.inline_off, p->plan_inline_off,
+               sizeof ctx.plan.inline_off);
+        ctx.plan.inline_data = p->off_inline ? base + p->off_inline : NULL;
+        ctx.plan.inline_bytes = p->inline_bytes;
+        for (u32 a = 0; a < RSX_DSP_NUM_VERTEX_ATTR; a++) {
+            const eng_pkt_attr* s = &p->plan_attr[a];
+            rsx_vertex_fetch_attr* d = &ctx.plan.attr[a];
+            d->desc = s->desc;
+            d->elem_size = s->elem_size;
+            d->stride = s->stride;
+            memcpy(d->default_value, s->def, sizeof d->default_value);
+            d->stable_base = s->has_span ? base + s->span_off : NULL;
+            d->stable_first = s->stable_first;
+            d->stable_last = s->stable_last;
+        }
+        ctx.refs = (const rsx_vertex_ref*)(base + p->off_refs);
+        ctx.n = p->n_refs;
+        g.be->draw_fill(g.be->user, (rsx_topology)p->topology, eng_pkt_fill,
+                        &ctx, p->uploaded, p->stride, idx,
+                        p->indexed ? p->n_draw : 0);
+    } else {
+        g.be->draw(g.be->user, (rsx_topology)p->topology, base + p->off_verts,
+                   p->uploaded, p->stride, idx, p->indexed ? p->n_draw : 0);
+    }
+}
+
+static void eng_pkt_track(const eng_draw_pkt* p)
+{
+    if (p->track_color_mask) {
+        eng_surfaces_wrote(p->track_targets, p->n_targets);
+        for (u32 i = 0; i < p->n_targets; i++) {
+            g.surfaces[p->track_targets[i]].last_writer_fp = s_miss_fp_hash;
+            g.surfaces[p->track_targets[i]].last_writer_pipe = s_miss_pipeline;
+        }
+    }
+    if (p->track_depth_write && p->zslot != ENG_INVALID) {
+        g.zdepths[p->zslot].had_write = 1;
+        eng_zdepth_wrote(p->zslot, &p->track_sf);
+    }
+}
+
+static void eng_mt_record_exec(void* ctx, const void* rec, u32 size)
+{
+    (void)ctx;
+    if (size < sizeof(eng_draw_pkt)) return;
+    const eng_draw_pkt* p = (const eng_draw_pkt*)rec;
+    if (p->magic != ENG_MT_PKT_MAGIC) return;
+    eng_pkt_commit_snapshot((const u8*)rec, p);
+}
+
+/* Copy every byte the worker will read into the packet arena. Returns 0 when
+ * some guest array has no stable span (the packet then runs inline). */
+static int eng_pkt_snapshot(eng_draw_pkt* p)
+{
+    p->snapshot_ok = 0;
+    s_mt.snapshots++;
+
+    if (p->indexed) {
+        p->off_idx = eng_mt_alloc(p->n_draw * 4u);
+        if (p->off_idx) memcpy(s_mt.scratch + p->off_idx, g.indices,
+                               (size_t)p->n_draw * 4u);
+        else return 0;
+    }
+    p = (eng_draw_pkt*)s_mt.scratch;   /* the arena may have moved */
+
+    if (!p->deferred) {
+        const u32 vbytes = p->uploaded * p->stride;
+        p->off_verts = eng_mt_alloc(vbytes);
+        if (!p->off_verts) return 0;
+        p = (eng_draw_pkt*)s_mt.scratch;
+        memcpy(s_mt.scratch + p->off_verts, dc.verts, vbytes);
+        p->snapshot_ok = 1;
+        p->total_bytes = s_mt.used;
+        return 1;
+    }
+
+    const rsx_vertex_fetch_plan* plan = &dc.fetch_plan;
+    p->plan_layout = plan->layout;
+    p->plan_base_offset = plan->base_offset;
+    p->plan_divider_mask = plan->divider_mask;
+    p->plan_inline_stride = plan->inline_stride;
+    memcpy(p->plan_inline_off, plan->inline_off, sizeof p->plan_inline_off);
+
+    if (plan->inline_data && plan->inline_bytes) {
+        p->off_inline = eng_mt_alloc(plan->inline_bytes);
+        if (!p->off_inline) return 0;
+        p = (eng_draw_pkt*)s_mt.scratch;
+        memcpy(s_mt.scratch + p->off_inline, plan->inline_data,
+               plan->inline_bytes);
+        p->inline_bytes = plan->inline_bytes;
+    }
+
+    for (u32 a = 0; a < RSX_DSP_NUM_VERTEX_ATTR; a++) {
+        const rsx_vertex_fetch_attr* s = &plan->attr[a];
+        eng_pkt_attr* d = &p->plan_attr[a];
+        d->desc = s->desc;
+        d->elem_size = s->elem_size;
+        d->stride = s->stride;
+        memcpy(d->def, s->default_value, sizeof d->def);
+        d->has_span = 0;
+        d->span_off = 0;
+        d->stable_first = s->stable_first;
+        d->stable_last = s->stable_last;
+        if (!s->stable_base) continue;
+        /* An INLINE_ARRAY span lives in the stream already copied once. */
+        if (plan->inline_data && s->stable_base >= plan->inline_data &&
+            s->stable_base <= plan->inline_data + plan->inline_bytes) {
+            d->has_span = 1;
+            d->span_off = p->off_inline +
+                          (u32)(s->stable_base - plan->inline_data);
+            continue;
+        }
+        const u64 bytes = (u64)(s->stable_last - s->stable_first) * s->stride +
+                          s->elem_size;
+        if (bytes > 16u * 1024u * 1024u) return 0;
+        const u32 off = eng_mt_alloc((u32)bytes);
+        if (!off) return 0;
+        p = (eng_draw_pkt*)s_mt.scratch;
+        memcpy(s_mt.scratch + off, s->stable_base, (size_t)bytes);
+        p->plan_attr[a].has_span = 1;
+        p->plan_attr[a].span_off = off;
+    }
+
+    /* Every active attribute must be one the worker can read. A plan that
+     * needed a per-element guest lookup cannot be handed over safely. */
+    for (u32 slot = 0; slot < p->plan_layout.count; slot++) {
+        const u32 a = p->plan_layout.attrs[slot];
+        const eng_pkt_attr* d = &p->plan_attr[a];
+        if (d->desc.type && d->desc.size && !d->has_span) {
+            s_mt.snapshot_fail++;
+            return 0;
+        }
+    }
+
+    p->n_refs = p->uploaded;
+    p->off_refs = eng_mt_alloc(p->n_refs * (u32)sizeof(rsx_vertex_ref));
+    if (!p->off_refs) return 0;
+    p = (eng_draw_pkt*)s_mt.scratch;
+    memcpy(s_mt.scratch + p->off_refs, dc.refs,
+           (size_t)p->n_refs * sizeof(rsx_vertex_ref));
+
+    eng_check_gpu_vertex_offload(&p->gpu_desc, p->uploaded);
+    if (p->gpu_desc.gpu_eligible && p->gpu_desc.raw_data && p->gpu_desc.raw_bytes) {
+        p->raw_bytes = p->gpu_desc.raw_bytes;
+        p->off_raw = eng_mt_alloc(p->raw_bytes);
+        if (!p->off_raw) return 0;
+        p = (eng_draw_pkt*)s_mt.scratch;
+        memcpy(s_mt.scratch + p->off_raw, p->gpu_desc.raw_data, p->raw_bytes);
+        if (p->gpu_desc.flags & 1u) {
+            p->n_remap = p->uploaded;
+            p->off_remap = eng_mt_alloc(p->n_remap * 4u);
+            if (!p->off_remap) return 0;
+            p = (eng_draw_pkt*)s_mt.scratch;
+            memcpy(s_mt.scratch + p->off_remap, p->gpu_desc.remap_indices,
+                   (size_t)p->n_remap * 4u);
+        }
+    }
+    p->snapshot_ok = 1;
+    p->total_bytes = s_mt.used;
+    return 1;
+}
+
 static void sink_end_work(void* user, const rsx_dispatch* r)
 {
     (void)user; (void)r;
@@ -6507,27 +7004,12 @@ static void sink_end_work(void* user, const rsx_dispatch* r)
     unsigned long long wp_t0 = wp ? rsx_wprof_now() : 0;
     if (s_wprof > 0) s_wp_draws++;   /* exact even when drains are sampled */
     if (s_wp2 > 0) s_wp2_draw_groups++;
-    /* EXP_NO_DRAW ceiling: the draw's own work is gone (fetch plan, texture
-     * decode, pipeline lookup/create, and every backend/Vulkan recording).
-     * Everything that makes a fence visible lives in cellGcmSys/rsx_commands,
-     * not here; the flips keep coming and the image is whatever was last
-     * presented. WCB arms must be off: readback needs the real draws. */
     if (s_no_draw) return;
     if (!g.ready || !dc.n_packets || !dc.fetch_ok) return;
-    /* Mixed geometry sources have no defined concatenation here. Reject the
-     * whole group instead of drawing partial/misordered geometry. */
     if (dc.n_immediate && (dc.n_arr || dc.n_idx || dc.inl_bytes ||
                           r->inline_dropped != dc.inline_dropped_at_begin)) return;
 
     const u32 prim = g.rsx.current_primitive;
-    /* Everything that becomes triangles -- lists, strips, fans, quads, quad
-     * strips and polygons -- is REBUILT into one triangle list through an
-     * index buffer. A host strip topology cannot express a restart cut, which
-     * is the whole reason the reference engine rebuilds them, and rebuilding
-     * is also what lets repeated references share an uploaded vertex. Points
-     * and lines pass through as the guest issued them, and anything left that
-     * would need an expansion this engine does not have is dropped rather
-     * than drawn as something else. */
     rsx_topology topology = RSX_TOPOLOGY_TRIANGLES;
     int scratch = 0;
     const int rebuild = eng_topology_rebuild(prim, 0, &scratch) != 0;
@@ -6535,6 +7017,17 @@ static void sink_end_work(void* user, const rsx_dispatch* r)
         if (rsx_primitive_needs_expansion(prim)) return;
         topology = rsx_primitive_topology(prim);
         if (topology == RSX_TOPOLOGY_UNSUPPORTED) return;
+    }
+
+    const int mt = eng_mt_ensure();
+    eng_draw_pkt* p = NULL;
+    if (mt) {
+        s_mt.used = (u32)((sizeof(eng_draw_pkt) + 15u) & ~15u);
+        if (s_mt.used > s_mt.cap) return;
+        p = (eng_draw_pkt*)s_mt.scratch;
+        memset(p, 0, sizeof *p);
+        p->magic = ENG_MT_PKT_MAGIC;
+        p->seq = ++s_mt.seq;
     }
 
     rsx_vertex_layout_plan layout;
@@ -6579,10 +7072,6 @@ static void sink_end_work(void* user, const rsx_dispatch* r)
                                      sf.clip_w, sf.clip_h);
     wp2_add(WPROF2_SURFACE, w2_surface);
 
-    /* A guest program pair that will not translate has no fallback: the draw
-     * is dropped, as the reference engine drops it. Substituting the built-in
-     * program would draw the geometry in the wrong colours, which is harder to
-     * see than a missing object and hides the translation failure. */
     int pipeline_is_fixed = 1;
     u32 tex_used = 0;
     u64 fp_hash = 0;
@@ -6598,8 +7087,6 @@ static void sink_end_work(void* user, const rsx_dispatch* r)
       wp2_add(WPROF2_PIPE_DEBUG, w2);
       if (dbg) return; }
 
-    /* Textures before any pipeline or target binding: a cache refresh can
-     * replace a resource, and the backend is free to submit while doing it. */
     u32 textures[RSX_BE_MAX_TEXTURES];
     rsx_be_sampler_desc samplers[RSX_BE_MAX_TEXTURES];
     u32 vtextures[RSX_BE_MAX_VERTEX_TEXTURES];
@@ -6612,7 +7099,6 @@ static void sink_end_work(void* user, const rsx_dispatch* r)
     const unsigned long long w2_texbind = wp2_t0();
     s_miss_fp_hash = fp_hash;
     s_miss_pipeline = pipeline;
-    /* Full-screen draws only, for the tiled-wipe bind log. */
     s_fs_draw = eng_fsbind_on() && target < g.n_surfaces &&
                 (u64)(sf.clip_w ? sf.clip_w : g.width) *
                     (sf.clip_h ? sf.clip_h : g.height) * 10ull >=
@@ -6641,13 +7127,8 @@ static void sink_end_work(void* user, const rsx_dispatch* r)
     }
 
     const unsigned long long w2_const = wp2_t0();
-    /* The transform constant block, then the viewport epilogue the vertex
-     * program's tail multiplies by: RSX window coordinates mapped into the
-     * host's clip space (rsx_live_draw.c:6143-6156). */
     const float W = sf.clip_w ? (float)sf.clip_w : (float)g.width;
     const float H = sf.clip_h ? (float)sf.clip_h : (float)g.height;
-    /* The guest viewport is in pixels; an antialiased surface's clip is in
-     * samples (aa_sx x aa_sy per pixel), so map NDC over the pixel extent. */
     const float Wv = W / (float)sf.aa_sx;
     const float Hv = H / (float)sf.aa_sy;
     float xf[8] = { 1, 1, 1, 0, 0, 0, 0, 0 };
@@ -6659,18 +7140,12 @@ static void sink_end_work(void* user, const rsx_dispatch* r)
         xf[5] = -((vp.translate[1] - Hv * 0.5f) / (Hv * 0.5f));
         xf[6] = vp.translate[2];
     }
-    /* Only the rows the vertex program can read, when the backend takes a
-     * range: copying the whole 8 KB block per draw, twice, was most of the
-     * constant traffic. PS3RECOMP_ENG_VPC_FULL=1 (read at engine init)
-     * always hands over the whole block. */
     const int vpc_range = g.be->bind_vs_constants_range && !s_vpc.full && !s_vpc_force_full;
     if (!vpc_range) {
         memcpy(g.vp_cb, g.rsx.constants, RSX_DSP_NUM_CONSTANTS * 16u);
         memcpy(g.vp_cb + RSX_DSP_NUM_CONSTANTS * 16u, xf, sizeof xf);
     }
 
-    /* The buffered fragment constants, then fp_alpha: the layout
-     * rsx_fp_decompile_buffered_ex compiled the shader against. */
     const u32 nslots = g.fp_constants.count ? g.fp_constants.count : 1u;
     const u32 fp_bytes = (nslots + 1u) * 16u;
     if (g.fp_cb_cap < fp_bytes) {
@@ -6684,9 +7159,6 @@ static void sink_end_work(void* user, const rsx_dispatch* r)
         memcpy(g.fp_cb, g.fp_constants.values, g.fp_constants.count * 16u);
     { float* alpha = (float*)(g.fp_cb + nslots * 16u);
       alpha[0] = rsx_fp_alpha_ref(rs.alpha_ref_raw, rs.alpha_ref_format);
-      /* Window convention for WPOS (rsx_fp_decompiler.c, _rsx_wpos): SET_SHADER_WINDOW
-       * height in bits 0-11, origin (1 = BOTTOM) in 12-15, pixel centers (1 = INTEGER)
-       * in 16-19. */
       const u32 win = rsx_dsp_reg(&g.rsx, 0x1D88);
       alpha[1] = ((win >> 12) & 0xFu) ? (float)(win & 0xFFFu) : 0.0f;
       alpha[2] = ((win >> 16) & 0xFu) ? -0.5f : 0.0f;
@@ -6698,17 +7170,148 @@ static void sink_end_work(void* user, const rsx_dispatch* r)
       wp2_add(WPROF2_SURFTRACK, w2); }
 
     if (wp) wp_t0 = rsx_wprof_now();
-    /* The depth attachment is cleared the first time it is bound, so a title
-     * that never clears its shadow zeta still tests against something. */
     const u32 depth_handle = (zslot != ENG_INVALID) ? g.zdepths[zslot].handle : 0;
-    if (zslot != ENG_INVALID && !g.zdepths[zslot].cleared) {
-        g.be->clear_depth_stencil(g.be->user, depth_handle,
-                                  RSX_BE_CLEAR_DEPTH | RSX_BE_CLEAR_STENCIL,
-                                  1.0f, 0);
+    const int do_clear_depth =
+        zslot != ENG_INVALID && !g.zdepths[zslot].cleared;
+    if (do_clear_depth) {
         g.zdepths[zslot].cleared = 1;
         g.zdepths[zslot].had_write = 0;
     }
 
+    u32 sc[4];
+    eng_scissor_rect(&sf, g.surfaces[target].w, g.surfaces[target].h, sc);
+    u32 stencil_ref = rsx_dsp_reg(&g.rsx, M_STENCIL_FUNC_REF) & 0xFFu;
+    int has_bounds = g.be->set_depth_bounds != NULL;
+    float bounds[2] = { 0, 0 };
+    if (has_bounds) {
+        const u32 lo = rsx_dsp_reg(&g.rsx, M_DEPTH_BOUNDS_MIN);
+        const u32 hi = rsx_dsp_reg(&g.rsx, M_DEPTH_BOUNDS_MAX);
+        memcpy(&bounds[0], &lo, sizeof bounds[0]);
+        memcpy(&bounds[1], &hi, sizeof bounds[1]);
+    }
+    int has_bias = g.be->set_depth_bias != NULL;
+    float bias[2] = { 0, 0 };
+    u32 bias_bits = sf.depth_format == 1u ? 16u : 24u;
+    if (has_bias) {
+        const u32 en = topology == RSX_TOPOLOGY_POINTS ? M_POLY_OFFSET_POINT
+                     : (topology == RSX_TOPOLOGY_LINES || topology == RSX_TOPOLOGY_LINE_STRIP)
+                       ? M_POLY_OFFSET_LINE : M_POLY_OFFSET_FILL;
+        if (eng_poly_offset_on() && (rsx_dsp_reg(&g.rsx, en) & 1u)) {
+            const u32 f = rsx_dsp_reg(&g.rsx, M_POLY_OFFSET_FACTOR);
+            const u32 b = rsx_dsp_reg(&g.rsx, M_POLY_OFFSET_BIAS);
+            memcpy(&bias[0], &f, sizeof bias[0]);
+            memcpy(&bias[1], &b, sizeof bias[1]);
+            if (bias[0] != bias[0]) bias[0] = 0.0f;
+            if (bias[1] != bias[1]) bias[1] = 0.0f;
+        }
+    }
+
+    if (mt) {
+        /* Fill the packet. Everything the worker reads is either by value in
+         * the packet or copied into its arena. */
+        p = (eng_draw_pkt*)s_mt.scratch;
+        p->topology = (u32)topology;
+        p->indexed = (u32)indexed;
+        p->n_draw = indexed ? n_draw : 0;
+        p->uploaded = indexed ? dc.n_verts : n_draw;
+        p->stride = layout.stride;
+        p->deferred = (u32)dc.fetch_deferred;
+        p->n_targets = n_targets;
+        memcpy(p->track_targets, targets, sizeof p->track_targets);
+        for (u32 i = 0; i < n_targets; i++) p->targets[i] = g.surfaces[targets[i]].handle;
+        p->depth_handle = depth_handle;
+        p->zslot = zslot;
+        p->do_clear_depth = (u32)do_clear_depth;
+        p->clear_depth_handle = depth_handle;
+        p->pipeline = pipeline;
+        p->vpc_range = (u32)vpc_range;
+        p->vpc_lo = s_vpc.lo;
+        p->vpc_n = s_vpc.n;
+        p->vpc_total = ENG_VP_CB_BYTES;
+        p->fp_bytes = fp_bytes;
+        p->tex_mask = tex_mask;
+        p->vtex_mask = vtex_mask;
+        memcpy(p->textures, textures, sizeof p->textures);
+        memcpy(p->samplers, samplers, sizeof p->samplers);
+        memcpy(p->vtextures, vtextures, sizeof p->vtextures);
+        memcpy(p->vsamplers, vsamplers, sizeof p->vsamplers);
+        p->W = W;
+        p->H = H;
+        memcpy(p->sc, sc, sizeof p->sc);
+        p->stencil = stencil_ref;
+        p->has_bounds = (u32)has_bounds;
+        p->has_bias = (u32)has_bias;
+        p->bias_bits = bias_bits;
+        memcpy(p->bounds, bounds, sizeof p->bounds);
+        memcpy(p->bias, bias, sizeof p->bias);
+        p->track_color_mask = rs.color_mask ? 1u : 0u;
+        p->track_depth_write = (zslot != ENG_INVALID && rs.depth_test && rs.depth_write) ? 1u : 0u;
+        p->track_sf = sf;
+
+        if (vpc_range) {
+            /* The backend reads rows[first..first+count) of the block it is
+             * handed, so the packet copy keeps the same leading rows. */
+            p->rows_bytes = (s_vpc.lo + s_vpc.n) * 16u;
+            p->off_rows = eng_mt_alloc(p->rows_bytes);
+            if (!p->off_rows) return;
+            p = (eng_draw_pkt*)s_mt.scratch;
+            memcpy(s_mt.scratch + p->off_rows + s_vpc.lo * 16u,
+                   (const u8*)g.rsx.constants + s_vpc.lo * 16u,
+                   s_vpc.n * 16u);
+            p->tail_bytes = (u32)sizeof xf;
+            p->off_tail = eng_mt_alloc(p->tail_bytes);
+            if (!p->off_tail) return;
+            p = (eng_draw_pkt*)s_mt.scratch;
+            memcpy(s_mt.scratch + p->off_tail, xf, sizeof xf);
+        } else {
+            p->vp_full_bytes = ENG_VP_CB_BYTES;
+            p->off_vp_full = eng_mt_alloc(p->vp_full_bytes);
+            if (!p->off_vp_full) return;
+            p = (eng_draw_pkt*)s_mt.scratch;
+            memcpy(s_mt.scratch + p->off_vp_full, g.vp_cb, p->vp_full_bytes);
+        }
+        p->off_fp = eng_mt_alloc(p->fp_bytes);
+        if (!p->off_fp) return;
+        p = (eng_draw_pkt*)s_mt.scratch;
+        memcpy(s_mt.scratch + p->off_fp, g.fp_cb, p->fp_bytes);
+        p->total_bytes = s_mt.used;
+
+        if (s_mt.workers > 0 && eng_pkt_snapshot(p)) {
+            p = (eng_draw_pkt*)s_mt.scratch;
+            if (rsx_record_queue_push(s_mt.q, p, p->total_bytes)) {
+                s_mt.enqueued++;
+                eng_pkt_track(p);
+                if (!pipeline_is_fixed) g.guest_draws++;
+                wp2_add(WPROF2_BIND_BE, w2_const);
+                if (wp) wprof_phase(RSX_WPROF_DRAW, rsx_wprof_now() - wp_t0);
+                return;
+            }
+            /* Full: drain and retry once, then run the packet here. */
+            eng_mt_sync();
+            if (rsx_record_queue_push(s_mt.q, p, p->total_bytes)) {
+                s_mt.enqueued++;
+                eng_pkt_track(p);
+                if (!pipeline_is_fixed) g.guest_draws++;
+                wp2_add(WPROF2_BIND_BE, w2_const);
+                if (wp) wprof_phase(RSX_WPROF_DRAW, rsx_wprof_now() - wp_t0);
+                return;
+            }
+            s_mt.inline_fallbacks++;
+        } else if (s_mt.workers > 0) {
+            s_mt.inline_fallbacks++;
+        }
+
+        /* Serial packet path: commit on the walker, in packet order. */
+        eng_pkt_commit_live(p);
+        p = (eng_draw_pkt*)s_mt.scratch;
+        eng_pkt_track(p);
+        if (!pipeline_is_fixed) g.guest_draws++;
+        wp2_add(WPROF2_BIND_BE, w2_const);
+        if (wp) wprof_phase(RSX_WPROF_DRAW, rsx_wprof_now() - wp_t0);
+        return;
+    }
+
+    /* The old path, unchanged when the key is off. */
     const unsigned long long w2_bind = wp2_t0();
     u32 handles[RSX_BE_MAX_COLOR_TARGETS];
     for (u32 i = 0; i < n_targets; i++) handles[i] = g.surfaces[targets[i]].handle;
@@ -6723,17 +7326,8 @@ static void sink_end_work(void* user, const rsx_dispatch* r)
     g.be->bind_textures(g.be->user, textures, samplers, tex_mask);
     g.be->bind_vertex_textures(g.be->user, vtextures, vsamplers, vtex_mask);
     g.be->set_viewport(g.be->user, 0.0f, 0.0f, W, H);
-
-    {
-        u32 sc[4];
-        eng_scissor_rect(&sf, g.surfaces[target].w, g.surfaces[target].h, sc);
-        g.be->set_scissor(g.be->user, sc[0], sc[1], sc[2], sc[3]);
-    }
-    /* Dynamic, and deliberately outside the pipeline key. */
-    g.be->set_stencil_ref(g.be->user,
-                          rsx_dsp_reg(&g.rsx, M_STENCIL_FUNC_REF) & 0xFFu);
-    /* The bounds too: a deferred renderer moves them between its light and
-     * sky passes without changing anything else. Raw floats, as written. */
+    g.be->set_scissor(g.be->user, sc[0], sc[1], sc[2], sc[3]);
+    g.be->set_stencil_ref(g.be->user, stencil_ref);
     if (g.be->set_depth_bounds) {
         const u32 lo = rsx_dsp_reg(&g.rsx, M_DEPTH_BOUNDS_MIN);
         const u32 hi = rsx_dsp_reg(&g.rsx, M_DEPTH_BOUNDS_MAX);
@@ -6742,9 +7336,6 @@ static void sink_end_work(void* user, const rsx_dispatch* r)
         memcpy(&fmax, &hi, sizeof fmax);
         g.be->set_depth_bounds(g.be->user, fmin, fmax);
     }
-
-    /* Polygon offset: dynamic state, like the stencil reference. The
-     * enable that applies is the one for what the primitive rasterises as. */
     if (g.be->set_depth_bias) {
         float slope = 0.0f, units = 0.0f;
         const u32 en = topology == RSX_TOPOLOGY_POINTS ? M_POLY_OFFSET_POINT
@@ -6755,11 +7346,10 @@ static void sink_end_work(void* user, const rsx_dispatch* r)
             const u32 b = rsx_dsp_reg(&g.rsx, M_POLY_OFFSET_BIAS);
             memcpy(&slope, &f, sizeof slope);
             memcpy(&units, &b, sizeof units);
-            if (slope != slope) slope = 0.0f;   /* NaN */
+            if (slope != slope) slope = 0.0f;
             if (units != units) units = 0.0f;
         }
         g.be->set_depth_bias(g.be->user, slope, units,
-                             /* SURFACE_FORMAT depth: 1 Z16, 2 Z24S8 */
                              sf.depth_format == 1u ? 16u : 24u);
     }
     wp2_add(WPROF2_BIND_BE, w2_bind);
@@ -6780,17 +7370,12 @@ static void sink_end_work(void* user, const rsx_dispatch* r)
         wp2_add(WPROF2_DRAW_BE, w2_draw);
         if (drew) {
             if (s_wp2 > 0 && s_fill_ok > 0) { s_wp2_draws++; s_wp2_verts += uploaded; }
-            /* A conversion that failed drew nothing, as a failed fetch never
-             * did; a draw the backend dropped by its own rules counts as one,
-             * as it always has. */
             if (!s_fill_ok) return;
             static u32 logs = 0;
             if (s_fill_ok > 0 && PS3_LOG_FIRST(logs, 1))
                 fprintf(stderr, "[rsx engine] vertices converted straight into the "
                                 "backend's vertex memory (PS3RECOMP_ENG_VTX_DIRECT=0 copies)\n");
         } else {
-            /* The backend had no room for them: convert here and hand them
-             * over the old way. */
             unsigned long long conv_t0 = wp ? rsx_wprof_now() : 0;
             if (!dc_convert_verts()) { wp2_add(WPROF2_DRAW_BE, w2_draw); return; }
             if (wp) wprof_phase(RSX_WPROF_FETCH, rsx_wprof_now() - conv_t0);
@@ -6806,17 +7391,11 @@ static void sink_end_work(void* user, const rsx_dispatch* r)
         if (s_wp2 > 0) { s_wp2_draws++; s_wp2_verts += uploaded; }
     }
     if (wp) wprof_phase(RSX_WPROF_DRAW, rsx_wprof_now() - wp_t0);
-    /* Counted only when the draw ran the guest's OWN programs, which is what
-     * the test hook means: a draw through the built-in pair is a draw, not
-     * evidence that the decompile-translate-compile path worked. */
     if (!pipeline_is_fixed) g.guest_draws++;
 
     const unsigned long long w2_surftrack = wp2_t0();
     if (rs.color_mask) {
         eng_surfaces_wrote(targets, n_targets);
-        /* Which program produced each target, for the cube-face census: the
-         * six faces of an environment probe are ordinary colour targets and
-         * the only way to name their producer is to remember the last draw. */
         for (u32 i = 0; i < n_targets; i++) {
             g.surfaces[targets[i]].last_writer_fp = s_miss_fp_hash;
             g.surfaces[targets[i]].last_writer_pipe = s_miss_pipeline;
@@ -6865,6 +7444,7 @@ static void sink_end(void* user, const rsx_dispatch* r)
 static void sink_clear(void* user, const rsx_dispatch* r, u32 mask)
 {
     (void)user; (void)r;
+    eng_mt_sync();
     if (!g.ready) return;
     u32 targets[RSX_BE_MAX_COLOR_TARGETS];
     const u32 n_targets = eng_current_target_set(targets);
@@ -7004,6 +7584,7 @@ static int eng_is_display_offset(u32 location, u32 offset)
 
 void rsx_draw_engine_flush_dirty_to_guest(void)
 {
+    eng_mt_sync();
     if (!g.ready || !g.be) return;
     const int mode = rsx_draw_engine_wcb_mode();
     if (!mode) return;
@@ -7062,6 +7643,7 @@ static void eng_present_trace(u32 buffer_id, u32 target)
 
 static void eng_present(u32 buffer_id)
 {
+    eng_mt_sync();
     if (!g.ready) return;
     rsx_draw_engine_flush_dirty_to_guest();
     const u32 target = eng_present_surface(buffer_id);
@@ -7135,6 +7717,7 @@ int rsx_draw_engine_enabled(void)
 int rsx_draw_engine_init(u32 width, u32 height)
 {
     if (!g.be) return -1;
+    eng_mt_reset();
     /* Re-read PS3RECOMP_TEX_DIRTY at each engine up (the fixtures change the
      * environment between engine sessions in one process). */
     s_texdirty_env = -1;
@@ -7211,6 +7794,7 @@ int rsx_draw_engine_init(u32 width, u32 height)
 void rsx_draw_engine_shutdown(void)
 {
     if (!g.be) return;
+    eng_mt_sync();
     if (g.ready && s_wcb_live) {
         /* Armed targets go to guest memory and their pages reopen: the guest
          * may outlive the engine (a backend switch, a window close). */
@@ -7235,6 +7819,7 @@ void rsx_draw_engine_shutdown(void)
     }
     if (g.ready && g.be->shutdown) g.be->shutdown(g.be->user);
 
+    eng_mt_reset();
     rsx_texdirty_shutdown();
     s_texdirty_live = 0;
     rsx_tex_miss_flush(stderr);
@@ -7286,6 +7871,7 @@ void rsx_draw_engine_set_display_buffer(u32 buffer_id, u32 location, u32 offset,
 
 void rsx_draw_engine_flush(void)
 {
+    eng_mt_sync();
     rsx_draw_engine_flush_dirty_to_guest();
     if (g.ready && g.be->submit_and_wait)
         g.be->submit_and_wait(g.be->user, RSX_BE_FLUSH_GUEST_REFERENCE);

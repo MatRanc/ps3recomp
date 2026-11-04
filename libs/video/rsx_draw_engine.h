@@ -439,6 +439,11 @@ void rsx_draw_engine_set_display_buffer(u32 buffer_id, u32 location, u32 offset,
  * on its fence sees the GPU catch up. */
 void rsx_draw_engine_flush(void);
 
+/* Wait until every packet published to the draw-record worker has executed.
+ * No-op when PS3RECOMP_WALKER_MT is off or WORKERS=0. The replay harness and
+ * any caller that tears down backend state between frames calls this. */
+void rsx_draw_engine_mt_sync(void);
+
 /* Present whatever the frame has recorded, for a host that drives the flip
  * itself rather than through the FIFO's 0xE944. */
 void rsx_draw_engine_present(void);

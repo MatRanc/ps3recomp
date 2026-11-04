@@ -84,6 +84,10 @@ enum {
     PS3_LIVE_WCB_STREAM,                /* WCB: demand readbacks join the open draw batch (one submit+wait) */
     PS3_LIVE_WCB_PREFETCH,              /* WCB: queue+submit hot-target copies at a sync point, not at the read */
     PS3_LIVE_REMAP_DIRECT,              /* PS3RECOMP_REMAP_DIRECT: dense constant-base index lists dedup by direct slot */
+    PS3_LIVE_WALKER_MT,                 /* PS3RECOMP_WALKER_MT: packet path + one draw-record worker */
+    PS3_LIVE_WALKER_MT_WORKERS,         /* PS3RECOMP_WALKER_MT_WORKERS: 0 inline, 1 record worker */
+    PS3_LIVE_WALKER_MT_STAGES,          /* PS3RECOMP_WALKER_MT_STAGES: reserved pipeline stages mask */
+    PS3_LIVE_WALKER_MT_SNAPSHOT,        /* PS3RECOMP_WALKER_MT_SNAPSHOT: copy borrowed guest bytes */
     PS3_LIVE_COUNT
 };
 
