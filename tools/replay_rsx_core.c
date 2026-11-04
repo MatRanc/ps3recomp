@@ -277,7 +277,12 @@ rsx_replay_context* rsx_replay_create(uint32_t io_addr, uint32_t io_size, int en
     ctx->engine_mode = engine_mode;
     g_active_replay_ctx = ctx;
 
-    const uint32_t vm_size = ppu_hle_inject_base + 0x100000u;
+    /* A raw FIFO dump can carry 2D inline transfers into local memory at
+     * 0xC0000000, which the 4 GB PS3 address space maps. Allocate the full
+     * 32-bit window (anonymous, lazily committed) so those stores land; the
+     * old 0x20100000-byte image made them write past vm_base and segfault.
+     * replay_rsx_engine already does the same through vm_init(). */
+    const uint32_t vm_size = 0xFFFFF000u;
     vm_base = (uint8_t*)calloc(1, vm_size);
     if (!vm_base) {
         free(ctx);

@@ -105,12 +105,35 @@ def scan(words, show_draws, top, only_prim):
     methods = Counter()
     draws = 0
     triangles = 0
+    draw_total = 0
+    triangle_total = 0
+    frames_reported = 0
     words_in_frame = 0
 
+    def emit_draw(batch_method, count_field):
+        # A draw batch is any dispatched 0x1814/0x1824 word, including the
+        # second and later data words of a non-incrementing packet. The old
+        # count only looked at the packet's base method, so a type-2 packet
+        # carrying two batches was counted once (12 short on the team-select
+        # capture, while the walker dispatched all of them).
+        nonlocal draws, triangles, draw_total, triangle_total
+        draws += 1
+        draw_total += 1
+        if st.prim in (5, 6, 7):
+            triangles += 1
+            triangle_total += 1
+        if show_draws and (only_prim is None or st.prim == only_prim):
+            kind = "index" if batch_method == M_IDX_BATCH else "array"
+            print(f"  draw f{frame} #{draws} {kind} prim={PRIM.get(st.prim, hex(st.prim))}"
+                  f" count_field={count_field} {st.summary()}")
+
     def flush_frame():
-        nonlocal frame_word_start
-        if frame == 0 and words_in_frame == 0:
+        # A trailing flip marker leaves an empty section; do not report it as
+        # a frame. A dump that stops mid-frame still reports its partial one.
+        nonlocal frames_reported
+        if words_in_frame == 0:
             return
+        frames_reported += 1
         ph = ", ".join(f"{PRIM.get(k, hex(k))}={v}" for k, v in prims.most_common(8)) or "no draws"
         print(f"[frame {frame}] words={words_in_frame} draws={draws} begin_end={sum(prims.values())}  {ph}")
 
@@ -179,24 +202,21 @@ def scan(words, show_draws, top, only_prim):
             elif m == M_IDXBUF_FMT:
                 st.surface["idx_fmt"] = v
 
-        # The batch methods carry the first/count in the header; their data
-        # (if any) are inline index/batch words. A header itself is a draw.
-        if method in (M_VERT_BATCH, M_IDX_BATCH):
-            draws += 1
-            if st.prim == 5 or st.prim == 6 or st.prim == 7:
-                triangles += 1
-            if show_draws and (only_prim is None or st.prim == only_prim):
-                kind = "index" if method == M_IDX_BATCH else "array"
-                print(f"  draw f{frame} #{draws} {kind} prim={PRIM.get(st.prim, hex(st.prim))}"
-                      f" count_field={count} {st.summary()}")
-        elif method == M_BEGIN_END and show_draws and count and only_prim is None:
+            if m in (M_VERT_BATCH, M_IDX_BATCH):
+                emit_draw(m, count)
+
+        # A batch header with no data words is still one draw; when it has
+        # data words the per-word loop above already dispatched them.
+        if count == 0 and method in (M_VERT_BATCH, M_IDX_BATCH):
+            emit_draw(method, 0)
+        if method == M_BEGIN_END and show_draws and count and only_prim is None:
             if data and data[0]:
                 print(f"  begin f{frame} prim={PRIM.get(data[0], hex(data[0]))}")
         i += 1 + count
 
     flush_frame()
-    print(f"[total] frames={frame + 1} words={n} draw_batches={sum(v for (s, m), v in methods.items() if m in (M_VERT_BATCH, M_IDX_BATCH))}"
-          f" triangle_batches={triangles}")
+    print(f"[total] frames={frames_reported} words={n} draw_batches={draw_total}"
+          f" triangle_batches={triangle_total}")
     print("[methods] top %d:" % top)
     for (subch, m), c in methods.most_common(top):
         print(f"   subch{subch} 0x{m:04X}  {c}")
