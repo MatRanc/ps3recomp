@@ -80,19 +80,35 @@ int g_c690_gap = 0;          /* PS3RECOMP_C690_GAP: inter-job turnover breakdown
 #define C690_IMAGE_ID        6
 #define C690_JOB_ENTRY_LS    0x135B8u
 #define C690_JOB_END_LS      0x12AB8u
-#define C690_HOT_N           20
+#define C690_HOT_N           62
 #define C690_FN_COUNT        (C690_HOT_N + 1)   /* last slot is "other" */
 #define C690_MAX_THREADS     64
 #define C690_WALL_BUCKETS    65536u             /* 1 us buckets, up to 65.5 ms */
 #define C690_REPORT_PERIOD_NS 2000000000ull     /* 2 s between periodic reports */
 
-/* The hot set, in report order (index 0. C690_HOT_N is "other"). */
+/* The hot set, in report order (index 0. C690_HOT_N is "other"). The meter's
+ * 0x0A command path (handler 0x12478 -> 0x10B88 -> pack/gather family) is the
+ * largest single opcode (31 % of commands), so the whole family is named
+ * rather than left in "other"; the same for the 0x2A assembler chain, skin,
+ * normalize and cull. Only functions entered at an SPU_DIRECT/indirect
+ * boundary can be charged separately. */
 #define C690_HOT_LIST(X)      \
     X( 0, 0x6D68u) X( 1, 0x7C18u) X( 2, 0x8160u) X( 3, 0xAF98u) \
     X( 4, 0xB238u) X( 5, 0xA798u) X( 6, 0xA9B0u) X( 7, 0xD2B8u) \
     X( 8, 0xD4A8u) X( 9, 0xC98Cu) X(10, 0xFDA0u) X(11, 0xFCB8u) \
     X(12, 0xFCE4u) X(13, 0xE0A8u) X(14, 0x10F78u) X(15, 0x10C70u) \
-    X(16, 0x109C0u) X(17, 0x10700u) X(18, 0x132E0u) X(19, 0x12C08u)
+    X(16, 0x109C0u) X(17, 0x10700u) X(18, 0x132E0u) X(19, 0x12C08u) \
+    X(20, 0x10B88u) X(21, 0x12478u) X(22, 0x7540u) X(23, 0x7840u) \
+    X(24, 0x7AC0u) X(25, 0x7D40u) X(26, 0x7FC0u) X(27, 0x78C0u) \
+    X(28, 0x7960u) X(29, 0x7998u) X(30, 0x7DA8u) X(31, 0x7E58u) \
+    X(32, 0x7E98u) X(33, 0x8040u) X(34, 0x8120u) X(35, 0x76B8u) \
+    X(36, 0x82C0u) X(37, 0x82FCu) X(38, 0x6860u) X(39, 0x6EC0u) \
+    X(40, 0x6F10u) X(41, 0xB268u) X(42, 0xB830u) X(43, 0xC9D0u) \
+    X(44, 0xFA58u) X(45, 0xF520u) X(46, 0xD080u) X(47, 0xD540u) \
+    X(48, 0x12830u) X(49, 0x126D8u) X(50, 0x11790u) X(51, 0x13080u) \
+    X(52, 0x11F58u) X(53, 0x11A60u) X(54, 0x12948u) X(55, 0x11DF0u) \
+    X(56, 0x11BF8u) X(57, 0x05000u) X(58, 0x10758u) X(59, 0x5BC0u) \
+    X(60, 0xE750u) X(61, 0xE6B8u)
 
 static const uint32_t s_hot_lsa[C690_HOT_N] = {
 #define C690_HOT_ENTRY(i, a) [i] = a,
@@ -154,6 +170,9 @@ typedef struct {
     unsigned long long fn_ns[C690_FN_COUNT];
     unsigned long long fn_entries[C690_FN_COUNT];
     unsigned long long opcode[256];
+    /* Per-command inclusive time: from a handler's entry to the next handler's
+     * entry (or the job end). 0xFF is the pre-first-command entry/parse. */
+    unsigned long long op_ns[257];
     unsigned long long jobs;
     unsigned long long job_ns_sum;
     unsigned long long wall_max_ns;
@@ -186,6 +205,9 @@ static SPU_THREAD_LOCAL struct {
     uint64_t job_start_ns;
     uint64_t last_ns;
     uint32_t current_lsa;
+    /* Per-command inclusive time (see op_ns). */
+    uint64_t cmd_start_ns;
+    int cmd_op;
     uint64_t tr_t0;          /* PS3RECOMP_TRACE: open c690.job span, 0 when untraced */
     uint32_t tr_desc_ea;     /* the job descriptor the jm2 ABI passed in r3 */
     /* PS3RECOMP_C690_HASH: sampled-job input/output hashes. `hash_tail` is
@@ -494,6 +516,9 @@ void c690_stats_on_lookup(const struct spu_context* ctx, uint32_t lsa)
 
     if (t_run.job_active) {
         if (lsa == C690_JOB_END_LS) {
+            if (t_run.cmd_op >= 0) s->op_ns[t_run.cmd_op] += now - t_run.cmd_start_ns;
+            else                   s->op_ns[256] += now - t_run.cmd_start_ns;
+            t_run.cmd_op = -1;
             if (t_run.current_lsa) c690_charge(s, t_run.current_lsa, now - t_run.last_ns);
             c690_opcode_inc(s, 0x00u);       /* the end command itself */
             if (__builtin_expect(g_c690_corpus_on, 0)) c690_corpus_job_end(ctx);
@@ -528,6 +553,10 @@ void c690_stats_on_lookup(const struct spu_context* ctx, uint32_t lsa)
         t_run.last_ns = now;
         const int op = c690_opcode_for_lsa(lsa);
         if (op >= 0) {
+            if (t_run.cmd_op >= 0) s->op_ns[t_run.cmd_op] += now - t_run.cmd_start_ns;
+            else                   s->op_ns[256] += now - t_run.cmd_start_ns;
+            t_run.cmd_op = op;
+            t_run.cmd_start_ns = now;
             c690_opcode_inc(s, (unsigned)op);
             if (__builtin_expect(g_c690_corpus_on, 0))
                 c690_corpus_note_op(ctx, (unsigned)op);
@@ -546,6 +575,8 @@ void c690_stats_on_lookup(const struct spu_context* ctx, uint32_t lsa)
         t_run.hash_active = 0;   /* a body with no tail is discarded */
         t_run.job_active = 1;
         t_run.job_start_ns = now;
+        t_run.cmd_op = -1;
+        t_run.cmd_start_ns = now;
         t_run.hash_tail = 0;
         if (g_c690_hash_on) {
             const unsigned long long seq =
@@ -648,6 +679,7 @@ static void c690_aggregate(c690_thread_stats* dst, const c690_thread_stats* src,
         dst->fn_entries[i] += src->fn_entries[i];
     }
     for (unsigned i = 0; i < 256u; i++) dst->opcode[i] += src->opcode[i];
+    for (unsigned i = 0; i < 257u; i++) dst->op_ns[i] += src->op_ns[i];
     per_thread_jobs[idx] = src->jobs;
     per_thread_spu[idx] = src->spu_id;
 }
@@ -899,14 +931,28 @@ static void c690_report_common(const char* tag, uint64_t now_ns)
 
     unsigned long long cmd_total = 0;
     for (unsigned i = 0; i < 256u; i++) cmd_total += total.opcode[i];
-    fprintf(stderr, "[c690-stats] opcode histogram (%llu mapped commands):\n",
-            cmd_total);
+    unsigned long long cmd_ns_total = 0;
+    for (unsigned i = 0; i < 257u; i++) cmd_ns_total += total.op_ns[i];
+    fprintf(stderr, "[c690-stats] opcode histogram (%llu mapped commands, "
+                    "%llu us inclusive):\n",
+            cmd_total, cmd_ns_total / 1000ull);
     for (unsigned i = 0; i < C690_OP_MAP_N; i++) {
         const unsigned op = s_op_map[i].op;
         const unsigned long long c = total.opcode[op];
+        const unsigned long long t = total.op_ns[op];
         const unsigned p = c690_pct_tenths(c, cmd_total);
-        fprintf(stderr, "[c690-stats]   op 0x%02X handler 0x%05X  %10llu  %u.%u%%\n",
-                op, s_op_map[i].lsa, c, p / 10u, p % 10u);
+        const unsigned pt = c690_pct_tenths(t, cmd_ns_total);
+        fprintf(stderr, "[c690-stats]   op 0x%02X handler 0x%05X  %10llu  %u.%u%%  "
+                        "%12llu us  %u.%u%%  avg=%.2f us\n",
+                op, s_op_map[i].lsa, c, p / 10u, p % 10u,
+                t / 1000ull, pt / 10u, pt % 10u,
+                c ? (double)t / (double)c / 1000.0 : 0.0);
+    }
+    {
+        const unsigned long long t = total.op_ns[256];
+        const unsigned pt = c690_pct_tenths(t, cmd_ns_total);
+        fprintf(stderr, "[c690-stats]   entry/parse (before first handler)  "
+                        "%12llu us  %u.%u%%\n", t / 1000ull, pt / 10u, pt % 10u);
     }
 
     unsigned long long charged = 0;
