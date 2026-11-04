@@ -315,6 +315,36 @@ int main(int argc, char** argv)
             uint32_t base_n = 0;
             list_read(ctx.ls, cur_ctx, base_list, &base_n);
 
+            /* Optional +0x114 semantics probe: run the unpatched body with
+             * the candidate count changed by CULL_TEST_PROBE_DELTA and report
+             * whether the kept count follows it.  Beyond the input list we
+             * plant a canary to check the cull never writes past its input. */
+            const char* pdelta = getenv("CULL_TEST_PROBE_DELTA");
+            if (pdelta && seq == (uint32_t)atol(getenv("CULL_TEST_PROBE_SEQ") ? getenv("CULL_TEST_PROBE_SEQ") : "1")) {
+                const int delta = atoi(pdelta);
+                memcpy(ctx.ls, ls_in, SPU_LS_SIZE);
+                memcpy(ctx.gpr, gpr_in, 128u * 16u);
+                ctx.pc = 0x132E0; ctx.image_id = 6; ctx.host_depth = 0;
+                g_spu_trampoline_fn = NULL; g_dispatch_n = 0;
+                const uint32_t pc2 = ctx.gpr[3]._u32[0] & SPU_LS_MASK;
+                const uint32_t pp = get_be32(ctx.ls + pc2 + 0x110) & SPU_LS_MASK;
+                const uint32_t ci2 = get_be32(ctx.ls + pc2 + 0x114);
+                memset(ctx.ls + pp + ci2 * 2u, 0xA5, 32);
+                int nc = (int)ci2 + delta; if (nc < 0) nc = 0;
+                uint32_t be = (((uint32_t)nc & 0xffu) << 24) |
+                              (((uint32_t)nc & 0xff00u) << 8) |
+                              (((uint32_t)nc & 0xff0000u) >> 8) |
+                              (((uint32_t)nc & 0xff000000u) >> 24);
+                memcpy(ctx.ls + pc2 + 0x114, &be, 4);
+                jobmod_c690c2f7b09a_eF5B8_spu_func_000132E0_body(&ctx);
+                int canary = 0;
+                for (int k = 0; k < 32; k++)
+                    if (ctx.ls[pp + ci2 * 2u + k] != 0xA5) canary = 1;
+                printf("PROBE seq=%u ci=%u base_co=%u delta=%d probe_co=%u "
+                       "beyond_input_written=%d\n", seq, ci2, base_n, delta,
+                       get_be32(ctx.ls + pc2 + 0x114), canary);
+            }
+
             /* 2. union driver on a fresh copy of the same input. */
             memcpy(ctx.ls, ls_in, SPU_LS_SIZE);
             memcpy(ctx.gpr, gpr_in, 128u * 16u);

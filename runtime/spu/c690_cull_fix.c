@@ -30,7 +30,10 @@ typedef struct {
 
 static unsigned long long s_calls, s_patched, s_no_block, s_blocks;
 static unsigned long long s_union_runs, s_union_added_tris;
-static unsigned long long s_union_cap_hits, s_union_odd_tail;
+static unsigned long long s_union_cap_hits, s_union_cap_skipped;
+static unsigned long long s_union_odd_tail;
+static unsigned long long s_union_skip_setup, s_union_skip_range;
+static unsigned long long s_union_skip_realloc;
 static int s_env_read;
 static int s_env_fix, s_env_fix_2c;
 
@@ -46,10 +49,11 @@ static SPU_THREAD_LOCAL int t_nsaved;
 static SPU_THREAD_LOCAL uint8_t* t_ls_save;
 static SPU_THREAD_LOCAL uint8_t* t_gpr_save;
 static SPU_THREAD_LOCAL uint8_t* t_list_save;
-static SPU_THREAD_LOCAL uint32_t t_list_cap;
+static SPU_THREAD_LOCAL uint32_t t_list_cap;   /* realloc'd local copy */
 static SPU_THREAD_LOCAL uint32_t t_list_n;
 static SPU_THREAD_LOCAL uint32_t t_cull_ctx;
-static SPU_THREAD_LOCAL uint32_t t_entry_cap;
+static SPU_THREAD_LOCAL uint32_t t_entry_ptr;   /* +0x110 at entry */
+static SPU_THREAD_LOCAL uint32_t t_cap_entries; /* proven buffer capacity */
 static SPU_THREAD_LOCAL uint32_t t_save_pc;
 static SPU_THREAD_LOCAL uint32_t t_save_status;
 static SPU_THREAD_LOCAL uint32_t t_save_stop;
@@ -294,6 +298,35 @@ static int union_ensure_buffers(void)
     return 1;
 }
 
+/* The cull context (r3) describes the index list as:
+ *   +0x110  pointer to the u16 index buffer
+ *   +0x114  candidate index count (3 per triangle) the cull will consume
+ *   +0x1E0  end of that buffer / start of the next allocation
+ * +0x114 is a count, not a capacity: changing it by n changes the kept-index
+ * count by n one-for-one on the captured pairs, and the cull reads exactly
+ * that many candidates.  It writes its output back into the same buffer and
+ * never past the input extent (canary probe: 0 writes beyond +0x110+2*+0x114
+ * on all 400 pairs).  The bytes at +0x1E0 are the next live structure (a
+ * command header, identical across frames; 7 captured buffers even end exactly
+ * at another buffer's +0x110).  The proven writable extent is therefore
+ * [ptr, +0x1E0); that is the capacity the union may append into. */
+static int cull_list_capacity(const struct spu_context* ctx, uint32_t* out_ptr,
+                              uint32_t* out_cnt, uint32_t* out_cap)
+{
+    const uint32_t c = ctx->gpr[3]._u32[0] & SPU_LS_MASK;
+    const uint32_t ptr = be32(ctx->ls + c + 0x110) & SPU_LS_MASK;
+    const uint32_t cnt = be32(ctx->ls + c + 0x114);
+    const uint32_t end = be32(ctx->ls + c + 0x1E0) & SPU_LS_MASK;
+    if (ptr == 0 || (ptr & 0xFu) || (end & 0xFu) || end <= ptr ||
+        end > SPU_LS_SIZE || cnt > (end - ptr) / 2u ||
+        cnt > C690_CULL_LIST_MAX)
+        return 0;
+    *out_ptr = ptr;
+    *out_cnt = cnt;
+    *out_cap = (end - ptr) / 2u;
+    return 1;
+}
+
 int c690_cull_fix_begin(struct spu_context* ctx, int family)
 {
     if (!ctx || !ctx->ls) return 0;
@@ -302,7 +335,10 @@ int c690_cull_fix_begin(struct spu_context* ctx, int family)
 
     __atomic_fetch_add(&s_calls, 1ull, __ATOMIC_RELAXED);
 
-    if (!union_ensure_buffers()) return 0;
+    if (!union_ensure_buffers()) {
+        __atomic_fetch_add(&s_union_skip_setup, 1ull, __ATOMIC_RELAXED);
+        return 0;
+    }
 
     /* The corpus snapshot is taken by the wrapper before this call, so this
      * copy is the same real input state. */
@@ -313,8 +349,15 @@ int c690_cull_fix_begin(struct spu_context* ctx, int family)
     t_save_stop = ctx->stop_code;
     t_save_image = ctx->image_id;
     t_cull_ctx = ctx->gpr[3]._u32[0] & SPU_LS_MASK;
-    t_entry_cap = be32(ctx->ls + t_cull_ctx + 0x114);
     t_list_n = 0;
+
+    uint32_t ptr, cnt, cap;
+    if (!cull_list_capacity(ctx, &ptr, &cnt, &cap)) {
+        __atomic_fetch_add(&s_union_skip_setup, 1ull, __ATOMIC_RELAXED);
+        return 0;
+    }
+    t_entry_ptr = ptr;
+    t_cap_entries = cap;
 
     t_union_depth = 1;
     if (!cull_apply_patch(ctx)) {
@@ -331,10 +374,14 @@ void c690_cull_fix_mid(struct spu_context* ctx)
 
     const uint32_t ptr = be32(ctx->ls + t_cull_ctx + 0x110) & SPU_LS_MASK;
     const uint32_t cnt = be32(ctx->ls + t_cull_ctx + 0x114);
-    if (ptr + (size_t)cnt * 2u <= SPU_LS_SIZE && cnt <= C690_CULL_LIST_MAX) {
+    if (ptr != t_entry_ptr || cnt > t_cap_entries ||
+        ptr + (size_t)cnt * 2u > SPU_LS_SIZE) {
+        __atomic_fetch_add(&s_union_skip_range, 1ull, __ATOMIC_RELAXED);
+    } else {
         if (cnt > t_list_cap) {
             uint8_t* p = (uint8_t*)realloc(t_list_save, (size_t)cnt * 2u);
             if (p) { t_list_save = p; t_list_cap = cnt; }
+            else __atomic_fetch_add(&s_union_skip_realloc, 1ull, __ATOMIC_RELAXED);
         }
         if (t_list_save && cnt <= t_list_cap) {
             memcpy(t_list_save, ctx->ls + ptr, (size_t)cnt * 2u);
@@ -361,31 +408,40 @@ void c690_cull_fix_end(struct spu_context* ctx)
     }
 
     const uint32_t ptr = be32(ctx->ls + t_cull_ctx + 0x110) & SPU_LS_MASK;
-    uint32_t cnt = be32(ctx->ls + t_cull_ctx + 0x114);
-    uint32_t cap = t_entry_cap;
-    if (!cap) cap = cnt;
+    const uint32_t cnt = be32(ctx->ls + t_cull_ctx + 0x114);
+    uint32_t out_cnt = cnt;
+
+    /* The capacity is the proven buffer extent from +0x1E0, not the entry
+     * count: appending stays inside this call's allocation and never reaches
+     * the next live structure. */
+    uint32_t cap = t_cap_entries;
+    if (ptr != t_entry_ptr || cnt > cap) {
+        __atomic_fetch_add(&s_union_skip_range, 1ull, __ATOMIC_RELAXED);
+        cap = cnt;
+    }
     if (cap > C690_CULL_LIST_MAX) cap = C690_CULL_LIST_MAX;
     if (ptr + (size_t)cap * 2u > SPU_LS_SIZE) cap = (SPU_LS_SIZE - ptr) / 2u;
 
     uint32_t added = 0;
-    if (t_list_save && t_list_n) {
+    if (t_list_save && t_list_n && out_cnt <= cap) {
         if (t_list_n % 3u) __atomic_fetch_add(&s_union_odd_tail, 1ull, __ATOMIC_RELAXED);
         for (uint32_t i = 0; i + 2 < t_list_n; i += 3) {
             const uint16_t a = be16(t_list_save + 2 * i);
             const uint16_t b = be16(t_list_save + 2 * (i + 1));
             const uint16_t c = be16(t_list_save + 2 * (i + 2));
-            if (list_has_tri(ctx->ls + ptr, cnt, a, b, c)) continue;
-            if (cnt + 3u > cap) {
+            if (list_has_tri(ctx->ls + ptr, out_cnt, a, b, c)) continue;
+            if (out_cnt + 3u > cap) {
                 __atomic_fetch_add(&s_union_cap_hits, 1ull, __ATOMIC_RELAXED);
-                break;
+                __atomic_fetch_add(&s_union_cap_skipped, 1ull, __ATOMIC_RELAXED);
+                continue;
             }
-            put16(ctx->ls + ptr + 2u * cnt, a);
-            put16(ctx->ls + ptr + 2u * (cnt + 1u), b);
-            put16(ctx->ls + ptr + 2u * (cnt + 2u), c);
-            cnt += 3u;
+            put16(ctx->ls + ptr + 2u * out_cnt, a);
+            put16(ctx->ls + ptr + 2u * (out_cnt + 1u), b);
+            put16(ctx->ls + ptr + 2u * (out_cnt + 2u), c);
+            out_cnt += 3u;
             added++;
         }
-        put32(ctx->ls + t_cull_ctx + 0x114, cnt);
+        put32(ctx->ls + t_cull_ctx + 0x114, out_cnt);
     }
 
     __atomic_fetch_add(&s_union_runs, 1ull, __ATOMIC_RELAXED);
@@ -404,7 +460,11 @@ void c690_cull_fix_get_counters(c690_cull_fix_counters* out)
     out->union_runs = s_union_runs;
     out->union_added_tris = s_union_added_tris;
     out->union_cap_hits = s_union_cap_hits;
+    out->union_cap_skipped = s_union_cap_skipped;
     out->union_odd_tail = s_union_odd_tail;
+    out->union_skip_setup = s_union_skip_setup;
+    out->union_skip_range = s_union_skip_range;
+    out->union_skip_realloc = s_union_skip_realloc;
 }
 
 static void cull_fix_report(const char* tag)
@@ -412,9 +472,12 @@ static void cull_fix_report(const char* tag)
     if (!s_calls) return;
     fprintf(stderr, "[c690-cull-fix] %s calls=%llu patched=%llu blocks=%llu "
                     "no_block=%llu union_runs=%llu added_tris=%llu "
-                    "cap_hits=%llu odd_tail=%llu\n", tag, s_calls, s_patched,
-            s_blocks, s_no_block, s_union_runs, s_union_added_tris,
-            s_union_cap_hits, s_union_odd_tail);
+                    "cap_hits=%llu cap_skipped=%llu odd_tail=%llu "
+                    "skip_setup=%llu skip_range=%llu skip_realloc=%llu\n",
+            tag, s_calls, s_patched, s_blocks, s_no_block, s_union_runs,
+            s_union_added_tris, s_union_cap_hits, s_union_cap_skipped,
+            s_union_odd_tail, s_union_skip_setup, s_union_skip_range,
+            s_union_skip_realloc);
     fflush(stderr);
 }
 

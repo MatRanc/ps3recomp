@@ -62,17 +62,24 @@ def patch(path):
     changed = False
     for lsa, family in TARGETS:
         name = PREFIX + f"{lsa:08X}"
-        if f"void {name}(spu_context* ctx) {{\n        extern int g_c690_corpus_on;" in text:
+        old = f"void {name}(spu_context* ctx) {{\n"
+        body = f"void {name}_body(spu_context* ctx) {{\n"
+        if old + "        extern int g_c690_corpus_on;" in text:
             if "c690_cull_fix_begin" in text:
                 continue        # already the union wrapper
-            raise SystemExit(
-                f"{path}: {name} has the old single-grid wrapper; regenerate the "
-                f"module (or delete the wrapper) before applying the union wrapper")
-        old = f"void {name}(spu_context* ctx) {{\n"
+            # Migrate the old single-grid wrapper: drop it and give the body
+            # its original definition back, then insert the union wrapper.
+            start = text.index(old)
+            bstart = text.find(body, start)
+            if bstart < 0:
+                raise SystemExit(f"{path}: old {name} wrapper without a body")
+            text = text[:start] + text[bstart:]
+            if text.count(body) != 1:
+                raise SystemExit(f"{path}: expected one body for {name}")
+            text = text.replace(body, old, 1)
         if text.count(old) != 1:
             raise SystemExit(f"{path}: expected one definition of {name}, "
                              f"found {text.count(old)}")
-        body = f"void {name}_body(spu_context* ctx) {{\n"
         wrapper = WRAPPER.format(name=name, family=family, lsa=lsa)
         text = text.replace(old, wrapper + body)
         changed = True
