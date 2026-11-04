@@ -156,11 +156,21 @@ static u32 s_current_display_buffer_id = 0;
  * presenting on a raw flip-count change raced the drain and showed empty or
  * mixed batches (wave: black flashes, layout flicker). */
 static volatile int s_flip_pending = 0;
-/* PS3RECOMP_TICK_IN_DRAIN: the request sequence whose image has actually been
- * queued by the present path. The drain checkpoint below only completes a
- * flip whose image is on its way to the screen, never one that is merely
- * requested. Guarded by FLIP_LOCK. */
+/* The request sequence of the image the present path has taken (see
+ * cellGcm_take_flip_pending). It is the sequence stored when the image became
+ * pending, not the sequence current at take time: a ResetFlipStatus or the
+ * next request may have advanced s_flip_req_seq in between, and stamping that
+ * newer sequence would let a checkpoint complete a flip that was never
+ * presented. Guarded by FLIP_LOCK. */
 static u32 s_flip_presented_seq = 0;
+/* The request sequence of the pending image (set where s_flip_pending is set,
+ * under FLIP_LOCK). */
+static u32 s_flip_pending_seq = 0;
+/* The last request sequence a completion edge marked. */
+static u32 s_flip_completed_seq = 0;
+/* The ref-register value the guest had already seen when it requested the
+ * latest flip. A later fence publication is the next frame's fence. */
+static u32 s_flip_req_ref = 0;
 /* A flip _cellGcmSetFlipCommand queued in the FIFO: | bufferId, bit 8 = ours. */
 #define GCM_FLIP_MARKER 0xFEAD0100u
 /* Flips queued into the command stream by gcm_flip_into_fifo, and how many of
@@ -199,9 +209,13 @@ static int gcm_flip_executed_take(void)
 
 int cellGcm_take_flip_pending(void)
 {
-    int v = s_flip_pending;
-    s_flip_pending = 0;
-    if (v) { FLIP_LOCK(); s_flip_presented_seq = s_flip_req_seq; FLIP_UNLOCK(); }
+    int v;
+    /* Read/clear under the lock so the request side cannot publish a new
+     * pending image between the flag and its sequence. */
+    FLIP_LOCK();
+    v = s_flip_pending;
+    if (v) { s_flip_pending = 0; s_flip_presented_seq = s_flip_pending_seq; }
+    FLIP_UNLOCK();
     return v;
 }
 
@@ -1018,6 +1032,70 @@ void cellGcmTickVBlank(void) { s_vblank_count++; GCM_PENDING_SET(1); }
  * and its handler runs code that puts the status back to WAITING, so the
  * poll never saw DONE and the game never rendered another frame. On hardware
  * the callback IS the flip interrupt -- no flip, no callback. */
+/* The three completion edges (display tick, drain checkpoint, present) ask the
+ * same question with a different gate. Keeping them in one place is what makes
+ * "which flip does this beat complete?" a single rule; the earlier copies had
+ * already drifted (one stamped the newest request, one required the presented
+ * sequence, one did neither). Returns the completed request sequence or 0.
+ * Caller holds FLIP_LOCK. */
+enum gcm_flip_gate {
+    GCM_FLIP_GATE_TICK = 0,   /* executed in the stream; newest request      */
+    GCM_FLIP_GATE_PRESENTED,  /* executed and this request's image is queued */
+    GCM_FLIP_GATE_FENCE,      /* the image presented before a newer fence    */
+};
+
+static u32 gcm_flip_complete_locked(enum gcm_flip_gate gate, u32 ref)
+{
+    u32 seq = 0;
+    switch (gate) {
+    case GCM_FLIP_GATE_TICK:
+        /* Same rule as cellGcm_request_tick: a flip still ahead of the drain
+         * has not happened yet. */
+        if (s_flip_status == CELL_GCM_FLIP_STATUS_WAITING &&
+            gcm_flip_executed_take())
+            seq = s_flip_req_seq;
+        break;
+    case GCM_FLIP_GATE_PRESENTED:
+        if (s_flip_status == CELL_GCM_FLIP_STATUS_WAITING &&
+            s_flip_presented_seq == s_flip_req_seq &&
+            gcm_flip_executed_take())
+            seq = s_flip_req_seq;
+        break;
+    case GCM_FLIP_GATE_FENCE:
+        /* The marker-side design, for a title whose flip is an immediate HLE
+         * call and therefore never appears in the FIFO: complete the image
+         * already presented once a fence newer than the one its request saw
+         * is published. That fence belongs to a later frame, so the display
+         * thread will find the next buffer's ref ready instead of blocking on
+         * it (the FLIP_ON_DONE failure). The status is deliberately not
+         * consulted: this title's SetPrepareFlip writes DONE ahead of the
+         * display thread, and the guest's wait is on the handler, not the
+         * status. */
+        if (s_flip_presented_seq && s_flip_presented_seq != s_flip_completed_seq &&
+            (s32)(ref - s_flip_req_ref) > 0)
+            seq = s_flip_presented_seq;
+        break;
+    }
+    if (seq) {
+        s_flip_tick_seq = seq;
+        s_flip_completed_seq = seq;
+    }
+    return seq;
+}
+
+static void gcm_flip_complete(enum gcm_flip_gate gate, u32 ref)
+{
+    FLIP_LOCK();
+    const u32 seq = gcm_flip_complete_locked(gate, ref);
+    FLIP_UNLOCK();
+    if (!seq) return;
+    GCM_PENDING_SET(2);
+    if (ps3_trace_on()) {
+        ps3_trace_instant(PS3_TR_GCM_FLIP_DONE, seq, 0);
+        ps3_trace_note(PS3_TR_NOTE_FLIP_DONE, seq);
+    }
+}
+
 void cellGcmTickFlip(void)
 {
     /* PS3RECOMP_FLIP_ON_DONE: the flip is completed where its present is
@@ -1027,17 +1105,13 @@ void cellGcmTickFlip(void)
     if (s_flip_present_path && gcm_live_get(PS3_LIVE_FLIP_ON_DONE,
                                             "PS3RECOMP_FLIP_ON_DONE"))
         return;
-    /* Same rule as cellGcm_request_tick: a flip still ahead of the drain has
-     * not happened yet. */
-    FLIP_LOCK();
-    const int waiting = s_flip_status == CELL_GCM_FLIP_STATUS_WAITING && gcm_flip_executed_take();
-    if (waiting) s_flip_tick_seq = s_flip_req_seq;
-    FLIP_UNLOCK();
-    if (waiting) GCM_PENDING_SET(2);
-    if (waiting && ps3_trace_on()) {
-        ps3_trace_instant(PS3_TR_GCM_FLIP_DONE, s_flip_tick_seq, 0);
-        ps3_trace_note(PS3_TR_NOTE_FLIP_DONE, s_flip_tick_seq);
-    }
+    /* PS3RECOMP_FLIP_FENCE_DONE: the completion is the newer fence's
+     * publication (see cellGcmFlipFenceCheckpoint); the tick must not deliver
+     * an earlier handler that the display thread would take for the next
+     * flip. */
+    if (gcm_live_get(PS3_LIVE_FLIP_FENCE_DONE, "PS3RECOMP_FLIP_FENCE_DONE"))
+        return;
+    gcm_flip_complete(GCM_FLIP_GATE_TICK, 0);
 }
 
 /* PS3RECOMP_TICK_IN_DRAIN: the display tick and the FIFO drain share the
@@ -1053,17 +1127,18 @@ void cellGcmFlipTickCheckpoint(void)
 {
     if (!gcm_live_get(PS3_LIVE_TICK_IN_DRAIN, "PS3RECOMP_TICK_IN_DRAIN"))
         return;
-    FLIP_LOCK();
-    const int waiting = s_flip_status == CELL_GCM_FLIP_STATUS_WAITING &&
-                        s_flip_presented_seq == s_flip_req_seq &&
-                        gcm_flip_executed_take();
-    if (waiting) s_flip_tick_seq = s_flip_req_seq;
-    FLIP_UNLOCK();
-    if (waiting) GCM_PENDING_SET(2);
-    if (waiting && ps3_trace_on()) {
-        ps3_trace_instant(PS3_TR_GCM_FLIP_DONE, s_flip_tick_seq, 0);
-        ps3_trace_note(PS3_TR_NOTE_FLIP_DONE, s_flip_tick_seq);
-    }
+    if (gcm_live_get(PS3_LIVE_FLIP_FENCE_DONE, "PS3RECOMP_FLIP_FENCE_DONE"))
+        return;
+    gcm_flip_complete(GCM_FLIP_GATE_PRESENTED, 0);
+}
+
+/* PS3RECOMP_FLIP_FENCE_DONE, called where the fence register is published
+ * (gcm_ref_publish_one). See GCM_FLIP_GATE_FENCE. */
+void cellGcmFlipFenceCheckpoint(u32 ref)
+{
+    if (!gcm_live_get(PS3_LIVE_FLIP_FENCE_DONE, "PS3RECOMP_FLIP_FENCE_DONE"))
+        return;
+    gcm_flip_complete(GCM_FLIP_GATE_FENCE, ref);
 }
 
 /* PS3RECOMP_FLIP_ON_DONE, called by the runner after a present has been
@@ -1077,16 +1152,9 @@ void cellGcmFlipTickCheckpoint(void)
 void cellGcmFlipOnPresent(void)
 {
     if (!gcm_live_get(PS3_LIVE_FLIP_ON_DONE, "PS3RECOMP_FLIP_ON_DONE")) return;
-    FLIP_LOCK();
-    const int waiting = s_flip_status == CELL_GCM_FLIP_STATUS_WAITING &&
-                        gcm_flip_executed_take();
-    if (waiting) s_flip_tick_seq = s_flip_req_seq;
-    FLIP_UNLOCK();
-    if (waiting) GCM_PENDING_SET(2);
-    if (waiting && ps3_trace_on()) {
-        ps3_trace_instant(PS3_TR_GCM_FLIP_DONE, s_flip_tick_seq, 0);
-        ps3_trace_note(PS3_TR_NOTE_FLIP_DONE, s_flip_tick_seq);
-    }
+    if (gcm_live_get(PS3_LIVE_FLIP_FENCE_DONE, "PS3RECOMP_FLIP_FENCE_DONE"))
+        return;
+    gcm_flip_complete(GCM_FLIP_GATE_TICK, 0);
 }
 
 /* Set by the runner once the present backend is up. When it is 0 (backend
@@ -1165,6 +1233,9 @@ static u32 s_flip_log_last_present;
 /* The flip seq each queued FIFO marker will create, in queue order. */
 #define GCM_FLIP_MARKER_N 256
 static u32 s_flip_marker_seq[GCM_FLIP_MARKER_N];
+/* The request sequence of each queued FIFO marker, so the drain can record the
+ * image's own sequence in s_flip_pending_seq when it reaches the marker. */
+static u32 s_flip_marker_req_seq[GCM_FLIP_MARKER_N];
 
 static unsigned long long gcm_us_now(void)
 {
@@ -1785,8 +1856,11 @@ int cellGcm_take_flip_pending_synced(void)
     u32 put = vm_read32(GCM_CONTROL_GUEST_ADDR + 0);
     u32 get = vm_read32(GCM_CONTROL_GUEST_ADDR + 4);
     if (get != put) return 0;   /* frame not fully drained yet */
+    FLIP_LOCK();
+    if (!s_flip_pending) { FLIP_UNLOCK(); return 0; }
     s_flip_pending = 0;
-    FLIP_LOCK(); s_flip_presented_seq = s_flip_req_seq; FLIP_UNLOCK();
+    s_flip_presented_seq = s_flip_pending_seq;
+    FLIP_UNLOCK();
     return 1;
 }
 
@@ -2202,6 +2276,10 @@ static void gcm_ref_publish_one(int src)
                 s_ref_q[h % GCM_REF_QLEN], vm_read32(GCM_CONTROL_GUEST_ADDR + 8)); } }
     s_ref_qhead = h + 1;
     g_gcm_ref_pub_count++;
+    /* PS3RECOMP_FLIP_FENCE_DONE: a fence newer than the one the outstanding
+     * flip's request saw is the next frame's, so the display thread can
+     * advance now without blocking on its buffer ref. No-op when off. */
+    cellGcmFlipFenceCheckpoint(val);
 }
 
 /* Read-driven fence publication. cellGcmFinish / FIFO-space waits spin-read the
@@ -3098,7 +3176,11 @@ static void gcm_rsx_process_fifo_unlocked(void)
                 /* Queued by _cellGcmSetFlipCommand, which already did the
                  * guest-visible half of the request. */
                 gcm_set_current_display_buffer(w & 7u);
+                FLIP_LOCK();
+                s_flip_pending_seq =
+                    s_flip_marker_req_seq[s_fifo_flips_reached % GCM_FLIP_MARKER_N];
                 s_flip_pending = 1;
+                FLIP_UNLOCK();
                 s_flip_request_count++;
                 gcm_fifo_dump_flip(w);
                 /* Not past `queued`: a resync may already have written off
@@ -4006,12 +4088,15 @@ static s32 gcm_flip_request(u32 bufferId, int in_fifo)
 
     /* in_fifo: the flip sits in the command stream as a GCM_FLIP_MARKER, and
      * the drain does this half when it reaches it (see the 0xFEAD case). */
-    if (!in_fifo) {
-        gcm_set_current_display_buffer(bufferId);
-        s_flip_pending = 1;   /* ticker: present BEFORE the next drain */
-        s_flip_request_count++;
-        s_flip_direct_pending = 1;
-    }
+    if (!in_fifo) gcm_set_current_display_buffer(bufferId);
+    /* The ref value the guest had already seen when it issued this flip: the
+     * display thread waits for the frame's fence with an equality test just
+     * before flipping, so the current value is that fence. A later
+     * publication is the next frame's fence (GCM_FLIP_GATE_FENCE). Read only
+     * while that completion edge is enabled. */
+    const u32 ref_at_request =
+        gcm_live_get(PS3_LIVE_FLIP_FENCE_DONE, "PS3RECOMP_FLIP_FENCE_DONE")
+            ? vm_read32(GCM_CONTROL_GUEST_ADDR + 8) : 0;
     /* Flip requested but not yet shown: a subsequent cellGcmSetWaitFlip blocks
      * until the present thread's cellGcmTickFlip marks it done (vsync). */
     u32 req_seq;
@@ -4019,7 +4104,21 @@ static s32 gcm_flip_request(u32 bufferId, int in_fifo)
     s_flip_status = CELL_GCM_FLIP_STATUS_WAITING;
     s_flip_req_seq++;
     req_seq = s_flip_req_seq;
+    s_flip_req_ref = ref_at_request;
+    if (!in_fifo) {
+        /* Ticker: present BEFORE the next drain. The sequence travels with
+         * the pending image so the take cannot claim a newer request. */
+        s_flip_pending_seq = req_seq;
+        s_flip_pending = 1;
+        s_flip_direct_pending = 1;
+    } else {
+        /* The drain sets pending when it reaches the marker; remember which
+         * request that marker belongs to. gcm_flip_into_fifo queued it. */
+        const u32 q = s_fifo_flips_queued ? s_fifo_flips_queued - 1u : 0u;
+        s_flip_marker_req_seq[q % GCM_FLIP_MARKER_N] = req_seq;
+    }
     FLIP_UNLOCK();
+    if (!in_fifo) s_flip_request_count++;
     s_last_flip_time = get_timestamp_ns();
     if (PS3_FT_ON()) { const uint64_t t = ps3_ft_now();
                        ps3_ft_span(PS3_FT_FLIP_REQ, 0, bufferId, (uint32_t)in_fifo, t, t); }

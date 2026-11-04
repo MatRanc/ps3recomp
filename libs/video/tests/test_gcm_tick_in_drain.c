@@ -7,6 +7,10 @@
  * its image has been queued by the present path (the presented sequence).
  * Without the present guard this is the FLIP_ON_DONE failure: the guest
  * advances and blocks on the next buffer's ref hand-off.
+ *
+ * PS3RECOMP_FLIP_FENCE_DONE: the image's own sequence is carried from the
+ * request through the take, and the completion waits for a fence newer than
+ * the one the request saw (the next frame's fence).
  */
 #include "../cellGcmSys.c"
 #include <assert.h>
@@ -38,11 +42,36 @@ static void request_direct(void)
 
 int main(void)
 {
-    setenv("PS3RECOMP_TICK_IN_DRAIN", "1", 1);
     g_ps3_guest_caller = callback;
     s_flip_handler_opd = 0x400;
+    setenv("PS3RECOMP_FLIP_FENCE_DONE", "0", 1);
+
+    /* The take records the pending image's request sequence, not whatever the
+     * request counter has advanced to since (a ResetFlipStatus or the next
+     * request). */
+    request_direct();
+    s_flip_pending_seq = s_flip_req_seq;
+    s_flip_pending = 1;
+    s_flip_req_seq += 3;                 /* a newer frame moved the counter */
+    assert(cellGcm_take_flip_pending() == 1);
+    assert(s_flip_presented_seq == s_flip_pending_seq);
+    assert(s_flip_presented_seq != s_flip_req_seq);
+
+    /* The same identity for a FIFO marker: the sequence queued with the
+     * marker is the one the drain puts in the pending image. */
+    request_direct();
+    const u32 marker_req = s_flip_req_seq;
+    s_fifo_flips_queued = s_fifo_flips_reached = 0;
+    s_flip_marker_req_seq[s_fifo_flips_reached % GCM_FLIP_MARKER_N] = marker_req;
+    s_flip_pending_seq =
+        s_flip_marker_req_seq[s_fifo_flips_reached % GCM_FLIP_MARKER_N];
+    s_flip_pending = 1;
+    s_flip_req_seq += 2;                 /* the next frame moved the counter */
+    assert(cellGcm_take_flip_pending() == 1);
+    assert(s_flip_presented_seq == marker_req);
 
     /* Executed and presented: the checkpoint is the completion edge. */
+    setenv("PS3RECOMP_TICK_IN_DRAIN", "1", 1);
     request_direct();
     s_flip_presented_seq = s_flip_req_seq;
     cellGcmFlipTickCheckpoint();
@@ -74,6 +103,29 @@ int main(void)
     ppu_gcm_pump();
     assert(flips == 3 && cellGcmGetFlipStatus() == CELL_GCM_FLIP_STATUS_DONE);
 
-    puts("GCM tick-in-drain checks passed");
+    /* Fence-side completion (the marker-side design for an immediate flip):
+     * the previous image completes only once a fence newer than its request
+     * is published. */
+    setenv("PS3RECOMP_FLIP_FENCE_DONE", "1", 1);
+    request_direct();
+    s_flip_pending_seq = s_flip_req_seq;
+    s_flip_pending = 1;
+    assert(cellGcm_take_flip_pending() == 1);
+    s_flip_req_ref = 100;
+    cellGcmFlipFenceCheckpoint(100);     /* the fence it already saw */
+    ppu_gcm_pump();
+    assert(flips == 3 && cellGcmGetFlipStatus() == CELL_GCM_FLIP_STATUS_WAITING);
+    cellGcmTickFlip();                   /* the tick must not race the fence */
+    ppu_gcm_pump();
+    assert(flips == 3 && cellGcmGetFlipStatus() == CELL_GCM_FLIP_STATUS_WAITING);
+    cellGcmFlipFenceCheckpoint(101);     /* the next frame's fence */
+    ppu_gcm_pump();
+    assert(flips == 4 && cellGcmGetFlipStatus() == CELL_GCM_FLIP_STATUS_DONE);
+    cellGcmFlipFenceCheckpoint(102);     /* already completed: no re-fire */
+    ppu_gcm_pump();
+    assert(flips == 4);
+    setenv("PS3RECOMP_FLIP_FENCE_DONE", "0", 1);
+
+    puts("GCM tick-in-drain / fence checks passed");
     return 0;
 }

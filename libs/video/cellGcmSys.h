@@ -296,6 +296,11 @@ void cellGcmTickFlip(void);
  * waiting for the next 16 ms display tick. Called at the top of every drain
  * pass; a no-op while the switch is off. */
 void cellGcmFlipTickCheckpoint(void);
+/* PS3RECOMP_FLIP_FENCE_DONE: complete the flip whose image the present path
+ * has taken once a fence newer than the one its request saw is published;
+ * called by the ref-register publication path. A no-op while the switch is
+ * off. */
+void cellGcmFlipFenceCheckpoint(u32 ref);
 /* PS3RECOMP_FLIP_ON_DONE: the runner tells cellGcmSys whether a present path
  * exists (cellGcmSetFlipPresentPath) and calls cellGcmFlipOnPresent right
  * after a present has been queued, so the flip completes there instead of on

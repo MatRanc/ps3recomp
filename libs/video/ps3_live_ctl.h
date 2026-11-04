@@ -75,6 +75,7 @@ enum {
     PS3_LIVE_SPURS_PM_FAST_ACTIVE,      /* SPURS_PM_FAST_ACTIVE: fast rerun may keep a lane already at maxContention */
     PS3_LIVE_SPURS_PM_FAST_ONE_LOCK,    /* SPURS_PM_FAST_ONE_LOCK: check+consume a fast rerun under one lock line */
     PS3_LIVE_SPURS_PM_FAST_GEN,         /* SPURS_PM_FAST_GEN: skip the workload-registry lock when unchanged */
+    PS3_LIVE_FLIP_FENCE_DONE,           /* PS3RECOMP_FLIP_FENCE_DONE: complete a presented flip when the next frame's fence publishes */
     PS3_LIVE_COUNT
 };
 
