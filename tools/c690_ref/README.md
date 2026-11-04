@@ -96,6 +96,17 @@ adds the default-off `PS3RECOMP_C690_NATIVE_CULL` / `..._SHADOW` switches, the
 layout guard, and the full-LS/GPR shadow comparator. See
 `mlb16-recomp/docs/edge-native-step2.md`.
 
+## Cull hooks and the live bypass
+
+`patch_cull_hooks.py` also installs the `MLB16_CULL_BYPASS` dispatch helper and
+its three guards (0x13518/0x13520 for family 0x25/0x26, 0x12DC0 for 0x2C). The
+helper calls `c690_cull_bypass_mode()` in `runtime/spu/c690_cull_fix.c`, which
+reads the live key `PS3_LIVE_CULL_BYPASS` while `PS3RECOMP_CTL` is configured
+and otherwise falls back to the environment. Values: 0 normal, 1 both families,
+2 0x2C only, 3 0x25/0x26 only. The guards are inert at 0, and a fresh lift gets
+them (and the helper) inserted by the same script. See
+`mlb16-recomp/docs/cull-bypass-ab.md`.
+
 ## Run
 
 ```sh

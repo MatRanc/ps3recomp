@@ -98,6 +98,25 @@ int c690_cull_fix_enabled(int family)
     return cull_live_get(PS3_LIVE_C690_CULL_FIX, s_env_fix);
 }
 
+/* MLB16_CULL_BYPASS: the generated c690 module calls this for every 0x25/0x26
+ * and 0x2C cull dispatch. The value is a bitmask over the two families
+ * (1 = both, 2 = 0x2C, 3 = 0x25/0x26); 0 is inert and is the default. The
+ * control file wins while it is configured, so an A/B can flip it mid-run;
+ * without PS3RECOMP_CTL it reads the environment once, as before. */
+int c690_cull_bypass_mode(void)
+{
+    static int env = -1;
+    if (env < 0) {
+        const char* e = getenv("MLB16_CULL_BYPASS");
+        env = e && *e ? atoi(e) : 0;
+    }
+#ifdef C690_CULL_HAVE_LIVE_CTL
+    if (ps3_live_ctl_get && ps3_live_ctl_enabled && ps3_live_ctl_enabled())
+        return ps3_live_ctl_get(PS3_LIVE_CULL_BYPASS);
+#endif
+    return env;
+}
+
 int c690_cull_fix_maybe(void)
 {
     cull_read_env();
