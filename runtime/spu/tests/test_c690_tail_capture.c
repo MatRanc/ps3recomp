@@ -88,6 +88,21 @@ int main(int argc, char** argv)
         run_2a(&ctx, 0x2F88, 0x55, 2000);
         c690_corpus_tail_trace(&ctx, 0x12AB8, 0, 3000);   /* job end */
         c690_corpus_tail_job_begin(&ctx);
+    } else if (!strcmp(mode, "cap")) {
+        fill_ctx(&ctx, 0x13140);
+        c690_corpus_tail_job_begin(&ctx);
+        /* Six selector-1 commands with PS3RECOMP_C690_TAIL_PAIRS=2: only the
+         * first two may snapshot, but all six are still counted. */
+        ctx.gpr[6]._u32[0] = 1;
+        for (uint32_t i = 0; i < 6; i++) {
+            ctx.pc = 0x13140;
+            c690_corpus_tail_cmd_enter(&ctx, 0x13140, 0x21);
+            write_line(&ctx, 0x1F75, (uint8_t)(0x20 + i));
+            ctx.pc = ctx.gpr[0]._u32[0];
+            c690_corpus_tail_cmd_exit(&ctx);
+        }
+        c690_corpus_tail_trace(&ctx, 0x12AB8, 0, 6000);   /* job end */
+        c690_corpus_tail_job_begin(&ctx);
     } else if (!strcmp(mode, "a730")) {
         fill_ctx(&ctx, 0x13140);
         c690_corpus_tail_job_begin(&ctx);

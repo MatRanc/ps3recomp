@@ -43,7 +43,10 @@ void c690_gap_on_overlay(int kind, int ok);
  * handler's sub-selector targets (0x13178/0x13140/0x131A0/0x131F8/0x13240/
  * 0x13248/0x13250/0x13288), and counts the DMA bytes and time, GETLLAR/PUTLLC,
  * tag-status reads, decrementer reads and trampoline steps made while the
- * command is current. Measurement only; off by default. */
+ * command is current. It also splits the command window by its first
+ * sub-selector (0x13140 sel1, 0x131A0 sel7) and reports a per-LS function
+ * table inside each window, plus the all-class synchronous DMA (copy) time
+ * charged to the current command. Measurement only; off by default. */
 extern int g_c690_op21;
 void c690_op21_dma_begin(const struct spu_context* ctx, int is_put, uint32_t size);
 void c690_op21_dma_end(const struct spu_context* ctx);

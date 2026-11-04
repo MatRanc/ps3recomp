@@ -180,6 +180,7 @@ static unsigned long long s_tail_seq;
 static unsigned long long s_tail_files;
 static unsigned long long s_tail_entries;
 static unsigned long long s_tail_pairs_written;
+static unsigned long long s_tail_snapshots;
 static unsigned s_max_jobs = 2000;
 static unsigned s_stage_jobs = 20;
 static unsigned s_stage_stride = 1;
@@ -766,8 +767,10 @@ static void c690_tail_write_hist(void)
     }
     if (f) fclose(f);
     if (calls)
-        fprintf(stderr, "[c690-tail] hist pairs=%llu calls=%llu time=%.3fms\n",
-                s_tail_pairs_written, calls, (double)ns / 1e6);
+        fprintf(stderr, "[c690-tail] hist pairs=%llu snapshots=%llu "
+                        "calls=%llu time=%.3fms\n",
+                s_tail_pairs_written, s_tail_snapshots, calls,
+                (double)ns / 1e6);
     fflush(stderr);
 }
 
@@ -793,7 +796,7 @@ static void c690_tail_close(const struct spu_context* ctx, uint64_t now)
             __atomic_fetch_add(&k->ns, now - s->entry_ns, __ATOMIC_RELAXED);
     }
     c690_tail_maybe_hist(now);
-    if (!s->sampled) return;
+    if (s->sampled != 1) return;
 
     unsigned long long pairs = k ? __atomic_load_n(&k->pairs, __ATOMIC_RELAXED)
                                  : 0ull;
@@ -815,8 +818,32 @@ static void c690_tail_close(const struct spu_context* ctx, uint64_t now)
     __atomic_fetch_add(&s_tail_pairs_written, 1ull, __ATOMIC_RELAXED);
 }
 
+/* True while this format key still needs a pair. The key slot is created so a
+ * key that is never sampled is still counted for the histogram; the cap check
+ * itself only reads the pair counter, before any LS snapshot. */
+static int c690_tail_key_below_cap(uint32_t key)
+{
+    c690_tail_key* k = c690_tail_key_slot(key, 1);
+    if (!k) return 0;
+    return __atomic_load_n(&k->pairs, __ATOMIC_RELAXED) < s_tail_pairs;
+}
+
+static void c690_tail_snapshot(const struct spu_context* ctx, c690_tail_run* s)
+{
+    for (int i = 0; i < 8; i++)
+        s->cmd[i] = c690_tail_be32(ctx->ls, s->gpr3 + 0x150u + (uint32_t)i * 4u);
+    memcpy(s->in_ls, ctx->ls, SPU_LS_SIZE);
+    memcpy(s->in_gpr, ctx->gpr, C690_CORPUS_GPR_SIZE);
+    s->sampled = 1;
+    __atomic_fetch_add(&s_tail_snapshots, 1ull, __ATOMIC_RELAXED);
+}
+
+/* `key` is the format key when it is already known at entry (every wrapper
+ * passes it) and C690_TAIL_UNKNOWN_KEY for a command-boundary 0x21, whose key
+ * only appears when the sub-selector body is entered. In that last case the
+ * snapshot is deferred to that entry, so the cap is still checked first. */
 static void c690_tail_open(const struct spu_context* ctx, uint32_t lsa,
-                           int op, uint64_t now)
+                           int op, uint64_t now, uint32_t key)
 {
     if (!t_tail) {
         t_tail = (c690_tail_run*)calloc(1, sizeof *t_tail);
@@ -834,21 +861,22 @@ static void c690_tail_open(const struct spu_context* ctx, uint32_t lsa,
     s->gpr5 = ctx->gpr[5]._u32[0];
     s->gpr6 = ctx->gpr[6]._u32[0];
     s->ret_pc = (op == 0x2A) ? (ctx->gpr[0]._u32[0] & SPU_LS_MASK) : 0;
-    for (int i = 0; i < 8; i++)
-        s->cmd[i] = c690_tail_be32(ctx->ls, s->gpr3 + 0x150u + (uint32_t)i * 4u);
 
-    /* Key: the sub-selector for 0x21 (filled in when it is entered), the
-     * opcode for the single-path stages. */
-    s->key = (op == 0x21) ? C690_TAIL_UNKNOWN_KEY : (uint32_t)op;
-    s->key_lsa = 0;
+    s->key = key;
+    s->key_lsa = (key != C690_TAIL_UNKNOWN_KEY && op == 0x21) ? lsa : 0;
+    s->sampled = 0;
 
     const unsigned long long entry =
         __atomic_fetch_add(&s_tail_entries, 1ull, __ATOMIC_RELAXED);
-    s->sampled = (s_tail_stride <= 1u ||
-                  (entry % (unsigned long long)s_tail_stride) == 0);
-    if (!s->sampled) return;
-    memcpy(s->in_ls, ctx->ls, SPU_LS_SIZE);
-    memcpy(s->in_gpr, ctx->gpr, C690_CORPUS_GPR_SIZE);
+    if (s_tail_stride > 1u &&
+        (entry % (unsigned long long)s_tail_stride) != 0)
+        return;
+    if (key == C690_TAIL_UNKNOWN_KEY) {
+        s->sampled = 2;             /* snapshot when the selector key is known */
+        return;
+    }
+    if (!c690_tail_key_below_cap(key)) return;
+    c690_tail_snapshot(ctx, s);
 }
 
 void c690_corpus_tail_job_begin(const struct spu_context* ctx)
@@ -870,14 +898,25 @@ void c690_corpus_tail_trace(const struct spu_context* ctx, uint32_t lsa,
     if (op >= 0) {
         /* Top-level command boundary: the previous command has finished. */
         if (t_tail && t_tail->active) c690_tail_close(ctx, now);
-        if (c690_tail_is_stage_op(op)) c690_tail_open(ctx, lsa, op, now);
+        if (c690_tail_is_stage_op(op)) {
+            const uint32_t key = (op == 0x21) ? C690_TAIL_UNKNOWN_KEY
+                                              : (uint32_t)op;
+            c690_tail_open(ctx, lsa, op, now, key);
+        }
         return;
     }
     if (!t_tail || !t_tail->active) return;
     if (t_tail->op == 0x21 && c690_tail_sel_lsa(lsa)) {
         const uint32_t g6 = ctx->gpr[6]._u32[0];
-        t_tail->key = (g6 & 0x1Fu) | ((lsa & 0xFFFFFu) << 8);
+        const uint32_t key = (g6 & 0x1Fu) | ((lsa & 0xFFFFFu) << 8);
+        t_tail->key = key;
         t_tail->key_lsa = lsa;
+        if (t_tail->sampled == 2) {
+            if (c690_tail_key_below_cap(key))
+                c690_tail_snapshot(ctx, t_tail);
+            else
+                t_tail->sampled = 0;
+        }
     }
 }
 
@@ -894,12 +933,15 @@ void c690_corpus_tail_cmd_enter(const struct spu_context* ctx, uint32_t lsa,
     const uint64_t now = c690_corpus_now_ns();
     if (!c690_tail_armed(now)) return;
     if (t_tail && t_tail->active) c690_tail_close(ctx, now);
-    c690_tail_open(ctx, lsa, op, now);
+    /* The wrapper knows the format key before the snapshot: the 0x21 key is
+     * (sub-selector LSA << 8) | (r6 & 0x1f); everything else keys on its
+     * opcode. Passing it in lets the pair cap be checked first. */
+    uint32_t key = (uint32_t)op;
     if (op == 0x21) {
         const uint32_t g6 = ctx->gpr[6]._u32[0];
-        t_tail->key = (g6 & 0x1Fu) | ((lsa & 0xFFFFFu) << 8);
-        t_tail->key_lsa = lsa;
+        key = (g6 & 0x1Fu) | ((lsa & 0xFFFFFu) << 8);
     }
+    c690_tail_open(ctx, lsa, op, now, key);
 }
 
 void c690_corpus_tail_cmd_exit(const struct spu_context* ctx)

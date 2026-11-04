@@ -65,7 +65,7 @@ def run(binary, mode, env):
                          env=full, timeout=60)
     if out.returncode:
         raise AssertionError(f'{mode}: exit {out.returncode}\n{out.stdout}\n{out.stderr}')
-    return out.stdout
+    return out.stdout + out.stderr
 
 
 def main():
@@ -129,6 +129,20 @@ def main():
         pairs = parse_spool(sorted(cap.glob('tail_*.bin'))[0])
         keys = sorted(x['in']['key'] for x in pairs.values())
         assert keys == [1 | (0x13140 << 8), 7 | (0x131A0 << 8)], [hex(k) for k in keys]
+
+        # Cap is checked before the 256 KiB snapshot: six same-key commands
+        # with a cap of two keep two pairs and take exactly two snapshots.
+        cap = tmp / 'cap'
+        out = run(binary, 'cap', {
+            'PS3RECOMP_C690_TAIL_CAPTURE': str(cap),
+            'PS3RECOMP_C690_TAIL_PAIRS': '2',
+            'PS3RECOMP_C690_TAIL_STRIDE': '1',
+        })
+        pairs = parse_spool(sorted(cap.glob('tail_*.bin'))[0])
+        assert len(pairs) == 2, pairs
+        assert 'snapshots=2' in out, out
+        hist = (cap / 'tail_hist.txt').read_text()
+        assert ('0x%08X 6 ' % (1 | (0x13140 << 8))) in hist, hist
 
         # A trigger file that has not appeared leaves the capture idle.
         cap = tmp / 'no-trigger'

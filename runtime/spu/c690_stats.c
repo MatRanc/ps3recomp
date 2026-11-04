@@ -141,24 +141,70 @@ static int c690_hot_index(uint32_t lsa)
     }
 }
 
-/* Parser 0x10700 handler -> command opcode, in opcode order for the report. */
+/* PS3RECOMP_C690_OP21: per-function exclusive time inside a 0x21
+ * sub-selector window. The window opens at the first sub-selector target
+ * (0x13140 = selector 1, 0x131A0 = selector 7) and closes with the command;
+ * the function table names the bodies on those paths (the A730/A3E0 leaves
+ * and the pack family), which the global hot table cannot separate by
+ * selector. The table is keyed by the actual LS address; overflow goes to a
+ * per-window "other" bucket. */
+#define C690_WIN_N       3
+#define C690_WIN_FN_MAX  256
+
+typedef struct {
+    uint32_t lsa;
+    unsigned long long ns;
+    unsigned long long n;
+} c690_win_fn_ent;
+
+/* Parser 0x10700 handler -> command opcode, in opcode order for the report.
+ * Complete 52-entry table read from the raw module's handler-pointer table at
+ * LS 0x14770 (EBOOT file offset 0x1161370; big-endian words). The old list
+ * omitted 0x22 (handler 0x10190, the 0xFDA0 tree/cull stage), so a 0x21
+ * command did not close at 0x22 and the 0x22 time was charged to 0x21. */
 typedef struct { uint32_t lsa; unsigned op; } c690_op_map;
 static const c690_op_map s_op_map[] = {
     { 0x12AB8u, 0x00u },   /* end command: also the job-end marker */
+    { 0x105C0u, 0x01u },
+    { 0x10660u, 0x02u },
+    { 0x105F0u, 0x03u },
     { 0x11F58u, 0x04u },
+    { 0x11CC0u, 0x05u },
+    { 0x11848u, 0x06u },
     { 0x11DF0u, 0x07u },
     { 0x11BF8u, 0x08u },
     { 0x05000u, 0x09u },
     { 0x12478u, 0x0Au },
+    { 0x11B90u, 0x0Bu },
     { 0x12830u, 0x0Cu },
+    { 0x11AC0u, 0x0Du },
+    { 0x11AA8u, 0x0Eu },
+    { 0x11A90u, 0x0Fu },
+    { 0x11A78u, 0x12u },
     { 0x11A60u, 0x13u },
+    { 0x11CD8u, 0x14u },
+    { 0x12828u, 0x15u },
+    { 0x053C0u, 0x18u },
+    { 0x04F00u, 0x19u },
+    { 0x129F0u, 0x1Au },
+    { 0x0F520u, 0x1Bu },
+    { 0x11BC0u, 0x1Cu },
+    { 0x0F680u, 0x1Du },
+    { 0x12A60u, 0x1Eu },
     { 0x12948u, 0x1Fu },
     { 0x13080u, 0x21u },
+    { 0x10190u, 0x22u },   /* 0xFDA0 tree/cull continuation */
+    { 0x12DC8u, 0x23u },
     { 0x13520u, 0x25u },
     { 0x13518u, 0x26u },
     { 0x11790u, 0x27u },
+    { 0x11268u, 0x28u },
+    { 0x11410u, 0x29u },
     { 0x10F78u, 0x2Au },
+    { 0x11A28u, 0x2Bu },
     { 0x12DC0u, 0x2Cu },
+    { 0x118C8u, 0x2Du },
+    { 0x0EE48u, 0x2Eu },
 };
 #define C690_OP_MAP_N (sizeof s_op_map / sizeof s_op_map[0])
 
@@ -208,6 +254,14 @@ typedef struct {
     unsigned long long op21_getllar, op21_putllc, op21_putllc_fail;
     unsigned long long op21_tagstat, op21_atomstat, op21_dec;
     unsigned long long op21_steps;
+    /* 0x21 selector windows and their per-function exclusive time. */
+    unsigned long long win_calls[C690_WIN_N], win_ns[C690_WIN_N];
+    unsigned win_fn_n[C690_WIN_N];
+    c690_win_fn_ent win_fn[C690_WIN_N][C690_WIN_FN_MAX];
+    unsigned long long win_fn_other_ns[C690_WIN_N], win_fn_other_n[C690_WIN_N];
+    /* All-class DMA time (fast-path copy) inside the job. */
+    unsigned long long dma_ns, dma_n[256];
+    unsigned long long dma_ns_op[256];
 } c690_thread_stats;
 
 static c690_thread_stats s_threads[C690_MAX_THREADS];
@@ -254,6 +308,13 @@ static SPU_THREAD_LOCAL struct {
     unsigned op21_dma_depth;
     uint64_t op21_start, op21_last, op21_dma_t0;
     uint32_t op21_steps0;
+    /* 0x21 selector window: 0 none, 1 sel1, 2 sel7, 3 other. */
+    unsigned op21_win;
+    uint32_t op21_win_fn;
+    uint64_t op21_win_start;
+    /* All-class synchronous DMA (fast-path copy). */
+    unsigned dma_all_depth;
+    uint64_t dma_all_t0;
 } t_run;
 
 /* ---- PS3RECOMP_C690_HASH: do repeated jobs produce identical bytes? ----
@@ -538,6 +599,9 @@ static void c690_op21_begin(const struct spu_context* ctx, uint64_t now,
     t_run.op21_last = now;
     t_run.op21_sub = 0;
     t_run.op21_steps0 = ctx ? ctx->steps : 0;
+    t_run.op21_win = 0;
+    t_run.op21_win_fn = 0;
+    t_run.op21_win_start = 0;
     s->op21_calls++;
     s->op21_sub_n[0]++;
 }
@@ -549,17 +613,62 @@ static void c690_op21_charge(c690_thread_stats* s, uint64_t now)
     t_run.op21_last = now;
 }
 
+/* Charge the interval since the last entry to the function that was current
+ * inside the open selector window. Runs before c690_op21_charge(), which
+ * advances the same timestamp for the sub-selector split. */
+static void c690_op21_win_charge(c690_thread_stats* s, uint64_t now)
+{
+    if (!t_run.op21_win || !t_run.op21_win_fn || now <= t_run.op21_last) return;
+    const unsigned wi = t_run.op21_win - 1u;
+    const uint64_t dt = now - t_run.op21_last;
+    for (unsigned i = 0; i < s->win_fn_n[wi]; i++) {
+        if (s->win_fn[wi][i].lsa == t_run.op21_win_fn) {
+            s->win_fn[wi][i].ns += dt;
+            s->win_fn[wi][i].n++;
+            return;
+        }
+    }
+    if (s->win_fn_n[wi] < C690_WIN_FN_MAX) {
+        c690_win_fn_ent* e = &s->win_fn[wi][s->win_fn_n[wi]++];
+        e->lsa = t_run.op21_win_fn;
+        e->ns = dt;
+        e->n = 1;
+    } else {
+        s->win_fn_other_ns[wi] += dt;
+        s->win_fn_other_n[wi]++;
+    }
+}
+
 static void c690_op21_note_entry(const struct spu_context* ctx, uint32_t lsa,
                                  uint64_t now)
 {
     (void)ctx;
     if (!t_run.op21_active) return;
     c690_thread_stats* const s = c690_slot();
+    c690_op21_win_charge(s, now);
     c690_op21_charge(s, now);
     const int idx = c690_op21_sub_index(lsa);
     if (idx >= 0) {
         t_run.op21_sub = (unsigned)idx;
         s->op21_sub_n[idx]++;
+    }
+    /* The first sub-selector target fixes the window; later entries only
+     * move the current function, including nested bodies (0x13250 and the
+     * trampoline targets on the selector-1 path). */
+    if (!t_run.op21_win) {
+        unsigned win = 0;
+        if (lsa == 0x13140u)      win = 1;
+        else if (lsa == 0x131A0u) win = 2;
+        else if (lsa == 0x13178u || lsa == 0x131F8u ||
+                 lsa == 0x13198u || lsa == 0x132D8u) win = 3;
+        if (win) {
+            t_run.op21_win = win;
+            t_run.op21_win_start = now;
+            t_run.op21_win_fn = lsa;
+            s->win_calls[win - 1u]++;
+        }
+    } else {
+        t_run.op21_win_fn = lsa;
     }
 }
 
@@ -567,7 +676,10 @@ static void c690_op21_close(const struct spu_context* ctx, uint64_t now)
 {
     if (!t_run.op21_active) return;
     c690_thread_stats* const s = c690_slot();
+    c690_op21_win_charge(s, now);
     c690_op21_charge(s, now);
+    if (t_run.op21_win && now > t_run.op21_win_start)
+        s->win_ns[t_run.op21_win - 1u] += now - t_run.op21_win_start;
     const uint64_t wall = now - t_run.op21_start;
     s->op21_ns += wall;
     if (wall > s->op21_max_ns) s->op21_max_ns = wall;
@@ -581,20 +693,38 @@ static void c690_op21_close(const struct spu_context* ctx, uint64_t now)
 void c690_op21_dma_begin(const struct spu_context* ctx, int is_put, uint32_t size)
 {
     (void)ctx;
-    if (!g_c690_op21 || !t_run.op21_active) return;
-    c690_thread_stats* const s = c690_slot();
-    if (is_put) { s->op21_put_n++; s->op21_put_b += size; }
-    else        { s->op21_get_n++; s->op21_get_b += size; }
-    if (t_run.op21_dma_depth++ == 0) t_run.op21_dma_t0 = c690_now_ns();
+    if (!g_c690_op21) return;
+    if (t_run.op21_active) {
+        c690_thread_stats* const s = c690_slot();
+        if (is_put) { s->op21_put_n++; s->op21_put_b += size; }
+        else        { s->op21_get_n++; s->op21_get_b += size; }
+        if (t_run.op21_dma_depth++ == 0) t_run.op21_dma_t0 = c690_now_ns();
+    }
+    /* All-class DMA: the fast path is a synchronous copy, so timing the whole
+     * transfer interval is the host-side "DMA wait" (there is no tag wait in
+     * this runtime). Charged to the command that is current. */
+    if (t_run.job_active && t_run.dma_all_depth++ == 0)
+        t_run.dma_all_t0 = c690_now_ns();
 }
 
 void c690_op21_dma_end(const struct spu_context* ctx)
 {
     (void)ctx;
-    if (!g_c690_op21 || !t_run.op21_active) return;
-    if (t_run.op21_dma_depth && --t_run.op21_dma_depth == 0) {
+    if (!g_c690_op21) return;
+    if (t_run.op21_active && t_run.op21_dma_depth &&
+        --t_run.op21_dma_depth == 0) {
         c690_thread_stats* const s = c690_slot();
         s->op21_dma_ns += c690_now_ns() - t_run.op21_dma_t0;
+    }
+    if (t_run.job_active && t_run.dma_all_depth &&
+        --t_run.dma_all_depth == 0) {
+        const uint64_t dt = c690_now_ns() - t_run.dma_all_t0;
+        c690_thread_stats* const s = c690_slot();
+        s->dma_ns += dt;
+        if (t_run.cmd_op >= 0) {
+            s->dma_n[ (unsigned)t_run.cmd_op ]++;
+            s->dma_ns_op[ (unsigned)t_run.cmd_op ] += dt;
+        }
     }
 }
 
@@ -760,6 +890,9 @@ void c690_stats_on_lookup(const struct spu_context* ctx, uint32_t lsa)
         t_run.job_active = 1;
         t_run.op21_active = 0;
         t_run.op21_dma_depth = 0;
+        t_run.op21_win = 0;
+        t_run.op21_win_fn = 0;
+        t_run.dma_all_depth = 0;
         t_run.job_start_ns = now;
         t_run.cmd_op = -1;
         t_run.cmd_start_ns = now;
@@ -892,6 +1025,36 @@ static void c690_aggregate(c690_thread_stats* dst, const c690_thread_stats* src,
     dst->op21_atomstat += src->op21_atomstat;
     dst->op21_dec += src->op21_dec;
     dst->op21_steps += src->op21_steps;
+    for (unsigned i = 0; i < C690_WIN_N; i++) {
+        dst->win_calls[i] += src->win_calls[i];
+        dst->win_ns[i] += src->win_ns[i];
+        dst->win_fn_other_ns[i] += src->win_fn_other_ns[i];
+        dst->win_fn_other_n[i] += src->win_fn_other_n[i];
+        for (unsigned j = 0; j < src->win_fn_n[i]; j++) {
+            const c690_win_fn_ent* e = &src->win_fn[i][j];
+            unsigned k = 0;
+            for (; k < dst->win_fn_n[i]; k++)
+                if (dst->win_fn[i][k].lsa == e->lsa) break;
+            if (k == dst->win_fn_n[i] && dst->win_fn_n[i] < C690_WIN_FN_MAX) {
+                c690_win_fn_ent* d = &dst->win_fn[i][dst->win_fn_n[i]++];
+                d->lsa = e->lsa;
+                d->ns = 0;
+                d->n = 0;
+            }
+            if (k < dst->win_fn_n[i]) {
+                dst->win_fn[i][k].ns += e->ns;
+                dst->win_fn[i][k].n += e->n;
+            } else {
+                dst->win_fn_other_ns[i] += e->ns;
+                dst->win_fn_other_n[i] += e->n;
+            }
+        }
+    }
+    dst->dma_ns += src->dma_ns;
+    for (unsigned i = 0; i < 256u; i++) {
+        dst->dma_n[i] += src->dma_n[i];
+        dst->dma_ns_op[i] += src->dma_ns_op[i];
+    }
     per_thread_jobs[idx] = src->jobs;
     per_thread_spu[idx] = src->spu_id;
 }
@@ -1062,6 +1225,10 @@ static const char* const s_op21_sub_name[C690_OP21_SUB_N] = {
     "0x13288->0xA3F8", "stop(0x13198/0x132D8)"
 };
 
+static const char* const s_win_name[C690_WIN_N] = {
+    "sel1 @0x13140", "sel7 @0x131A0", "other selector"
+};
+
 static void c690_op21_report(const c690_thread_stats* t)
 {
     if (!g_c690_op21 || !t->op21_calls) return;
@@ -1083,6 +1250,53 @@ static void c690_op21_report(const c690_thread_stats* t)
                 p / 10u, p % 10u,
                 (double)t->op21_sub_ns[i] / (double)t->op21_sub_n[i] / 1000.0);
     }
+    /* Selector windows: inclusive time plus the exclusive split by body. */
+    for (unsigned w = 0; w < C690_WIN_N; w++) {
+        if (!t->win_calls[w]) continue;
+        const unsigned p = c690_pct_tenths(t->win_ns[w], wall);
+        fprintf(stderr,
+                "[c690-op21]   win %-16s calls=%llu  %11llu us  %u.%u%% of "
+                "0x21  avg=%.2f us\n",
+                s_win_name[w], t->win_calls[w], t->win_ns[w] / 1000ull,
+                p / 10u, p % 10u,
+                (double)t->win_ns[w] / (double)t->win_calls[w] / 1000.0);
+        const unsigned nf = t->win_fn_n[w];
+        int order[C690_WIN_FN_MAX];
+        unsigned long long acc = t->win_fn_other_ns[w];
+        for (unsigned f = 0; f < nf; f++) {
+            order[f] = (int)f;
+            acc += t->win_fn[w][f].ns;
+        }
+        for (unsigned i = 1; i < nf; i++) {
+            const int v = order[i];
+            int j = (int)i - 1;
+            while (j >= 0 && t->win_fn[w][order[j]].ns < t->win_fn[w][v].ns) {
+                order[j + 1] = order[j];
+                j--;
+            }
+            order[j + 1] = v;
+        }
+        for (unsigned k = 0; k < nf; k++) {
+            const c690_win_fn_ent* e = &t->win_fn[w][order[k]];
+            const unsigned pf = c690_pct_tenths(e->ns, acc);
+            fprintf(stderr,
+                    "[c690-op21]     win %s 0x%05X   %11llu us  %u.%u%%"
+                    "  n=%llu  avg=%.2f us\n",
+                    s_win_name[w], e->lsa, e->ns / 1000ull,
+                    pf / 10u, pf % 10u, e->n,
+                    (double)e->ns / (double)e->n / 1000.0);
+        }
+        if (t->win_fn_other_n[w]) {
+            const unsigned pf = c690_pct_tenths(t->win_fn_other_ns[w], acc);
+            fprintf(stderr,
+                    "[c690-op21]     win %s other       %11llu us  %u.%u%%"
+                    "  n=%llu  avg=%.2f us\n",
+                    s_win_name[w], t->win_fn_other_ns[w] / 1000ull,
+                    pf / 10u, pf % 10u, t->win_fn_other_n[w],
+                    (double)t->win_fn_other_ns[w] /
+                        (double)t->win_fn_other_n[w] / 1000.0);
+        }
+    }
     fprintf(stderr,
             "[c690-op21] dma get=%llu (%.2f MiB) put=%llu (%.2f MiB) "
             "dma_us=%llu (%.1f%% of wall) slow=%llu (%.2f MiB) "
@@ -1093,6 +1307,19 @@ static void c690_op21_report(const c690_thread_stats* t)
             wall ? 100.0 * (double)t->op21_dma_ns / (double)wall : 0.0,
             t->op21_slow_n, (double)t->op21_slow_b / 1048576.0,
             t->op21_getllar, t->op21_putllc, t->op21_putllc_fail);
+    fprintf(stderr,
+            "[c690-op21] all-dma_us=%llu (%.1f%% of job wall) "
+            "copy_inclusive\n",
+            t->dma_ns / 1000ull,
+            t->dma_ns && t->job_ns_sum
+                ? 100.0 * (double)t->dma_ns / (double)t->job_ns_sum : 0.0);
+    for (unsigned op = 0; op < 256u; op++) {
+        if (!t->dma_n[op]) continue;
+        fprintf(stderr,
+                "[c690-op21]   dma op 0x%02X n=%llu %llu us avg=%.2f us\n",
+                op, t->dma_n[op], t->dma_ns_op[op] / 1000ull,
+                (double)t->dma_ns_op[op] / (double)t->dma_n[op] / 1000.0);
+    }
     fprintf(stderr,
             "[c690-op21] tagstat=%llu atomstat=%llu dec=%llu (per call: "
             "tag=%.3f atom=%.3f dec=%.3f)\n",
