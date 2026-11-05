@@ -31,6 +31,24 @@ int rsx_fp_txd_enabled(void)
     return e && *e && strcmp(e, "0") != 0;
 }
 
+/* Per-pixel LOD on an antialiased target (see the header). */
+int rsx_fp_aa_enabled(void)
+{
+#if defined(__GNUC__) && !defined(_WIN32)
+    if (ps3_live_ctl_get) return ps3_live_ctl_get(PS3_LIVE_FP_AA);
+#endif
+    const char* e = getenv("PS3RECOMP_FP_AA");
+    return e && *e && strcmp(e, "0") != 0;
+}
+
+static int s_aa_sx = 1, s_aa_sy = 1;
+static u32 s_aa_unnorm;
+void rsx_fp_set_aa_scale(int sx, int sy, u32 unnorm_mask)
+{
+    if (!rsx_fp_aa_enabled() || sx < 1 || sy < 1) { s_aa_sx = s_aa_sy = 1; s_aa_unnorm = 0; return; }
+    s_aa_sx = sx; s_aa_sy = sy; s_aa_unnorm = unnorm_mask;
+}
+
 /* ---- DWORD 0 (OPDEST) --------------------------------------------------- */
 #define FP_END              (1u << 0)
 #define FP_OUT_REG_SHIFT    1
@@ -908,7 +926,7 @@ static int rsx_fp_decompile_internal(
             dbg_done = 1;
         }
         /* Build the RHS expression for this opcode. */
-        char rhs[640];
+        char rhs[2048];
         int handled = 1;
         switch (opcode) {
         case OP_NOP: rhs[0] = '\0'; handled = 0; break;
@@ -990,7 +1008,33 @@ static int rsx_fp_decompile_internal(
                 /* Cubemap or volume: sample with all three coordinates. */
                 snprintf(rhs, sizeof(rhs),
                          "rsx_tex%u.Sample(rsx_samp[%u], (%s).xyz)", tex_unit, tex_unit, a);
-            else if (tex_sep_mask)
+            else if (s_aa_sx > 1 || s_aa_sy > 1) {
+                /* Implicit derivatives are per sample on a target held at its
+                 * 2x1 sample resolution; the guest hardware shades a pixel and
+                 * derives per pixel. SampleGrad with the grid-scaled partials
+                 * gives its LOD. UN units keep Sample so the later unnorm
+                 * rescale of their coordinate still finds the call. */
+                const int unnorm = (s_aa_unnorm >> tex_unit) & 1u;
+                if (unnorm) {
+                    if (tex_sep_mask)
+                        snprintf(rhs, sizeof(rhs),
+                                 "rsx_tex%u.Sample(rsx_samp[%u], (%s).xy)", tex_unit, tex_unit, a);
+                    else
+                        snprintf(rhs, sizeof(rhs),
+                                 "rsx_tex[%u].Sample(rsx_samp[%u], (%s).xy)", tex_unit, tex_unit, a);
+                } else {
+                    const char* tn = tex_sep_mask ? "rsx_tex%u.SampleGrad" : "rsx_tex[%u].SampleGrad";
+                    snprintf(rhs, sizeof(rhs),
+                             tn, tex_unit);
+                    /* Append args in one more step so the long coordinate text
+                     * is bounded by sizeof(rhs), not by a format string. */
+                    const int used = (int)strlen(rhs);
+                    snprintf(rhs + used, sizeof(rhs) - (size_t)used,
+                             "(rsx_samp[%u], (%s).xy, ddx((%s).xy) * float2(%d.0, %d.0),"
+                             " ddy((%s).xy) * float2(%d.0, %d.0))",
+                             tex_unit, a, a, s_aa_sx, s_aa_sy, a, s_aa_sx, s_aa_sy);
+                }
+            } else if (tex_sep_mask)
                 snprintf(rhs, sizeof(rhs),
                          "rsx_tex%u.Sample(rsx_samp[%u], (%s).xy)", tex_unit, tex_unit, a);
             else
@@ -1006,6 +1050,9 @@ static int rsx_fp_decompile_internal(
                          opcode, rsx_fp_opcode_name(opcode), w0, w1, w2, w3);
                 out_puts(&o, todo);
                 handled = 0;
+            } else if (s_aa_sx > 1 || s_aa_sy > 1) {
+                snprintf(rhs, sizeof(rhs), "(%s(%s)) * float4(%d.0, %d.0, 1.0, 1.0)",
+                         opcode == OP_DDX ? "ddx" : "ddy", a, s_aa_sx, s_aa_sy);
             } else {
                 snprintf(rhs, sizeof(rhs), "%s(%s)",
                          opcode == OP_DDX ? "ddx" : "ddy", a);

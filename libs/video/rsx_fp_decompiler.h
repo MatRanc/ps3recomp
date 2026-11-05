@@ -79,6 +79,18 @@ int rsx_fp_decompile(const u8* ucode, u32 max_bytes, u32 ctrl, char* out, u32 ou
  * fetches. Every one of the title's character shaders uses this pair. */
 int rsx_fp_txd_enabled(void);
 
+/* PS3RECOMP_FP_AA (live key PS3_LIVE_FP_AA, default off): the RSX runs the
+ * fragment program once per pixel and computes derivatives per pixel, while
+ * this renderer keeps a 2x1 antialiased target at its sample resolution and
+ * shades each sample. Scaling DDX/DDY and implicit 2D samples by the sample
+ * grid gives the per-pixel LOD the guest hardware would pick. */
+int rsx_fp_aa_enabled(void);
+/* Set the sample grid the next decompile should scale derivatives by, and
+ * the units whose coordinates are rescaled by a later post-pass (those keep
+ * their implicit Sample so that pass can still patch them). Reset with
+ * (1,1,0) after the decompile. */
+void rsx_fp_set_aa_scale(int sx, int sy, u32 unnorm_mask);
+
 /* Apply the NV4097 fixed-function alpha test to an already-decompiled pixel
  * shader. D3D12 has no fixed-function alpha test, so the comparison is
  * emitted immediately before the shader's final color return. `func` uses

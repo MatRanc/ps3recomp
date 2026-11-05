@@ -628,6 +628,36 @@ int main(void)
         unsetenv("PS3RECOMP_FP_TXD");
     }
 
+    /* PS3RECOMP_FP_AA: on a target held at its sample resolution the
+     * implicit fetch becomes SampleGrad with the grid-scaled partials, and
+     * an explicit DDX result is scaled the same way. With the key off the
+     * text is exactly the old one. */
+    {
+        u8 prog[16];
+        u32 nk = 0;
+        put_word(prog + 0, OPC(0x17) | OUTMASK_ALL | INSRC(4) | TEXU(3) | END); /* TEX r0, TC0 */
+        put_word(prog + 4, T_INPUT | SWZ_IDENT | EXEC_ALWAYS);
+        put_word(prog + 8, 0);
+        put_word(prog + 12, 0);
+        unsetenv("PS3RECOMP_FP_AA");
+        rsx_fp_set_aa_scale(2, 1, 0);
+        rsx_fp_decompile_buffered_ex(prog, sizeof prog, CTRL_32BIT, 0, hlsl, sizeof hlsl, &nk);
+        check("aa_off_keeps_sample", hlsl, "rsx_tex[3].Sample(rsx_samp[3]");
+        setenv("PS3RECOMP_FP_AA", "1", 1);
+        rsx_fp_set_aa_scale(2, 1, 0);
+        rsx_fp_decompile_buffered_ex(prog, sizeof prog, CTRL_32BIT, 0, hlsl, sizeof hlsl, &nk);
+        check("aa_tex_sample_grad", hlsl,
+              "rsx_tex[3].SampleGrad(rsx_samp[3], ((input.tc0).xyzw).xy,"
+              " ddx(((input.tc0).xyzw).xy) * float2(2.0, 1.0),"
+              " ddy(((input.tc0).xyzw).xy) * float2(2.0, 1.0))");
+        /* A UN unit keeps its implicit Sample for the later unnorm post-pass. */
+        rsx_fp_set_aa_scale(2, 1, 1u << 3);
+        rsx_fp_decompile_buffered_ex(prog, sizeof prog, CTRL_32BIT, 0, hlsl, sizeof hlsl, &nk);
+        check("aa_unnorm_keeps_sample", hlsl, "rsx_tex[3].Sample(rsx_samp[3]");
+        rsx_fp_set_aa_scale(1, 1, 0);
+        unsetenv("PS3RECOMP_FP_AA");
+    }
+
     printf("\n===========================================\n");
     printf("Results: %d passed, %d failed\n", g_pass, g_fail);
     return g_fail ? 1 : 0;

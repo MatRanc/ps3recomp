@@ -4333,6 +4333,34 @@ static void eng_decode_sampler(u32 filter, u32 wrap, u32 control0,
     if (out->max_lod < out->min_lod) out->max_lod = out->min_lod;
 }
 
+/* PS3RECOMP_ENG_SAMPLER_DUMP=<max>: the distinct sampler register sets a run
+ * samples, once each, with the fields the Vulkan sampler does not use (LOD
+ * bias, max anisotropy) so an offline capture can price them. Diagnostic
+ * only; every other path is unchanged. */
+static void eng_sampler_dump(u64 fp, u32 u, const rsx_dsp_texture* t, const rsx_be_sampler_desc* sd)
+{
+    static int max = -1, n;
+    static u64 seen[4096];
+    if (max < 0) { const char* e = getenv("PS3RECOMP_ENG_SAMPLER_DUMP"); max = e ? atoi(e) : 0; }
+    if (!max || n >= max) return;
+    const u64 key = ((u64)t->filter << 32) ^ ((u64)t->wrap << 8) ^ t->control0;
+    for (int i = 0; i < n; i++) if (seen[i] == key) return;
+    if (n < (int)(sizeof seen / sizeof seen[0])) seen[n] = key;
+    int bias = (int)(t->filter & 0x1FFFu);
+    if (bias & 0x1000) bias -= 0x2000;
+    static const u8 aniso[8] = { 1, 2, 4, 6, 8, 10, 12, 16 };
+    fprintf(stderr, "[sampdump] %d frame=%u fp=0x%016llX unit=%u"
+                    " filter=0x%08X minf=%u magf=%u ctrl0=0x%08X bias=%d/256 aniso=%u"
+                    " wrap=0x%08X lod=%.2f..%.2f mips=%u %ux%u fmt=0x%02X"
+                    " loc=%u off=0x%08X pitch=%u\n",
+            n, g.frames, (unsigned long long)fp, u, t->filter,
+            (t->filter >> 16) & 7u, (t->filter >> 24) & 7u, t->control0, bias,
+            aniso[(t->control0 >> 4) & 7u], t->wrap, sd->min_lod, sd->max_lod,
+            t->mipmaps, t->width, t->height, t->format,
+            t->location, t->offset, t->pitch);
+    n++;
+}
+
 /* Each fragment unit's decoded registers, decoded again only after a write
  * changed one of them (rsx_dispatch.tex_wgen): the pipeline key and the
  * binding read all 16 units on every draw. PS3RECOMP_ENG_TEXWGEN=0 (read at
@@ -4907,6 +4935,12 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
         key = eng_fnv1a(&unnorm_mask, sizeof unnorm_mask, key);
         if (unnorm_mask) key = eng_fnv1a(unnorm_dim, sizeof unnorm_dim, key);
         if (wpos_scaled) key = eng_fnv1a(wpos_grid, sizeof wpos_grid, key);
+        /* PS3RECOMP_FP_AA bakes the sample grid into the generated shader. */
+        if (rsx_fp_aa_enabled()) {
+            static const u32 aa_tag = 0x41414647u;   /* "GFAA" */
+            key = eng_fnv1a(&aa_tag, sizeof aa_tag, key);
+            if (wpos_scaled) key = eng_fnv1a(wpos_grid, sizeof wpos_grid, key);
+        }
         /* PS3RECOMP_FP_TXD changes the generated program (a TXD gamma program
          * that used to be rejected now translates), so a live flip must not
          * reuse a pipeline built under the other setting. */
@@ -4962,9 +4996,11 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
                 fprintf(stderr, "[rsx engine] user clip planes 0x%06X: vertex program text not in the"
                                 " decompiler's form, draw skipped\n", rsx_dsp_reg(&g.rsx, 0x1478u));
         }
+        rsx_fp_set_aa_scale((int)wpos_grid[0], (int)wpos_grid[1], unnorm_mask);
         fi = rsx_fp_decompile_buffered_shadow_color_expand_vol_ex(fp_uc, fp_size, fp_ctrl, cube_mask, vol_mask,
                 shadow_mask ? shadow : NULL, gamma_masks, expand_units ? expand_masks : NULL,
                 s_ps_hlsl, sizeof s_ps_hlsl, &nconst);
+        rsx_fp_set_aa_scale(1, 1, 0);
         if (fi > 0 && nconst != g.fp_constants.count) fi = -1;
         if (fi > 0 && wpos_scaled &&
             rsx_fp_apply_wpos_grid(s_ps_hlsl, sizeof s_ps_hlsl, wpos_grid[0], wpos_grid[1]) < 0)
@@ -6002,6 +6038,7 @@ static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
         s_tex_c_full++;
         eng_decode_sampler(t.filter, t.wrap, t.control0, &samplers[u]);
         samplers[u].border = eng_border_class(t.format, t.border_color);
+        eng_sampler_dump(s_miss_fp_hash, u, &t, &samplers[u]);
 
         int sampled = -1, own = 0, surface_at = -1;
         /* One hashed test answers "is there any target at this address". A

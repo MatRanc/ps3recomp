@@ -96,6 +96,7 @@ enum {
     PS3_LIVE_ENG_TARGET_BLOOM,          /* PS3RECOMP_ENG_TARGET_BLOOM: skip target-table scans for non-target addresses */
     PS3_LIVE_C690_HOLES_NATIVE,         /* PS3RECOMP_C690_HOLES_NATIVE: fused 0x25/0x26 native sample-grid union */
     PS3_LIVE_FP_TXD,                    /* PS3RECOMP_FP_TXD: explicit-derivative fetches (TXD) and DDX/DDY */
+    PS3_LIVE_FP_AA,                     /* PS3RECOMP_FP_AA: scale derivative LOD by the 2x1 AA sample grid */
     PS3_LIVE_COUNT
 };
 
