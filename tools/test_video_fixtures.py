@@ -91,7 +91,9 @@ def run(name, extra, tmp):
            '-ffunction-sections', '-fdata-sections',
            '-I' + str(root / 'include'), '-I' + str(root / 'libs/video'),
            '-I' + str(root / 'libs/video/tests'), '-I' + str(root / 'runtime/platform'),
-           str(root / 'libs/video/tests' / (name + '.c')), *[str(root / e) for e in extra],
+           str(root / 'libs/video/tests' / (name + '.c')),
+           str(root / 'libs/video/tests' / 'fixture_runtime_stubs.c'),
+           *[str(root / e) for e in extra],
            *link, '-pthread', '-o', str(exe)]
     b = subprocess.run(cmd, capture_output=True, text=True)
     if b.returncode:
