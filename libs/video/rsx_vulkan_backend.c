@@ -4245,11 +4245,13 @@ static void vk_pa_run(void* job, void* user)
     }
 
     vk_eng_pipe* P = &s_epipe[j->slot];
-    const int ok = vk_eng_pipe_modules(P, j->vs, j->ps, j->key,
+    /* vk_eng_pipe_modules returns 0 on success and -1 on failure; the state
+     * is 2 for ready modules and 3 for a failed translation. */
+    const int rc = vk_eng_pipe_modules(P, j->vs, j->ps, j->key,
                                        s_pa.spv, VK_SPV_WORDS,
                                        s_pa.log, VK_PA_LOG);
     pthread_mutex_lock(&s_pa.mu);
-    __atomic_store_n(&P->async_state, ok ? 2 : 3, __ATOMIC_RELEASE);
+    __atomic_store_n(&P->async_state, rc == 0 ? 2 : 3, __ATOMIC_RELEASE);
     pthread_cond_broadcast(&s_pa.cv);
     pthread_mutex_unlock(&s_pa.mu);
     free(j->vs);
@@ -4496,6 +4498,9 @@ static int vk_eng_translate_scratch(u64 guest_key, const char* hlsl, int stage,
                 (double)(t_translated - t_start) / 1000.0,
                 (double)(rsx_wprof_now() - t_translated) / 1000.0, src);
     }
+    if (vr != VK_SUCCESS)
+        VK_LOG("engine: %s vkCreateShaderModule failed (VkResult %d)\n",
+               stage == RSX_SHADER_STAGE_VERTEX ? "vertex" : "fragment", (int)vr);
     return vr == VK_SUCCESS ? 0 : -1;
 }
 
