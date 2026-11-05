@@ -512,6 +512,7 @@ if(PS3RECOMP_BUILD_TESTS)
     if(NOT WIN32)
     add_executable(test_color_readback_guest
         libs/video/tests/test_color_readback_guest.c
+        libs/video/rsx_draw_queue.c
         libs/video/rsx_dispatch.c
         libs/video/rsx_vertex_compact.c
         libs/video/rsx_texture_layout.c

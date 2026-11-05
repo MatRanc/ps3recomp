@@ -395,6 +395,20 @@ typedef struct rsx_draw_backend {
      * cannot submit asynchronously; the engine then leaves the batch open. */
     void (*submit_async)(void* user);
 
+    /* Optional per-worker Vulkan recording (PS3RECOMP_WALKER_MT). mt_init
+     * creates `workers` private command/descriptor contexts; mt_chunk_begin
+     * starts a chunk on one, the engine then calls every bind and draw with
+     * the context pointer as `user`, and mt_chunk_submit ends and submits it.
+     * The engine calls mt_chunk_submit in chunk order (the same turn the
+     * serialised path uses), so command buffers reach the queue in guest
+     * order. NULL makes the engine keep the serialised turn-per-packet path
+     * (the null replay backend). */
+    int  (*mt_init)(void* user, int workers);
+    void (*mt_shutdown)(void* user);
+    int  (*mt_chunk_begin)(void* user, void* ctx);
+    int  (*mt_chunk_submit)(void* user, void* ctx);
+    void* (*mt_ctx)(void* user, int worker);
+
 } rsx_draw_backend;
 
 /* ---- the engine --------------------------------------------------------- */

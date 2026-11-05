@@ -33,12 +33,34 @@
 #include <string.h>
 #include <stdatomic.h>
 #include <sched.h>
+#include <pthread.h>
 #include <time.h>
 #include "ps3emu/log_first.h"
 #include "../../runtime/memory/vm.h"   /* vm_commit: the capture images pages */
 
 /* Draw-record worker barriers (defined with the packet code below). */
 static void eng_mt_sync(void);
+
+/* M4 texture resolver: workerable draws enqueue plain guest textures and the
+ * packet carries a token; the worker waits for the handle at record time. */
+#define ENG_TEX_TOKEN 0x80000000u
+static u32 eng_texture_slot_or_async(u32 location, u32 offset, u32 fmt, u32 w,
+                                     u32 h, u32 levels, u32 pitch, int cube,
+                                     u32 remap, u32 depth);
+static void eng_tex_frame_reset(void);
+static void eng_tex_group_close(void);
+static int eng_tex_resolver_start(void);
+static void eng_tex_resolver_stop(void);
+static int s_tex_async_draw;
+/* Set on the M4 resolver thread while it runs a texture job: it already holds
+ * the ordered turn, so it must not drain (or wait on) itself. */
+static __thread int t_is_tex_resolver;
+static __thread int t_mt_no_sync;
+/* While the resolver runs a job, its guest reads come from the byte snapshot
+ * the state thread took at the bind, so later FIFO methods cannot change them
+ * underneath it. */
+static __thread const u8* t_tex_snap;
+static __thread u32 t_tex_snap_loc, t_tex_snap_off, t_tex_snap_len;
 
 /* Guest memory and the RSX offset resolvers, declared the way every backend
  * that reads guest data declares them (rsx_vertex_fetch.h). */
@@ -1257,6 +1279,10 @@ static const u8* eng_guest_ptr(void* user, u32 location, u32 offset,
                                u32 min_bytes)
 {
     (void)user;
+    if (t_tex_snap && location == t_tex_snap_loc &&
+        offset >= t_tex_snap_off && offset - t_tex_snap_off <= t_tex_snap_len &&
+        min_bytes <= t_tex_snap_len - (offset - t_tex_snap_off))
+        return t_tex_snap + (offset - t_tex_snap_off);
     const u8* p = eng_guest_ptr_raw(location, offset, min_bytes);
     if (p && s_wcb_live) rsx_wcb_access(p, min_bytes);
     return p;
@@ -3282,6 +3308,14 @@ static u32 eng_texture_slot_work(u32 location, u32 offset, u32 fmt, u32 w, u32 h
     if (e.handle || !evicted) g.textures[index] = e;
     if (e.handle) s_tslot_last = index;
     return e.handle;
+}
+
+/* The synchronous texture paths mutate the one texture cache, and the M4
+ * resolver may still be running jobs that do too: let it finish first. Called
+ * only at the target/depth/cube branches, not on every plain bind. */
+static void eng_tex_sync_path(void)
+{
+    if (!t_is_tex_resolver) eng_mt_sync();
 }
 
 static u32 eng_texture_slot(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
@@ -5732,8 +5766,11 @@ static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
             ((s_tex_wgen_on && mm->wgen == g.rsx.tex_wgen[u]) || !memcmp(&mm->t, &t, sizeof t))) {
             mm->wgen = g.rsx.tex_wgen[u];
             samplers[u] = mm->samp;
-            /* Still the most recently used, as the probe would have made it. */
-            g.textures[mm->entry].last_use_serial = ++g.texture_use_serial;
+            /* Still the most recently used, as the probe would have made it.
+             * An async token's cache entry lives on the resolver thread; the
+             * resolver already touched it when it resolved the job. */
+            if (!(mm->handle & ENG_TEX_TOKEN))
+                g.textures[mm->entry].last_use_serial = ++g.texture_use_serial;
             textures[u] = mm->handle;
             continue;
         }
@@ -5841,6 +5878,7 @@ static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
                 s_wcb_trigger = saved;
             }
             if (copied) {
+                eng_tex_sync_path();
                 static int logs;
                 if (s_wcb.attr_on && logs++ < 32) {
                     const eng_zdepth* z = &g.zdepths[zsrc];
@@ -5900,6 +5938,7 @@ static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
             s_wcb_trigger = saved;
         }
         if (reinterpreted) {
+            eng_tex_sync_path();
             static int logs;
             if (s_wcb.attr_on && logs++ < 32) {
                 const eng_surface* s = &g.surfaces[sampled];
@@ -5941,13 +5980,18 @@ static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
                 }
             if (textures[u]) continue;
         }
-        textures[u] = eng_texture_slot(t.location, t.offset, t.format,
+        textures[u] = s_tex_async_draw
+            ? eng_texture_slot_or_async(t.location, t.offset, t.format,
+                                       t.width, t.height, t.mipmaps, t.pitch,
+                                       (int)t.cubemap, t.remap & 0xFFFFu,
+                                       (t.dimension == 3 && !t.cubemap) ? t.depth : 1u)
+            : eng_texture_slot(t.location, t.offset, t.format,
                                        t.width, t.height, t.mipmaps, t.pitch,
                                        (int)t.cubemap, t.remap & 0xFFFFu,
                                        (t.dimension == 3 && !t.cubemap) ? t.depth : 1u);
         if (!textures[u]) eng_tex_miss_note_unit(u, &t);
-        if (s_texmemo_on && textures[u] && s_tslot_last != ENG_INVALID &&
-            !eng_target_at(t.location, t.offset)) {
+        if (s_texmemo_on && textures[u] && !(textures[u] & ENG_TEX_TOKEN) &&
+            s_tslot_last != ENG_INVALID && !eng_target_at(t.location, t.offset)) {
             mm->t = t; mm->samp = samplers[u];
             mm->handle = textures[u]; mm->frame = g.frames; mm->gen = s_tex_gen;
             mm->entry = s_tslot_last; mm->wgen = g.rsx.tex_wgen[u];
@@ -5973,6 +6017,7 @@ static u32 sink_bind_vertex_textures(
         eng_decode_sampler(vt.filter, vt.wrap, vt.control0, &samplers[u]);
         samplers[u].border = eng_border_class(vt.format, vt.border_color);
         /* A vertex unit has no crossbar, so its remap is the identity. */
+        eng_tex_sync_path();
         textures[u] = eng_texture_slot(vt.location, vt.offset, vt.format,
                                        vt.width, vt.height, vt.mipmaps,
                                        vt.pitch, 0, 0xAAE4u, 1u);
@@ -6602,6 +6647,7 @@ typedef struct {
     u32 magic;
     u32 total_bytes;
     u64 seq;
+    u32 tex_epoch;              /* M4: texture groups resolved before this packet */
 
     u32 topology;
     u32 indexed;
@@ -6700,6 +6746,8 @@ typedef struct {
  * at a time while the expensive preparation runs on N threads. */
 typedef struct {
     int id;
+    void* be_user;          /* this worker's recording context (NULL: global) */
+    int rec;                /* backend records a whole chunk on this worker */
     rsx_vertex_remap remap;
     rsx_vertex_ref* refs; u32 refs_cap, n_unique, n_source;
     u32* remap_buf; u32 remap_cap;
@@ -6712,6 +6760,7 @@ static struct {
     int inited;
     int on;
     int workers;
+    int rec;                /* backend records whole chunks on the workers */
     rsx_record_queue* q[ENG_MT_MAX_WORKERS];
     eng_worker w[ENG_MT_MAX_WORKERS];
     eng_worker inline_w;
@@ -6723,13 +6772,15 @@ static struct {
     u32 chunk_cap, chunk_used, chunk_pkts;
     u64 chunk_id, seq, pushed_seq;
     _Atomic u64 next_commit;
+    _Atomic u32 tex_epoch;      /* texture groups allocated this frame */
+    _Atomic u32 tex_taken;      /* texture groups the resolver has taken */
     u64 enqueued, inline_fallbacks, syncs, snapshots, snapshot_fail, chunks;
 } s_mt;
 
 static void eng_mt_worker_exec(void* ctx, const void* rec, u32 size);
 static void eng_mt_sync(void);
 static int  eng_mt_prepare_one(const eng_draw_pkt* p, eng_worker* w, eng_prep* out);
-static void eng_mt_commit_packet(const eng_draw_pkt* p, const eng_prep* r);
+static void eng_mt_commit_packet(const eng_draw_pkt* p, const eng_prep* r, void* u);
 static void eng_mt_run_packet_inline(const eng_draw_pkt* p);
 
 static int eng_mt_env_int(const char* name, int def)
@@ -6811,10 +6862,13 @@ static void eng_mt_worker_ready(eng_worker* w, int id)
 
 static void eng_mt_reset(void)
 {
+    /* Joining the record workers first guarantees no worker can still be
+     * waiting on a texture token when the resolver's job table goes away. */
     for (int i = 0; i < ENG_MT_MAX_WORKERS; i++) {
         if (s_mt.q[i]) rsx_record_queue_destroy(s_mt.q[i]);
         eng_worker_free(&s_mt.w[i]);
     }
+    eng_tex_resolver_stop();
     eng_worker_free(&s_mt.inline_w);
     free(s_mt.chunk);
     free(s_mt.scratch);
@@ -6853,6 +6907,7 @@ static int eng_mt_ensure(void)
     s_mt.chunk_used = 8;
     s_mt.next_commit = 1;
     eng_mt_worker_ready(&s_mt.inline_w, -1);
+    s_mt.inline_w.be_user = g.be->user;
     if (s_mt.workers > 0) {
         const int mb = eng_mt_env_int("PS3RECOMP_WALKER_MT_QUEUE_MB", 16);
         const u32 qcap = (u32)(mb > 0 ? mb : 16) * 1024u * 1024u;
@@ -6873,6 +6928,24 @@ static int eng_mt_ensure(void)
         else
             fprintf(stderr, "[walker-mt] %d record workers up (queue %d MB, chunk %u KB)\n",
                     up, mb > 0 ? mb : 16, s_mt.chunk_cap / 1024u);
+        /* A backend with per-worker recording contexts records a whole chunk
+         * on the worker and only submits in turn order. Without one (the null
+         * replay backend) every packet still takes its turn per packet. */
+        s_mt.rec = 0;
+        if (up && g.be->mt_init && g.be->mt_init(g.be->user, up) && g.be->mt_chunk_begin) {
+            for (int i = 0; i < up; i++) {
+                void* c = g.be->mt_ctx ? g.be->mt_ctx(g.be->user, i) : NULL;
+                s_mt.w[i].be_user = c;
+                s_mt.w[i].rec = c != NULL;
+                if (c) s_mt.rec = 1;
+            }
+            if (s_mt.rec)
+                fprintf(stderr, "[walker-mt] per-worker recording active\n");
+        }
+        for (int i = 0; i < up; i++)
+            if (!s_mt.w[i].be_user) s_mt.w[i].be_user = g.be->user;
+        s_mt.inline_w.be_user = g.be->user;
+        eng_tex_resolver_start();
     }
     return 1;
 }
@@ -6982,6 +7055,8 @@ static void eng_mt_chunk_close(void)
 static void eng_mt_sync(void)
 {
     if (!s_mt.on) return;
+    if (t_mt_no_sync) return;      /* the resolver already holds its turn */
+    eng_tex_group_close();
     eng_mt_chunk_close();
     if (!s_mt.workers) return;
     eng_mt_wait_upto(s_mt.seq);
@@ -6991,6 +7066,259 @@ static void eng_mt_sync(void)
 void rsx_draw_engine_mt_sync(void)
 {
     eng_mt_sync();
+}
+
+/* ---- M4: plain guest texture resolver ------------------------------------
+ *
+ * A workerable draw does not resolve its plain guest textures on the state
+ * thread. The state thread enqueues a job, closes the open chunk and takes a
+ * turn token (one per packet position, shared by every unit resolved there),
+ * and the packet carries ENG_TEX_TOKEN | job index. The rsx-tex thread waits
+ * for that turn, runs the existing engine texture path (the texture cache has
+ * one writer again), publishes each handle and then takes the turn. Workers
+ * after that position cannot record until it is taken, so the guest order --
+ * and the null replay's digest order -- is unchanged. Target, depth and cube
+ * units stay on the walker, as the design requires. */
+typedef struct {
+    u32 location, offset, fmt, w, h, levels, pitch, remap, depth;
+    int cube;
+    u64 seq;
+    u32 epoch;
+    _Atomic int state;          /* 0 pending, 1 published */
+    u32 handle;
+    u8* snap;                   /* guest bytes as of the bind (owned) */
+    u32 snap_len;
+} eng_tex_job;
+
+#define ENG_TEX_JOBS 65536u
+static struct {
+    eng_tex_job* jobs;
+    u32 n;                      /* allocated this frame (tokens are indices) */
+    u32 head, tail;             /* SPSC queue indices */
+    pthread_mutex_t mu;
+    pthread_cond_t qcv;         /* a job is queued */
+    pthread_cond_t gcv;         /* a group closed */
+    pthread_t th;
+    int up, stop;
+    _Atomic int group_open;
+    _Atomic u64 closed_seq;
+    u64 group_seq;
+    u32 group_epoch;
+    u64 enqueued, done, full;
+} s_texr;
+
+static int eng_tex_resolver_on(void)
+{
+    if (!s_mt.on || s_mt.workers <= 0) return 0;
+    const char* e = getenv("PS3RECOMP_WALKER_MT_TEX_RESOLVE");
+    return !e || !*e || strcmp(e, "0") != 0;
+}
+
+static void eng_tex_group_close(void)
+{
+    if (!s_mt.on || !s_texr.up) return;
+    if (atomic_load_explicit(&s_texr.group_open, memory_order_acquire)) {
+        atomic_store_explicit(&s_texr.closed_seq, s_texr.group_seq, memory_order_release);
+        atomic_store_explicit(&s_texr.group_open, 0, memory_order_release);
+        pthread_mutex_lock(&s_texr.mu);
+        pthread_cond_broadcast(&s_texr.gcv);
+        pthread_mutex_unlock(&s_texr.mu);
+    }
+}
+
+static u32 eng_tex_enqueue(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
+                           u32 levels, u32 pitch, int cube, u32 remap, u32 depth)
+{
+    if (!s_texr.up || s_texr.n >= ENG_TEX_JOBS) {
+        __atomic_fetch_add(&s_texr.full, 1, __ATOMIC_RELAXED);
+        eng_tex_sync_path();
+        return eng_texture_slot(location, offset, fmt, w, h, levels, pitch,
+                                cube, remap, depth);
+    }
+    int group_first = 0;
+    if (!atomic_load_explicit(&s_texr.group_open, memory_order_acquire)) {
+        /* No chunk close: the worker splits its command buffer at the group's
+         * turn, so a chunk can carry packets on both sides of it. */
+        s_texr.group_seq = ++s_mt.seq;
+        s_texr.group_epoch = atomic_fetch_add_explicit(&s_mt.tex_epoch, 1,
+                                                       memory_order_acq_rel) + 1;
+        atomic_store_explicit(&s_texr.group_open, 1, memory_order_release);
+        group_first = 1;
+    }
+    /* Take the bytes now, at the stream position that named them. */
+    static int snap_on = -1;
+    if (snap_on < 0) { const char* e = getenv("PS3RECOMP_WALKER_MT_TEX_SNAP");
+                      snap_on = !e || !*e || strcmp(e, "0") != 0; }
+    const u32 span = (depth > 1 && !cube)
+        ? eng_texture_span_3d(fmt, w, h, depth, levels, pitch)
+        : eng_texture_span(fmt, w, h, levels, pitch, cube);
+    const u8* src = (snap_on && span) ? eng_guest_ptr(NULL, location, offset, span) : NULL;
+    u8* snap = NULL;
+    if (src && span) {
+        snap = (u8*)malloc(span);
+        if (snap) memcpy(snap, src, span);
+    }
+    pthread_mutex_lock(&s_texr.mu);
+    const u32 idx = s_texr.n++;
+    eng_tex_job* j = &s_texr.jobs[idx];
+    memset(j, 0, sizeof *j);
+    j->snap = snap; j->snap_len = snap ? span : 0;
+    j->location = location; j->offset = offset; j->fmt = fmt;
+    j->w = w; j->h = h; j->levels = levels; j->pitch = pitch;
+    j->remap = remap; j->depth = depth; j->cube = cube;
+    j->seq = s_texr.group_seq;
+    j->epoch = s_texr.group_epoch;
+    atomic_store_explicit(&j->state, 0, memory_order_relaxed);
+    s_texr.tail++;
+    s_texr.enqueued++;
+    if (group_first) pthread_cond_signal(&s_texr.qcv);
+    pthread_mutex_unlock(&s_texr.mu);
+    return ENG_TEX_TOKEN | idx;
+}
+
+static void* eng_tex_resolver_main(void* arg)
+{
+    (void)arg;
+    t_is_tex_resolver = 1;
+    for (;;) {
+        pthread_mutex_lock(&s_texr.mu);
+        while (s_texr.head == s_texr.tail && !s_texr.stop)
+            pthread_cond_wait(&s_texr.qcv, &s_texr.mu);
+        if (s_texr.stop && s_texr.head == s_texr.tail) {
+            pthread_mutex_unlock(&s_texr.mu);
+            break;
+        }
+        const u64 seq = s_texr.jobs[s_texr.head].seq;
+        pthread_mutex_unlock(&s_texr.mu);
+
+        /* Wait for the group to close, then for the turn that orders it
+         * between the chunks before and after. */
+        pthread_mutex_lock(&s_texr.mu);
+        while (seq > atomic_load_explicit(&s_texr.closed_seq, memory_order_acquire) &&
+               !s_texr.stop)
+            pthread_cond_wait(&s_texr.gcv, &s_texr.mu);
+        pthread_mutex_unlock(&s_texr.mu);
+        if (s_texr.stop) continue;
+        eng_mt_wait_turn(seq);
+
+        /* Every job of the group is already queued: the group is closed. */
+        t_mt_no_sync = 1;
+        for (;;) {
+            pthread_mutex_lock(&s_texr.mu);
+            if (s_texr.head == s_texr.tail ||
+                s_texr.jobs[s_texr.head].seq != seq) {
+                pthread_mutex_unlock(&s_texr.mu);
+                break;
+            }
+            const u32 idx = s_texr.head++;
+            eng_tex_job* j = &s_texr.jobs[idx];
+            pthread_mutex_unlock(&s_texr.mu);
+            if (j->snap) {
+                t_tex_snap = j->snap; t_tex_snap_loc = j->location;
+                t_tex_snap_off = j->offset; t_tex_snap_len = j->snap_len;
+            }
+            const u32 h = eng_texture_slot(j->location, j->offset, j->fmt,
+                                           j->w, j->h, j->levels, j->pitch,
+                                           j->cube, j->remap, j->depth);
+            t_tex_snap = NULL;
+            free(j->snap); j->snap = NULL;
+            j->handle = h;
+            atomic_store_explicit(&j->state, 1, memory_order_release);
+            s_texr.done++;
+        }
+        t_mt_no_sync = 0;
+        atomic_store_explicit(&s_mt.tex_taken, s_texr.group_epoch,
+                              memory_order_release);
+        eng_mt_take_turn(seq);
+    }
+    return NULL;
+}
+
+static int eng_tex_resolver_start(void)
+{
+    if (s_texr.up) return 1;
+    if (!eng_tex_resolver_on()) return 0;
+    memset(&s_texr, 0, sizeof s_texr);
+    s_texr.jobs = (eng_tex_job*)calloc(ENG_TEX_JOBS, sizeof(eng_tex_job));
+    if (!s_texr.jobs) return 0;
+    pthread_mutex_init(&s_texr.mu, NULL);
+    pthread_cond_init(&s_texr.qcv, NULL);
+    pthread_cond_init(&s_texr.gcv, NULL);
+    if (pthread_create(&s_texr.th, NULL, eng_tex_resolver_main, NULL) != 0) {
+        free(s_texr.jobs); s_texr.jobs = NULL;
+        return 0;
+    }
+    s_texr.up = 1;
+    atomic_store_explicit(&s_texr.closed_seq, 0, memory_order_relaxed);
+    fprintf(stderr, "[walker-mt] rsx-tex resolver up (plain guest textures)\n");
+    return 1;
+}
+
+static void eng_tex_resolver_stop(void)
+{
+    if (!s_texr.up) return;
+    pthread_mutex_lock(&s_texr.mu);
+    s_texr.stop = 1;
+    pthread_cond_broadcast(&s_texr.qcv);
+    pthread_cond_broadcast(&s_texr.gcv);
+    pthread_mutex_unlock(&s_texr.mu);
+    pthread_join(s_texr.th, NULL);
+    for (u32 i = 0; i < s_texr.n; i++) free(s_texr.jobs[i].snap);
+    pthread_mutex_destroy(&s_texr.mu);
+    pthread_cond_destroy(&s_texr.qcv);
+    pthread_cond_destroy(&s_texr.gcv);
+    free(s_texr.jobs); s_texr.jobs = NULL;
+    memset(&s_texr, 0, sizeof s_texr);
+}
+
+static void eng_tex_frame_reset(void)
+{
+    if (!s_texr.up) return;
+    /* Called after eng_mt_sync at a present: every job of the frame has been
+     * consumed and every packet that named a token has been submitted. */
+    pthread_mutex_lock(&s_texr.mu);
+    for (u32 i = 0; i < s_texr.n; i++) {
+        free(s_texr.jobs[i].snap);
+        s_texr.jobs[i].snap = NULL;
+    }
+    s_texr.n = 0;
+    s_texr.head = s_texr.tail = 0;
+    pthread_mutex_unlock(&s_texr.mu);
+    atomic_store_explicit(&s_texr.closed_seq, s_mt.seq, memory_order_release);
+    atomic_store_explicit(&s_texr.group_open, 0, memory_order_release);
+    s_texr.group_seq = s_mt.seq;
+}
+
+static u32 eng_tex_token_wait(u32 token)
+{
+    if (!(token & ENG_TEX_TOKEN)) return token;
+    const u32 idx = token & ~ENG_TEX_TOKEN;
+    if (!s_texr.jobs || idx >= s_texr.n) return 0;
+    eng_tex_job* j = &s_texr.jobs[idx];
+    int spins = 0;
+    while (atomic_load_explicit(&j->state, memory_order_acquire) == 0) {
+        if (++spins < 20000) {
+#if defined(__x86_64__) || defined(__i386__)
+            __builtin_ia32_pause();
+#endif
+            continue;
+        }
+        spins = 0;
+        sched_yield();
+    }
+    return j->handle;
+}
+
+static u32 eng_texture_slot_or_async(u32 location, u32 offset, u32 fmt, u32 w,
+                                     u32 h, u32 levels, u32 pitch, int cube,
+                                     u32 remap, u32 depth)
+{
+    if (s_tex_async_draw && s_texr.up)
+        return eng_tex_enqueue(location, offset, fmt, w, h, levels, pitch,
+                               cube, remap, depth);
+    eng_tex_sync_path();
+    return eng_texture_slot(location, offset, fmt, w, h, levels, pitch,
+                            cube, remap, depth);
 }
 
 /* Snapshot every stable source span into the worker arena and repoint the
@@ -7128,7 +7456,7 @@ static void eng_mt_run_packet_inline(const eng_draw_pkt* p)
     eng_prep pr;
     const int ok = eng_mt_prepare_one(p, &s_mt.inline_w, &pr);
     eng_mt_wait_turn(p->seq);
-    if (ok && pr.ok) eng_mt_commit_packet(p, &pr);
+    if (ok && pr.ok) eng_mt_commit_packet(p, &pr, g.be->user);
     eng_mt_take_turn(p->seq);
     s_mt.inline_fallbacks++;
 }
@@ -7205,30 +7533,35 @@ static void eng_pkt_track(const eng_draw_pkt* p)
     }
 }
 
-static void eng_mt_commit_packet(const eng_draw_pkt* p, const eng_prep* r)
+static void eng_mt_commit_packet(const eng_draw_pkt* p, const eng_prep* r, void* u)
 {
     eng_pkt_binds(p);
-    g.be->bind_targets(g.be->user, p->targets, p->n_targets, p->depth_handle);
-    g.be->bind_pipeline(g.be->user, p->pipeline);
+    g.be->bind_targets(u, p->targets, p->n_targets, p->depth_handle);
+    g.be->bind_pipeline(u, p->pipeline);
     const u8* base = (const u8*)p;
     if (p->vpc_range)
-        g.be->bind_vs_constants_range(g.be->user, base + p->off_rows, p->vpc_lo,
+        g.be->bind_vs_constants_range(u, base + p->off_rows, p->vpc_lo,
                                       p->vpc_n, base + p->off_tail, p->tail_bytes,
                                       p->vpc_total);
     else
-        g.be->bind_vs_constants(g.be->user, base + p->off_vp_full,
+        g.be->bind_vs_constants(u, base + p->off_vp_full,
                                 p->vp_full_bytes);
-    g.be->bind_ps_constants(g.be->user, base + p->off_fp, p->fp_bytes);
-    g.be->bind_textures(g.be->user, p->textures, p->samplers, p->tex_mask);
-    g.be->bind_vertex_textures(g.be->user, p->vtextures, p->vsamplers,
+    g.be->bind_ps_constants(u, base + p->off_fp, p->fp_bytes);
+    u32 tex[RSX_BE_MAX_TEXTURES];
+    const u32* tp = p->textures;
+    for (u32 i = 0; i < RSX_BE_MAX_TEXTURES; i++)
+        tex[i] = (p->tex_mask >> i) & 1u ? eng_tex_token_wait(p->textures[i]) : 0u;
+    tp = tex;
+    g.be->bind_textures(u, tp, p->samplers, p->tex_mask);
+    g.be->bind_vertex_textures(u, p->vtextures, p->vsamplers,
                                p->vtex_mask);
-    g.be->set_viewport(g.be->user, 0.0f, 0.0f, p->W, p->H);
-    g.be->set_scissor(g.be->user, p->sc[0], p->sc[1], p->sc[2], p->sc[3]);
-    g.be->set_stencil_ref(g.be->user, p->stencil);
+    g.be->set_viewport(u, 0.0f, 0.0f, p->W, p->H);
+    g.be->set_scissor(u, p->sc[0], p->sc[1], p->sc[2], p->sc[3]);
+    g.be->set_stencil_ref(u, p->stencil);
     if (g.be->set_depth_bounds && p->has_bounds)
-        g.be->set_depth_bounds(g.be->user, p->bounds[0], p->bounds[1]);
+        g.be->set_depth_bounds(u, p->bounds[0], p->bounds[1]);
     if (g.be->set_depth_bias && p->has_bias)
-        g.be->set_depth_bias(g.be->user, p->bias[0], p->bias[1], p->bias_bits);
+        g.be->set_depth_bias(u, p->bias[0], p->bias[1], p->bias_bits);
 
     const u32* idx = r->indexed ? r->idx : NULL;
     if (r->deferred) {
@@ -7236,11 +7569,11 @@ static void eng_mt_commit_packet(const eng_draw_pkt* p, const eng_prep* r)
         ctx.gpu = r->gpu;
         ctx.verts = r->verts;
         ctx.bytes = (u32)((u64)r->uploaded * p->stride);
-        g.be->draw_fill(g.be->user, (rsx_topology)r->topology, eng_mt_copy_fill,
+        g.be->draw_fill(u, (rsx_topology)r->topology, eng_mt_copy_fill,
                         &ctx, r->uploaded, p->stride, idx,
                         r->indexed ? r->n_draw : 0);
     } else {
-        g.be->draw(g.be->user, (rsx_topology)r->topology, r->verts, r->uploaded,
+        g.be->draw(u, (rsx_topology)r->topology, r->verts, r->uploaded,
                    p->stride, idx, r->indexed ? r->n_draw : 0);
     }
 }
@@ -7268,11 +7601,70 @@ static void eng_mt_worker_exec(void* ctx, const void* rec, u32 size)
         qq += p->total_bytes;
     }
 
-    /* Pass 2: commit in global packet order. */
+    /* Pass 2: commit in global packet order. With a recording backend the
+     * chunk is recorded into this worker's command buffers in segments split
+     * at the M4 texture-group turns: a group must execute between the packets
+     * before and after it, so the segment that precedes it is submitted and
+     * then the worker waits for the resolver to take the group. Without one
+     * (the null replay backend) every packet takes its turn. */
+    if (w->rec) {
+        int seg_open = 0, failed = 0;
+        u64 seg_first = 0, seg_last = 0;
+        u32 prev_epoch = 0;
+        for (u32 i = 0; i < prepared; i++) {
+            const eng_draw_pkt* p = (const eng_draw_pkt*)q;
+            if (seg_open && p->tex_epoch > prev_epoch) {
+                eng_mt_wait_turn(seg_first);
+                g.be->mt_chunk_submit(g.be->user, w->be_user);
+                eng_mt_take_turn(seg_last);
+                seg_open = 0;
+            }
+            if (!seg_open) {
+                int spins = 0;
+                while (atomic_load_explicit(&s_mt.tex_taken, memory_order_acquire) < p->tex_epoch) {
+                    if (++spins < 20000) {
+#if defined(__x86_64__) || defined(__i386__)
+                        __builtin_ia32_pause();
+#endif
+                        continue;
+                    }
+                    spins = 0;
+                    sched_yield();
+                }
+                if (g.be->mt_chunk_begin(g.be->user, w->be_user) != 0) {
+                    if (!failed) {
+                        failed = 1;
+                        fprintf(stderr, "[walker-mt] worker %d: chunk begin failed\n", w->id);
+                    }
+                } else {
+                    seg_open = 1; seg_first = p->seq;
+                }
+            }
+            if (seg_open && w->prep[i].ok)
+                eng_mt_commit_packet(p, &w->prep[i], w->be_user);
+            seg_last = p->seq;
+            prev_epoch = p->tex_epoch;
+            q += p->total_bytes;
+        }
+        if (seg_open) {
+            eng_mt_wait_turn(seg_first);
+            g.be->mt_chunk_submit(g.be->user, w->be_user);
+            eng_mt_take_turn(seg_last);
+        } else if (failed) {
+            /* Drop the rest of the chunk but keep the ordered turn advancing. */
+            for (u32 i = 0; i < prepared; i++) {
+                const eng_draw_pkt* p = (const eng_draw_pkt*)q;
+                eng_mt_wait_turn(p->seq);
+                eng_mt_take_turn(p->seq);
+                q += p->total_bytes;
+            }
+        }
+        return;
+    }
     for (u32 i = 0; i < prepared; i++) {
         const eng_draw_pkt* p = (const eng_draw_pkt*)q;
         eng_mt_wait_turn(p->seq);
-        if (w->prep[i].ok) eng_mt_commit_packet(p, &w->prep[i]);
+        if (w->prep[i].ok) eng_mt_commit_packet(p, &w->prep[i], w->be_user);
         eng_mt_take_turn(p->seq);
         q += p->total_bytes;
     }
@@ -7388,8 +7780,10 @@ static void sink_end_work(void* user, const rsx_dispatch* r)
                 (u64)(sf.clip_w ? sf.clip_w : g.width) *
                     (sf.clip_h ? sf.clip_h : g.height) * 10ull >=
                 (u64)g.surfaces[target].w * g.surfaces[target].h * 9ull;
+    s_tex_async_draw = (workerable && s_mt.on && s_mt.workers > 0 && s_texr.up);
     const u32 tex_mask = sink_bind_textures(targets, n_targets, zslot, tex_used,
                                             textures, samplers);
+    s_tex_async_draw = 0;
     s_fs_draw = 0;
     wp2_add(WPROF2_TEX_BIND, w2_texbind);
     if (wp) wprof_phase(RSX_WPROF_TEX, rsx_wprof_now() - wp_t0);
@@ -7586,6 +7980,8 @@ static void sink_end_work(void* user, const rsx_dispatch* r)
         if (workerable) {
             /* The finalize point for a worker packet: no early return may
              * follow, or the ordered turn would never advance. */
+            eng_tex_group_close();
+            p->tex_epoch = atomic_load_explicit(&s_mt.tex_epoch, memory_order_acquire);
             p->seq = ++s_mt.seq;
             if (!eng_mt_chunk_add(p, p->total_bytes)) {
                 eng_mt_chunk_close();
@@ -7605,6 +8001,8 @@ static void sink_end_work(void* user, const rsx_dispatch* r)
          * inline stream): drain every earlier packet, then commit this one in
          * order and take its turn so later worker packets can proceed. */
         if (s_mt.workers > 0) eng_mt_sync();
+        eng_tex_group_close();
+        p->tex_epoch = atomic_load_explicit(&s_mt.tex_epoch, memory_order_acquire);
         p->seq = ++s_mt.seq;
         eng_pkt_commit_live(p);
         eng_mt_take_turn(p->seq);
@@ -7952,6 +8350,7 @@ static void eng_present_trace(u32 buffer_id, u32 target)
 static void eng_present(u32 buffer_id)
 {
     eng_mt_sync();
+    eng_tex_frame_reset();
     if (!g.ready) return;
     rsx_draw_engine_flush_dirty_to_guest();
     const u32 target = eng_present_surface(buffer_id);
@@ -8125,6 +8524,7 @@ void rsx_draw_engine_shutdown(void)
         if (g.zdepths[i].conv) g.be->texture_release(g.be->user, g.zdepths[i].conv);
         if (g.zdepths[i].handle) g.be->depth_target_release(g.be->user, g.zdepths[i].handle);
     }
+    if (g.be->mt_shutdown) g.be->mt_shutdown(g.be->user);
     if (g.ready && g.be->shutdown) g.be->shutdown(g.be->user);
 
     eng_mt_reset();
