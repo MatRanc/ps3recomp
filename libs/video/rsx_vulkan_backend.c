@@ -2879,7 +2879,7 @@ static void vk_cb_present(void* ud, u32 buffer_id)
  * Pipelines, draws and textures are the next stages; until then
  * pipeline_create reports 0, which the engine caches as "cannot build".
  * -------------------------------------------------------------------------*/
-#define VK_ENG_MAX_OBJ 2048          /* the engine's texture cache is 1024 */
+#define VK_ENG_MAX_OBJ 8192          /* engine texture cache max 4096 + targets/views */
 
 enum { VK_ENG_FREE = 0, VK_ENG_COLOR, VK_ENG_DEPTH, VK_ENG_TEXTURE, VK_ENG_VIEW };
 
@@ -3507,15 +3507,52 @@ static void vk_eng_texture_upload(void* user, u32 texture, u32 face, u32 mip, u3
 
 /* A colour target sampled with a unit's crossbar: an extra view of the same
  * image, cached by (surface, crossbar, format) and released with the target. */
+/* PS3RECOMP_VK_VIEW_MEMO: the (surface, crossbar, format) -> view answer in a
+ * direct-mapped table. The old path scanned all 2048 object slots on every
+ * target-as-texture bind; a crowded frame does that thousands of times. The
+ * cached answer is validated against the object table (kind, surface, remap,
+ * format), so a released or reused handle simply misses. */
+#define VK_VIEW_MEMO 512u
+static struct { u32 surface, remap, rsx_fmt, handle; } s_view_memo[VK_VIEW_MEMO];
+static int s_view_memo_on = -1;
+
+static int vk_view_memo_on(void)
+{
+    if (ps3_live_ctl_get) return ps3_live_ctl_get(PS3_LIVE_VK_VIEW_MEMO);
+    if (s_view_memo_on < 0) {
+        const char* e = getenv("PS3RECOMP_VK_VIEW_MEMO");
+        s_view_memo_on = e && *e && strcmp(e, "0") != 0 ? 1 : 0;
+    }
+    return s_view_memo_on;
+}
+
+static u32 vk_view_memo_slot(u32 surface, u32 remap, u32 rsx_format)
+{
+    u32 h = surface * 0x9E3779B1u ^ remap * 0x85EBCA77u ^ rsx_format * 0xC2B2AE3Du;
+    h ^= h >> 15;
+    return h & (VK_VIEW_MEMO - 1u);
+}
+
 static u32 vk_eng_surface_view(void* user, u32 surface, u32 remap, u32 rsx_format)
 {
     (void)user;
     vk_eng_obj* t = vk_eng_get(surface, VK_ENG_COLOR);
     if (!t) return 0;
+    const int memo = vk_view_memo_on();
+    const u32 ms = vk_view_memo_slot(surface, remap, rsx_format);
+    if (memo) {
+        const u32 mh = s_view_memo[ms].handle;
+        if (mh && mh < VK_ENG_MAX_OBJ && s_eobj[mh].kind == VK_ENG_VIEW &&
+            s_eobj[mh].surface == surface && s_eobj[mh].remap == remap &&
+            s_eobj[mh].rsx_fmt == rsx_format)
+            return mh;
+    }
     for (u32 i = 1; i < VK_ENG_MAX_OBJ; i++)
         if (s_eobj[i].kind == VK_ENG_VIEW && s_eobj[i].surface == surface &&
-            s_eobj[i].remap == remap && s_eobj[i].rsx_fmt == rsx_format)
+            s_eobj[i].remap == remap && s_eobj[i].rsx_fmt == rsx_format) {
+            if (memo) s_view_memo[ms] = (typeof(s_view_memo[0])){ surface, remap, rsx_format, i };
             return i;
+        }
     const u32 hd = vk_eng_alloc();
     if (!hd) return 0;
     vk_eng_obj* o = &s_eobj[hd];
@@ -3524,6 +3561,7 @@ static u32 vk_eng_surface_view(void* user, u32 surface, u32 remap, u32 rsx_forma
     }
     o->kind = VK_ENG_VIEW; o->fmt = t->fmt; o->w = t->w; o->h = t->h;
     o->surface = surface; o->remap = remap; o->rsx_fmt = rsx_format;
+    if (memo) s_view_memo[ms] = (typeof(s_view_memo[0])){ surface, remap, rsx_format, hd };
     return hd;
 }
 /* ---- cube render targets (PS3RECOMP_RSX_CUBE_RT) -------------------------

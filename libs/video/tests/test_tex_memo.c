@@ -67,6 +67,27 @@ int main(void)
           stub.bound_tex[0], surface);
     engine_down();
 
+    printf("-- target bloom\n");
+    up_plain();
+    s_tbloom_on = 1;
+    s_tbloom_on = 1;                     /* engine_up resets the cached mode */
+    m(M_CONTEXT_DMA_COLOR_A, DMA_MAIN);
+    m(M_COLOR_A_OFFSET, TEX_OFFSET);
+    m(M_CLEAR_BUFFERS, 0xF0u);
+    const u32 bsurface = stub.last_created_color;
+    m(M_CONTEXT_DMA_COLOR_A, DMA_LOCAL);
+    m(M_COLOR_A_OFFSET, 0x40000u);
+    draw_triangle();
+    CHECK(stub.bound_tex[0] == bsurface,
+          "a target created at the address is still found with the bloom on (%u, want %u)",
+          stub.bound_tex[0], bsurface);
+    bind_texture_unit(RSX_LOCATION_MAIN, TEX_OFFSET + 0x1000u);
+    draw_triangle();
+    CHECK(stub.n_texture_create == 2 && stub.bound_tex[0] != bsurface,
+          "a plain address still binds its guest texture with the bloom on");
+    s_tbloom_on = 0;
+    engine_down();
+
     printf("-- a rewritten texture\n");
     up_plain();
     const u32 old = stub.bound_tex[0];
@@ -75,6 +96,48 @@ int main(void)
     draw_triangle();
     CHECK(stub.bound_tex[0] != old && !stub.alive[old] && stub.bound_tex[0] == s_tmemo[0].handle,
           "the replaced handle is bound and remembered, the old one is gone");
+    engine_down();
+
+    printf("-- local invalidation\n");
+    s_texmemo_local = 1;
+    up_plain();
+    s_texmemo_local = 1;                 /* engine_up resets the cached mode */
+    const u32 la = stub.bound_tex[0];
+    const u32 lentry = s_tmemo[0].entry;
+    const int lup = stub.n_texture_upload;
+    s_tex_gen++;                          /* an upload/eviction elsewhere */
+    draw_triangle();
+    CHECK(stub.n_texture_upload == lup && stub.bound_tex[0] == la,
+          "an unrelated upload generation bump keeps the local memo answer");
+    g.textures[lentry].rewritten = 1;
+    g.textures[lentry].last_hash_frame = g.frames - 1u;
+    draw_triangle();
+    CHECK(stub.n_texture_upload == lup + 1,
+          "a rewritten entry is revalidated even when the memo key matches");
+    s_texmemo_local = 0;
+    engine_down();
+
+    printf("-- local memo and targets elsewhere\n");
+    s_texmemo_local = 1;
+    up_plain();
+    s_texmemo_local = 1;                 /* engine_up resets the cached mode */
+    const u32 tla = stub.bound_tex[0];
+    const int tlup = stub.n_texture_upload;
+    s_target_gen++;                       /* a target created at another address */
+    draw_triangle();
+    CHECK(stub.n_texture_upload == tlup && stub.bound_tex[0] == tla,
+          "a target created elsewhere keeps the local memo answer");
+    m(M_CONTEXT_DMA_COLOR_A, DMA_MAIN);
+    m(M_COLOR_A_OFFSET, TEX_OFFSET);
+    m(M_CLEAR_BUFFERS, 0xF0u);
+    const u32 tsurf = stub.last_created_color;
+    m(M_CONTEXT_DMA_COLOR_A, DMA_LOCAL);
+    m(M_COLOR_A_OFFSET, 0x40000u);
+    draw_triangle();
+    CHECK(stub.bound_tex[0] == tsurf && stub.bound_tex[0] != tla,
+          "a target created at the address drops the remembered plain texture (%u, want %u)",
+          stub.bound_tex[0], tsurf);
+    s_texmemo_local = 0;
     engine_down();
 
     printf("-- registers and frames\n");
@@ -97,6 +160,23 @@ int main(void)
     draw_triangle();
     CHECK(stub.bound_tex[0] != a && !stub.alive[a],
           "the next frame re-checks the bytes instead of using the memo");
+    engine_down();
+
+    printf("-- texture cache cap\n");
+    up_plain();
+    s_texcache_on = 1;                   /* engine_up resets the cached mode */
+    const int cbase = stub.n_texture_create;
+    const int crel = stub.n_texture_release;
+    for (u32 i = 0; i < RSX_DRAW_ENGINE_TEXTURE_CACHE + 80u; i++) {
+        bind_texture_unit(RSX_LOCATION_MAIN, TEX_OFFSET + 0x2000u + i * 0x100u);
+        draw_triangle();
+    }
+    CHECK(stub.n_texture_release == crel,
+          "with the cap raised past 1024 distinct textures nothing is evicted (%d releases)",
+          stub.n_texture_release - crel);
+    CHECK(stub.n_texture_create == cbase + (int)RSX_DRAW_ENGINE_TEXTURE_CACHE + 80,
+          "every distinct texture got its own cache entry");
+    s_texcache_on = 0;
     engine_down();
 
     free(vm_base);

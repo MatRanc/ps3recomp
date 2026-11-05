@@ -90,6 +90,10 @@ enum {
     PS3_LIVE_WALKER_MT_SNAPSHOT,        /* PS3RECOMP_WALKER_MT_SNAPSHOT: copy borrowed guest bytes */
     PS3_LIVE_WALKER_MT_TEX_RESOLVE,     /* PS3RECOMP_WALKER_MT_TEX_RESOLVE: plain guest texture resolver */
     PS3_LIVE_FLIP_TICK_OWN_STATE,       /* PS3RECOMP_FLIP_TICK_OWN_STATE: tick completes by our request state, age-bounded */
+    PS3_LIVE_ENG_TEXMEMO_LOCAL,         /* PS3RECOMP_ENG_TEXMEMO_LOCAL: per-entry texture binding memo validation */
+    PS3_LIVE_VK_VIEW_MEMO,              /* PS3RECOMP_VK_VIEW_MEMO: O(1) backend surface-view cache */
+    PS3_LIVE_ENG_TEXCACHE,              /* PS3RECOMP_ENG_TEXCACHE: 4096-entry texture cache instead of 1024 */
+    PS3_LIVE_ENG_TARGET_BLOOM,          /* PS3RECOMP_ENG_TARGET_BLOOM: skip target-table scans for non-target addresses */
     PS3_LIVE_COUNT
 };
 

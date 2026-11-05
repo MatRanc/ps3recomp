@@ -115,8 +115,17 @@ typedef struct rsx_be_render_state {
 
 /* How many distinct guest textures the engine keeps before it evicts the
  * least recently used one. Public so the eviction test can be exact about
- * where the boundary is rather than assuming a number. */
+ * where the boundary is rather than assuming a number.
+ *
+ * The default is still 1024. PS3RECOMP_ENG_TEXCACHE opens the cache to
+ * RSX_DRAW_ENGINE_TEXTURE_CACHE_MAX: a crowded replay frame binds ~3,400
+ * units and the working set can exceed 1024, and every eviction both
+ * re-uploads the texture and drops the binding memo for the rest of the
+ * frame (the MIT inFAMOUS 2 port hit the same cliff at 1024 and keeps 4096).
+ * The array is sized for the maximum so the switch is live; the backend
+ * object table (VK_ENG_MAX_OBJ) is raised to match. */
 #define RSX_DRAW_ENGINE_TEXTURE_CACHE 1024
+#define RSX_DRAW_ENGINE_TEXTURE_CACHE_MAX 4096
 
 typedef struct {
     uint32_t src_off_dst_slot; /* low 16 bits = src byte offset within vertex, high 16 bits = dst slot index */

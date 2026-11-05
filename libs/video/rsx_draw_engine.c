@@ -90,7 +90,7 @@ extern u32 cellGcm_flip_frame_count(void) __attribute__((weak));
 
 #define ENG_MAX_SURFACES   64
 #define ENG_MAX_ZDEPTHS    64
-#define ENG_MAX_TEXTURES   RSX_DRAW_ENGINE_TEXTURE_CACHE
+#define ENG_MAX_TEXTURES   RSX_DRAW_ENGINE_TEXTURE_CACHE_MAX
 #define ENG_MAX_VTEXTURES  64
 #define ENG_MAX_PIPELINES  8192
 #define ENG_PIPELINE_INDEX 16384u        /* open-addressed key index, 2x the table */
@@ -572,6 +572,79 @@ static struct {
  * address, a cached texture's handle replaced or evicted, or cached textures
  * marked rewritten. Drops the binding memo (sink_bind_textures). */
 static u32 s_tex_gen = 1;
+/* Bumped only when a colour or depth target is created/recreated. The local
+ * binding memo validates each entry against its own cache slot instead of
+ * this global, so an ordinary texture upload or eviction no longer flushes
+ * every memo answer for the rest of the frame; a target appearing at an
+ * address still does. */
+static u32 s_target_gen = 1;
+static int s_texmemo_local = -1;
+
+/* PS3RECOMP_ENG_TEXCACHE: grow the texture cache from 1024 to 4096 entries.
+ * The array is sized for the maximum; this is the live cap. See
+ * rsx_draw_engine.h. */
+static int s_texcache_on = -1;
+static int eng_texcache_on(void)
+{
+#if defined(__GNUC__) && !defined(_WIN32)
+    if (ps3_live_ctl_get) return ps3_live_ctl_get(PS3_LIVE_ENG_TEXCACHE);
+#endif
+    if (s_texcache_on < 0) {
+        const char* e = getenv("PS3RECOMP_ENG_TEXCACHE");
+        s_texcache_on = e && *e && strcmp(e, "0") != 0 ? 1 : 0;
+    }
+    return s_texcache_on;
+}
+static u32 eng_texcache_cap(void)
+{
+    return eng_texcache_on() ? (u32)RSX_DRAW_ENGINE_TEXTURE_CACHE_MAX
+                             : (u32)RSX_DRAW_ENGINE_TEXTURE_CACHE;
+}
+
+/* PS3RECOMP_ENG_TARGET_BLOOM: one bit per hashed (location, offset) says
+ * whether a colour or depth target may live there. A plain guest texture --
+ * which is most binds -- can then skip both target-table scans. The filter is
+ * rebuilt whenever a target is created or recreated, so a clear bit is
+ * authoritative; a stale set bit only costs the scan it always did.
+ *
+ * Portions derived from inFAMOUS 2 recomp (c) 2026 the infamous2-recomp
+ * contributors, MIT (docs/NOTES.md: "a bloom of target addresses spares
+ * sink_bind_textures its scans of the target tables"). */
+static u64 s_tbloom[64];
+static int s_tbloom_on = -1;
+static int eng_tbloom_on(void)
+{
+#if defined(__GNUC__) && !defined(_WIN32)
+    if (ps3_live_ctl_get) return ps3_live_ctl_get(PS3_LIVE_ENG_TARGET_BLOOM);
+#endif
+    if (s_tbloom_on < 0) {
+        const char* e = getenv("PS3RECOMP_ENG_TARGET_BLOOM");
+        s_tbloom_on = e && *e && strcmp(e, "0") != 0 ? 1 : 0;
+    }
+    return s_tbloom_on;
+}
+static inline u32 eng_tbloom_bit(u32 location, u32 offset)
+{
+    return ((offset >> 4 ^ location << 28) * 0x9E3779B1u) >> 20;
+}
+static inline int eng_tbloom_maybe(u32 location, u32 offset)
+{
+    const u32 b = eng_tbloom_bit(location, offset);
+    return (int)(s_tbloom[b >> 6] >> (b & 63) & 1u);
+}
+static void eng_tbloom_set(u32 location, u32 offset)
+{
+    const u32 b = eng_tbloom_bit(location, offset);
+    s_tbloom[b >> 6] |= 1ull << (b & 63);
+}
+static void eng_tbloom_rebuild(void)
+{
+    memset(s_tbloom, 0, sizeof s_tbloom);
+    for (u32 i = 0; i < g.n_surfaces; i++)
+        if (g.surfaces[i].handle) eng_tbloom_set(g.surfaces[i].location, g.surfaces[i].offset);
+    for (u32 i = 0; i < g.n_zdepths; i++)
+        if (g.zdepths[i].handle) eng_tbloom_set(g.zdepths[i].location, g.zdepths[i].offset);
+}
 
 /* ---- guest memory -------------------------------------------------------- */
 
@@ -668,6 +741,23 @@ static unsigned long long s_wp2_draws, s_wp2_verts, s_wp2_draw_groups;
 static unsigned long long s_wp2_conv_verts, s_wp2_conv_bytes;
 static unsigned long long s_wp2_pipe_hits, s_wp2_pipe_gets, s_wp2_pipe_created;
 static unsigned long long s_wp2_tex_slots, s_wp2_tex_uploads;
+/* Texture path census (WPROF2): where a bind was answered. Cheap integer
+ * increments on the hot path; reported with the phase line. */
+static unsigned long long s_tex_c_memo_hit, s_tex_c_full, s_tex_c_new, s_tex_c_evict;
+static unsigned long long s_tex_c_sv, s_tex_c_dsnap, s_tex_c_dguest, s_tex_c_reinterp;
+static unsigned long long s_tex_c_cube, s_tex_c_feedback;
+static unsigned long long s_tex_c_slots;
+static unsigned long long s_tex_c_scan, s_tex_c_bloom_skip;
+static unsigned long long s_tex_c_smiss, s_tex_c_ssteps;
+static int s_tex_stats = -1;
+static int eng_tex_stats_on(void)
+{
+    if (s_tex_stats < 0) {
+        const char* e = getenv("PS3RECOMP_TEX_STATS");
+        s_tex_stats = e && *e && strcmp(e, "0") != 0 ? 1 : 0;
+    }
+    return s_tex_stats;
+}
 static unsigned long long s_wp2_fetch_hit, s_wp2_fetch_miss;
 static unsigned long long s_wp2_remap_hit, s_wp2_remap_miss;
 
@@ -830,6 +920,27 @@ void rsx_wprof_drain_end(int profiled)
             (double)s_wp_n[RSX_WPROF_PIPE] / f * scale,
             (double)s_wp_n[RSX_WPROF_BIND] / f * scale,
             (double)s_wp_n[RSX_WPROF_DRAW] / f * scale);
+    if (eng_tex_stats_on()) {
+        fprintf(stderr, "[tex-stats] frames=%.0f slots=%.1f memo=%llu full=%llu "
+                "new=%llu evict=%llu sv=%llu dsnap=%llu dguest=%llu reint=%llu "
+                "cube=%llu fb=%llu ntex=%u cap=%u nsurf=%u nz=%u scan=%llu "
+                "bskip=%llu smiss=%llu ssteps=%llu uploads=%.1f\n",
+                f, (double)s_tex_c_slots / f, s_tex_c_memo_hit, s_tex_c_full,
+                s_tex_c_new, s_tex_c_evict, s_tex_c_sv, s_tex_c_dsnap,
+                s_tex_c_dguest, s_tex_c_reinterp, s_tex_c_cube, s_tex_c_feedback,
+                g.n_textures, eng_texcache_cap(), g.n_surfaces, g.n_zdepths,
+                s_tex_c_scan, s_tex_c_bloom_skip, s_tex_c_smiss,
+                s_tex_c_ssteps, (double)s_wp2_tex_uploads / f);
+        if (s_wp2 <= 0) {
+            s_wp2_tex_uploads = 0;
+            s_tex_c_slots = 0;
+            s_tex_c_memo_hit = s_tex_c_full = s_tex_c_new = s_tex_c_evict = 0;
+            s_tex_c_sv = s_tex_c_dsnap = s_tex_c_dguest = s_tex_c_reinterp = 0;
+            s_tex_c_cube = s_tex_c_feedback = 0;
+            s_tex_c_scan = s_tex_c_bloom_skip = 0;
+            s_tex_c_smiss = s_tex_c_ssteps = 0;
+        }
+    }
     if (s_wp2 < 0) rsx_wprof2_enabled();
     if (s_wp2 > 0) {
         fprintf(stderr,
@@ -843,7 +954,8 @@ void rsx_wprof_drain_end(int profiled)
                 "index=%.3f bind_be=%.3f surftrack=%.3f draw_be=%.3f "
                 "| pipe_hit=%.1f pipe_get=%.1f pipe_new=%.1f "
                 "fetch_hit=%.0f fetch_miss=%.0f remap_hit=%.0f remap_miss=%.0f "
-                "tex_binds=%.1f tex_loads=%.1f\n",
+                "tex_binds=%.1f tex_loads=%.1f "
+                "tmemo=%llu/%llu new=%llu evict=%llu sv=%llu dsnap=%llu dguest=%llu reint=%llu cube=%llu fb=%llu ntex=%u\n",
                 at_ms, (double)s_wp2_draws / f, (double)s_wp2_verts / f,
                 (double)s_wp2_conv_verts / f,
                 (double)s_wp2_conv_bytes / 1024.0 / f,
@@ -873,7 +985,10 @@ void rsx_wprof_drain_end(int profiled)
                 (double)s_wp2_pipe_created / f,
                 (double)s_wp2_fetch_hit / f, (double)s_wp2_fetch_miss / f,
                 (double)s_wp2_remap_hit / f, (double)s_wp2_remap_miss / f,
-                (double)s_wp2_tex_slots / f, (double)s_wp2_tex_uploads / f);
+                (double)s_wp2_tex_slots / f, (double)s_wp2_tex_uploads / f,
+                s_tex_c_memo_hit, s_tex_c_full, s_tex_c_new, s_tex_c_evict,
+                s_tex_c_sv, s_tex_c_dsnap, s_tex_c_dguest, s_tex_c_reinterp,
+                s_tex_c_cube, s_tex_c_feedback, g.n_textures);
         fflush(stderr);
         memset(s_wp2_ns, 0, sizeof s_wp2_ns);
         memset(s_wp2_n, 0, sizeof s_wp2_n);
@@ -881,6 +996,12 @@ void rsx_wprof_drain_end(int profiled)
         s_wp2_conv_verts = s_wp2_conv_bytes = 0;
         s_wp2_pipe_hits = s_wp2_pipe_gets = s_wp2_pipe_created = 0;
         s_wp2_tex_slots = s_wp2_tex_uploads = 0;
+        s_tex_c_memo_hit = s_tex_c_full = s_tex_c_new = s_tex_c_evict = 0;
+        s_tex_c_sv = s_tex_c_dsnap = s_tex_c_dguest = s_tex_c_reinterp = 0;
+        s_tex_c_cube = s_tex_c_feedback = 0;
+        s_tex_c_slots = 0;
+        s_tex_c_scan = s_tex_c_bloom_skip = 0;
+        s_tex_c_smiss = s_tex_c_ssteps = 0;
         s_wp2_fetch_hit = s_wp2_fetch_miss = 0;
         s_wp2_remap_hit = s_wp2_remap_miss = 0;
     }
@@ -1863,6 +1984,7 @@ static u32 eng_surface_get(u32 location, u32 offset, u32 want_w, u32 want_h,
     if (s->handle) g.be->color_target_release(g.be->user, s->handle);
     s->location = location; s->offset = offset;
     s_tex_gen++;
+    s_target_gen++;
     s->w = want_w; s->h = want_h; s->fmt = want_fmt; s->aa_grid = aa_grid;
     s->handle = handle;
     s->color_serial = 0;
@@ -1876,6 +1998,7 @@ static u32 eng_surface_get(u32 location, u32 offset, u32 want_w, u32 want_h,
         fprintf(stderr, "[rsx engine] surface %u:0x%08X %ux%u fmt %d%s\n",
                 location, offset, want_w, want_h, (int)want_fmt,
                 seed ? " (seeded from guest memory)" : ""); }
+    eng_tbloom_rebuild();
     return slot;
 }
 
@@ -2451,6 +2574,7 @@ static u32 eng_zdepth_get(u32 location, u32 offset, u32 rt_w, u32 rt_h)
     z->conv = 0;
     z->location = location; z->offset = offset;
     s_tex_gen++;
+    s_target_gen++;
     z->w = want_w; z->h = want_h;
     z->handle = handle;
     z->snapshot = 0;
@@ -2464,6 +2588,7 @@ static u32 eng_zdepth_get(u32 location, u32 offset, u32 rt_w, u32 rt_h)
     eng_zdepth_extend(z, rt_w, rt_h);
 
     if (slot == g.n_zdepths) g.n_zdepths++;
+    eng_tbloom_rebuild();
     return slot;
 }
 
@@ -2820,6 +2945,7 @@ static int eng_cube_log_on(void)
 
 static u32 eng_surface_at_exact(u32 location, u32 offset)
 {
+    if (eng_tbloom_on() && !eng_tbloom_maybe(location, offset)) return ENG_INVALID;
     for (u32 i = 0; i < g.n_surfaces; i++) {
         const eng_surface* s = &g.surfaces[i];
         if (s->handle && s->location == location && s->offset == offset) return i;
@@ -3091,9 +3217,23 @@ static u32 eng_texture_slot_work(u32 location, u32 offset, u32 fmt, u32 w, u32 h
      * Remember where each key was last found; a remembered slot is used only
      * if its entry still matches, otherwise the scan runs as before. Keys are
      * unique in the cache, so the result is the same either way. */
-    static u16 s_slot_memo[4096];
-    const u32 memo = (offset >> 4 ^ offset >> 16 ^ fmt * 0x9E37u ^ w * 31u ^ h ^
-                      location << 11) & 4095u;
+    static u16 s_slot_memo[65536];
+    u32 memo;
+    if (eng_texcache_on()) {
+        /* The 4096-entry direct map collides often once a crowded frame keeps
+         * ~1,000 textures resident, and each collision falls back to the linear
+         * scan of the whole cache. With the cache opened to 4096 entries use a
+         * 64K-entry map (<=6% occupancy) and mix every key field; the old hash
+         * is dominated by `offset`. */
+        u32 mix = offset ^ (offset >> 16) ^ fmt * 0x9E3779B1u ^
+                  w * 0x85EBCA77u ^ h * 0xC2B2AE3Du ^
+                  (location ? 0x27D4EB2Fu : 0u) ^ pitch * 0x165667B1u;
+        mix ^= mix >> 15; mix *= 0x2545F491u; mix ^= mix >> 13;
+        memo = mix & 65535u;
+    } else {
+        memo = (offset >> 4 ^ offset >> 16 ^ fmt * 0x9E37u ^ w * 31u ^ h ^
+                location << 11) & 4095u;
+    }
 #define ENG_TEXTURE_KEY_MATCHES(e) ((e)->location == location && (e)->offset == offset && \
         (e)->format == fmt && (e)->width == w && (e)->height == h && \
         (e)->pitch == pitch && (e)->remap == remap && \
@@ -3102,6 +3242,8 @@ static u32 eng_texture_slot_work(u32 location, u32 offset, u32 fmt, u32 w, u32 h
     if (s_slot_memo[memo] < g.n_textures && ENG_TEXTURE_KEY_MATCHES(&g.textures[s_slot_memo[memo]])) {
         hit = &g.textures[s_slot_memo[memo]];
     } else {
+        s_tex_c_smiss++;
+        s_tex_c_ssteps += g.n_textures;
         for (u32 i = 0; i < g.n_textures; i++)
             if (ENG_TEXTURE_KEY_MATCHES(&g.textures[i])) {
                 hit = &g.textures[i];
@@ -3247,9 +3389,12 @@ static u32 eng_texture_slot_work(u32 location, u32 offset, u32 fmt, u32 w, u32 h
 
     u32 index;
     u32 evicted = 0;
-    if (g.n_textures < ENG_MAX_TEXTURES) {
+    s_tex_c_new++;
+    const u32 tex_cap = eng_texcache_cap();
+    if (g.n_textures < tex_cap) {
         index = g.n_textures++;
     } else {
+        s_tex_c_evict++;
         /* PS3RECOMP_RSX_TEX_PIN (#136): never evict an entry bound this
          * frame. A texture created mid-frame can otherwise evict the very
          * one the draw that needed it just bound, forcing a re-upload
@@ -3342,6 +3487,7 @@ static u32 eng_texture_slot(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
     const unsigned long long wp2 = wp2_t0();
     const u32 handle = eng_texture_slot_work(location, offset, fmt, w, h, levels,
                                              pitch, cube, remap, depth);
+    s_tex_c_slots++;
     if (wp2) { wp2_add(WPROF2_TEX_SLOT, wp2); s_wp2_tex_slots++; }
     return handle;
 }
@@ -5652,14 +5798,51 @@ static u32 eng_color_feedback_failure(u32 unit, const eng_surface* s,
 typedef struct {
     rsx_dsp_texture t;
     rsx_be_sampler_desc samp;
-    u32 handle, frame, gen, entry;
+    u32 handle, frame, gen, entry, tgen;
     u32 wgen;               /* the unit's tex_wgen when t was decoded */
 } eng_tmemo;
 static eng_tmemo s_tmemo[RSX_BE_MAX_TEXTURES];
 static int s_texmemo_on;
 
+static int eng_texmemo_local_on(void)
+{
+#if defined(__GNUC__) && !defined(_WIN32)
+    if (ps3_live_ctl_get) return ps3_live_ctl_get(PS3_LIVE_ENG_TEXMEMO_LOCAL);
+#endif
+    if (s_texmemo_local < 0) {
+        const char* e = getenv("PS3RECOMP_ENG_TEXMEMO_LOCAL");
+        s_texmemo_local = e && *e && strcmp(e, "0") != 0 ? 1 : 0;
+    }
+    return s_texmemo_local;
+}
+
+/* The memo answer is still the cache's answer: same entry, same handle, same
+ * key, and the engine has not marked the bytes rewritten since. This replaces
+ * the global s_tex_gen test in local mode, so an upload or eviction elsewhere
+ * no longer invalidates every unit's answer. A target appearing at the
+ * address is handled separately (eng_target_at), so a target created anywhere
+ * else does not drop the memo either. */
+static int eng_texmemo_entry_ok(const eng_tmemo* mm, const rsx_dsp_texture* t)
+{
+    if (mm->entry >= g.n_textures) return 0;
+    const eng_texture* e = &g.textures[mm->entry];
+    if (!e->handle || e->handle != mm->handle || e->rewritten) return 0;
+    return e->location == t->location && e->offset == t->offset &&
+           e->format == t->format && e->width == t->width &&
+           e->height == t->height && e->pitch == t->pitch &&
+           e->remap == (t->remap & 0xFFFFu) &&
+           e->cubemap == (u32)(t->cubemap != 0) &&
+           e->levels == t->mipmaps &&
+           e->depth == ((t->dimension == 3 && !t->cubemap) ? t->depth : 1u);
+}
+
 static int eng_target_at(u32 location, u32 offset)
 {
+    if (eng_tbloom_on() && !eng_tbloom_maybe(location, offset)) {
+        s_tex_c_bloom_skip++;
+        return 0;
+    }
+    s_tex_c_scan++;
     for (u32 i = 0; i < g.n_surfaces; i++)
         if (g.surfaces[i].location == location && g.surfaces[i].offset == offset) return 1;
     for (u32 i = 0; i < g.n_zdepths; i++)
@@ -5780,8 +5963,21 @@ static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
             eng_fsbind_log(u, &t, n_targets && target_slots[0] < g.n_surfaces
                                       ? &g.surfaces[target_slots[0]] : NULL);
         eng_tmemo* mm = &s_tmemo[u];
-        if (s_texmemo_on && mm->handle && mm->gen == s_tex_gen && mm->frame == g.frames &&
-            ((s_tex_wgen_on && mm->wgen == g.rsx.tex_wgen[u]) || !memcmp(&mm->t, &t, sizeof t))) {
+        const int memo_regs = mm->handle && mm->frame == g.frames &&
+            ((s_tex_wgen_on && mm->wgen == g.rsx.tex_wgen[u]) || !memcmp(&mm->t, &t, sizeof t));
+        int memo_live;
+        if (s_texmemo_on && memo_regs && eng_texmemo_local_on() &&
+            !(mm->handle & ENG_TEX_TOKEN))
+            /* A memo is only saved for a plain address, so if no target has
+             * been created since it was saved the address still has none. If
+             * one was created (anywhere), test this address: the bloom makes
+             * that one bit for a plain texture. */
+            memo_live = eng_texmemo_entry_ok(mm, &t) &&
+                        (mm->tgen == s_target_gen ||
+                         !eng_target_at(t.location, t.offset));
+        else
+            memo_live = s_texmemo_on && memo_regs && mm->gen == s_tex_gen;
+        if (memo_live) {
             mm->wgen = g.rsx.tex_wgen[u];
             samplers[u] = mm->samp;
             /* Still the most recently used, as the probe would have made it.
@@ -5790,12 +5986,18 @@ static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
             if (!(mm->handle & ENG_TEX_TOKEN))
                 g.textures[mm->entry].last_use_serial = ++g.texture_use_serial;
             textures[u] = mm->handle;
+            s_tex_c_memo_hit++;
             continue;
         }
+        s_tex_c_full++;
         eng_decode_sampler(t.filter, t.wrap, t.control0, &samplers[u]);
         samplers[u].border = eng_border_class(t.format, t.border_color);
 
         int sampled = -1, own = 0, surface_at = -1;
+        /* One hashed test answers "is there any target at this address". A
+         * plain texture, the common case, then skips both table scans. */
+        const int target_maybe = !eng_tbloom_on() || eng_tbloom_maybe(t.location, t.offset);
+        if (target_maybe) s_tex_c_scan++; else s_tex_c_bloom_skip++;
         /* DXT data is never a render target's output: no surface colour
          * format is block-compressed, so whatever a compressed texture names
          * came from memory. Matching it against a target at the same offset
@@ -5813,7 +6015,7 @@ static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
          * only a probe that was never complete keeps the dummy (and the
          * census says so). Never let the 2-D surface path hand a 2-D target
          * to a cube unit (that is the census's `surface` miss). */
-        if (t.cubemap && !compressed && g.be->cube_target_view && eng_cube_rt_on()) {
+        if (target_maybe && t.cubemap && !compressed && g.be->cube_target_view && eng_cube_rt_on()) {
             eng_cube_desc cd;
             if (eng_cube_collect(&t, &cd)) {
                 const u32 all = (1u << ENG_CUBE_FACES) - 1u;
@@ -5826,7 +6028,7 @@ static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
                                                             cd.w, cd.h,
                                                             t.remap & 0xFFFFu,
                                                             t.format);
-                    if (cube) { textures[u] = cube; continue; }
+                    if (cube) { textures[u] = cube; s_tex_c_cube++; continue; }
                 }
                 /* A face is being rewritten (its target was recreated) or has
                  * not been rendered yet this scene. Keep the last complete
@@ -5847,7 +6049,7 @@ static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
                 continue;
             }
         }
-        for (u32 i = 0; i < g.n_surfaces && !compressed; i++) {
+        for (u32 i = 0; target_maybe && i < g.n_surfaces && !compressed; i++) {
             if (!g.surfaces[i].handle || g.surfaces[i].location != t.location ||
                 g.surfaces[i].offset != t.offset)
                 continue;
@@ -5863,7 +6065,7 @@ static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
         /* The depth at this address, when it was written after any colour
          * there: a depth-only pass names its zeta as a colour target too. */
         int zsrc = -1;
-        for (u32 i = 0; i < g.n_zdepths && !compressed; i++) {
+        for (u32 i = 0; target_maybe && i < g.n_zdepths && !compressed; i++) {
             const eng_zdepth* z = &g.zdepths[i];
             if (z->location != t.location || z->offset != t.offset || !z->depth_serial)
                 continue;
@@ -5880,7 +6082,7 @@ static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
                 const u32 snap = eng_zdepth_snapshot((u32)zsrc, t.width, t.height);
                 if (snap) {
                     if (t.cubemap) eng_tex_miss_note_reason(u, &t, RSX_TEX_MISS_SURFACE);
-                    textures[u] = snap; continue;
+                    textures[u] = snap; s_tex_c_dsnap++; continue;
                 }
             }
             const u32 conv = eng_zdepth_as_color((u32)zsrc, &t);
@@ -5896,6 +6098,7 @@ static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
                 s_wcb_trigger = saved;
             }
             if (copied) {
+                s_tex_c_dguest++;
                 eng_tex_sync_path();
                 static int logs;
                 if (s_wcb.attr_on && logs++ < 32) {
@@ -5943,6 +6146,7 @@ static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
             } else {
                 return eng_color_feedback_failure(u, s, &t);
             }
+            s_tex_c_feedback++;
             if (t.cubemap) eng_tex_miss_note_reason(u, &t, RSX_TEX_MISS_SURFACE);
             continue;
         }
@@ -5956,6 +6160,7 @@ static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
             s_wcb_trigger = saved;
         }
         if (reinterpreted) {
+            s_tex_c_reinterp++;
             eng_tex_sync_path();
             static int logs;
             if (s_wcb.attr_on && logs++ < 32) {
@@ -5988,6 +6193,7 @@ static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
                                      t.remap & 0xFFFFu, t.format)
                 : 0;
             textures[u] = view ? view : g.surfaces[sampled].handle;
+            s_tex_c_sv++;
             if (t.cubemap) eng_tex_miss_note_reason(u, &t, RSX_TEX_MISS_SURFACE);
             continue;
         }
@@ -6019,6 +6225,7 @@ static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
             s_tslot_last != ENG_INVALID && !eng_target_at(t.location, t.offset)) {
             mm->t = t; mm->samp = samplers[u];
             mm->handle = textures[u]; mm->frame = g.frames; mm->gen = s_tex_gen;
+            mm->tgen = s_target_gen;
             mm->entry = s_tslot_last; mm->wgen = g.rsx.tex_wgen[u];
         }
     }
@@ -8526,6 +8733,10 @@ int rsx_draw_engine_init(u32 width, u32 height)
     s_texdirty_env = -1;
     s_texdirty_paranoid = 0;
     s_texdirty_live = 0;
+    s_texmemo_local = -1;
+    s_texcache_on = -1;
+    s_tbloom_on = -1;
+    memset(s_tbloom, 0, sizeof s_tbloom);
     (void)rsx_wprof_enabled();
     g.width  = width  ? width  : 1280;
     g.height = height ? height : 720;
