@@ -21,10 +21,9 @@
 #include <time.h>
 #include <stdatomic.h>
 
-int g_c690_gpu_2a_on;
+_Atomic int g_c690_gpu_2a_on;
 
 #define C690_GPU_2A_MAX_RECORDS 8192u
-#define C690_GPU_2A_MAX_LANES   16u
 #define C690_GPU_2A_MAX_EXPORTS 8u
 #define C690_GPU_2A_LS_MASK     0x3FFFFu
 
@@ -47,9 +46,27 @@ typedef struct c690_gpu_2a_lane {
     unsigned exp_next;
 } c690_gpu_2a_lane;
 
-static c690_gpu_2a_lane s_lane[C690_GPU_2A_MAX_LANES];
+/*
+ * Lane state is per HOST THREAD, not per ctx->spu_id.
+ *
+ * The c690 mesh jobs do not run as lv2 SPU threads on this port: the SPURS
+ * PM workers dispatch them through spu_workload_dispatch_job ->
+ * spu_run_spurs_job, which builds a stack-local spu_context with
+ * spu_context_init(&ctx, 0). Every one of the five lanes therefore reports
+ * spu_id 0 (see [c690-stats] worker=N spu=0 in the live logs). Keying the
+ * export state on spu_id made all five concurrent lanes share one slot: the
+ * enter/exit/PUT state (r3, cursor, export ring) was written by one thread
+ * while another submitted/freed the same job buffers, which is the double
+ * free seen at the first key-on switch.
+ *
+ * A lane IS one host thread here (spu_run_spurs_job and the lifted thread
+ * run the whole job, including the submit epilogue PUT, synchronously on the
+ * caller). So thread-local state gives each lane its own export list with no
+ * lock and no id dependence.
+ */
+static SPU_THREAD_LOCAL c690_gpu_2a_lane t_lane;
 static c690_gpu_2a_sink_fn s_sink;
-static uint32_t s_seq;
+static _Atomic uint32_t s_seq;
 
 /* Diagnostics. */
 static unsigned long s_stat_enter, s_stat_class, s_stat_fallback,
@@ -78,7 +95,7 @@ static uint64_t now_ns(void)
 int c690_gpu_2a_enabled(void)
 {
     int on = ps3_live_ctl_get(PS3_LIVE_C690_GPU_2A) != 0;
-    __atomic_store_n(&g_c690_gpu_2a_on, on, __ATOMIC_RELAXED);
+    atomic_store_explicit(&g_c690_gpu_2a_on, on, memory_order_relaxed);
     return on;
 }
 
@@ -95,17 +112,21 @@ static void export_free(c690_gpu_2a_export* e)
     memset(e, 0, sizeof *e);
 }
 
+static c690_gpu_2a_lane* lane_self(void)
+{
+    return &t_lane;
+}
+
 void c690_gpu_2a_enter(struct spu_context* ctx)
 {
     if (!ctx) return;
-    const unsigned lane = (unsigned)ctx->spu_id % C690_GPU_2A_MAX_LANES;
-    c690_gpu_2a_lane* l = &s_lane[lane];
+    c690_gpu_2a_lane* l = lane_self();
     l->active = 0;          /* a lost exit must not confuse the next entry */
     if (!c690_gpu_2a_enabled()) return;
     l->active = 1;
     l->r3 = ctx->gpr[3]._u32[0] & C690_GPU_2A_LS_MASK;
     l->out_base = be32(ctx->ls + ((l->r3 + 0xD0u) & C690_GPU_2A_LS_MASK));
-    l->seq = ++s_seq;
+    l->seq = atomic_fetch_add(&s_seq, 1u) + 1u;
     __atomic_fetch_add(&s_stat_enter, 1, __ATOMIC_RELAXED);
 }
 
@@ -167,8 +188,7 @@ static void export_push(c690_gpu_2a_lane* l, c690_gpu_2a_export* e)
 void c690_gpu_2a_exit(struct spu_context* ctx)
 {
     if (!ctx) return;
-    const unsigned lane = (unsigned)ctx->spu_id % C690_GPU_2A_MAX_LANES;
-    c690_gpu_2a_lane* l = &s_lane[lane];
+    c690_gpu_2a_lane* l = lane_self();
     if (!l->active) return;
     l->active = 0;
     if (!g_c690_gpu_2a_on) return;
@@ -243,8 +263,7 @@ void c690_gpu_2a_put(const struct spu_context* ctx, uint32_t lsa, uint64_t ea,
                      uint32_t size)
 {
     if (!g_c690_gpu_2a_on || !ctx || !size) return;
-    const unsigned lane = (unsigned)ctx->spu_id % C690_GPU_2A_MAX_LANES;
-    c690_gpu_2a_lane* l = &s_lane[lane];
+    c690_gpu_2a_lane* l = lane_self();
     for (unsigned i = 0; i < C690_GPU_2A_MAX_EXPORTS; i++) {
         c690_gpu_2a_export* e = &l->exp[i];
         if (!e->valid) continue;

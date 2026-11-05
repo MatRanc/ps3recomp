@@ -453,7 +453,7 @@ static inline int mfc_do_transfer_fast(spu_context* spu, uint32_t lsa, uint64_t 
               extern void dxt_capture_dma(const spu_context*, int, uint32_t, uint64_t, uint32_t, const uint8_t*);
               dxt_capture_dma(spu, 1, lsa, ea, size, ls_ptr);
           } }
-        { extern int g_c690_gpu_2a_on;
+        { extern _Atomic int g_c690_gpu_2a_on;
           if (__builtin_expect(g_c690_gpu_2a_on, 0)) {
               extern void c690_gpu_2a_put(const spu_context*, uint32_t, uint64_t, uint32_t);
               c690_gpu_2a_put(spu, lsa, ea, size);
@@ -997,7 +997,7 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
               extern void dxt_capture_dma(const spu_context*, int, uint32_t, uint64_t, uint32_t, const uint8_t*);
               dxt_capture_dma(spu, 1, lsa, ea, size, ls_ptr);
           } }
-        { extern int g_c690_gpu_2a_on;
+        { extern _Atomic int g_c690_gpu_2a_on;
           if (__builtin_expect(g_c690_gpu_2a_on, 0)) {
               extern void c690_gpu_2a_put(const spu_context*, uint32_t, uint64_t, uint32_t);
               c690_gpu_2a_put(spu, lsa, ea, size);

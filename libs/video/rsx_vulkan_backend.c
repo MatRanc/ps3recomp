@@ -4774,6 +4774,74 @@ static unsigned long long s_c690_w_prepares, s_c690_w_jobs, s_c690_w_records,
     s_c690_w_wait_us;
 static void vk_c690_job_free(c690_gpu_2a_job* j);
 
+/* Retired exact-SPU seed jobs.
+ *
+ * The init-failure and resolve-only paths install the captured SPU record
+ * bytes as the resolver range, so the job's allocations must stay readable
+ * until the next drain clears the range map. Freeing them at install time
+ * (the first version) left the range pointing at freed heap. Bounded: one
+ * drain can retain at most C690_GPU_JOB_MAX jobs; past that the range is not
+ * installed and the draw reads the identical guest copy instead. */
+#define C690_GPU_RETAIN_MAX C690_GPU_JOB_MAX
+static c690_gpu_2a_job s_c690_retain[C690_GPU_RETAIN_MAX];
+static unsigned s_c690_retain_n;
+
+/* PS3RECOMP_C690_GPU_2A_DBG: isolate the live path without a rebuild.
+ *   0 = full GPU path (default)
+ *   1 = export on, GPU off  (sink queues; prepare drops the jobs, resolver
+ *       stays empty, so the walker reads the exact guest bytes)
+ *   2 = resolve only        (sink queues; prepare installs the exact SPU seed
+ *       as a resolver range, no Vulkan object is created)
+ * Any other value means 0. */
+static int vk_c690_dbg(void)
+{
+    static int s_dbg = -1;
+    if (s_dbg < 0) {
+        const char* e = getenv("PS3RECOMP_C690_GPU_2A_DBG");
+        s_dbg = e && *e ? atoi(e) : 0;
+    }
+    return s_dbg;
+}
+
+static void c690_retain_clear(void)
+{
+    pthread_mutex_lock(&s_c690_mu);
+    for (unsigned i = 0; i < s_c690_retain_n; i++)
+        vk_c690_job_free(&s_c690_retain[i]);
+    s_c690_retain_n = 0;
+    pthread_mutex_unlock(&s_c690_mu);
+}
+
+/* Install the exact SPU record bytes for this drain and keep the job alive
+ * until the next gpu_range_clear(). Called from the walker only. */
+static void c690_install_seed(c690_gpu_2a_job* j)
+{
+    pthread_mutex_lock(&s_c690_mu);
+    if (s_c690_retain_n < C690_GPU_RETAIN_MAX) {
+        s_c690_retain[s_c690_retain_n++] = *j;
+        /* Held across the install so a concurrent release's retain_clear
+         * cannot free the bytes before the range names them. Lock order is
+         * the sink's (s_c690_mu -> range map). */
+        rsx_draw_engine_gpu_range_add_ea(j->ea, j->count * 32u, j->seed);
+        pthread_mutex_unlock(&s_c690_mu);
+        return;
+    }
+    pthread_mutex_unlock(&s_c690_mu);
+    /* Cannot retain: the guest copy is byte-identical to the seed. */
+    vk_c690_job_free(j);
+}
+
+static void c690_queue_free_all(void)
+{
+    pthread_mutex_lock(&s_c690_mu);
+    c690_gpu_2a_job* q = s_c690_q;
+    const unsigned n = s_c690_qn;
+    s_c690_q = NULL; s_c690_qn = s_c690_qcap = 0;
+    pthread_mutex_unlock(&s_c690_mu);
+    for (unsigned i = 0; i < n; i++) vk_c690_job_free(&q[i]);
+    free(q);
+}
+
 static int vk_c690_sink(c690_gpu_2a_job* job)
 {
     if (!job || !ps3_live_ctl_get(PS3_LIVE_C690_GPU_2A)) return 0;
@@ -4802,6 +4870,11 @@ static int vk_c690_sink(c690_gpu_2a_job* job)
 
 static void vk_c690_release(void)
 {
+    /* Drop the ranges first: the retired seeds they may point at are freed
+     * below. */
+    rsx_draw_engine_gpu_range_clear();
+    c690_queue_free_all();
+    c690_retain_clear();
     if (s_vk.c690_pipe) pvkDestroyPipeline(s_vk.device, s_vk.c690_pipe, NULL);
     if (s_vk.c690_layout) pvkDestroyPipelineLayout(s_vk.device, s_vk.c690_layout, NULL);
     if (s_vk.c690_pool) pvkDestroyDescriptorPool(s_vk.device, s_vk.c690_pool, NULL);
@@ -4934,6 +5007,9 @@ static void vk_c690_job_free(c690_gpu_2a_job* j)
 static void vk_c690_prepare(void)
 {
     rsx_draw_engine_gpu_range_clear();
+    /* The map is empty again: any seed ranges installed last drain are now
+     * unreachable, so their owned record buffers can go. */
+    c690_retain_clear();
     c690_gpu_2a_job* jobs = NULL;
     unsigned n = 0;
     pthread_mutex_lock(&s_c690_mu);
@@ -4941,12 +5017,23 @@ static void vk_c690_prepare(void)
     s_c690_q = NULL; s_c690_qn = s_c690_qcap = 0;
     pthread_mutex_unlock(&s_c690_mu);
     if (!n) { free(jobs); return; }
+    const int dbg = vk_c690_dbg();
+    if (dbg == 1) {
+        /* Export on, GPU off: keep the range map empty so the walker serves
+         * the exact SPU bytes from guest memory. */
+        for (unsigned i = 0; i < n; i++) vk_c690_job_free(&jobs[i]);
+        free(jobs);
+        return;
+    }
+    if (dbg == 2) {
+        /* Resolve only: no Vulkan object is created; the resolver serves the
+         * exact SPU seed bytes. */
+        for (unsigned i = 0; i < n; i++) c690_install_seed(&jobs[i]);
+        free(jobs);
+        return;
+    }
     if (vk_c690_init() != 0) {
-        for (unsigned i = 0; i < n; i++) {
-            c690_gpu_2a_job* j = &jobs[i];
-            rsx_draw_engine_gpu_range_add_ea(j->ea, j->count * 32u, j->seed);
-            vk_c690_job_free(j);
-        }
+        for (unsigned i = 0; i < n; i++) c690_install_seed(&jobs[i]);
         free(jobs);
         return;
     }
@@ -4960,11 +5047,7 @@ static void vk_c690_prepare(void)
         .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
         .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT };
     if (pvkBeginCommandBuffer(cb, &bi) != VK_SUCCESS) {
-        for (unsigned i = 0; i < n; i++) {
-            c690_gpu_2a_job* j = &jobs[i];
-            rsx_draw_engine_gpu_range_add_ea(j->ea, j->count * 32u, j->seed);
-            vk_c690_job_free(j);
-        }
+        for (unsigned i = 0; i < n; i++) c690_install_seed(&jobs[i]);
         free(jobs);
         return;
     }
@@ -4986,11 +5069,18 @@ static void vk_c690_prepare(void)
             pthread_mutex_lock(&s_c690_mu);
             if (s_c690_qn == s_c690_qcap) {
                 unsigned cap = s_c690_qcap ? s_c690_qcap * 2u : 64u;
+                if (cap > 1024u) cap = 1024u;
                 c690_gpu_2a_job* p = (c690_gpu_2a_job*)realloc(s_c690_q, cap * sizeof *p);
                 if (p) { s_c690_q = p; s_c690_qcap = cap; }
             }
-            if (s_c690_qn < s_c690_qcap) s_c690_q[s_c690_qn++] = *j;
-            else vk_c690_job_free(j);
+            if (s_c690_qn < s_c690_qcap) {
+                s_c690_q[s_c690_qn++] = *j;
+                /* Ownership moved to the queue; leave j empty so the sweep
+                 * below cannot free it twice. */
+                j->offs = NULL; j->arrays = NULL; j->seed = NULL;
+            } else {
+                vk_c690_job_free(j);
+            }
             pthread_mutex_unlock(&s_c690_mu);
             continue;
         }
@@ -5015,7 +5105,13 @@ static void vk_c690_prepare(void)
         s_c690_jobs++; s_c690_records += j->count;
         s_c690_w_jobs++; s_c690_w_records += j->count;
     }
-    if (pvkEndCommandBuffer(cb) != VK_SUCCESS) { free(jobs); return; }
+    if (pvkEndCommandBuffer(cb) != VK_SUCCESS) {
+        /* Processed jobs already point their ranges at the seed-filled output
+         * arena; drop whatever was not reached. */
+        for (unsigned i = 0; i < n; i++) vk_c690_job_free(&jobs[i]);
+        free(jobs);
+        return;
+    }
     VkSubmitInfo si = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
                         .commandBufferCount = 1, .pCommandBuffers = &cb };
     pvkResetFences(s_vk.device, 1, &s_vk.c690_fence);

@@ -470,6 +470,25 @@ if(PS3RECOMP_BUILD_TESTS)
     endif()
     add_test(NAME c690_gpu_2a COMMAND test_c690_gpu_2a)
 
+    # Concurrent ownership of the same binding: five SPURS lanes (all spu_id
+    # 0, the job runner's context) feed one walker drain. Run the sanitizer
+    # variants with tools/run_c690_gpu_2a_race.sh; this target is the plain
+    # smoke test for ctest.
+    add_executable(test_c690_gpu_2a_race
+        tests/test_c690_gpu_2a_race.c
+        runtime/spu/c690_gpu_2a.c
+        libs/video/ps3_live_ctl.c
+    )
+    target_include_directories(test_c690_gpu_2a_race PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/runtime/spu"
+        "${CMAKE_CURRENT_SOURCE_DIR}/libs/video"
+        "${CMAKE_CURRENT_SOURCE_DIR}/include"
+    )
+    if(TARGET Threads::Threads)
+        target_link_libraries(test_c690_gpu_2a_race PRIVATE Threads::Threads)
+    endif()
+    add_test(NAME c690_gpu_2a_race COMMAND test_c690_gpu_2a_race)
+
     # PS3_LOG_FIRST, the saturating counter behind the "first n times" log lines.
     add_executable(test_log_first tests/test_log_first.c)
     target_include_directories(test_log_first PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
