@@ -841,6 +841,7 @@ unsigned long long rsx_wprof_now(void)
 
 /* PS3RECOMP_WALKER_WAITS: see rsx_draw_engine.h. */
 __thread int g_rsx_ww_walker;
+const char* g_rsx_ww_ctx;
 static int s_ww_on = -1;
 static unsigned long long s_ww_ns[RSX_WW_COUNT];
 static unsigned long long s_ww_n[RSX_WW_COUNT];
@@ -2536,7 +2537,7 @@ void rsx_draw_engine_guest_read(u32 location, u32 offset, u32 pitch, u32 w, u32 
         }
     }
     if (!streamed) {
-        g.be->submit_and_wait(g.be->user, RSX_BE_FLUSH_GUEST_REFERENCE);
+        (g_rsx_ww_ctx = "eng:guest_read", g.be->submit_and_wait)(g.be->user, RSX_BE_FLUSH_GUEST_REFERENCE);
         g.be->readback(g.be->user, s->handle, x, y, n, h, rows, n * bpp);
     }
     if (eng_coherence_log())
@@ -3805,7 +3806,7 @@ static int eng_zdepth_store(u32 slot, int forced)
         s_depth_rows = n;
         s_depth_cap = w * h;
     }
-    g.be->submit_and_wait(g.be->user, RSX_BE_FLUSH_GUEST_REFERENCE);
+    (g_rsx_ww_ctx = "eng:zdepth_store", g.be->submit_and_wait)(g.be->user, RSX_BE_FLUSH_GUEST_REFERENCE);
     if (g.be->depth_readback(g.be->user, z->handle, 0, 0, w, h, s_depth_rows,
                              w * (u32)sizeof(float)) != 0)
         return 0;
@@ -4040,7 +4041,7 @@ static int eng_wcb_copy_surface(u32 slot, int use_ticket)
     if (!from_ticket && !streamed) {
         eng_wcb_drop_ticket(s);
         if (!g.be->readback) return 0;
-        g.be->submit_and_wait(g.be->user, RSX_BE_FLUSH_GUEST_REFERENCE);
+        (g_rsx_ww_ctx = "eng:wcb_copy_surface", g.be->submit_and_wait)(g.be->user, RSX_BE_FLUSH_GUEST_REFERENCE);
         g.be->readback(g.be->user, s->handle, rx, ry, rw, rh, rows, rw * bpp);
     }
     eng_color_rows_store(bpp, s->location, s->offset + ry * s->pitch + rx * bpp,
@@ -6620,7 +6621,7 @@ static void pd_write_surface(u32 slot, const char* path)
     FILE* f = (raw && rgb) ? fopen(path, "wb") : NULL;
     if (f) {
         memset(raw, 0, (size_t)s->w * s->h * bpp);
-        g.be->submit_and_wait(g.be->user, RSX_BE_FLUSH_GUEST_REFERENCE);
+        (g_rsx_ww_ctx = "eng:pd_write_surface", g.be->submit_and_wait)(g.be->user, RSX_BE_FLUSH_GUEST_REFERENCE);
         g.be->readback(g.be->user, s->handle, 0, 0, s->w, s->h, raw, s->w * bpp);
         for (size_t i = 0; i < (size_t)s->w * s->h; i++) {
             const u8* p = raw + i * bpp;
@@ -6664,7 +6665,7 @@ static void pd_write_depth(u32 zslot, const char* path, float* lo_out, float* hi
     u8* px = (u8*)malloc((size_t)w * h);
     FILE* f = (d && px) ? fopen(path, "wb") : NULL;
     if (f) {
-        g.be->submit_and_wait(g.be->user, RSX_BE_FLUSH_GUEST_REFERENCE);
+        (g_rsx_ww_ctx = "eng:pd_write_depth", g.be->submit_and_wait)(g.be->user, RSX_BE_FLUSH_GUEST_REFERENCE);
         if (g.be->depth_readback(g.be->user, z->handle, 0, 0, w, h, d, w * 4u) == 0) {
             float lo = 1.0f, hi = 0.0f;
             for (size_t i = 0; i < (size_t)w * h; i++) {
@@ -9095,7 +9096,7 @@ void rsx_draw_engine_shutdown(void)
         s_wcb_live = 0;
     }
     if (g.ready && g.be->submit_and_wait)
-        g.be->submit_and_wait(g.be->user, RSX_BE_FLUSH_SHUTDOWN);
+        (g_rsx_ww_ctx = "eng:shutdown", g.be->submit_and_wait)(g.be->user, RSX_BE_FLUSH_SHUTDOWN);
     for (u32 i = 0; i < g.n_textures; i++)
         if (g.textures[i].handle) g.be->texture_release(g.be->user, g.textures[i].handle);
     for (u32 i = 0; i < g.n_pipelines; i++)
@@ -9166,7 +9167,7 @@ void rsx_draw_engine_flush(void)
     eng_mt_sync();
     rsx_draw_engine_flush_dirty_to_guest();
     if (g.ready && g.be->submit_and_wait)
-        g.be->submit_and_wait(g.be->user, RSX_BE_FLUSH_GUEST_REFERENCE);
+        (g_rsx_ww_ctx = "eng:flush", g.be->submit_and_wait)(g.be->user, RSX_BE_FLUSH_GUEST_REFERENCE);
 }
 
 void rsx_draw_engine_present(void)

@@ -3291,6 +3291,7 @@ static void vk_eng_submit_and_wait(void* user, u32 reason)
 {
     (void)user; (void)reason;      /* every other submission has already completed */
     if (s_eb_pending) { s_eb_why = 4; vk_eng_flush(); }
+    g_rsx_ww_ctx = NULL;
     vk_ebs_wait_other();
 }
 
@@ -3567,7 +3568,7 @@ static int vk_eng_readback_fetch(void* user, u32 ticket, void* out, u32 out_pitc
     vk_rb_ticket* t = &s_rbt[ticket - 1u];
     if (!t->done) {
         const unsigned long long w0 = vk_now_us();
-        if (t->batch == s_eb_batch_id && s_eb_pending) { s_eb_why = 4; vk_eng_flush(); }
+        if (t->batch == s_eb_batch_id && s_eb_pending) { s_eb_why = 4; g_rsx_ww_ctx = "be:readback_fetch"; vk_eng_flush(); }
         vk_ebs_wait_other();         /* a pipelined batch set may still hold it */
         s_eb_wait_us[8] += vk_now_us() - w0;
         t->done = 1;
@@ -5645,7 +5646,8 @@ static void vk_eng_flush(void)
     {   /* [oneshot-by] splits a blocking flush by why (the same codes as VK_EB_STATS) */
         static const char* const nm[9] = { "flush:other", "flush:ring", "flush:unbatched", "flush:max",
             "flush:engine", "flush:destroy", "flush:present", "flush:begin", "flush:own" };
-        vk_submit_and_wait_at(nm[s_wait_tag < 9 ? s_wait_tag : 8]); }
+        vk_submit_and_wait_at(s_wait_tag == 4 && g_rsx_ww_ctx ? g_rsx_ww_ctx : nm[s_wait_tag < 9 ? s_wait_tag : 8]);
+        g_rsx_ww_ctx = NULL; }
     s_eb_batch_id++;
     ps3_trace_instant(PS3_TR_DRAW_SUBMIT, s_eb_batch_id, (uint32_t)s_eb.flushes);
     s_wait_tag = 8;
@@ -5667,7 +5669,7 @@ static void vk_eng_submit_batch(void* user)
     (void)user;
     if (!s_eb_pending) return;
     if (s_ebs_on) vk_eng_flush_async();
-    else { s_eb_why = 4; vk_eng_flush(); }
+    else { s_eb_why = 4; g_rsx_ww_ctx = "be:submit_batch"; vk_eng_flush(); }
 }
 
 static VkDeviceSize vk_eb_take(VkDeviceSize* head, VkDeviceSize cap, VkDeviceSize bytes, VkDeviceSize align)

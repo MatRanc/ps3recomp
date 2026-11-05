@@ -578,6 +578,8 @@ enum {
     RSX_WW_COUNT
 };
 extern __thread int g_rsx_ww_walker;
+/* Names the engine call site of the next backend submit_and_wait ([oneshot-by] flush:engine split). */
+extern const char* g_rsx_ww_ctx;
 void rsx_ww_enter(void);
 void rsx_ww_leave(void);
 void rsx_ww_add(int site, unsigned long long ns);
