@@ -184,6 +184,8 @@ typedef struct {
     u32 snap_w, snap_h;    /* the region that copy holds                    */
     int cleared;
     int had_write;
+    int const_ok;          /* last depth op was a whole clear to const_val, no write since */
+    float const_val;
     int snapshot_valid;
     u64 depth_serial;      /* g.write_serial of the last depth write or clear */
     int guest_dirty;       /* written since guest memory last got a copy     */
@@ -2644,6 +2646,7 @@ static u32 eng_zdepth_get(u32 location, u32 offset, u32 rt_w, u32 rt_h)
     z->snapshot = 0;
     z->cleared = 0;
     z->had_write = 0;
+    z->const_ok = 0;
     z->snapshot_valid = 0;
     z->depth_serial = 0;
     z->guest_dirty = 0;
@@ -2688,11 +2691,39 @@ static int eng_depth_gpu(void)
     return s_depth_gpu;
 }
 
+/* PS3RECOMP_ENG_SHADOW_CONST=1 (needs DEPTH_GPU): a zeta whose last depth op
+ * was a whole clear and that nothing drew into since binds one shared
+ * constant texture holding the clear value instead of a per-frame copy of the
+ * (identical) device depth. */
+static int s_shadow_const = -1, s_shadow_const_force = -1;
+
+void rsx_draw_engine_set_shadow_const(int on)
+{
+    s_shadow_const_force = on;
+}
+
+static int eng_shadow_const(void)
+{
+    if (s_shadow_const_force >= 0) return s_shadow_const_force;
+#if defined(__GNUC__) && !defined(_WIN32)
+    if (ps3_live_ctl_get) return ps3_live_ctl_get(PS3_LIVE_ENG_SHADOW_CONST);
+#endif
+    if (s_shadow_const < 0) {
+        const char* e = getenv("PS3RECOMP_ENG_SHADOW_CONST");
+        s_shadow_const = e && *e && strcmp(e, "0") != 0;
+    }
+    return s_shadow_const;
+}
+
 static u32 eng_zdepth_snapshot(u32 slot, u32 tex_w, u32 tex_h)
 {
     eng_mt_sync();
     eng_zdepth* z = &g.zdepths[slot];
     if (!z->handle || !(z->had_write || (eng_depth_gpu() && z->guest_dirty))) return 0;
+    if (!z->had_write && z->const_ok && eng_depth_gpu() && eng_shadow_const() && g.be->depth_constant) {
+        const u32 c = g.be->depth_constant(g.be->user, z->const_val);
+        if (c) return c;
+    }
     /* The texture covers the top-left tex_w x tex_h of the zeta. The host
      * depth target is at least canvas-sized (eng_zdepth_get), so a 128x160
      * shadow map lives in the corner of a 1280x720 image; resolving all of it
@@ -7974,7 +8005,7 @@ static void eng_pkt_track(const eng_draw_pkt* p)
         }
     }
     if (p->track_depth_write && p->zslot != ENG_INVALID) {
-        g.zdepths[p->zslot].had_write = 1;
+        g.zdepths[p->zslot].had_write = 1; g.zdepths[p->zslot].const_ok = 0;
         eng_zdepth_wrote(p->zslot, &p->track_sf);
     }
 }
@@ -8307,6 +8338,7 @@ static void sink_end_work(void* user, const rsx_dispatch* r)
     if (do_clear_depth) {
         g.zdepths[zslot].cleared = 1;
         g.zdepths[zslot].had_write = 0;
+        g.zdepths[zslot].const_ok = 0;
     }
 
     u32 sc[4];
@@ -8569,7 +8601,7 @@ mt_done:
         }
     }
     if (zslot != ENG_INVALID && rs.depth_test && rs.depth_write) {
-        g.zdepths[zslot].had_write = 1;
+        g.zdepths[zslot].had_write = 1; g.zdepths[zslot].const_ok = 0;
         eng_zdepth_wrote(zslot, &sf);
     }
     wp2_add(WPROF2_SURFTRACK, w2_surftrack);
@@ -8709,6 +8741,8 @@ static void sink_clear(void* user, const rsx_dispatch* r, u32 mask)
              * texture consumer resolves the newly written pass exactly once.
              * Past a partial clear the rest still holds what was drawn. */
             if (!partial) g.zdepths[zslot].had_write = 0;
+            g.zdepths[zslot].const_ok = !partial;
+            g.zdepths[zslot].const_val = depth;
             g.zdepths[zslot].snapshot_valid = 0;
             eng_zdepth_wrote(zslot, &sf);
         }

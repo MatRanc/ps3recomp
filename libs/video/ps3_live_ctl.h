@@ -99,6 +99,10 @@ enum {
     PS3_LIVE_FP_AA,                     /* PS3RECOMP_FP_AA: scale derivative LOD by the 2x1 AA sample grid */
     PS3_LIVE_PIPE_ASYNC,                /* PS3RECOMP_PIPE_ASYNC: translate/build pipelines on a worker */
     PS3_LIVE_ENG_DEPTH_GPU,             /* PS3RECOMP_ENG_DEPTH_GPU: snapshot a clear-only zeta on the GPU instead of a guest store */
+    PS3_LIVE_ENG_SHADOW_CONST,          /* PS3RECOMP_ENG_SHADOW_CONST: a clear-only depth texture binds one constant texture */
+    PS3_LIVE_VK_PASS_KEEP,              /* PS3RECOMP_VK_PASS_KEEP: consecutive draws to the same targets share a render pass and one barrier */
+    PS3_LIVE_VK_DRAW_STATE,             /* PS3RECOMP_VK_DRAW_STATE: skip re-binding unchanged pipeline / viewport / scissor / stencil */
+    PS3_LIVE_VK_VTX_PRE,                /* PS3RECOMP_VK_VTX_PRE (needs PASS_KEEP): vertex-unpack dispatches go to a pre command buffer */
     PS3_LIVE_COUNT
 };
 

@@ -224,6 +224,9 @@ typedef struct rsx_draw_backend {
     /* Resolve a depth target into a sampleable texture and return it; 0 when
      * the backend cannot. The engine only asks after a depth-writing draw. */
     u32  (*depth_snapshot)(void* user, u32 depth, u32 w, u32 h);
+    /* Optional: a shared 1x1 float texture holding `value`, for a depth map
+     * that was cleared and never drawn into; 0 when the backend cannot. */
+    u32  (*depth_constant)(void* user, float value);
 
     /* Pipelines, from the decompilers' HLSL plus the state that selects a
      * variant. This is the one call that hides D3DCompile against glslang
@@ -581,6 +584,8 @@ void rsx_draw_engine_set_refs_hash_fast(int on);
 void rsx_draw_engine_set_no_draw(int on);
 /* Unit tests: force PS3RECOMP_ENG_DEPTH_GPU on/off (-1 follows the key again). */
 void rsx_draw_engine_set_depth_gpu(int on);
+/* Unit tests: force PS3RECOMP_ENG_SHADOW_CONST on/off (-1 follows the key again). */
+void rsx_draw_engine_set_shadow_const(int on);
 
 /* Captured dispatcher state: enough to start a replay at the frame boundary
  * the capture began on. The sink and the coverage counters are not part of
