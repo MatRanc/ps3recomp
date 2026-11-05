@@ -92,12 +92,16 @@ static int  s_gcm_initialized = 0;
 /* Defined with the other switch helpers below. */
 static int  gcm_live_get(int key, const char* env);
 static void gcm_publish_offset_tables(void);
+static unsigned long long gcm_us_now(void);
 static u32  s_flip_mode   = CELL_GCM_DISPLAY_VSYNC;
 static u32  s_flip_status = CELL_GCM_FLIP_STATUS_DONE;
 /* Flip requests (each puts the status back to WAITING) and the request a
  * pending flip completion was marked for: a completion delivered late must not
  * mark DONE a flip requested after it (see ppu_gcm_pump). */
 static volatile u32 s_flip_req_seq, s_flip_tick_seq;
+/* Monotonic us of the latest request (the age bound in the own-state tick
+ * gate). Guarded by FLIP_LOCK. */
+static volatile unsigned long long s_flip_req_us;
 /* The status's read-modify-write transitions (request, tick, completion) run
  * on different threads; without a lock a completion could read "no newer
  * request" just before a request stored WAITING and then overwrite it. */
@@ -196,13 +200,23 @@ static int s_flip_present_path = 0;
  * second to build its next frame here, then queues the flip, and a beat in
  * between that reported a flip made it take the new one for done. It then
  * rebuilt the command segment the walker was still waiting in. */
+static int gcm_flip_direct_take(void)
+{
+    if (s_flip_direct_pending) { s_flip_direct_pending = 0; return 1; }
+    return 0;
+}
 static int gcm_flip_executed_take(void)
 {
     const u32 r = s_fifo_flips_reached;
     if (r != s_fifo_flips_completed) { s_fifo_flips_completed = r; return 1; }
-    if (s_flip_direct_pending) { s_flip_direct_pending = 0; return 1; }
-    return 0;
+    return gcm_flip_direct_take();
 }
+/* The guest's first flip-done wait: Gfx_DisplayFlip calls Cond_Wait with
+ * 17000 us twice and gives up after DAT_011203f8 << 1 (2 x 16683 us). A tick
+ * that fires later than this has either been superseded or belongs to a frame
+ * the guest is about to abandon; completing then is the KEEP_STATUS failure
+ * mode. This is the guest's own bound, not a tuning constant. */
+#define GCM_FLIP_TICK_AGE_US 17000ull
 /* ponytail: fixed headroom, far above one frame's commands (Simpsons ~10 KB);
  * derive it from the observed per-frame volume if a title outgrows it. */
 #define GCM_FLIP_WRAP_BYTES 0x40000u
@@ -1049,6 +1063,22 @@ static u32 gcm_flip_complete_locked(enum gcm_flip_gate gate, u32 ref)
     u32 seq = 0;
     switch (gate) {
     case GCM_FLIP_GATE_TICK:
+        /* PS3RECOMP_FLIP_TICK_OWN_STATE: judge the tick by our own
+         * outstanding-flip state instead of the guest-visible status word.
+         * cellGcmSetPrepareFlip prepares frames ahead and writes DONE a few
+         * ms after the request (docs/menu-34ms.md), so a status gate skips the
+         * tick and the guest waits out both 17 ms timeouts. The direct-pending
+         * flag is the request itself; the age bound keeps the change a no-op
+         * once the guest has left on its fallback (the meter), which is what
+         * made PS3RECOMP_PREPARE_FLIP_KEEP_STATUS lose frames. */
+        if (gcm_live_get(PS3_LIVE_FLIP_TICK_OWN_STATE,
+                         "PS3RECOMP_FLIP_TICK_OWN_STATE")) {
+            const unsigned long long age = gcm_us_now() - s_flip_req_us;
+            if (s_flip_direct_pending && s_flip_req_us &&
+                age < GCM_FLIP_TICK_AGE_US && gcm_flip_direct_take())
+                seq = s_flip_req_seq;
+            break;
+        }
         /* Same rule as cellGcm_request_tick: a flip still ahead of the drain
          * has not happened yet. */
         if (s_flip_status == CELL_GCM_FLIP_STATUS_WAITING &&
@@ -4164,10 +4194,12 @@ static s32 gcm_flip_request(u32 bufferId, int in_fifo)
     /* Flip requested but not yet shown: a subsequent cellGcmSetWaitFlip blocks
      * until the present thread's cellGcmTickFlip marks it done (vsync). */
     u32 req_seq;
+    const unsigned long long req_us = gcm_us_now();
     FLIP_LOCK();
     s_flip_status = CELL_GCM_FLIP_STATUS_WAITING;
     s_flip_req_seq++;
     req_seq = s_flip_req_seq;
+    s_flip_req_us = req_us;
     s_flip_req_ref = ref_at_request;
     if (!in_fifo) {
         /* Ticker: present BEFORE the next drain. The sequence travels with

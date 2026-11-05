@@ -89,6 +89,7 @@ enum {
     PS3_LIVE_WALKER_MT_STAGES,          /* PS3RECOMP_WALKER_MT_STAGES: reserved pipeline stages mask */
     PS3_LIVE_WALKER_MT_SNAPSHOT,        /* PS3RECOMP_WALKER_MT_SNAPSHOT: copy borrowed guest bytes */
     PS3_LIVE_WALKER_MT_TEX_RESOLVE,     /* PS3RECOMP_WALKER_MT_TEX_RESOLVE: plain guest texture resolver */
+    PS3_LIVE_FLIP_TICK_OWN_STATE,       /* PS3RECOMP_FLIP_TICK_OWN_STATE: tick completes by our request state, age-bounded */
     PS3_LIVE_COUNT
 };
 

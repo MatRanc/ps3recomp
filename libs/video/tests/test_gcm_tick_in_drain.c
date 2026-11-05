@@ -25,6 +25,8 @@ void spu_coh_notify_write(uint32_t a) { (void)a; }
 void spu_lockline_lock(void) {}
 void spu_lockline_unlock(void) {}
 ps3_guest_caller_fn g_ps3_guest_caller;
+int rsx_draw_engine_enabled(void) { return 0; }
+void rsx_draw_engine_note_flip(uint32_t buffer_id) { (void)buffer_id; }
 static unsigned flips;
 static void callback(uint32_t opd, uint64_t a, uint64_t b, uint64_t c,
                      uint64_t d, uint64_t e, uint64_t f, uint64_t h, uint64_t i)
@@ -37,6 +39,7 @@ static void request_direct(void)
 {
     s_flip_status = CELL_GCM_FLIP_STATUS_WAITING;
     s_flip_req_seq++;
+    s_flip_req_us = gcm_us_now();
     s_flip_direct_pending = 1;
 }
 
@@ -45,6 +48,8 @@ int main(void)
     g_ps3_guest_caller = callback;
     s_flip_handler_opd = 0x400;
     setenv("PS3RECOMP_FLIP_FENCE_DONE", "0", 1);
+    setenv("PS3RECOMP_FLIP_TICK_OWN_STATE", "0", 1);
+    setenv("GCM_FLIPCB_ONTICK", "1", 1);
 
     /* The take records the pending image's request sequence, not whatever the
      * request counter has advanced to since (a ResetFlipStatus or the next
@@ -125,6 +130,55 @@ int main(void)
     ppu_gcm_pump();
     assert(flips == 4);
     setenv("PS3RECOMP_FLIP_FENCE_DONE", "0", 1);
+
+    /* PS3RECOMP_FLIP_TICK_OWN_STATE: the tick completes a direct flip by our
+     * own request state even after SetPrepareFlip clobbered the visible
+     * status to DONE. request -> prepare -> tick completes exactly once. */
+    setenv("PS3RECOMP_FLIP_TICK_OWN_STATE", "1", 1);
+    s_display_buffer_set[0] = 1;
+    unsigned before = flips;
+    request_direct();                        /* the direct request */
+    assert(s_flip_direct_pending == 1);
+    cellGcmSetPrepareFlip(NULL, 0);          /* the title prepares ahead */
+    assert(cellGcmGetFlipStatus() == CELL_GCM_FLIP_STATUS_DONE);
+    cellGcmTickFlip();
+    ppu_gcm_pump();
+    assert(flips == before + 1);
+    assert(cellGcmGetFlipStatus() == CELL_GCM_FLIP_STATUS_DONE);
+    assert(s_flip_direct_pending == 0);
+
+    /* No double completion: a second tick with no request does nothing. */
+    cellGcmTickFlip();
+    ppu_gcm_pump();
+    assert(flips == before + 1);
+
+    /* A request older than the guest's first 17 ms wait is not completed
+     * (the guest has left on its own fallback; this is what keeps the meter
+     * a no-op). The pending request stays outstanding. */
+    request_direct();
+    s_flip_req_us = gcm_us_now() - 20000ull;
+    cellGcmTickFlip();
+    ppu_gcm_pump();
+    assert(flips == before + 1);
+    assert(cellGcmGetFlipStatus() == CELL_GCM_FLIP_STATUS_WAITING);
+    assert(s_flip_direct_pending == 1);
+
+    /* Inside the bound it completes, once. */
+    s_flip_req_us = gcm_us_now() - 16999ull;
+    cellGcmTickFlip();
+    ppu_gcm_pump();
+    assert(flips == before + 2);
+    assert(cellGcmGetFlipStatus() == CELL_GCM_FLIP_STATUS_DONE);
+    assert(s_flip_direct_pending == 0);
+
+    /* No request outstanding: the tick completes nothing even though a stale
+     * request stamp is still around and the status is WAITING. */
+    s_flip_status = CELL_GCM_FLIP_STATUS_WAITING;
+    s_flip_req_us = gcm_us_now();
+    cellGcmTickFlip();
+    ppu_gcm_pump();
+    assert(flips == before + 2);
+    setenv("PS3RECOMP_FLIP_TICK_OWN_STATE", "0", 1);
 
     puts("GCM tick-in-drain / fence checks passed");
     return 0;
