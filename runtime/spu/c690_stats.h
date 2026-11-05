@@ -38,6 +38,18 @@ void c690_gap_on_dma(const struct spu_context* ctx, int is_put, uint32_t lsa,
 void c690_gap_on_atomic(const struct spu_context* ctx, int kind, int ok);
 void c690_gap_on_overlay(int kind, int ok);
 
+/* PS3RECOMP_C690_STEPS=1: split the inter-job turnover into the head/tail
+ * sub-steps (tail submit, PM exit, claim/allocate, staging, dispatch) with a
+ * per-step wall-time histogram, and time the synchronous DMA copies and the
+ * lock-line atomics each step makes. Short (in-burst) gaps only; measurement
+ * only, off by default. */
+extern int g_c690_steps;
+void c690_step_dma_begin(const struct spu_context* ctx, int is_put,
+                         uint32_t lsa, uint32_t size);
+void c690_step_dma_end(const struct spu_context* ctx);
+void c690_step_atomic_begin(const struct spu_context* ctx, int kind);
+void c690_step_atomic_end(const struct spu_context* ctx);
+
 /* PS3RECOMP_C690_OP21=1: measure the 0x21 emit/ring command only
  * (handler LS 0x13080). Per call it splits the inclusive time across the
  * handler's sub-selector targets (0x13178/0x13140/0x131A0/0x131F8/0x13240/

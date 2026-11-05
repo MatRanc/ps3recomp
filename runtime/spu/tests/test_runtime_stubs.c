@@ -67,6 +67,12 @@ WEAK void c690_corpus_dma(const spu_context* c, int p, uint32_t lsa, uint64_t ea
 { (void)c; (void)p; (void)lsa; (void)ea; (void)n; (void)b; }
 WEAK void c690_gap_on_dma(const spu_context* c, int p, uint32_t lsa, uint32_t n)
 { (void)c; (void)p; (void)lsa; (void)n; }
+WEAK int g_c690_steps;
+WEAK void c690_step_dma_begin(const spu_context* c, int p, uint32_t lsa, uint32_t n)
+{ (void)c; (void)p; (void)lsa; (void)n; }
+WEAK void c690_step_dma_end(const spu_context* c) { (void)c; }
+WEAK void c690_step_atomic_begin(const spu_context* c, int k) { (void)c; (void)k; }
+WEAK void c690_step_atomic_end(const spu_context* c) { (void)c; }
 WEAK int g_c690_stats;
 WEAK void c690_stats_on_direct(const spu_context* c, uint32_t lsa) { (void)c; (void)lsa; }
 WEAK void c690_stats_on_lookup(const spu_context* c, uint32_t lsa) { (void)c; (void)lsa; }

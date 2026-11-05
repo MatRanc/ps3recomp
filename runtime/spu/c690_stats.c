@@ -77,6 +77,7 @@ int g_c690_stats = 0;
 int g_c690_hash_on = 0;      /* PS3RECOMP_C690_HASH: sample stride, 0 = off */
 int g_c690_gap = 0;          /* PS3RECOMP_C690_GAP: inter-job turnover breakdown */
 int g_c690_op21 = 0;         /* PS3RECOMP_C690_OP21: 0x21 emit/ring breakdown */
+int g_c690_steps = 0;        /* PS3RECOMP_C690_STEPS: head/tail sub-steps */
 
 #define C690_IMAGE_ID        6
 #define C690_JOB_ENTRY_LS    0x135B8u
@@ -86,6 +87,17 @@ int g_c690_op21 = 0;         /* PS3RECOMP_C690_OP21: 0x21 emit/ring breakdown */
 #define C690_MAX_THREADS     64
 #define C690_WALL_BUCKETS    65536u             /* 1 us buckets, up to 65.5 ms */
 #define C690_REPORT_PERIOD_NS 2000000000ull     /* 2 s between periodic reports */
+
+/* PS3RECOMP_C690_STEPS: the head/tail sub-steps of one inter-job gap. */
+#define C690_STEP_TAIL_SUBMIT   0   /* job end -> PM exit (c690 submit epilogue) */
+#define C690_STEP_PM_EXIT       1   /* PM exit -> head start (incl. re-entry/host) */
+#define C690_STEP_HEAD_ALLOC    2   /* claim + AllocateJob (GETLLAR/PUTLLC) */
+#define C690_STEP_HEAD_STAGE    3   /* descriptor/code DMA, job context */
+#define C690_STEP_HEAD_DISPATCH 4   /* DispatchJob -> job entry */
+#define C690_STEP_OTHER_WORK    5   /* another workload ran on this lane */
+#define C690_STEP_N             6
+#define C690_STEP_HIST          1024u
+#define C690_STEP_SHORT_NS      2000000ull  /* "in-burst" gap bound */
 
 /* PS3RECOMP_C690_OP21: the 0x21 emit/ring handler (LS 0x13080) is a
  * sub-selector dispatcher. The table at LS 0x1311C has eight targets:
@@ -325,6 +337,22 @@ static SPU_THREAD_LOCAL struct {
     /* All-class synchronous DMA (fast-path copy). */
     unsigned dma_all_depth;
     uint64_t dma_all_t0;
+    /* PS3RECOMP_C690_STEPS: per-gap head/tail step ledger on this lane. */
+    unsigned step_active;
+    int step_phase;
+    uint64_t step_t0, step_last;
+    uint64_t step_phase_ns[C690_STEP_N];
+    uint64_t step_dma_ns[C690_STEP_N][3];
+    uint64_t step_dma_n[C690_STEP_N][3];
+    uint64_t step_dma_b[C690_STEP_N][3];
+    uint64_t step_atom_ns[C690_STEP_N][2];
+    uint64_t step_atom_n[C690_STEP_N][2];
+    unsigned step_dma_active;
+    uint64_t step_dma_t0;
+    int step_dma_cat;
+    unsigned step_atom_active;
+    uint64_t step_atom_t0;
+    int step_atom_kind;
 } t_run;
 
 /* ---- PS3RECOMP_C690_HASH: do repeated jobs produce identical bytes? ----
@@ -570,6 +598,269 @@ void c690_gap_on_overlay(int kind, int ok)
         s->gap_ctr[10]++;
         if (!ok) s->gap_ctr[11]++;
     }
+}
+
+/* ===========================================================================
+ * PS3RECOMP_C690_STEPS: split the inter-job turnover into head/tail sub-steps.
+ *
+ * The gap is the same job end (0x12AB8) -> next job entry (0x135B8) window the
+ * GAP counters use. One lane runs a single thread, so the step ledger lives in
+ * the thread-local t_run: every lifted entry (indirect or SPU_DIRECT) charges
+ * the elapsed time to the step that was active, then a few well-known entry
+ * LSAs move the active step. The synchronous DMA copies and lock-line atomics
+ * made while a step is active are timed separately and folded into that step.
+ *
+ * Steps:
+ *   tail submit   job end -> first PM (LS < 0x4000) entry; the c690 submit
+ *                 epilogue, its output PUTs included.
+ *   PM exit       first PM entry -> head: 0x2D10/0x2D20/0x2D48/0x3630 exit,
+ *                 PM re-entry and any host dispatch wait in between.
+ *   head alloc    claim/AllocateJob: 0x23BC/0x2498 claim body, 0x3020.
+ *   head stage    0x3080: job descriptor and the 67 KiB job-code re-DMA.
+ *   head dispatch 0x31B0: job context build and the branch to the job entry.
+ *   other work    another workload image ran on the lane inside the gap.
+ *
+ * Only gaps shorter than C690_STEP_SHORT_NS are merged, so the burst duty-cycle
+ * idle does not dominate the means. Measurement only; off by default.
+ * ===========================================================================*/
+static unsigned c690_pct_tenths(unsigned long long part, unsigned long long total);
+
+static unsigned long long s_step_ns[C690_STEP_N];
+static unsigned long long s_step_n[C690_STEP_N];
+static unsigned int s_step_hist[C690_STEP_N][C690_STEP_HIST];
+static unsigned long long s_step_dma_ns[C690_STEP_N][3];
+static unsigned long long s_step_dma_n[C690_STEP_N][3];
+static unsigned long long s_step_dma_b[C690_STEP_N][3];
+static unsigned long long s_step_atom_ns[C690_STEP_N][2];
+static unsigned long long s_step_atom_n[C690_STEP_N][2];
+static unsigned long long s_step_gaps, s_step_total_ns;
+static unsigned int s_step_close[C690_STEP_N];
+
+static const char* const s_step_name[C690_STEP_N] = {
+    "tail_submit", "pm_exit+host", "head_alloc+claim", "head_stage",
+    "head_dispatch", "other_workload"
+};
+
+static void c690_step_charge(uint64_t now)
+{
+    if (!t_run.step_active) return;
+    const uint64_t dt = now - t_run.step_last;
+    if (t_run.step_phase >= 0 && t_run.step_phase < C690_STEP_N)
+        t_run.step_phase_ns[t_run.step_phase] += dt;
+    t_run.step_last = now;
+}
+
+static void c690_step_open(uint64_t now)
+{
+    if (!g_c690_steps) return;
+    memset(t_run.step_phase_ns, 0, sizeof t_run.step_phase_ns);
+    memset(t_run.step_dma_ns, 0, sizeof t_run.step_dma_ns);
+    memset(t_run.step_dma_n, 0, sizeof t_run.step_dma_n);
+    memset(t_run.step_dma_b, 0, sizeof t_run.step_dma_b);
+    memset(t_run.step_atom_ns, 0, sizeof t_run.step_atom_ns);
+    memset(t_run.step_atom_n, 0, sizeof t_run.step_atom_n);
+    t_run.step_active = 1;
+    t_run.step_phase = C690_STEP_TAIL_SUBMIT;
+    t_run.step_t0 = now;
+    t_run.step_last = now;
+    t_run.step_dma_active = 0;
+    t_run.step_atom_active = 0;
+}
+
+static void c690_step_close(uint64_t now)
+{
+    if (!t_run.step_active) return;
+    c690_step_charge(now);
+    const uint64_t total = now - t_run.step_t0;
+    if (total && total < C690_STEP_SHORT_NS) {
+        s_step_gaps++;
+        s_step_total_ns += total;
+        for (int p = 0; p < C690_STEP_N; p++) {
+            const unsigned long long ns = t_run.step_phase_ns[p];
+            s_step_ns[p] += ns;
+            s_step_n[p]++;
+            unsigned us = (unsigned)(ns / 1000u);
+            if (us >= C690_STEP_HIST) us = C690_STEP_HIST - 1u;
+            __atomic_fetch_add(&s_step_hist[p][us], 1u, __ATOMIC_RELAXED);
+            for (int c = 0; c < 3; c++) {
+                __atomic_fetch_add(&s_step_dma_ns[p][c], t_run.step_dma_ns[p][c],
+                                   __ATOMIC_RELAXED);
+                __atomic_fetch_add(&s_step_dma_n[p][c], t_run.step_dma_n[p][c],
+                                   __ATOMIC_RELAXED);
+                __atomic_fetch_add(&s_step_dma_b[p][c], t_run.step_dma_b[p][c],
+                                   __ATOMIC_RELAXED);
+            }
+            for (int c = 0; c < 2; c++) {
+                __atomic_fetch_add(&s_step_atom_ns[p][c], t_run.step_atom_ns[p][c],
+                                   __ATOMIC_RELAXED);
+                __atomic_fetch_add(&s_step_atom_n[p][c], t_run.step_atom_n[p][c],
+                                   __ATOMIC_RELAXED);
+            }
+        }
+        __atomic_fetch_add(&s_step_close[t_run.step_phase], 1u, __ATOMIC_RELAXED);
+    }
+    t_run.step_active = 0;
+}
+
+static void c690_step_on_job_end(uint64_t now) { c690_step_open(now); }
+
+/* Every lifted entry while the gap is open. `lsa` is the target LS. */
+static void c690_step_on_entry(const struct spu_context* ctx, uint32_t lsa,
+                               uint64_t now)
+{
+    if (!g_c690_steps) return;
+    if (ctx && ctx->image_id == C690_IMAGE_ID && lsa == C690_JOB_ENTRY_LS) {
+        c690_step_close(now);
+        return;
+    }
+    if (!t_run.step_active) return;
+    c690_step_charge(now);
+    if (!ctx || ctx->image_id != C690_IMAGE_ID) {
+        t_run.step_phase = C690_STEP_OTHER_WORK;
+        return;
+    }
+    switch (lsa) {
+    case 0x2D10u: case 0x2D20u: case 0x2D48u: case 0x3630u:
+        t_run.step_phase = C690_STEP_PM_EXIT;
+        break;
+    case 0x3020u:                /* AllocateJob */
+    case 0x23BCu: case 0x2498u:  /* ticket claim body / commit */
+        if (t_run.step_phase != C690_STEP_HEAD_STAGE &&
+            t_run.step_phase != C690_STEP_HEAD_DISPATCH)
+            t_run.step_phase = C690_STEP_HEAD_ALLOC;
+        break;
+    case 0x3080u:                /* LoadJob: descriptor + code DMA */
+        t_run.step_phase = C690_STEP_HEAD_STAGE;
+        break;
+    case 0x31B0u:                /* DispatchJob */
+        t_run.step_phase = C690_STEP_HEAD_DISPATCH;
+        break;
+    default:
+        /* Any other c690-image entry at LSA >= 0x4000 is the submit epilogue
+         * after the end command. PM code below 0x4000 while the tail is still
+         * active means the submit has handed back to the PM: the exit phase
+         * has started, even when the 0x2D10 marker itself is entered through
+         * a direct host call. */
+        if (lsa >= 0x4000u) {
+            if (t_run.step_phase == C690_STEP_TAIL_SUBMIT)
+                /* stay */;
+        } else if (t_run.step_phase == C690_STEP_TAIL_SUBMIT) {
+            t_run.step_phase = C690_STEP_PM_EXIT;
+        }
+        break;
+    }
+}
+
+void c690_step_dma_begin(const struct spu_context* ctx, int is_put,
+                         uint32_t lsa, uint32_t size)
+{
+    (void)ctx;
+    if (!g_c690_steps || !t_run.step_active || t_run.step_dma_active) return;
+    const int cat = is_put ? 2 : (lsa >= 0x4000u && lsa < 0x14840u ? 0 : 1);
+    t_run.step_dma_active = 1;
+    t_run.step_dma_cat = cat;
+    t_run.step_dma_t0 = c690_now_ns();
+    const int p = t_run.step_phase;
+    if (p >= 0 && p < C690_STEP_N) {
+        t_run.step_dma_n[p][cat]++;
+        t_run.step_dma_b[p][cat] += size;
+    }
+}
+
+void c690_step_dma_end(const struct spu_context* ctx)
+{
+    (void)ctx;
+    if (!g_c690_steps || !t_run.step_dma_active) return;
+    const uint64_t dt = c690_now_ns() - t_run.step_dma_t0;
+    const int p = t_run.step_phase;
+    const int cat = t_run.step_dma_cat;
+    if (p >= 0 && p < C690_STEP_N && cat >= 0 && cat < 3)
+        t_run.step_dma_ns[p][cat] += dt;
+    t_run.step_dma_active = 0;
+}
+
+void c690_step_atomic_begin(const struct spu_context* ctx, int kind)
+{
+    (void)ctx;
+    if (!g_c690_steps || !t_run.step_active || t_run.step_atom_active) return;
+    t_run.step_atom_active = 1;
+    t_run.step_atom_kind = kind ? 1 : 0;
+    t_run.step_atom_t0 = c690_now_ns();
+}
+
+void c690_step_atomic_end(const struct spu_context* ctx)
+{
+    (void)ctx;
+    if (!g_c690_steps || !t_run.step_atom_active) return;
+    const uint64_t dt = c690_now_ns() - t_run.step_atom_t0;
+    const int p = t_run.step_phase;
+    const int k = t_run.step_atom_kind;
+    if (p >= 0 && p < C690_STEP_N && k >= 0 && k < 2) {
+        t_run.step_atom_ns[p][k] += dt;
+        t_run.step_atom_n[p][k]++;
+    }
+    t_run.step_atom_active = 0;
+}
+
+static unsigned c690_step_percentile(int p, unsigned pct)
+{
+    unsigned long long total = 0, cum = 0, target;
+    for (unsigned i = 0; i < C690_STEP_HIST; i++)
+        total += __atomic_load_n(&s_step_hist[p][i], __ATOMIC_RELAXED);
+    if (!total) return 0;
+    target = (total * pct + 99u) / 100u;
+    for (unsigned i = 0; i < C690_STEP_HIST; i++) {
+        cum += __atomic_load_n(&s_step_hist[p][i], __ATOMIC_RELAXED);
+        if (cum >= target) return i;
+    }
+    return C690_STEP_HIST - 1u;
+}
+
+static void c690_step_report(void)
+{
+    if (!g_c690_steps || !s_step_gaps) return;
+    fprintf(stderr,
+            "[c690-step] short_gaps=%llu total_us=%llu mean_gap_us=%.2f "
+            "(gaps under %llu us)\n",
+            s_step_gaps, s_step_total_ns / 1000ull,
+            (double)s_step_total_ns / (double)s_step_gaps / 1000.0,
+            C690_STEP_SHORT_NS / 1000ull);
+    fprintf(stderr, "[c690-step] step | us/gap | p50 | p90 | share | dma_us/gap "
+                    "(code_get/data_get/put) | atomics_us/gap (llar/llc)\n");
+    for (int p = 0; p < C690_STEP_N; p++) {
+        if (!s_step_n[p]) continue;
+        const unsigned long long ns = s_step_ns[p];
+        const double us = (double)ns / (double)s_step_gaps / 1000.0;
+        const unsigned share = c690_pct_tenths(ns, s_step_total_ns);
+        const double d0 = (double)s_step_dma_ns[p][0] / (double)s_step_gaps / 1000.0;
+        const double d1 = (double)s_step_dma_ns[p][1] / (double)s_step_gaps / 1000.0;
+        const double d2 = (double)s_step_dma_ns[p][2] / (double)s_step_gaps / 1000.0;
+        const double a0 = (double)s_step_atom_ns[p][0] / (double)s_step_gaps / 1000.0;
+        const double a1 = (double)s_step_atom_ns[p][1] / (double)s_step_gaps / 1000.0;
+        fprintf(stderr,
+                "[c690-step] %-16s %8.2f  %3u  %3u  %2u.%u%%  "
+                "%.2f/%.2f/%.2f  %.2f/%.2f\n",
+                s_step_name[p], us, c690_step_percentile(p, 50),
+                c690_step_percentile(p, 90), share / 10u, share % 10u,
+                d0, d1, d2, a0, a1);
+        if (s_step_dma_n[p][0] || s_step_dma_n[p][1] || s_step_dma_n[p][2]) {
+            fprintf(stderr,
+                    "[c690-step]   %-16s dma n/gap code=%.2f data=%.2f put=%.2f "
+                    "bytes/gap code=%.0f data=%.0f put=%.0f\n",
+                    "", (double)s_step_dma_n[p][0] / (double)s_step_gaps,
+                    (double)s_step_dma_n[p][1] / (double)s_step_gaps,
+                    (double)s_step_dma_n[p][2] / (double)s_step_gaps,
+                    (double)s_step_dma_b[p][0] / (double)s_step_gaps,
+                    (double)s_step_dma_b[p][1] / (double)s_step_gaps,
+                    (double)s_step_dma_b[p][2] / (double)s_step_gaps);
+        }
+    }
+    fprintf(stderr, "[c690-step] closes in step:");
+    for (int p = 0; p < C690_STEP_N; p++) {
+        if (s_step_close[p])
+            fprintf(stderr, " %s=%u", s_step_name[p], s_step_close[p]);
+    }
+    fprintf(stderr, "\n");
 }
 
 static c690_thread_stats* c690_slot(void)
@@ -826,6 +1117,7 @@ void c690_stats_on_lookup(const struct spu_context* ctx, uint32_t lsa)
     if (lsa == 0) return;                    /* LS 0 is an end, not an entry */
     const uint64_t now = c690_now_ns();
     if (__builtin_expect(g_c690_gap, 0)) c690_gap_on_lookup(ctx, lsa, now);
+    if (__builtin_expect(g_c690_steps, 0)) c690_step_on_entry(ctx, lsa, now);
     if (ctx->image_id != C690_IMAGE_ID) return;
     c690_thread_stats* const s = c690_slot();
 
@@ -868,6 +1160,7 @@ void c690_stats_on_lookup(const struct spu_context* ctx, uint32_t lsa)
             t_run.current_lsa = 0;
             __atomic_fetch_sub(&s_active_jobs, 1u, __ATOMIC_RELAXED);
             if (__builtin_expect(g_c690_gap, 0)) c690_gap_open(now);
+            if (__builtin_expect(g_c690_steps, 0)) c690_step_on_job_end(now);
             c690_maybe_periodic(now);
             return;
         }
@@ -948,6 +1241,8 @@ void c690_stats_on_direct(const struct spu_context* ctx, uint32_t lsa)
          * (image 2) tail calls too. */
         c690_gap_on_direct(ctx, lsa, c690_now_ns());
     }
+    if (lsa != 0 && __builtin_expect(g_c690_steps, 0))
+        c690_step_on_entry(ctx, lsa, c690_now_ns());
     if (ctx->image_id != C690_IMAGE_ID) return;
     if (!t_run.job_active || lsa == 0) return;
     const uint64_t now = c690_now_ns();
@@ -1449,6 +1744,7 @@ static void c690_report_common(const char* tag, uint64_t now_ns)
 
     c690_gap_report();
     c690_gap_window_report(jobs, wall_ns);
+    c690_step_report();
     c690_op21_report(&total);
     c690_op21_window_report(&total);
 
@@ -1553,16 +1849,19 @@ static void c690_stats_startup(void)
     const char* g = getenv("PS3RECOMP_C690_GAP");
     const char* o = getenv("PS3RECOMP_C690_OP21");
     const char* t = getenv("PS3RECOMP_C690_TAIL_CAPTURE");
+    const char* sp = getenv("PS3RECOMP_C690_STEPS");
     const int hash_stride = (h && *h) ? atoi(h) : 0;
     const int corpus_on = c && *c;
     const int gap_on = g && *g && strcmp(g, "0") != 0;
     const int op21_on = o && *o && strcmp(o, "0") != 0;
     const int tail_on = t && *t;
+    const int steps_on = sp && *sp && strcmp(sp, "0") != 0;
     if ((!e || strcmp(e, "1") != 0) && hash_stride <= 0 && !corpus_on &&
-        !gap_on && !op21_on && !tail_on) return;
+        !gap_on && !op21_on && !tail_on && !steps_on) return;
     g_c690_stats = 1;                     /* job tracking also feeds the hash/corpus */
     g_c690_gap = gap_on;
     g_c690_op21 = op21_on;
+    g_c690_steps = steps_on;
     g_c690_hash_on = hash_stride > 0 ? hash_stride : 0;
     s_t0_ns = c690_now_ns();
     s_last_report_ns = s_t0_ns;

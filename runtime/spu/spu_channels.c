@@ -1147,7 +1147,21 @@ static void spu_ch_diag_init(void)
 /* spu_wrch(MFC_Cmd): the same effects, without the channel switch. */
 void spu_mfc_cmd(spu_context* ctx, uint32_t cmd)
 {
-    if (spu_mfc_atomic(ctx, cmd)) return;
+    { extern int g_c690_steps;
+      const int atom = (cmd == MFC_GETLLAR_CMD || cmd == MFC_PUTLLC_CMD);
+      if (__builtin_expect(g_c690_steps, 0) && atom) {
+          extern void c690_step_atomic_begin(const spu_context*, int);
+          c690_step_atomic_begin(ctx, cmd == MFC_GETLLAR_CMD ? 0 : 1); }
+      if (spu_mfc_atomic(ctx, cmd)) {
+          if (__builtin_expect(g_c690_steps, 0) && atom) {
+              extern void c690_step_atomic_end(const spu_context*);
+              c690_step_atomic_end(ctx); }
+          return;
+      }
+      if (__builtin_expect(g_c690_steps, 0) && atom) {
+          extern void c690_step_atomic_end(const spu_context*);
+          c690_step_atomic_end(ctx); }
+    }
     mfc_submit(mfc_for(ctx), ctx, cmd);
 }
 
@@ -1190,8 +1204,22 @@ void spu_wrch(spu_context* ctx, uint32_t channel, u128 value)
         }
         /* Atomic line ops (GETLLAR/PUTLLC/...) need real reservation semantics,
          * not the plain GET/PUT the DMA engine would do. */
-        if (channel == MFC_Cmd && spu_mfc_atomic(ctx, v))
-            return;
+        if (channel == MFC_Cmd) {
+            extern int g_c690_steps;
+            const int atom = (v == MFC_GETLLAR_CMD || v == MFC_PUTLLC_CMD);
+            if (__builtin_expect(g_c690_steps, 0) && atom) {
+                extern void c690_step_atomic_begin(const spu_context*, int);
+                c690_step_atomic_begin(ctx, v == MFC_GETLLAR_CMD ? 0 : 1); }
+            if (spu_mfc_atomic(ctx, v)) {
+                if (__builtin_expect(g_c690_steps, 0) && atom) {
+                    extern void c690_step_atomic_end(const spu_context*);
+                    c690_step_atomic_end(ctx); }
+                return;
+            }
+            if (__builtin_expect(g_c690_steps, 0) && atom) {
+                extern void c690_step_atomic_end(const spu_context*);
+                c690_step_atomic_end(ctx); }
+        }
         mfc_channel_write(mfc_for(ctx), ctx, channel, v);
         /* MFC tag-status-update EVENT producer (channel-stall milestone). Our
          * DMA completes synchronously, so the instant the program arms tag

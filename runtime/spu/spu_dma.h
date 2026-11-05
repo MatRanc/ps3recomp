@@ -404,6 +404,10 @@ static inline int mfc_do_transfer_fast(spu_context* spu, uint32_t lsa, uint64_t 
       if (__builtin_expect(g_c690_gap, 0)) {
           extern void c690_gap_on_dma(const spu_context*, int, uint32_t, uint32_t);
           c690_gap_on_dma(spu, mfc_is_put(cmd), lsa, size); } }
+    { extern int g_c690_steps;
+      if (__builtin_expect(g_c690_steps, 0)) {
+          extern void c690_step_dma_begin(const spu_context*, int, uint32_t, uint32_t);
+          c690_step_dma_begin(spu, mfc_is_put(cmd), lsa, size); } }
     { extern int g_cri_video_dma;
       if (spu->image_id == 22 && mfc_is_get(cmd) && size > 0x100)
           g_cri_video_dma = 1; }
@@ -465,6 +469,10 @@ static inline int mfc_do_transfer_fast(spu_context* spu, uint32_t lsa, uint64_t 
       if (__builtin_expect(g_c690_op21, 0)) {
           extern void c690_op21_dma_end(const spu_context*);
           c690_op21_dma_end(spu); } }
+    { extern int g_c690_steps;
+      if (__builtin_expect(g_c690_steps, 0)) {
+          extern void c690_step_dma_end(const spu_context*);
+          c690_step_dma_end(spu); } }
     return 0;
 }
 
