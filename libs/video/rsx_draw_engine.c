@@ -40,6 +40,10 @@
 
 /* Draw-record worker barriers (defined with the packet code below). */
 static void eng_mt_sync(void);
+static int eng_mt_has_workers(void);
+static int eng_mt_recording(void);
+static int eng_mt_defers_release(void);
+static void eng_mt_retire(u32 handle);
 
 /* M4 texture resolver: workerable draws enqueue plain guest textures and the
  * packet carries a token; the worker waits for the handle at record time. */
@@ -3151,14 +3155,19 @@ static u32 eng_texture_slot_work(u32 location, u32 offset, u32 fmt, u32 w, u32 h
                 if (need) {
                     rsx_texdirty_reprotect(e->ea, espan);
                     const u64 seq0 = rsx_texdirty_seq();
-                    const u32 into = (g.be->texture_upload_ordered && depth <= 1 &&
-                                      e->levels == levels) ? e->handle : 0u;
+                    /* Under MT a texture image bound by an already queued
+                     * chunk must not be rewritten in place: the chunk may not
+                     * have been submitted yet. A fresh handle keeps the old
+                     * bytes immutable for it (step 4, walker-mt-repair.md). */
+                    const int mt_workers = eng_mt_has_workers();
+                    const u32 into = (!mt_workers && g.be->texture_upload_ordered &&
+                                      depth <= 1 && e->levels == levels) ? e->handle : 0u;
                     const u32 fresh = eng_texture_upload(location, offset, fmt, w, h,
                                                          levels, pitch, cube, remap, depth, into);
                     if (fresh && !into) {
                         s_tex_gen++;
-                        eng_mt_sync();
-                        g.be->texture_release(g.be->user, e->handle);
+                        if (eng_mt_defers_release()) eng_mt_retire(e->handle);
+                        else { eng_mt_sync(); g.be->texture_release(g.be->user, e->handle); }
                         e->handle = fresh;
                         if (e->levels != levels) {
                             rsx_texdirty_uncover(e->ea, espan);
@@ -3211,14 +3220,19 @@ static u32 eng_texture_slot_work(u32 location, u32 offset, u32 fmt, u32 w, u32 h
                      * that sampled the old bytes; a volume keeps create-and-swap,
                      * and so does a different mip count (the key does not hold it,
                      * and the levels to upload would not all exist). */
-                    const u32 into = (g.be->texture_upload_ordered && depth <= 1 &&
-                                      e->levels == levels) ? e->handle : 0u;
+                    /* Under MT a texture image bound by an already queued
+                     * chunk must not be rewritten in place: the chunk may not
+                     * have been submitted yet. A fresh handle keeps the old
+                     * bytes immutable for it (step 4, walker-mt-repair.md). */
+                    const int mt_workers = eng_mt_has_workers();
+                    const u32 into = (!mt_workers && g.be->texture_upload_ordered &&
+                                      depth <= 1 && e->levels == levels) ? e->handle : 0u;
                     const u32 fresh = eng_texture_upload(location, offset, fmt, w, h,
                                                          levels, pitch, cube, remap, depth, into);
                     if (fresh && !into) {
                         s_tex_gen++;
-                        eng_mt_sync();
-                        g.be->texture_release(g.be->user, e->handle);
+                        if (eng_mt_defers_release()) eng_mt_retire(e->handle);
+                        else { eng_mt_sync(); g.be->texture_release(g.be->user, e->handle); }
                         e->handle = fresh;
                         e->levels = levels;
                     }
@@ -3304,7 +3318,11 @@ static u32 eng_texture_slot_work(u32 location, u32 offset, u32 fmt, u32 w, u32 h
         e.handle = eng_texture_upload(location, offset, fmt, w, h, levels, pitch,
                                       cube, remap, depth, 0u);
     }
-    if (e.handle && evicted) { eng_mt_sync(); g.be->texture_release(g.be->user, evicted); s_tex_gen++; }
+    if (e.handle && evicted) {
+        if (eng_mt_defers_release()) eng_mt_retire(evicted);
+        else { eng_mt_sync(); g.be->texture_release(g.be->user, evicted); }
+        s_tex_gen++;
+    }
     if (e.handle || !evicted) g.textures[index] = e;
     if (e.handle) s_tslot_last = index;
     return e.handle;
@@ -5958,9 +5976,16 @@ static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
             continue;
         }
         if (sampled >= 0) {
+            /* A surface view is a host object; the packet carries the handle
+             * and the queue order orders the sampling after the draws that
+             * wrote the target (their chunks are submitted by earlier turns).
+             * A recording backend therefore needs no drain here (this was the
+             * meter's per-bind texture wait); the null replay digests the call
+             * and still needs the queue drained in front of it. */
+            if (!eng_mt_recording() && g.be->surface_view) eng_mt_sync();
             const u32 view = g.be->surface_view
-                ? (eng_mt_sync(), g.be->surface_view(g.be->user, g.surfaces[sampled].handle,
-                                     t.remap & 0xFFFFu, t.format))
+                ? g.be->surface_view(g.be->user, g.surfaces[sampled].handle,
+                                     t.remap & 0xFFFFu, t.format)
                 : 0;
             textures[u] = view ? view : g.surfaces[sampled].handle;
             if (t.cubemap) eng_tex_miss_note_reason(u, &t, RSX_TEX_MISS_SURFACE);
@@ -6774,8 +6799,40 @@ static struct {
     _Atomic u64 next_commit;
     _Atomic u32 tex_epoch;      /* texture groups allocated this frame */
     _Atomic u32 tex_taken;      /* texture groups the resolver has taken */
+    /* Texture handles replaced by a create-and-swap while chunks may still
+     * name the old one. Released at a real sync point, after every queued
+     * packet has been submitted; no per-bind drain is needed. */
+    u32 retire[4096];
+    u32 n_retire;
     u64 enqueued, inline_fallbacks, syncs, snapshots, snapshot_fail, chunks;
 } s_mt;
+
+static int eng_mt_has_workers(void) { return s_mt.on && s_mt.workers > 0; }
+static int eng_mt_recording(void) { return s_mt.rec && s_mt.workers > 0; }
+/* Only a recording backend queues a chunk that may still name a texture we
+ * are replacing; without one the per-packet turn path is already ordered and
+ * the null replay's digest must keep its historical call sequence. */
+static int eng_mt_defers_release(void) { return s_mt.rec && s_mt.workers > 0; }
+
+static void eng_mt_release_retired(void)
+{
+    while (s_mt.n_retire) {
+        const u32 h = s_mt.retire[--s_mt.n_retire];
+        if (h && g.be->texture_release) g.be->texture_release(g.be->user, h);
+    }
+}
+
+static void eng_mt_retire(u32 handle)
+{
+    if (!handle) return;
+    if (s_mt.n_retire >= (u32)(sizeof s_mt.retire / sizeof s_mt.retire[0])) {
+        /* Do not grow the list in the hot path: a real drain here is rare. */
+        eng_mt_sync();
+        if (g.be->texture_release) g.be->texture_release(g.be->user, handle);
+        return;
+    }
+    s_mt.retire[s_mt.n_retire++] = handle;
+}
 
 static void eng_mt_worker_exec(void* ctx, const void* rec, u32 size);
 static void eng_mt_sync(void);
@@ -7060,6 +7117,7 @@ static void eng_mt_sync(void)
     eng_mt_chunk_close();
     if (!s_mt.workers) return;
     eng_mt_wait_upto(s_mt.seq);
+    eng_mt_release_retired();
     s_mt.syncs++;
 }
 
@@ -7109,14 +7167,14 @@ static struct {
 
 static int eng_tex_resolver_on(void)
 {
-    if (!s_mt.on || s_mt.workers <= 0) return 0;
-    /* The control file may switch this per arm (live A/B); without it the
-     * environment keeps its historical default of on. */
-    if (ps3_live_ctl_file_set &&
-        ps3_live_ctl_file_set(PS3_LIVE_WALKER_MT_TEX_RESOLVE))
-        return ps3_live_ctl_get(PS3_LIVE_WALKER_MT_TEX_RESOLVE) != 0;
-    const char* e = getenv("PS3RECOMP_WALKER_MT_TEX_RESOLVE");
-    return !e || !*e || strcmp(e, "0") != 0;
+    /* The M4 async resolver ran the walker's texture path on a second thread
+     * that used the walker's one-shot Vulkan command buffer and fence
+     * (vk_t_user == NULL), racing the state thread and wedging in
+     * vkWaitForFences. Plain textures now resolve on the state thread before
+     * the packet is queued (walker-mt-repair.md, step 4); the key is kept so
+     * old measurement commands still parse, but it selects nothing. */
+    (void)ps3_live_ctl_file_set; (void)ps3_live_ctl_get;
+    return 0;
 }
 
 static void eng_tex_group_close(void)
@@ -7256,7 +7314,8 @@ static int eng_tex_resolver_start(void)
     }
     s_texr.up = 1;
     atomic_store_explicit(&s_texr.closed_seq, 0, memory_order_relaxed);
-    fprintf(stderr, "[walker-mt] rsx-tex resolver up (plain guest textures)\n");
+    fprintf(stderr, "[walker-mt] plain textures resolve on the state thread"
+                    " (async resolver disabled)\n");
     return 1;
 }
 
@@ -7322,7 +7381,12 @@ static u32 eng_texture_slot_or_async(u32 location, u32 offset, u32 fmt, u32 w,
     if (s_tex_async_draw && s_texr.up)
         return eng_tex_enqueue(location, offset, fmt, w, h, levels, pitch,
                                cube, remap, depth);
-    eng_tex_sync_path();
+    /* A recording backend queues the upload before the chunk that samples it,
+     * so a plain bind does not drain the worker chunks. A non-recording
+     * backend (the null replay) digests the texture call at the state-thread
+     * position and needs the queue drained in front of it to keep the digest
+     * in stream order. */
+    if (!eng_mt_recording() && eng_mt_has_workers()) eng_tex_sync_path();
     return eng_texture_slot(location, offset, fmt, w, h, levels, pitch,
                             cube, remap, depth);
 }
@@ -7457,20 +7521,34 @@ static int eng_mt_copy_fill(void* ctx, void* dst)
     return 1;
 }
 
+/* Anything the state thread records in the shared batch (a clear, an inline
+ * packet draw) must be submitted before a later worker chunk can reach the
+ * queue. Otherwise it executes at the next present, after the worker-recorded
+ * draws it should precede. */
+static void eng_mt_submit_state_batch(void)
+{
+    if (s_mt.workers <= 0) return;
+    /* A backend without recording (the null replay) digests every call, so
+     * an extra submit would change its byte vector; there is nothing open to
+     * order there either. */
+    if (g.be->submit_batch) g.be->submit_batch(g.be->user);
+}
+
 static void eng_mt_run_packet_inline(const eng_draw_pkt* p)
 {
     eng_prep pr;
     const int ok = eng_mt_prepare_one(p, &s_mt.inline_w, &pr);
     eng_mt_wait_turn(p->seq);
     if (ok && pr.ok) eng_mt_commit_packet(p, &pr, g.be->user);
+    eng_mt_submit_state_batch();
     eng_mt_take_turn(p->seq);
     s_mt.inline_fallbacks++;
 }
 
-static void eng_pkt_binds(const eng_draw_pkt* p)
+static void eng_pkt_binds(const eng_draw_pkt* p, void* user)
 {
     if (p->do_clear_depth)
-        g.be->clear_depth_stencil(g.be->user, p->clear_depth_handle,
+        g.be->clear_depth_stencil(user, p->clear_depth_handle,
                                   RSX_BE_CLEAR_DEPTH | RSX_BE_CLEAR_STENCIL,
                                   1.0f, 0);
 }
@@ -7479,7 +7557,7 @@ static void eng_pkt_binds(const eng_draw_pkt* p)
  * g.indices (the serial packet path, workers==0). */
 static void eng_pkt_commit_live(eng_draw_pkt* p)
 {
-    eng_pkt_binds(p);
+    eng_pkt_binds(p, g.be->user);
     g.be->bind_targets(g.be->user, p->targets, p->n_targets, p->depth_handle);
     g.be->bind_pipeline(g.be->user, p->pipeline);
     if (p->vpc_range) {
@@ -7541,7 +7619,7 @@ static void eng_pkt_track(const eng_draw_pkt* p)
 
 static void eng_mt_commit_packet(const eng_draw_pkt* p, const eng_prep* r, void* u)
 {
-    eng_pkt_binds(p);
+    eng_pkt_binds(p, u);
     g.be->bind_targets(u, p->targets, p->n_targets, p->depth_handle);
     g.be->bind_pipeline(u, p->pipeline);
     const u8* base = (const u8*)p;
@@ -7985,6 +8063,12 @@ static void sink_end_work(void* user, const rsx_dispatch* r)
         p->total_bytes = s_mt.used;
 
         if (workerable) {
+            /* Anything the state thread recorded while resolving this packet
+             * (a texture upload, a clear) must be on the queue before the
+             * chunk that samples it is handed to a worker. Otherwise the
+             * first frame of a new texture draws it empty until the state
+             * batch happens to be submitted. */
+            eng_mt_submit_state_batch();
             /* The finalize point for a worker packet: no early return may
              * follow, or the ordered turn would never advance. */
             eng_tex_group_close();
@@ -8012,6 +8096,9 @@ static void sink_end_work(void* user, const rsx_dispatch* r)
         p->tex_epoch = atomic_load_explicit(&s_mt.tex_epoch, memory_order_acquire);
         p->seq = ++s_mt.seq;
         eng_pkt_commit_live(p);
+        /* Same rule as the inline fallback: this draw is in the shared batch,
+         * so it must be submitted before the turn lets worker chunks past. */
+        eng_mt_submit_state_batch();
         eng_mt_take_turn(p->seq);
         p = (eng_draw_pkt*)s_mt.scratch;
 mt_done:
@@ -8200,6 +8287,7 @@ static void sink_clear(void* user, const rsx_dispatch* r, u32 mask)
             wrote = 1;
         }
         if (wrote) eng_surfaces_wrote(targets, n_targets);
+        eng_mt_submit_state_batch();   /* before the next worker chunk */
     }
     if (mask & (RSX_CLEAR_DEPTH | RSX_CLEAR_STENCIL)) {
         const u32 zslot = eng_zdepth_get(sf.zeta_location, sf.zeta_offset,
@@ -8257,6 +8345,7 @@ static void sink_clear(void* user, const rsx_dispatch* r, u32 mask)
             g.zdepths[zslot].snapshot_valid = 0;
             eng_zdepth_wrote(zslot, &sf);
         }
+        eng_mt_submit_state_batch();   /* before the next worker chunk */
     }
 }
 

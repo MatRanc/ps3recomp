@@ -650,6 +650,16 @@ static int vk_create_image(vk_image* im, VkFormat fmt, u32 w, u32 h,
 static void vk_present_wait_gpu(void);
 /* The recording context of the calling thread, or NULL on the state thread. */
 static __thread void* vk_t_user;
+/* Non-NULL while this thread is recording a worker chunk: command helpers
+ * that would otherwise open a one-shot buffer record into the chunk instead.
+ * A worker's clear (first depth bind) and scratch-depth setup belong at their
+ * packet's position in the chunk, not in a separate submission that could
+ * overtake earlier chunks. */
+static __thread VkCommandBuffer vk_t_chunk;
+static VkCommandBuffer vk_rec_cmd(void)
+{
+    return vk_t_chunk ? vk_t_chunk : s_vk.cmd;
+}
 /* Wait for every record worker's submitted chunk (PS3RECOMP_WALKER_MT). */
 static void vk_mt_wait_all(void);
 static int  vk_mt_oneshot_begin(void* user);
@@ -887,7 +897,7 @@ static void vk_barrier_image_on(VkCommandBuffer cb, VkImage img, VkImageAspectFl
 
 static void vk_barrier_image(VkImage img, VkImageAspectFlags aspect, VkImageLayout old_layout)
 {
-    vk_barrier_image_on(s_vk.cmd, img, aspect, old_layout);
+    vk_barrier_image_on(vk_rec_cmd(), img, aspect, old_layout);
 }
 
 /* ---------------------------------------------------------------------------
@@ -3196,11 +3206,16 @@ static void vk_eng_clear_color(void* user, u32 surface, const float rgba[4])
                        (u32)(rgba[2] * 255.0f + 0.5f);
     vk_eng_obj* o = vk_eng_get(surface, VK_ENG_COLOR);
     if (!o) return;
-    const int batched = vk_eb_active();
-    if (batched ? (!s_eb_pending && vk_begin()) : vk_begin()) return;
     VkClearColorValue v;
     memcpy(v.float32, rgba, sizeof v.float32);
     VkImageSubresourceRange r = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+    if (vk_t_chunk) {
+        vk_barrier_image_on(vk_t_chunk, o->im.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL);
+        pvkCmdClearColorImage(vk_t_chunk, o->im.img, VK_IMAGE_LAYOUT_GENERAL, &v, 1, &r);
+        return;
+    }
+    const int batched = vk_eb_active();
+    if (batched ? (!s_eb_pending && vk_begin()) : vk_begin()) return;
     vk_barrier_image(o->im.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL);
     pvkCmdClearColorImage(s_vk.cmd, o->im.img, VK_IMAGE_LAYOUT_GENERAL, &v, 1, &r);
     if (batched) vk_eb_recorded();
@@ -3216,10 +3231,15 @@ static void vk_eng_clear_depth_stencil(void* user, u32 depth, u32 flags,
     if (flags & RSX_BE_CLEAR_DEPTH) aspect |= VK_IMAGE_ASPECT_DEPTH_BIT;
     if (flags & RSX_BE_CLEAR_STENCIL) aspect |= s_vk.depth_aspect & VK_IMAGE_ASPECT_STENCIL_BIT;
     if (!o || !aspect) return;
-    const int batched = vk_eb_active();
-    if (batched ? (!s_eb_pending && vk_begin()) : vk_begin()) return;
     VkClearDepthStencilValue d = { depth_value, stencil };
     VkImageSubresourceRange r = { aspect, 0, 1, 0, 1 };
+    if (vk_t_chunk) {
+        vk_barrier_image_on(vk_t_chunk, o->im.img, s_vk.depth_aspect, VK_IMAGE_LAYOUT_GENERAL);
+        pvkCmdClearDepthStencilImage(vk_t_chunk, o->im.img, VK_IMAGE_LAYOUT_GENERAL, &d, 1, &r);
+        return;
+    }
+    const int batched = vk_eb_active();
+    if (batched ? (!s_eb_pending && vk_begin()) : vk_begin()) return;
     vk_barrier_image(o->im.img, s_vk.depth_aspect, VK_IMAGE_LAYOUT_GENERAL);
     pvkCmdClearDepthStencilImage(s_vk.cmd, o->im.img, VK_IMAGE_LAYOUT_GENERAL, &d, 1, &r);
     if (batched) vk_eb_recorded();
@@ -4539,13 +4559,25 @@ static VkImageView vk_eng_scratch_depth(u32 w, u32 h)
     vk_destroy_image(&s_e2.scratch_depth);
     if (vk_create_image(&s_e2.scratch_depth, s_vk.depth_format, w, h,
                         VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
-                        s_vk.depth_aspect) || vk_begin())
+                        s_vk.depth_aspect))
         return VK_NULL_HANDLE;
-    vk_barrier_image(s_e2.scratch_depth.img, s_vk.depth_aspect, VK_IMAGE_LAYOUT_UNDEFINED);
     VkClearDepthStencilValue far_plane = { 1.0f, 0 };
     VkImageSubresourceRange r = { s_vk.depth_aspect, 0, 1, 0, 1 };
-    pvkCmdClearDepthStencilImage(s_vk.cmd, s_e2.scratch_depth.img, VK_IMAGE_LAYOUT_GENERAL, &far_plane, 1, &r);
-    if (vk_submit_and_wait()) return VK_NULL_HANDLE;
+    if (vk_t_chunk) {
+        /* A worker's chunk: the image is private to this context and the
+         * clear must execute at this draw's position, not in a submission
+         * that could run before the chunks recorded earlier. */
+        vk_barrier_image_on(vk_t_chunk, s_e2.scratch_depth.img, s_vk.depth_aspect,
+                            VK_IMAGE_LAYOUT_UNDEFINED);
+        pvkCmdClearDepthStencilImage(vk_t_chunk, s_e2.scratch_depth.img,
+                                     VK_IMAGE_LAYOUT_GENERAL, &far_plane, 1, &r);
+    } else {
+        if (vk_begin()) return VK_NULL_HANDLE;
+        vk_barrier_image(s_e2.scratch_depth.img, s_vk.depth_aspect, VK_IMAGE_LAYOUT_UNDEFINED);
+        pvkCmdClearDepthStencilImage(s_vk.cmd, s_e2.scratch_depth.img,
+                                     VK_IMAGE_LAYOUT_GENERAL, &far_plane, 1, &r);
+        if (vk_submit_and_wait()) return VK_NULL_HANDLE;
+    }
     s_e2.scratch_w = w; s_e2.scratch_h = h;
     return s_e2.scratch_depth.view;
 }
@@ -5041,6 +5073,20 @@ static void vk_eng_flush(void)
     if (s_eb.sets) { pvkResetDescriptorPool(s_vk.device, s_eb.pool, 0); s_eb.sets = 0; }
     if ((++s_eb.flushes & 0x3FFFu) == 0)
         VK_LOG("draw batching: %llu draws in %llu submissions\n", s_eb.draws, s_eb.flushes);
+}
+
+/* Submit the open state-thread batch in stream order. Worker chunks are
+ * submitted by their own threads at the ordered turn; anything the state
+ * thread recorded (a clear, an inline packet draw) must be on the queue
+ * before a later worker chunk, or it would execute at the next present,
+ * after the draws it is supposed to precede. Asynchronous with frame
+ * pipelining, a wait without it. */
+static void vk_eng_submit_batch(void* user)
+{
+    (void)user;
+    if (!s_eb_pending) return;
+    if (s_ebs_on) vk_eng_flush_async();
+    else { s_eb_why = 4; vk_eng_flush(); }
 }
 
 static VkDeviceSize vk_eb_take(VkDeviceSize* head, VkDeviceSize cap, VkDeviceSize bytes, VkDeviceSize align)
@@ -5599,6 +5645,7 @@ static int vk_mt_chunk_begin(void* user, void* ctx)
     VkCommandBufferBeginInfo bi = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
                                     .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT };
     VK_CHECK(pvkBeginCommandBuffer(c->cmd, &bi), "vkBeginCommandBuffer(mt)");
+    vk_t_chunk = c->cmd;
     return 0;
 }
 
@@ -5608,6 +5655,7 @@ static int vk_mt_chunk_submit(void* user, void* ctx)
     vk_mt_ctx* c = (vk_mt_ctx*)ctx;
     if (!c) return -1;
     VK_CHECK(pvkEndCommandBuffer(c->cmd), "vkEndCommandBuffer(mt)");
+    vk_t_chunk = NULL;
     VkSubmitInfo si = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
                         .commandBufferCount = 1, .pCommandBuffers = &c->cmd };
     VK_CHECK(pvkResetFences(s_vk.device, 1, &c->fence), "vkResetFences(mt)");
@@ -5852,6 +5900,7 @@ static const rsx_draw_backend s_vk_engine_backend = {
     .readback_async_fetch = vk_eng_readback_fetch,
     .readback_async_release = vk_eng_readback_release,
     .submit_async         = vk_eng_submit_async,
+    .submit_batch         = vk_eng_submit_batch,
     .mt_init              = vk_mt_init,
     .mt_shutdown          = vk_mt_shutdown,
     .mt_chunk_begin       = vk_mt_chunk_begin,

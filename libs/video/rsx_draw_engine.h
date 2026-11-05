@@ -102,6 +102,7 @@ typedef struct rsx_be_render_state {
 #define RSX_BE_FLUSH_VERTEX_RING     0
 #define RSX_BE_FLUSH_GUEST_REFERENCE 1
 #define RSX_BE_FLUSH_SHUTDOWN        2
+#define RSX_BE_FLUSH_MT_ORDER        3   /* a state-thread packet before its turn */
 
 /* clear_depth_stencil flags */
 #define RSX_BE_CLEAR_DEPTH   0x1u
@@ -394,6 +395,13 @@ typedef struct rsx_draw_backend {
      * while the walker records the rest of the frame. NULL when the backend
      * cannot submit asynchronously; the engine then leaves the batch open. */
     void (*submit_async)(void* user);
+    /* Optional. Submit the open state-thread batch so that it reaches the
+     * queue before a later worker chunk. Asynchronous when the backend can,
+     * synchronously otherwise (or when NULL: the engine waits via
+     * submit_and_wait). Used for clears and state-thread packet draws under
+     * PS3RECOMP_WALKER_MT, where the open batch otherwise executes at the
+     * frame's present, after the worker-recorded draws it should precede. */
+    void (*submit_batch)(void* user);
 
     /* Optional per-worker Vulkan recording (PS3RECOMP_WALKER_MT). mt_init
      * creates `workers` private command/descriptor contexts; mt_chunk_begin

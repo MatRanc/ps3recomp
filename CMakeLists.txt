@@ -433,6 +433,15 @@ if(PS3RECOMP_BUILD_TESTS)
     endif()
     add_test(NAME draw_queue COMMAND test_draw_queue)
 
+    # The walker-MT turn/epoch protocol: state-thread seq allocation, worker
+    # segment splits at texture groups, and the resolver's group turn.  A
+    # deadlock here is the C-arm hang shape; the test fails on a timeout.
+    add_executable(test_mt_turns libs/video/tests/test_mt_turns.c)
+    if(TARGET Threads::Threads)
+        target_link_libraries(test_mt_turns PRIVATE Threads::Threads)
+    endif()
+    add_test(NAME mt_turns COMMAND test_mt_turns)
+
     # PS3_LOG_FIRST, the saturating counter behind the "first n times" log lines.
     add_executable(test_log_first tests/test_log_first.c)
     target_include_directories(test_log_first PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
