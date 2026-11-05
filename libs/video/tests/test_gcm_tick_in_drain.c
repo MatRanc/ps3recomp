@@ -171,13 +171,66 @@ int main(void)
     assert(cellGcmGetFlipStatus() == CELL_GCM_FLIP_STATUS_DONE);
     assert(s_flip_direct_pending == 0);
 
+    /* A flip queued in the command stream has no direct-pending bit. The
+     * own-state gate must fall through to the FIFO-reached half, or the tick
+     * would never complete it while the key is on. */
+    request_direct();
+    s_flip_direct_pending = 0;               /* this one went into the FIFO */
+    s_fifo_flips_reached = s_fifo_flips_completed + 1;
+    cellGcmTickFlip();
+    ppu_gcm_pump();
+    assert(flips == before + 3);
+    assert(s_fifo_flips_completed == s_fifo_flips_reached);
+    cellGcmTickFlip();                       /* no double completion */
+    ppu_gcm_pump();
+    assert(flips == before + 3);
+
+    /* Key value 2: the guest accepts a signal during its second 17 ms wait,
+     * so the bound is its whole deadline (2 x 16683 us = 33366 us). */
+    setenv("PS3RECOMP_FLIP_TICK_OWN_STATE", "2", 1);
+    request_direct();
+    s_flip_req_us = gcm_us_now() - 20000ull; /* missed by the first bound */
+    cellGcmTickFlip();
+    ppu_gcm_pump();
+    assert(flips == before + 4);
+    assert(cellGcmGetFlipStatus() == CELL_GCM_FLIP_STATUS_DONE);
+    assert(s_flip_direct_pending == 0);
+
+    /* But not after the guest's abandon point: a completion past
+     * DAT_011203f8 << 1 advances the consumer the guest is no longer waiting
+     * on, which is the KEEP_STATUS failure mode. */
+    request_direct();
+    s_flip_req_us = gcm_us_now() - 33367ull;
+    cellGcmTickFlip();
+    ppu_gcm_pump();
+    assert(flips == before + 4);
+    assert(cellGcmGetFlipStatus() == CELL_GCM_FLIP_STATUS_WAITING);
+    assert(s_flip_direct_pending == 1);
+    s_flip_req_us = gcm_us_now() - 33365ull; /* still inside the second wait */
+    cellGcmTickFlip();
+    ppu_gcm_pump();
+    assert(flips == before + 5);
+    assert(cellGcmGetFlipStatus() == CELL_GCM_FLIP_STATUS_DONE);
+    assert(s_flip_direct_pending == 0);
+
+    /* Key value 1 keeps the first-wait bound: the same 20 ms request is not
+     * completed. */
+    setenv("PS3RECOMP_FLIP_TICK_OWN_STATE", "1", 1);
+    request_direct();
+    s_flip_req_us = gcm_us_now() - 20000ull;
+    cellGcmTickFlip();
+    ppu_gcm_pump();
+    assert(flips == before + 5);
+    assert(s_flip_direct_pending == 1);
+    s_flip_direct_pending = 0;               /* drop the stale request */
+
     /* No request outstanding: the tick completes nothing even though a stale
      * request stamp is still around and the status is WAITING. */
     s_flip_status = CELL_GCM_FLIP_STATUS_WAITING;
     s_flip_req_us = gcm_us_now();
     cellGcmTickFlip();
     ppu_gcm_pump();
-    assert(flips == before + 2);
+    assert(flips == before + 5);
     setenv("PS3RECOMP_FLIP_TICK_OWN_STATE", "0", 1);
 
     puts("GCM tick-in-drain / fence checks passed");

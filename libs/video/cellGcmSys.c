@@ -211,12 +211,32 @@ static int gcm_flip_executed_take(void)
     if (r != s_fifo_flips_completed) { s_fifo_flips_completed = r; return 1; }
     return gcm_flip_direct_take();
 }
-/* The guest's first flip-done wait: Gfx_DisplayFlip calls Cond_Wait with
- * 17000 us twice and gives up after DAT_011203f8 << 1 (2 x 16683 us). A tick
- * that fires later than this has either been superseded or belongs to a frame
- * the guest is about to abandon; completing then is the KEEP_STATUS failure
- * mode. This is the guest's own bound, not a tuning constant. */
-#define GCM_FLIP_TICK_AGE_US 17000ull
+/* FIFO-marker half only. The own-state tick uses this as its fall-through so
+ * a flip the drain has reached is still completed; unlike
+ * gcm_flip_executed_take it never consumes a direct request, which would
+ * bypass the age bound. */
+static int gcm_flip_fifo_take(void)
+{
+    const u32 r = s_fifo_flips_reached;
+    if (r != s_fifo_flips_completed) { s_fifo_flips_completed = r; return 1; }
+    return 0;
+}
+/* The two bounds are both the guest's own, not new tuning constants:
+ *
+ *  - FIRST: Gfx_DisplayFlip's first Cond_Wait is 17000 us. A tick after this
+ *    has missed the wait the title started the frame with.
+ *  - DEADLINE: it then accepts a signal during a second 17000 us wait and
+ *    gives up after DAT_011203f8 << 1 = 2 x 16683 = 33366 us. A tick after
+ *    this belongs to a frame the guest has already abandoned; completing it
+ *    advances the consumer the guest is no longer waiting on and desyncs the
+ *    buffer hand-off (the KEEP_STATUS=1 failure, which completed ~7 ms after
+ *    the deadline and cost 4.3 fps at the meter).
+ *
+ * PS3RECOMP_FLIP_TICK_OWN_STATE=1 selects FIRST, =2 selects DEADLINE, any
+ * other non-zero value behaves as DEADLINE (the widest bound the guest
+ * itself accepts). */
+#define GCM_FLIP_TICK_AGE_FIRST_US    17000ull
+#define GCM_FLIP_TICK_AGE_DEADLINE_US 33366ull
 /* ponytail: fixed headroom, far above one frame's commands (Simpsons ~10 KB);
  * derive it from the observed per-frame volume if a title outgrows it. */
 #define GCM_FLIP_WRAP_BYTES 0x40000u
@@ -1062,7 +1082,7 @@ static u32 gcm_flip_complete_locked(enum gcm_flip_gate gate, u32 ref)
 {
     u32 seq = 0;
     switch (gate) {
-    case GCM_FLIP_GATE_TICK:
+    case GCM_FLIP_GATE_TICK: {
         /* PS3RECOMP_FLIP_TICK_OWN_STATE: judge the tick by our own
          * outstanding-flip state instead of the guest-visible status word.
          * cellGcmSetPrepareFlip prepares frames ahead and writes DONE a few
@@ -1071,11 +1091,22 @@ static u32 gcm_flip_complete_locked(enum gcm_flip_gate gate, u32 ref)
          * flag is the request itself; the age bound keeps the change a no-op
          * once the guest has left on its fallback (the meter), which is what
          * made PS3RECOMP_PREPARE_FLIP_KEEP_STATUS lose frames. */
-        if (gcm_live_get(PS3_LIVE_FLIP_TICK_OWN_STATE,
-                         "PS3RECOMP_FLIP_TICK_OWN_STATE")) {
+        const int own = gcm_live_get(PS3_LIVE_FLIP_TICK_OWN_STATE,
+                                     "PS3RECOMP_FLIP_TICK_OWN_STATE");
+        if (own) {
             const unsigned long long age = gcm_us_now() - s_flip_req_us;
+            const unsigned long long bound = own >= 2
+                ? GCM_FLIP_TICK_AGE_DEADLINE_US : GCM_FLIP_TICK_AGE_FIRST_US;
             if (s_flip_direct_pending && s_flip_req_us &&
-                age < GCM_FLIP_TICK_AGE_US && gcm_flip_direct_take())
+                age < bound && gcm_flip_direct_take())
+                seq = s_flip_req_seq;
+            /* Fall through to the FIFO-reached flip. The own-state test only
+             * judges a direct request; a flip queued in the command stream
+             * has no direct-pending bit and would otherwise never complete on
+             * this tick. The FIFO half keeps the old status gate, and the
+             * bound above still suppresses a stale direct request. */
+            else if (s_flip_status == CELL_GCM_FLIP_STATUS_WAITING &&
+                     gcm_flip_fifo_take())
                 seq = s_flip_req_seq;
             break;
         }
@@ -1085,6 +1116,7 @@ static u32 gcm_flip_complete_locked(enum gcm_flip_gate gate, u32 ref)
             gcm_flip_executed_take())
             seq = s_flip_req_seq;
         break;
+    }
     case GCM_FLIP_GATE_PRESENTED:
         if (s_flip_status == CELL_GCM_FLIP_STATUS_WAITING &&
             s_flip_presented_seq == s_flip_req_seq &&
@@ -2370,12 +2402,17 @@ static void gcm_walker_kick(void)
 }
 
 /* Live switch value, with the environment as the fallback for a fixture that
- * compiled this file without ps3_live_ctl.c. */
+ * compiled this file without ps3_live_ctl.c. Parse the number like
+ * ps3_live_ctl.c does: keys that select a variant (the flip-tick age bound)
+ * are not booleans. */
 static int gcm_live_get(int key, const char* env)
 {
     if (ps3_live_ctl_get) return ps3_live_ctl_get(key);
     const char* e = getenv(env);
-    return e && *e && strcmp(e, "0") != 0 ? 1 : 0;
+    if (!e || !*e) return 0;
+    if (!strcmp(e, "on") || !strcmp(e, "true") || !strcmp(e, "yes")) return 1;
+    if (!strcmp(e, "off") || !strcmp(e, "false") || !strcmp(e, "no")) return 0;
+    return (int)strtol(e, NULL, 0);
 }
 
 static int gcm_walker_wake_on(void)
