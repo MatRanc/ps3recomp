@@ -21,7 +21,7 @@
 #include <time.h>
 #include <stdatomic.h>
 
-_Atomic int g_c690_gpu_2a_on;
+int g_c690_gpu_2a_on;
 
 #define C690_GPU_2A_MAX_RECORDS 8192u
 #define C690_GPU_2A_MAX_EXPORTS 8u
@@ -66,7 +66,7 @@ typedef struct c690_gpu_2a_lane {
  */
 static SPU_THREAD_LOCAL c690_gpu_2a_lane t_lane;
 static c690_gpu_2a_sink_fn s_sink;
-static _Atomic uint32_t s_seq;
+static uint32_t s_seq;
 
 /* Diagnostics. */
 static unsigned long s_stat_enter, s_stat_class, s_stat_fallback,
@@ -95,7 +95,7 @@ static uint64_t now_ns(void)
 int c690_gpu_2a_enabled(void)
 {
     int on = ps3_live_ctl_get(PS3_LIVE_C690_GPU_2A) != 0;
-    atomic_store_explicit(&g_c690_gpu_2a_on, on, memory_order_relaxed);
+    __atomic_store_n(&g_c690_gpu_2a_on, on, __ATOMIC_RELAXED);
     return on;
 }
 
@@ -126,7 +126,7 @@ void c690_gpu_2a_enter(struct spu_context* ctx)
     l->active = 1;
     l->r3 = ctx->gpr[3]._u32[0] & C690_GPU_2A_LS_MASK;
     l->out_base = be32(ctx->ls + ((l->r3 + 0xD0u) & C690_GPU_2A_LS_MASK));
-    l->seq = atomic_fetch_add(&s_seq, 1u) + 1u;
+    l->seq = __atomic_add_fetch(&s_seq, 1u, __ATOMIC_RELAXED);
     __atomic_fetch_add(&s_stat_enter, 1, __ATOMIC_RELAXED);
 }
 
@@ -191,7 +191,7 @@ void c690_gpu_2a_exit(struct spu_context* ctx)
     c690_gpu_2a_lane* l = lane_self();
     if (!l->active) return;
     l->active = 0;
-    if (!g_c690_gpu_2a_on) return;
+    if (!__atomic_load_n(&g_c690_gpu_2a_on, __ATOMIC_RELAXED)) return;
 
     const uint32_t r3 = l->r3;
     const uint32_t out_base = l->out_base;
@@ -262,7 +262,7 @@ void c690_gpu_2a_exit(struct spu_context* ctx)
 void c690_gpu_2a_put(const struct spu_context* ctx, uint32_t lsa, uint64_t ea,
                      uint32_t size)
 {
-    if (!g_c690_gpu_2a_on || !ctx || !size) return;
+    if (!__atomic_load_n(&g_c690_gpu_2a_on, __ATOMIC_RELAXED) || !ctx || !size) return;
     c690_gpu_2a_lane* l = lane_self();
     for (unsigned i = 0; i < C690_GPU_2A_MAX_EXPORTS; i++) {
         c690_gpu_2a_export* e = &l->exp[i];

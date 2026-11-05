@@ -56,7 +56,7 @@ void c690_gpu_2a_put(const struct spu_context* ctx, uint32_t lsa,
                      uint64_t ea, uint32_t size);
 
 /* Nonzero when the live key is on.  Cached after the first 0x2A entry. */
-extern _Atomic int g_c690_gpu_2a_on;
+extern int g_c690_gpu_2a_on;
 int c690_gpu_2a_enabled(void);
 
 /* Diagnostics: a counter snapshot line on stderr (every ~2 s). */
