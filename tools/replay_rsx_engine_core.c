@@ -16,6 +16,7 @@
  * the null one. The backend is linked into this tool by the CMake target. */
 int rsx_vulkan_backend_init(u32 width, u32 height, const char* title);
 void rsx_vulkan_backend_shutdown(void);
+void rsx_vulkan_backend_present_finish(void);
 u32 rsx_vulkan_backend_guest_draws(void);
 
 #include <stdio.h>
@@ -311,6 +312,12 @@ int rsx_engine_replay_run_frame(rsx_engine_replay* r, rsx_engine_replay_stats* o
 
     rsx_draw_engine_mt_sync();
     rsx_draw_engine_replay_advance_frame();
+    /* PS3RECOMP_VK_DUMP: complete the present so the frame reaches the dump
+     * (the timing arms leave it unset and never wait here). */
+    if (r->vk && getenv("PS3RECOMP_VK_DUMP")) {
+        rsx_draw_engine_replay_present_last();
+        rsx_vulkan_backend_present_finish();
+    }
     if (out) {
         if (r->vk) {
             out->draws = rsx_vulkan_backend_guest_draws();

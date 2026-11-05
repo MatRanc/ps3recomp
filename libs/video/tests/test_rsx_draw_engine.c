@@ -2099,6 +2099,51 @@ static void test_depth_snapshot_release(void)
     engine_down();
 }
 
+/* PS3RECOMP_ENG_DEPTH_GPU: a zeta cleared and never drawn into (an empty
+ * shadow map) is snapshotted on the device while its guest copy is unstored,
+ * instead of a readback + store + upload; a later depth write refreshes it. */
+static void depth_clear_only(void)
+{
+    m(M_ZETA_OFFSET, ZETA_OFFSET);
+    m(M_COLOR_MASK, 0u);
+    m(M_DEPTH_TEST, 0u);
+    m(M_DEPTH_WRITE, 0u);
+    m(M_CLEAR_BUFFERS, 0x01u);
+    draw_triangle();
+}
+
+static void test_depth_gpu_clear_only(void)
+{
+    printf("-- depth GPU snapshot of a clear-only zeta\n");
+    for (int on = 0; on <= 1; on++) {
+        rsx_draw_engine_set_depth_gpu(on);
+        engine_up();
+        m(M_CONTEXT_DMA_ZETA, DMA_LOCAL);
+        m(M_SURFACE_FORMAT, 8u | (2u << 5));
+        m(M_ZETA_PITCH, 256u * 4u);
+        m(M_COLOR_A_OFFSET, 0x90000u);
+        depth_clear_only();
+        const u32 first = sample_depth();
+        if (!on) {
+            CHECK(stub.n_depth_snapshot == 0 && stub.n_depth_readback == 1,
+                  "key off: the clear-only zeta goes through guest memory (%d snaps, %d readbacks)",
+                  stub.n_depth_snapshot, stub.n_depth_readback);
+        } else {
+            CHECK(stub.n_depth_snapshot == 1 && stub.n_depth_readback == 0 && first,
+                  "key on: a device snapshot, no readback (%d snaps, %d readbacks)",
+                  stub.n_depth_snapshot, stub.n_depth_readback);
+            CHECK(sample_depth() == first && stub.n_depth_snapshot == 1,
+                  "the snapshot is reused until the zeta changes");
+            depth_pass();
+            const u32 second = sample_depth();
+            CHECK(stub.n_depth_snapshot == 2 && second && second != first,
+                  "a depth write after the copy takes a new snapshot (%d)", stub.n_depth_snapshot);
+        }
+        engine_down();
+    }
+    rsx_draw_engine_set_depth_gpu(-1);
+}
+
 /* depth_as_color: the zeta's bytes made on the GPU, no store to guest memory. */
 static int g_argb_calls, g_argb_fail;
 static u32 g_argb_w, g_argb_h, g_argb_fmt;
@@ -3095,6 +3140,7 @@ int main(void)
     test_antialiased_wpos();
     test_depth_read_as_color();
     test_depth_snapshot_release();
+    test_depth_gpu_clear_only();
     test_depth_read_as_argb_on_gpu();
     test_z16_read_as_depth16_on_gpu();
     test_full_tables_evict_the_oldest();

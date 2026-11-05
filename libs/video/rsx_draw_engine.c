@@ -2660,11 +2660,39 @@ static u32 eng_zdepth_get(u32 location, u32 offset, u32 rt_w, u32 rt_h)
  * a depth-WRITING draw: a write-enable bit alone does not prove the pass
  * produced a usable depth map, and a clear-only zeta falls through to guest
  * memory instead (rsx_live_draw.c:6016-6018, 6265-6269). */
+/* PS3RECOMP_ENG_DEPTH_GPU=1: a depth target cleared and not drawn into since
+ * (a shadow map with no casters) is snapshotted on the GPU too, while its
+ * guest copy is still unstored (guest_dirty). Its texels are the clear
+ * value, which the guest store would only have read back from the device, so
+ * the bind needs no submit_and_wait + readback + decode + upload; the store
+ * stays lazy (guest_dirty) for any guest reader. Once the copy has been
+ * stored, guest memory is the truth again and the old path applies. */
+static int s_depth_gpu = -1;      /* env cache */
+static int s_depth_gpu_force = -1;    /* unit tests: 0/1 beats the key */
+
+void rsx_draw_engine_set_depth_gpu(int on)
+{
+    s_depth_gpu_force = on;
+}
+
+static int eng_depth_gpu(void)
+{
+    if (s_depth_gpu_force >= 0) return s_depth_gpu_force;
+#if defined(__GNUC__) && !defined(_WIN32)
+    if (ps3_live_ctl_get) return ps3_live_ctl_get(PS3_LIVE_ENG_DEPTH_GPU);
+#endif
+    if (s_depth_gpu < 0) {
+        const char* e = getenv("PS3RECOMP_ENG_DEPTH_GPU");
+        s_depth_gpu = e && *e && strcmp(e, "0") != 0;
+    }
+    return s_depth_gpu;
+}
+
 static u32 eng_zdepth_snapshot(u32 slot, u32 tex_w, u32 tex_h)
 {
     eng_mt_sync();
     eng_zdepth* z = &g.zdepths[slot];
-    if (!z->handle || !z->had_write) return 0;
+    if (!z->handle || !(z->had_write || (eng_depth_gpu() && z->guest_dirty))) return 0;
     /* The texture covers the top-left tex_w x tex_h of the zeta. The host
      * depth target is at least canvas-sized (eng_zdepth_get), so a 128x160
      * shadow map lives in the corner of a 1280x720 image; resolving all of it
@@ -3756,6 +3784,7 @@ static void eng_zdepth_wrote(u32 slot, const rsx_dsp_surface* sf)
 {
     eng_zdepth* z = &g.zdepths[slot];
     z->depth_serial = ++g.write_serial;
+    if (eng_depth_gpu()) z->snapshot_valid = 0;     /* a draw after the copy was taken */
     if (!z->guest_dirty) WCB_COUNT(marked_dirty, 1);
     z->guest_dirty = 1;
     z->zfmt = sf->depth_format;
@@ -8822,6 +8851,20 @@ void rsx_draw_engine_replay_advance_frame(void)
 {
     if (!g.ready) return;
     g.frames++;
+}
+
+/* Replay image check (PS3RECOMP_VK_DUMP): the capture has no display buffer, so
+ * present the colour surface written last. */
+void rsx_draw_engine_replay_present_last(void)
+{
+    eng_mt_sync();
+    if (!g.ready || !g.be->present) return;
+    u32 best = ENG_INVALID;
+    for (u32 i = 0; i < g.n_surfaces; i++)
+        if (g.surfaces[i].handle &&
+            (best == ENG_INVALID || g.surfaces[i].last_write_serial > g.surfaces[best].last_write_serial))
+            best = i;
+    if (best != ENG_INVALID) g.be->present(g.be->user, g.surfaces[best].handle);
 }
 
 /* ---- public API ---------------------------------------------------------- */

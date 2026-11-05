@@ -97,6 +97,7 @@ static const char* const K_NAME[PS3_LIVE_COUNT] = {
     "PS3RECOMP_FP_TXD",
     "PS3RECOMP_FP_AA",
     "PS3RECOMP_PIPE_ASYNC",
+    "PS3RECOMP_ENG_DEPTH_GPU",
 };
 
 static _Atomic int s_val[PS3_LIVE_COUNT];

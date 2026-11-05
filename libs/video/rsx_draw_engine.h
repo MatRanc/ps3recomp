@@ -566,6 +566,8 @@ void rsx_wprof_drain_end(int profiled);
  * frame so the per-frame texture revalidation / hash cadence and the
  * last_use ageing follow the live path instead of staying on frame 0. */
 void rsx_draw_engine_replay_advance_frame(void);
+/* Replay image check: present the colour surface written last. */
+void rsx_draw_engine_replay_present_last(void);
 
 /* Live switches from PS3RECOMP_CTL (cellGcmSys polls the file and calls these
  * on the walker thread). Changing WALKER_FAST flushes the fetch/pipeline
@@ -577,6 +579,8 @@ void rsx_draw_engine_set_remap_cache(int on);
 void rsx_draw_engine_set_memo_index(int on);
 void rsx_draw_engine_set_refs_hash_fast(int on);
 void rsx_draw_engine_set_no_draw(int on);
+/* Unit tests: force PS3RECOMP_ENG_DEPTH_GPU on/off (-1 follows the key again). */
+void rsx_draw_engine_set_depth_gpu(int on);
 
 /* Captured dispatcher state: enough to start a replay at the frame boundary
  * the capture began on. The sink and the coverage counters are not part of

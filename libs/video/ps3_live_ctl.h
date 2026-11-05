@@ -98,6 +98,7 @@ enum {
     PS3_LIVE_FP_TXD,                    /* PS3RECOMP_FP_TXD: explicit-derivative fetches (TXD) and DDX/DDY */
     PS3_LIVE_FP_AA,                     /* PS3RECOMP_FP_AA: scale derivative LOD by the 2x1 AA sample grid */
     PS3_LIVE_PIPE_ASYNC,                /* PS3RECOMP_PIPE_ASYNC: translate/build pipelines on a worker */
+    PS3_LIVE_ENG_DEPTH_GPU,             /* PS3RECOMP_ENG_DEPTH_GPU: snapshot a clear-only zeta on the GPU instead of a guest store */
     PS3_LIVE_COUNT
 };
 
