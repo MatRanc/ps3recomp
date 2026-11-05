@@ -3154,6 +3154,25 @@ static u32 eng_texture_upload(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
                       levels ? levels : 1u);
     }
     if (wp2) { wp2_add(WPROF2_TEX_UPLOAD, wp2); s_wp2_tex_uploads++; }
+    /* PS3RECOMP_TEX_ZERO_LOG: name uploads whose guest bytes read all zero,
+     * with how many guest flip requests the walker is behind (team-select Bink
+     * green flash, mlb16-recomp/docs/rsx-sync.md). Diagnostic only. */
+    static int zlog = -1;
+    if (zlog < 0) { const char* e = getenv("PS3RECOMP_TEX_ZERO_LOG"); zlog = e && *e && *e != '0'; }
+    if (zlog && handle && w >= 64 && h >= 16) {
+        const u32 rp = pitch ? pitch : w;
+        const u8* src = eng_guest_ptr(NULL, location, offset, rp * h);
+        if (src) {
+            unsigned z = 0;
+            for (u32 r = 0; r < 64; r++) z += !src[(size_t)(r * h / 64) * rp + w / 2];
+            extern u32 cellGcm_flip_request_count(void) __attribute__((weak));
+            static unsigned n;
+            if (z == 64 && n++ < 400)
+                fprintf(stderr, "[tex-zero] frame=%u guest_flip=%u loc=%u off=0x%08X ea=0x%08X %ux%u fmt=0x%02X pitch=%u\n",
+                        g.frames, cellGcm_flip_request_count ? cellGcm_flip_request_count() : 0u,
+                        location, offset, (u32)(src - vm_base), w, h, fmt, pitch);
+        }
+    }
     return handle;
 }
 

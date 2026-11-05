@@ -158,6 +158,10 @@ void     rsx_texdirty_note_write(uint32_t ea, uint32_t len);
 void     rsx_texdirty_note_write_host(const void* host, size_t len);
 int      rsx_texdirty_on_fault(uintptr_t addr);
 void     rsx_texdirty_publish_hook(void);
+/* PS3RECOMP_RSX_SYNC_FIX: called before a write to a page a cached texture
+ * covers. The runtime installs a callback that lets the FIFO drain one pass
+ * (so a pending draw reads the old bytes first) and waits for it. */
+void     rsx_texdirty_set_sync_request(void (*fn)(void));
 
 /* Source-range write tracking on top of the page sequence (SPU_CODE_DMA_MEMO).
  * A small fixed table remembers a handful of guest ranges and the sequence of

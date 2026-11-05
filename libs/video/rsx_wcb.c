@@ -111,6 +111,7 @@ static void td_forget_prot_locked(uintptr_t lo, uintptr_t hi);
 int  rsx_texdirty_on_fault(uintptr_t addr);
 static int td_late_fault(uintptr_t addr);
 static void td_install_faults(void);
+static void td_sync_before_write(void);             /* RSX_SYNC_FIX */
 
 /* 0 on success. `open` restores read/write: render targets live in ordinary
  * read/write guest memory, which is the only kind the engine arms. TEX_DIRTY
@@ -1221,12 +1222,92 @@ void rsx_texdirty_note_write_host(const void* host, size_t len)
     rsx_texdirty_note_write((uint32_t)off, (uint32_t)len);
 }
 
+/* ---- PS3RECOMP_RSX_SYNC_FIX: order a guest write after the RSX reads ------
+ *
+ * The guest's copy of a memory write (a movie plane clear, an MFC PUT into a
+ * texture) lands as soon as the PPU/SPU executes the store, while our FIFO
+ * walker may still hold draw commands that name the same bytes: the game
+ * treats the RSX as executing commands as they are submitted, and only fences
+ * the *previous* frame, so on hardware the earlier draw has sampled the old
+ * bytes before the clear. The PPU can be one frame ahead of the walker by
+ * design; a clear issued in that window is re-uploaded zero before the pending
+ * draw has read it (the team-select green flash, docs/rsx-sync.md).
+ *
+ * With PS3RECOMP_RSX_SYNC_FIX=1 a write to a page a cached texture covers
+ * first asks the drain to run one pass that starts after the request (the
+ * callback set by cellGcmSys waits for that pass's acknowledgement). The draw
+ * then reads the pre-write bytes from the texture cache, exactly as the RSX
+ * would have, and the write is charged afterwards so the next bind re-uploads
+ * the new bytes. Off by default; when off this is one cached int test. */
+static void (*volatile s_sync_request)(void);
+static int s_sync_fix = -1;
+
+static int td_sync_fix_on(void)
+{
+    if (s_sync_fix < 0) {
+        const char* e = getenv("PS3RECOMP_RSX_SYNC_FIX");
+        s_sync_fix = e && *e && *e != '0' ? 1 : 0;
+    }
+    return s_sync_fix;
+}
+
+void rsx_texdirty_set_sync_request(void (*fn)(void))
+{
+    s_sync_request = fn;
+}
+
+static void td_sync_before_write(void)
+{
+    void (*fn)(void) = s_sync_request;
+    if (fn) fn();
+}
+
+/* Set by cellGcmSys while the walker is inside a drain pass. A guest write
+ * from that thread must not wait for the pass it is already in (and must not
+ * take the lock the pass may hold). Weak so the engine-only fixtures link. */
+#if defined(_WIN32)
+extern int cellGcm_texdirty_in_drain(void);
+#else
+extern int cellGcm_texdirty_in_drain(void) __attribute__((weak));
+#endif
+
+static int td_in_drain(void)
+{
+    return cellGcm_texdirty_in_drain && cellGcm_texdirty_in_drain();
+}
+
+/* Does any page of [off, off+len) belong to a cached texture? Lock held. */
+static int td_range_covered_locked(uintptr_t off, size_t len)
+{
+    if (!s_td.on || !s_td.page_cov || !len) return 0;
+    const uintptr_t end = off + len;
+    uint32_t p0 = (uint32_t)(off >> 12);
+    uint32_t p1 = (uint32_t)((end - 1) >> 12);
+    if (p0 >= TD_NPAGES) return 0;
+    if (p1 >= TD_NPAGES) p1 = TD_NPAGES - 1;
+    for (uint32_t i = p0; i <= p1; i++)
+        if (s_td.page_cov[i]) return 1;
+    return 0;
+}
+
+static int td_range_covered(uintptr_t off, size_t len)
+{
+    wcb_lock();
+    const int r = td_range_covered_locked(off, len);
+    wcb_unlock();
+    return r;
+}
+
 int rsx_texdirty_on_fault(uintptr_t addr)
 {
     if (!s_td.on || !s_td.page_flags) return 0;
     const uintptr_t off = addr - (uintptr_t)vm_base;
     if (off >= ((uintptr_t)TD_NPAGES << 12)) return 0;
     const uint32_t i = (uint32_t)(off >> 12);
+    /* Wait before charging the write: the pending draw must read the old
+     * bytes. Must be outside wcb_lock, because the drain takes it. */
+    if (td_sync_fix_on() && !td_in_drain() && td_range_covered(off, 1))
+        td_sync_before_write();
     int ours = 0;
     wcb_lock();
     ours = (s_td.page_flags[i] & TD_TEX_PROT) != 0;
@@ -1261,6 +1342,11 @@ static int td_late_fault(uintptr_t addr)
  * This one marks the pages dirty and removes our read-only protection. */
 static void td_guest_write_hook(const void* host, size_t len)
 {
+    if (td_sync_fix_on() && !td_in_drain() && host && len) {
+        const uintptr_t off = (uintptr_t)host - (uintptr_t)vm_base;
+        if (off < ((uintptr_t)TD_NPAGES << 12) && td_range_covered(off, len))
+            td_sync_before_write();
+    }
     rsx_texdirty_note_write_host(host, len);
 }
 

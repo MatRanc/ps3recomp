@@ -15,6 +15,7 @@
 #include "rsx_draw_engine.h"
 #include "rsx_primitives.h"   /* RSX_PRIMITIVE_* */
 #include "rsx_tex_miss.h"     /* RSX_TEX_MISS_* */
+#include "rsx_wcb.h"          /* rsx_texdirty_* */
 #include "rsx_test_programs.h"
 #include "ps3emu/guest_access.h"
 
@@ -898,10 +899,22 @@ static void test_texture_lookup_memo(void)
  * 2D transfer and file read uses) must re-upload on the next bind, and so
  * must a direct PPU store, which lands on a write-protected page and faults
  * into the engine's handler. */
+static int g_sync_calls;
+static uint64_t g_sync_seq;
+static void test_sync_request(void)
+{
+    g_sync_calls++;
+    g_sync_seq = rsx_texdirty_seq();
+}
+
 static void test_texture_dirty_generation(void)
 {
     printf("-- texture dirty generation\n");
     setenv("PS3RECOMP_TEX_DIRTY", "1", 1);
+    /* PS3RECOMP_RSX_SYNC_FIX is cached on first use; set it before the first
+     * fault so the ordering check below sees it. The callback is installed
+     * later, so the earlier writes are unaffected. */
+    setenv("PS3RECOMP_RSX_SYNC_FIX", "1", 1);
     engine_up();
     memset(vm_base + TEX_OFFSET, 0x11, 4 * 4 * 4);
     bind_texture_unit(RSX_LOCATION_MAIN, TEX_OFFSET);
@@ -937,6 +950,38 @@ static void test_texture_dirty_generation(void)
     CHECK(stub.n_texture_create == before_store + 1,
           "a direct PPU store faults and the next bind re-uploads (%d creates)",
           stub.n_texture_create);
+
+    /* PS3RECOMP_RSX_SYNC_FIX: a write to a covered page asks the drain to read
+     * the old bytes BEFORE the write is charged. With the callback installed
+     * the request runs at the fault, and rsx_texdirty_seq() must still be the
+     * pre-store value there (the write is only charged afterwards). */
+    rsx_draw_engine_present();
+    bind_texture_unit(RSX_LOCATION_MAIN, TEX_OFFSET);
+    draw_triangle();                       /* re-protect after the re-upload */
+    g_sync_calls = 0;
+    rsx_texdirty_set_sync_request(test_sync_request);
+    const uint64_t seq_before = rsx_texdirty_seq();
+    *(volatile u32*)(vm_base + TEX_OFFSET + 8) = 0x55667788u;
+    CHECK(g_sync_calls == 1, "a covered PPU store requests the RSX sync first");
+    CHECK(g_sync_seq == seq_before,
+          "the request runs before the write is charged (seq %llu, before %llu)",
+          (unsigned long long)g_sync_seq, (unsigned long long)seq_before);
+    CHECK(rsx_texdirty_seq() > seq_before,
+          "the store is charged after the sync request");
+    CHECK(*(volatile u32*)(vm_base + TEX_OFFSET + 8) == 0x55667788u,
+          "the store lands after the sync");
+
+    /* The SPU MFC PUT / HLE memset path goes through ps3_guest_write instead
+     * of faulting; it must request the same ordering. */
+    g_sync_calls = 0;
+    ps3_guest_write(vm_base + TEX_OFFSET + 8, 4);
+    CHECK(g_sync_calls == 1, "a covered host write also requests the sync");
+
+    /* A host write outside every cached texture must not request a drain. */
+    g_sync_calls = 0;
+    ps3_guest_write(vm_base + TEX_OFFSET + 0x20000u, 16);
+    CHECK(g_sync_calls == 0, "a write outside the texture does not request a sync");
+    rsx_texdirty_set_sync_request(NULL);
 
     engine_down();
     setenv("PS3RECOMP_TEX_DIRTY", "0", 1);

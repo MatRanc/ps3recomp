@@ -49,6 +49,7 @@ __attribute__((weak)) void (*volatile g_ps3_guest_write_hook)(const void* host, 
 #else
 #include <time.h>
 #include <sched.h>
+#include <unistd.h>
 #endif
 
 /* ---------------------------------------------------------------------------
@@ -93,6 +94,12 @@ static int  s_gcm_initialized = 0;
 static int  gcm_live_get(int key, const char* env);
 static void gcm_publish_offset_tables(void);
 static unsigned long long gcm_us_now(void);
+/* PS3RECOMP_RSX_SYNC_FIX: a texture-page write waits for one drain pass that
+ * starts after the request. Installed into rsx_wcb by cellGcmInit. */
+void cellGcm_texdirty_sync_request(void);
+int  cellGcm_texdirty_in_drain(void);
+static _Thread_local int t_in_gcm_drain;
+static u32 s_td_sync_req, s_td_sync_ack;
 static u32  s_flip_mode   = CELL_GCM_DISPLAY_VSYNC;
 static u32  s_flip_status = CELL_GCM_FLIP_STATUS_DONE;
 /* Flip requests (each puts the status back to WAITING) and the request a
@@ -702,6 +709,13 @@ s32 cellGcmInit(u32 cmdSize, u32 ioSize, u32 ioAddress)
 
     rsx_draw_engine_set_display_query(cellGcmOffsetIsDisplay);
 
+    /* PS3RECOMP_RSX_SYNC_FIX: rsx_wcb owns the page tracking, but the drain it
+     * waits for lives here. Weak so a GCM-only fixture still links. */
+    { extern void rsx_texdirty_set_sync_request(void (*)(void))
+          __attribute__((weak));
+      if (rsx_texdirty_set_sync_request)
+          rsx_texdirty_set_sync_request(cellGcm_texdirty_sync_request); }
+
     s_gcm_initialized = 1;
     return CELL_OK;
 }
@@ -1310,6 +1324,57 @@ static unsigned long long gcm_us_now(void)
          + (unsigned long long)ts.tv_nsec / 1000ull;
 #endif
 }
+
+/* PS3RECOMP_RSX_SYNC_FIX call point (rsx_wcb.c: a write to a texture page).
+ *
+ * The caller is about to overwrite bytes that a draw still in the FIFO may
+ * sample. Bump the request generation, then wait until a drain pass that
+ * STARTED after the bump has finished (cellGcm_rsx_process_fifo snapshots the
+ * generation on entry and acknowledges it on exit). Commands submitted before
+ * the write are then parsed and their texture bytes read, exactly as the RSX
+ * would have done before the PPU's store; the write is charged afterwards.
+ *
+ * Runs in the TEX_DIRTY fault handler, so everything here is async-signal-safe
+ * (atomics, clock_gettime, sched_yield/SwitchToThread, write(2)); no stdio.
+ * The drain itself runs on the frame-clock thread, never recursively from
+ * here.
+ *
+ * The bound is one drain pass: the measured pitch meter drain is 16-40 ms and
+ * the team-select drain is under 2 ms, so 100 ms is two to six passes. It also
+ * has to be short because the wait blocks the guest thread: a pass that is
+ * compiling a shader (0.25-2 s, present-stalls.md) must not stall a team
+ * switch for its whole length, so the wait is abandoned and the old
+ * (racy) order is kept for that write. */
+void cellGcm_texdirty_sync_request(void)
+{
+    if (t_in_gcm_drain) return;          /* the walker's own host write */
+    const u32 gen = __atomic_add_fetch(&s_td_sync_req, 1, __ATOMIC_ACQ_REL);
+    const unsigned long long t0 = gcm_us_now();
+    static unsigned timeouts = 0;
+    while ((s32)(__atomic_load_n(&s_td_sync_ack, __ATOMIC_ACQUIRE) - gen) < 0) {
+        if (gcm_us_now() - t0 > 100000ull) {
+            if (timeouts++ < 8) {
+                static const char msg[] = "[rsx-sync] drain did not acknowledge a write in 100 ms\n";
+#ifndef _WIN32
+                (void)!write(2, msg, sizeof msg - 1);
+#else
+                fputs(msg, stderr);
+#endif
+            }
+            break;
+        }
+#ifdef _WIN32
+        SwitchToThread();
+#else
+        sched_yield();
+#endif
+    }
+}
+
+/* True on the thread that runs cellGcm_rsx_process_fifo (the walker) while it
+ * is inside a drain pass. rsx_wcb checks this before taking its lock so a
+ * walker-side guest write can never wait for its own pass. */
+int cellGcm_texdirty_in_drain(void) { return t_in_gcm_drain; }
 
 static int gcm_flip_log_on_now(void)
 {
@@ -2671,6 +2736,11 @@ void cellGcm_rsx_process_fifo(void)
     { static int wake_set;
       if (!wake_set) { wake_set = 1; rsx_draw_engine_wcb_set_wake(gcm_wcb_wake); } }
     const uint64_t ft_t0 = PS3_FT_ON() ? ps3_ft_now() : 0;
+    /* PS3RECOMP_RSX_SYNC_FIX: requests present before this pass are served by
+     * this pass (it starts after them), so acknowledge them when it ends. A
+     * request that arrives during the pass waits for the next one. */
+    const u32 sync_entry = __atomic_load_n(&s_td_sync_req, __ATOMIC_ACQUIRE);
+    t_in_gcm_drain = 1;
     AcquireSRWLockExclusive(&s_gcm_fifo_lock);
     if (rsx_draw_engine_enabled()) rsx_draw_engine_wcb_service();
     const uint64_t tr_t0 = ps3_trace_begin();
@@ -2686,6 +2756,8 @@ void cellGcm_rsx_process_fifo(void)
         gcm_rsx_process_fifo_unlocked();
     }
     ReleaseSRWLockExclusive(&s_gcm_fifo_lock);
+    if (sync_entry) __atomic_store_n(&s_td_sync_ack, sync_entry, __ATOMIC_RELEASE);
+    t_in_gcm_drain = 0;
     if (ft_t0) {
         const uint64_t t1 = ps3_ft_now();
         if (t1 - ft_t0 >= ps3_ft_min_ns())
