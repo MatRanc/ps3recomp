@@ -664,6 +664,196 @@ void rsx_draw_engine_set_guest_memory(rsx_vertex_guest_ptr_fn reader, void* user
 }
 
 
+/* ---- c690 GPU ring resolver (PS3RECOMP_C690_GPU_2A) ---------------------
+ * A seqlock snapshot keeps the hot guest-read path lock-free; writers are the
+ * renderer (prepare) and the SPU lanes (pending markers), a handful per frame.
+ */
+#define ENG_GPU_RANGES 128
+typedef struct {
+    u32 ea, location, offset, size;
+    const u8* bytes;
+    u8 by_offset;
+    u8 pending;
+} eng_gpu_range;
+static eng_gpu_range s_gpu_rng[ENG_GPU_RANGES];
+static int s_gpu_rng_n;
+static unsigned s_gpu_rng_gen;
+static pthread_mutex_t s_gpu_rng_mu = PTHREAD_MUTEX_INITIALIZER;
+static rsx_gpu_range_prepare_fn s_gpu_prepare;
+static int s_gpu_preparing;
+
+static void eng_gpu_scratch_rewind(void);
+
+static void eng_gpu_range_wlock(void)
+{
+    pthread_mutex_lock(&s_gpu_rng_mu);
+    __atomic_fetch_add(&s_gpu_rng_gen, 1, __ATOMIC_RELEASE);   /* odd */
+}
+static void eng_gpu_range_wunlock(void)
+{
+    __atomic_store_n(&s_gpu_rng_n, s_gpu_rng_n, __ATOMIC_RELEASE);
+    __atomic_fetch_add(&s_gpu_rng_gen, 1, __ATOMIC_RELEASE);   /* even */
+    pthread_mutex_unlock(&s_gpu_rng_mu);
+}
+
+void rsx_draw_engine_gpu_range_clear(void)
+{
+    eng_gpu_range_wlock();
+    s_gpu_rng_n = 0;
+    eng_gpu_range_wunlock();
+    eng_gpu_scratch_rewind();
+}
+
+static void gpu_range_set(u32 ea, u32 location, u32 offset, u32 size,
+                          const u8* bytes, int by_offset, int pending)
+{
+    eng_gpu_range_wlock();
+    int slot = -1;
+    for (int i = 0; i < s_gpu_rng_n; i++) {
+        eng_gpu_range* e = &s_gpu_rng[i];
+        if (e->by_offset != by_offset) continue;
+        if (by_offset ? (e->location == location && e->offset == offset)
+                      : (e->ea == ea)) { slot = i; break; }
+    }
+    if (slot < 0) {
+        if (s_gpu_rng_n < ENG_GPU_RANGES) slot = s_gpu_rng_n++;
+        else slot = 0;   /* replace the oldest; the map is a per-drain cache */
+    }
+    eng_gpu_range* e = &s_gpu_rng[slot];
+    e->ea = ea; e->location = location; e->offset = offset; e->size = size;
+    e->bytes = bytes; e->by_offset = (u8)by_offset; e->pending = (u8)pending;
+    /* A shadow buffer must outlive the map entry; the renderer owns it. */
+    eng_gpu_range_wunlock();
+}
+
+void rsx_draw_engine_gpu_range_add_ea(u32 ea, u32 size, const u8* bytes)
+{
+    gpu_range_set(ea, 0, 0, size, bytes, 0, 0);
+}
+void rsx_draw_engine_gpu_range_add_offset(u32 location, u32 offset, u32 size,
+                                          const u8* bytes)
+{
+    gpu_range_set(0, location, offset, size, bytes, 1, 0);
+}
+void rsx_draw_engine_gpu_range_pending(u32 ea, u32 size)
+{
+    gpu_range_set(ea, 0, 0, size, NULL, 0, 1);
+}
+void rsx_draw_engine_gpu_range_set_prepare(rsx_gpu_range_prepare_fn fn)
+{
+    s_gpu_prepare = fn;
+}
+
+typedef struct {
+    const u8* bytes;    /* GPU bytes at the overlap start */
+    u32 req_start;      /* request coordinate of the read start */
+    u32 hit_start;      /* request coordinate of the overlap start */
+    u32 hit_len;        /* overlap length */
+} eng_gpu_hit;
+enum { ENG_GPU_MISS = 0, ENG_GPU_FULL = 1, ENG_GPU_PARTIAL = 2 };
+
+/* A resolved GPU range that overlaps the read.  FULL means the whole read is
+ * covered; PARTIAL means the read also touches guest bytes (the caller merges). */
+static int eng_gpu_range_probe(u32 location, u32 offset, u32 min_bytes,
+                               eng_gpu_hit* hit, int depth)
+{
+    if (!__atomic_load_n(&s_gpu_rng_n, __ATOMIC_RELAXED)) return ENG_GPU_MISS;
+    int n;
+    unsigned g1;
+    for (;;) {
+        g1 = __atomic_load_n(&s_gpu_rng_gen, __ATOMIC_ACQUIRE);
+        if (g1 & 1u) { sched_yield(); continue; }
+        n = __atomic_load_n(&s_gpu_rng_n, __ATOMIC_RELAXED);
+        if (n > ENG_GPU_RANGES) n = ENG_GPU_RANGES;
+        /* Scan in place; retry if a writer moved the generation. */
+        u32 req_ea = 0;
+        int have_ea = 0;
+        for (int i = 0; i < n; i++) {
+        const eng_gpu_range* e = &s_gpu_rng[i];
+        u32 req_start;
+        if (e->by_offset) {
+            if (location != e->location) continue;
+            req_start = offset;
+        } else {
+            if (!have_ea) {
+                req_ea = cellGcmResolveLocated(location == RSX_LOCATION_LOCAL, offset);
+                have_ea = 1;
+            }
+            if (!req_ea) continue;
+            req_start = req_ea;
+        }
+        const u64 rlo = req_start, rhi = (u64)req_start + min_bytes;
+        const u64 glo = e->by_offset ? e->offset : e->ea;
+        const u64 ghi = glo + e->size;
+        if (rhi <= glo || rlo >= ghi) continue;
+        if (__atomic_load_n(&s_gpu_rng_gen, __ATOMIC_ACQUIRE) != g1)
+            break;      /* writer moved: rescan */
+        if (e->pending) {
+            if (depth == 0 && s_gpu_prepare &&
+                __atomic_exchange_n(&s_gpu_preparing, 1, __ATOMIC_ACQ_REL) == 0) {
+                s_gpu_prepare();
+                __atomic_store_n(&s_gpu_preparing, 0, __ATOMIC_RELEASE);
+                return eng_gpu_range_probe(location, offset, min_bytes, hit, 1);
+            }
+            return ENG_GPU_MISS;
+        }
+        if (!e->bytes) continue;
+        const u64 lo = rlo > glo ? rlo : glo;
+        const u64 hi = rhi < ghi ? rhi : ghi;
+        hit->bytes = e->bytes + (lo - glo);
+        hit->req_start = req_start;
+        hit->hit_start = (u32)lo;
+        hit->hit_len = (u32)(hi - lo);
+        return (lo == rlo && hi == rhi) ? ENG_GPU_FULL : ENG_GPU_PARTIAL;
+        }
+        if (__atomic_load_n(&s_gpu_rng_gen, __ATOMIC_ACQUIRE) == g1)
+            return ENG_GPU_MISS;
+    }
+    return ENG_GPU_MISS;
+}
+
+/* Merge cache for a read that straddles a GPU range: guest bytes with the
+ * range overlaid.  Keyed by (location, offset, len); the buffer is stable for
+ * the key (a cached fetch plan may hold it) and is refreshed on every read, so
+ * it always carries the current frame's bytes.  Only straddling reads use it.
+ */
+#define ENG_GPU_MERGE_MAX 16
+typedef struct {
+    u32 location, offset, len;
+    u8* buf;
+    u32 cap;
+} eng_gpu_merge;
+static eng_gpu_merge s_merge[ENG_GPU_MERGE_MAX];
+static int s_merge_n;
+static pthread_mutex_t s_merge_mu = PTHREAD_MUTEX_INITIALIZER;
+
+static u8* eng_gpu_merge_buf(u32 location, u32 offset, u32 len)
+{
+    pthread_mutex_lock(&s_merge_mu);
+    eng_gpu_merge* e = NULL;
+    for (int i = 0; i < s_merge_n; i++)
+        if (s_merge[i].location == location && s_merge[i].offset == offset &&
+            s_merge[i].len == len) { e = &s_merge[i]; break; }
+    if (!e && s_merge_n < ENG_GPU_MERGE_MAX) {
+        e = &s_merge[s_merge_n++];
+        e->location = location; e->offset = offset; e->len = len;
+        e->buf = NULL; e->cap = 0;
+    }
+    if (!e) { pthread_mutex_unlock(&s_merge_mu); return NULL; }
+    if (e->cap < len) {
+        u8* p = (u8*)realloc(e->buf, len);
+        if (!p) { pthread_mutex_unlock(&s_merge_mu); return NULL; }
+        e->buf = p; e->cap = len;
+    }
+    u8* out = e->buf;
+    pthread_mutex_unlock(&s_merge_mu);
+    return out;
+}
+
+/* Fill the merge buffer from guest bytes and the GPU range.  The caller holds
+ * no engine locks; concurrent straddling reads of the same key are serialised
+ * by the CPU-side draw path (the MT workers are off in the play defaults). */
+static void eng_gpu_scratch_rewind(void) { }
 /* ==========================================================================
  * Walker profiler (PS3RECOMP_WALKER_PROF) and one-frame capture
  * (PS3RECOMP_WALKER_CAPTURE). Both are dormant unless their environment
@@ -1380,8 +1570,22 @@ int rsx_draw_engine_state_restore(const rsx_wcap_state* in)
 static const u8* eng_guest_ptr_raw(u32 location, u32 offset, u32 min_bytes)
 {
     if (!min_bytes || min_bytes > (256u << 20)) return NULL;
+    eng_gpu_hit gh;
+    int gstate = ENG_GPU_MISS;
+    if (__builtin_expect(__atomic_load_n(&s_gpu_rng_n, __ATOMIC_RELAXED) != 0, 0))
+        gstate = eng_gpu_range_probe(location, offset, min_bytes, &gh, 0);
+    if (gstate == ENG_GPU_FULL) return gh.bytes;   /* GPU bytes replace guest */
     if (s_guest_reader) {
         const u8* p = s_guest_reader(s_guest_user, location, offset, min_bytes);
+        if (p && gstate == ENG_GPU_PARTIAL) {
+            u8* m = eng_gpu_merge_buf(location, offset, min_bytes);
+            if (m) {
+                memcpy(m, p, min_bytes);
+                memcpy(m + (gh.hit_start - gh.req_start),
+                       gh.bytes, gh.hit_len);
+                return m;
+            }
+        }
         if (p && s_wcap_active)
             rsx_wcap_note_read(location, offset, min_bytes,
                                (u32)(uintptr_t)(p - vm_base));
@@ -1392,6 +1596,14 @@ static const u8* eng_guest_ptr_raw(u32 location, u32 offset, u32 min_bytes)
     if (!ea) return NULL;
     if (ppu_vm_size && (u64)ea + min_bytes > ppu_vm_size) return NULL;
     if (s_wcap_active) rsx_wcap_note_read(location, offset, min_bytes, ea);
+    if (gstate == ENG_GPU_PARTIAL) {
+        u8* m = eng_gpu_merge_buf(location, offset, min_bytes);
+        if (m) {
+            memcpy(m, vm_base + ea, min_bytes);
+            memcpy(m + (gh.hit_start - gh.req_start), gh.bytes, gh.hit_len);
+            return m;
+        }
+    }
     return vm_base + ea;
 }
 

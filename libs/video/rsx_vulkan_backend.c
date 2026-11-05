@@ -58,6 +58,8 @@
 #include "vulkan/rsx_vk_fallback_vert.spv.h"
 #include "vulkan/rsx_vk_fallback_frag.spv.h"
 #include "vulkan/vtx_unpack_comp.spv.h"
+#include "vulkan/c690_2a_32b_comp.spv.h"
+#include "../../runtime/spu/c690_gpu_2a.h"
 
 /* SDL2 is already required off Windows (cellPad, cellAudio); here it only
  * opens the optional window. Same include style as those two. */
@@ -226,6 +228,20 @@ typedef struct vk_state {
     VkPipeline            vtx_unpack_pipe;
     VkDescriptorPool      vtx_unpack_pool;
     VkDescriptorSet       vtx_unpack_ds[VK_EB_SETS];
+
+    /* PS3RECOMP_C690_GPU_2A: 0x2A 32-byte-class compute (one submit/drain). */
+    VkShaderModule        c690_module;
+    VkDescriptorSetLayout c690_dsl;
+    VkPipelineLayout      c690_layout;
+    VkPipeline            c690_pipe;
+    VkDescriptorPool      c690_pool;
+    VkDescriptorSet       c690_set;
+    vk_buffer             c690_in, c690_off, c690_out;
+    VkCommandPool         c690_cmd_pool;
+    VkCommandBuffer       c690_cmd;
+    VkFence               c690_fence;
+    u32                   c690_align;
+    int                   c690_ready;
 
     vk_image         dummy;           /* 1x1 magenta: "nothing bound"    */
     vk_image         tex[RSX_MAX_TEXTURES];   /* decoded guest textures  */
@@ -4735,6 +4751,298 @@ static struct {
 } s_eb = { .on = -1 };
 
 /* Macro Target 2: Vulkan compute pipeline for GPU vertex unpacking */
+/* ---------------------------------------------------------------------------
+ * PS3RECOMP_C690_GPU_2A: c690 Edge 0x2A 32-byte-class compute.
+ *
+ * The SPU lane exports (arrays, offsets, seed) per command; the draw engine's
+ * guest resolver serves the result for the mesh-ring span. All pending jobs
+ * of a drain are one command buffer, one submit, one fence wait (the wait is
+ * the draw that resolves the range). Nothing is created or run unless the key
+ * is on and a job exists.
+ * -------------------------------------------------------------------------*/
+#define C690_GPU_ARENA_IN   (32u << 20)
+#define C690_GPU_ARENA_OFF  (4u << 20)
+#define C690_GPU_ARENA_OUT  (32u << 20)
+#define C690_GPU_JOB_MAX    4096
+
+static pthread_mutex_t s_c690_mu = PTHREAD_MUTEX_INITIALIZER;
+static c690_gpu_2a_job* s_c690_q;
+static unsigned s_c690_qn, s_c690_qcap;
+static unsigned long long s_c690_prepares, s_c690_jobs, s_c690_records,
+    s_c690_wait_us, s_c690_last_stats_us;
+static unsigned long long s_c690_w_prepares, s_c690_w_jobs, s_c690_w_records,
+    s_c690_w_wait_us;
+static void vk_c690_job_free(c690_gpu_2a_job* j);
+
+static int vk_c690_sink(c690_gpu_2a_job* job)
+{
+    if (!job || !ps3_live_ctl_get(PS3_LIVE_C690_GPU_2A)) return 0;
+    pthread_mutex_lock(&s_c690_mu);
+    if (s_c690_qn == s_c690_qcap) {
+        unsigned cap = s_c690_qcap ? s_c690_qcap * 2u : 64u;
+        if (cap > 1024u) cap = 1024u;
+        c690_gpu_2a_job* p = (c690_gpu_2a_job*)realloc(s_c690_q, cap * sizeof *p);
+        if (!p) { pthread_mutex_unlock(&s_c690_mu); return 0; }
+        s_c690_q = p; s_c690_qcap = cap;
+        if (s_c690_qn == s_c690_qcap) {
+            /* Nothing reads these ranges (or the renderer stalled): drop the
+             * oldest so a frame cannot grow the queue without bound. */
+            vk_c690_job_free(&s_c690_q[0]);
+            memmove(&s_c690_q[0], &s_c690_q[1],
+                    (s_c690_qn - 1) * sizeof s_c690_q[0]);
+            s_c690_qn--;
+        }
+    }
+    s_c690_q[s_c690_qn++] = *job;
+    /* Arm the resolver so the next draw that reads the ring calls prepare. */
+    rsx_draw_engine_gpu_range_pending(job->ea, job->count * 32u);
+    pthread_mutex_unlock(&s_c690_mu);
+    return 1;
+}
+
+static void vk_c690_release(void)
+{
+    if (s_vk.c690_pipe) pvkDestroyPipeline(s_vk.device, s_vk.c690_pipe, NULL);
+    if (s_vk.c690_layout) pvkDestroyPipelineLayout(s_vk.device, s_vk.c690_layout, NULL);
+    if (s_vk.c690_pool) pvkDestroyDescriptorPool(s_vk.device, s_vk.c690_pool, NULL);
+    if (s_vk.c690_dsl) pvkDestroyDescriptorSetLayout(s_vk.device, s_vk.c690_dsl, NULL);
+    if (s_vk.c690_module) pvkDestroyShaderModule(s_vk.device, s_vk.c690_module, NULL);
+    if (s_vk.c690_in.buf) vk_destroy_buffer(&s_vk.c690_in);
+    if (s_vk.c690_off.buf) vk_destroy_buffer(&s_vk.c690_off);
+    if (s_vk.c690_out.buf) vk_destroy_buffer(&s_vk.c690_out);
+    if (s_vk.c690_cmd_pool) pvkDestroyCommandPool(s_vk.device, s_vk.c690_cmd_pool, NULL);
+    if (s_vk.c690_fence) pvkDestroyFence(s_vk.device, s_vk.c690_fence, NULL);
+    s_vk.c690_pipe = VK_NULL_HANDLE; s_vk.c690_layout = VK_NULL_HANDLE;
+    s_vk.c690_pool = VK_NULL_HANDLE; s_vk.c690_dsl = VK_NULL_HANDLE;
+    s_vk.c690_module = VK_NULL_HANDLE;
+    memset(&s_vk.c690_in, 0, sizeof s_vk.c690_in);
+    memset(&s_vk.c690_off, 0, sizeof s_vk.c690_off);
+    memset(&s_vk.c690_out, 0, sizeof s_vk.c690_out);
+    s_vk.c690_cmd_pool = VK_NULL_HANDLE; s_vk.c690_cmd = VK_NULL_HANDLE;
+    s_vk.c690_fence = VK_NULL_HANDLE; s_vk.c690_ready = 0;
+}
+
+static int vk_c690_init(void)
+{
+    if (s_vk.c690_ready) return 0;
+    if (!s_vk.device) return -1;
+    VkPhysicalDeviceProperties props;
+    pvkGetPhysicalDeviceProperties(s_vk.phys, &props);
+    u32 align = props.limits.minStorageBufferOffsetAlignment;
+    s_vk.c690_align = align > 256u ? align : 256u;
+
+    if (vk_create_shader(c690_2a_32b_comp_spv, sizeof c690_2a_32b_comp_spv,
+                         &s_vk.c690_module)) {
+        VK_LOG("c690 gpu 2a: shader module failed\n");
+        return -1;
+    }
+    VkDescriptorSetLayoutBinding binds[3] = {
+        { 0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL },
+        { 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL },
+        { 2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL },
+    };
+    VkDescriptorSetLayoutCreateInfo dlci = {
+        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+        .bindingCount = 3, .pBindings = binds };
+    if (pvkCreateDescriptorSetLayout(s_vk.device, &dlci, NULL, &s_vk.c690_dsl) != VK_SUCCESS)
+        goto fail;
+    VkPushConstantRange pcr = { .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
+                                .offset = 0, .size = 32 };
+    VkPipelineLayoutCreateInfo plci = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+        .setLayoutCount = 1, .pSetLayouts = &s_vk.c690_dsl,
+        .pushConstantRangeCount = 1, .pPushConstantRanges = &pcr };
+    if (pvkCreatePipelineLayout(s_vk.device, &plci, NULL, &s_vk.c690_layout) != VK_SUCCESS)
+        goto fail;
+    VkComputePipelineCreateInfo cpci = {
+        .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+        .stage = { .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+                   .stage = VK_SHADER_STAGE_COMPUTE_BIT,
+                   .module = s_vk.c690_module, .pName = "main" },
+        .layout = s_vk.c690_layout };
+    if (pvkCreateComputePipelines(s_vk.device, s_pipe_cache, 1, &cpci, NULL,
+                                  &s_vk.c690_pipe) != VK_SUCCESS)
+        goto fail;
+    VkDescriptorPoolSize ps = { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC, 3 };
+    VkDescriptorPoolCreateInfo dpci = {
+        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+        .maxSets = 1, .poolSizeCount = 1, .pPoolSizes = &ps };
+    if (pvkCreateDescriptorPool(s_vk.device, &dpci, NULL, &s_vk.c690_pool) != VK_SUCCESS)
+        goto fail;
+    VkDescriptorSetAllocateInfo dsai = {
+        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+        .descriptorPool = s_vk.c690_pool, .descriptorSetCount = 1,
+        .pSetLayouts = &s_vk.c690_dsl };
+    if (pvkAllocateDescriptorSets(s_vk.device, &dsai, &s_vk.c690_set) != VK_SUCCESS)
+        goto fail;
+
+    if (vk_create_host_buffer(&s_vk.c690_in, C690_GPU_ARENA_IN, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT) ||
+        !s_vk.c690_in.coherent ||
+        vk_create_host_buffer(&s_vk.c690_off, C690_GPU_ARENA_OFF, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT) ||
+        !s_vk.c690_off.coherent ||
+        vk_create_host_buffer(&s_vk.c690_out, C690_GPU_ARENA_OUT, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT) ||
+        !s_vk.c690_out.coherent) {
+        VK_LOG("c690 gpu 2a: no host-coherent arena\n");
+        goto fail;
+    }
+    VkDescriptorBufferInfo bi[3] = {
+        { s_vk.c690_in.buf, 0, VK_WHOLE_SIZE },
+        { s_vk.c690_off.buf, 0, VK_WHOLE_SIZE },
+        { s_vk.c690_out.buf, 0, VK_WHOLE_SIZE },
+    };
+    VkWriteDescriptorSet w[3];
+    for (int i = 0; i < 3; i++) {
+        w[i] = (VkWriteDescriptorSet){
+            .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+            .dstSet = s_vk.c690_set, .dstBinding = (uint32_t)i,
+            .descriptorCount = 1,
+            .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC,
+            .pBufferInfo = &bi[i] };
+    }
+    pvkUpdateDescriptorSets(s_vk.device, 3, w, 0, NULL);
+
+    VkCommandPoolCreateInfo cci = {
+        .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
+        .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT,
+        .queueFamilyIndex = s_vk.queue_family };
+    if (pvkCreateCommandPool(s_vk.device, &cci, NULL, &s_vk.c690_cmd_pool) != VK_SUCCESS)
+        goto fail;
+    VkCommandBufferAllocateInfo cbi = {
+        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+        .commandPool = s_vk.c690_cmd_pool,
+        .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY, .commandBufferCount = 1 };
+    if (pvkAllocateCommandBuffers(s_vk.device, &cbi, &s_vk.c690_cmd) != VK_SUCCESS)
+        goto fail;
+    VkFenceCreateInfo fci = { .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
+    if (pvkCreateFence(s_vk.device, &fci, NULL, &s_vk.c690_fence) != VK_SUCCESS)
+        goto fail;
+    s_vk.c690_ready = 1;
+    VK_LOG("c690 gpu 2a: compute pipeline ready\n");
+    return 0;
+fail:
+    VK_LOG("c690 gpu 2a: init failed\n");
+    vk_c690_release();
+    return -1;
+}
+
+static void vk_c690_job_free(c690_gpu_2a_job* j)
+{
+    free(j->offs); free(j->arrays); free(j->seed);
+    j->offs = NULL; j->arrays = NULL; j->seed = NULL;
+}
+
+static void vk_c690_prepare(void)
+{
+    rsx_draw_engine_gpu_range_clear();
+    c690_gpu_2a_job* jobs = NULL;
+    unsigned n = 0;
+    pthread_mutex_lock(&s_c690_mu);
+    jobs = s_c690_q; n = s_c690_qn;
+    s_c690_q = NULL; s_c690_qn = s_c690_qcap = 0;
+    pthread_mutex_unlock(&s_c690_mu);
+    if (!n) { free(jobs); return; }
+    if (vk_c690_init() != 0) {
+        for (unsigned i = 0; i < n; i++) {
+            c690_gpu_2a_job* j = &jobs[i];
+            rsx_draw_engine_gpu_range_add_ea(j->ea, j->count * 32u, j->seed);
+            vk_c690_job_free(j);
+        }
+        free(jobs);
+        return;
+    }
+
+    const u32 A = s_vk.c690_align;
+    u32 in_off = 0, off_off = 0, out_off = 0;
+    u32 used = 0;
+    VkCommandBuffer cb = s_vk.c690_cmd;
+    pvkResetCommandBuffer(cb, 0);
+    VkCommandBufferBeginInfo bi = {
+        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+        .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT };
+    if (pvkBeginCommandBuffer(cb, &bi) != VK_SUCCESS) {
+        for (unsigned i = 0; i < n; i++) {
+            c690_gpu_2a_job* j = &jobs[i];
+            rsx_draw_engine_gpu_range_add_ea(j->ea, j->count * 32u, j->seed);
+            vk_c690_job_free(j);
+        }
+        free(jobs);
+        return;
+    }
+    pvkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, s_vk.c690_pipe);
+    for (unsigned i = 0; i < n; i++) {
+        c690_gpu_2a_job* j = &jobs[i];
+        const u32 in_bytes = j->extent * 4u;
+        const u32 of_bytes = ((j->count * 2u) + 3u) & ~3u;
+        const u32 out_bytes = j->count * 32u;
+        const u32 in_at = (in_off + A - 1u) & ~(A - 1u);
+        const u32 of_at = (off_off + A - 1u) & ~(A - 1u);
+        const u32 out_at = (out_off + A - 1u) & ~(A - 1u);
+        if (used >= 64u ||
+            in_at + in_bytes > C690_GPU_ARENA_IN ||
+            of_at + of_bytes > C690_GPU_ARENA_OFF ||
+            out_at + out_bytes > C690_GPU_ARENA_OUT) {
+            /* Keep it for the next drain; re-arm its pending marker. */
+            rsx_draw_engine_gpu_range_pending(j->ea, j->count * 32u);
+            pthread_mutex_lock(&s_c690_mu);
+            if (s_c690_qn == s_c690_qcap) {
+                unsigned cap = s_c690_qcap ? s_c690_qcap * 2u : 64u;
+                c690_gpu_2a_job* p = (c690_gpu_2a_job*)realloc(s_c690_q, cap * sizeof *p);
+                if (p) { s_c690_q = p; s_c690_qcap = cap; }
+            }
+            if (s_c690_qn < s_c690_qcap) s_c690_q[s_c690_qn++] = *j;
+            else vk_c690_job_free(j);
+            pthread_mutex_unlock(&s_c690_mu);
+            continue;
+        }
+        memcpy((u8*)s_vk.c690_in.ptr + in_at, j->arrays, in_bytes);
+        memcpy((u8*)s_vk.c690_off.ptr + of_at, j->offs, (size_t)j->count * 2u);
+        memcpy((u8*)s_vk.c690_out.ptr + out_at, j->seed, out_bytes);
+        in_off = in_at + in_bytes; off_off = of_at + of_bytes; out_off = out_at + out_bytes;
+        const uint32_t dyn[3] = { in_at, of_at, out_at };
+        pvkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE,
+                                 s_vk.c690_layout, 0, 1, &s_vk.c690_set, 3, dyn);
+        struct { u32 pos, nrm, tan, uv, outb, count, pad0, pad1; } pc;
+        pc.pos = 0; pc.nrm = j->extent; pc.tan = 2u * j->extent;
+        pc.uv = 3u * j->extent; pc.outb = 0; pc.count = j->count;
+        pc.pad0 = pc.pad1 = 0;
+        pvkCmdPushConstants(cb, s_vk.c690_layout, VK_SHADER_STAGE_COMPUTE_BIT,
+                            0, sizeof pc, &pc);
+        pvkCmdDispatch(cb, (j->count + 63u) / 64u, 1, 1);
+        rsx_draw_engine_gpu_range_add_ea(j->ea, out_bytes,
+                                         (const u8*)s_vk.c690_out.ptr + out_at);
+        vk_c690_job_free(j);
+        used++;
+        s_c690_jobs++; s_c690_records += j->count;
+        s_c690_w_jobs++; s_c690_w_records += j->count;
+    }
+    if (pvkEndCommandBuffer(cb) != VK_SUCCESS) { free(jobs); return; }
+    VkSubmitInfo si = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+                        .commandBufferCount = 1, .pCommandBuffers = &cb };
+    pvkResetFences(s_vk.device, 1, &s_vk.c690_fence);
+    const unsigned long long t0 = rsx_wprof_now();
+    pthread_mutex_lock(&s_vk.queue_mu);
+    const VkResult sr = pvkQueueSubmit(s_vk.queue, 1, &si, s_vk.c690_fence);
+    if (sr == VK_SUCCESS)
+        pvkWaitForFences(s_vk.device, 1, &s_vk.c690_fence, VK_TRUE, UINT64_MAX);
+    pthread_mutex_unlock(&s_vk.queue_mu);
+    const unsigned long long t1 = rsx_wprof_now();
+    s_c690_prepares++;
+    s_c690_wait_us += t1 - t0;
+    s_c690_w_prepares++;
+    s_c690_w_wait_us += t1 - t0;
+    if (s_c690_last_stats_us == 0) s_c690_last_stats_us = t1;
+    else if (t1 - s_c690_last_stats_us >= 2000000ull) {
+        s_c690_last_stats_us = t1;
+        VK_LOG("[c690-gpu2a-gpu] prepares=%lu jobs=%lu records=%lu "
+               "sync_us=%llu (window prepares=%llu jobs=%llu records=%llu "
+               "sync_us=%llu)\n", s_c690_prepares, s_c690_jobs,
+               s_c690_records, s_c690_wait_us, s_c690_w_prepares,
+               s_c690_w_jobs, s_c690_w_records, s_c690_w_wait_us);
+        s_c690_w_prepares = s_c690_w_jobs = s_c690_w_records = s_c690_w_wait_us = 0;
+    }
+    free(jobs);
+}
+
 static int vk_vtx_unpack_init(void)
 {
     const char* off = getenv("PS3RECOMP_VK_VTX_UNPACK");
@@ -6168,8 +6476,13 @@ int rsx_vulkan_backend_init(u32 width, u32 height, const char* title)
      * Either way PS3RECOMP_RSX_ENGINE=dispatch|vtable overrides. */
     rsx_draw_engine_set_backend(&s_vk_engine_backend);
     rsx_draw_engine_set_default(s_g.on ? 1 : 0);
-    if (rsx_draw_engine_enabled() && rsx_draw_engine_init(s_vk.width, s_vk.height) == 0)
+    if (rsx_draw_engine_enabled() && rsx_draw_engine_init(s_vk.width, s_vk.height) == 0) {
         s_vk.eng_active = 1;
+        /* PS3RECOMP_C690_GPU_2A: the sink only takes a job when the live key
+         * is on; the prepare hook runs one compute submit per drain. */
+        c690_gpu_2a_set_sink(vk_c690_sink);
+        rsx_draw_engine_gpu_range_set_prepare(vk_c690_prepare);
+    }
     else
         rsx_set_backend(&s_vulkan_backend);
     VK_LOG("%s path\n", s_vk.eng_active ? "register-file draw engine" : "vtable");
@@ -6180,6 +6493,7 @@ int rsx_vulkan_backend_init(u32 width, u32 height, const char* title)
 
 void rsx_vulkan_backend_shutdown(void)
 {
+    vk_c690_release();
     rsx_vulkan_backend_present_finish();   /* a host that began one and quit */
     if (rsx_get_backend() == &s_vulkan_backend) rsx_set_backend(NULL);
     if (s_vk.eng_active) { rsx_draw_engine_shutdown(); s_vk.eng_active = 0; }

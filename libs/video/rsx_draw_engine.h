@@ -445,6 +445,20 @@ void rsx_draw_engine_set_default(int on);
 /* A runner with its own RSX IO map supplies its address resolver before init.
  * NULL restores the toolkit's cellGcm mapping. */
 void rsx_draw_engine_set_guest_memory(rsx_vertex_guest_ptr_fn reader, void* user);
+
+/* ---- c690 GPU ring resolver (PS3RECOMP_C690_GPU_2A) ---------------------
+ * A range of guest bytes produced by the GPU compute instead of the lifted
+ * SPU stores. The engine's guest resolver serves `bytes` for any read wholly
+ * inside the range; everything else takes the normal guest path. A range is
+ * `pending` until the renderer's prepare hook (one compute submit per drain)
+ * has produced it; a read that hits a pending range calls the hook. */
+void rsx_draw_engine_gpu_range_add_ea(u32 ea, u32 size, const u8* bytes);
+void rsx_draw_engine_gpu_range_add_offset(u32 location, u32 offset, u32 size,
+                                          const u8* bytes);
+void rsx_draw_engine_gpu_range_pending(u32 ea, u32 size);
+void rsx_draw_engine_gpu_range_clear(void);
+typedef void (*rsx_gpu_range_prepare_fn)(void);
+void rsx_draw_engine_gpu_range_set_prepare(rsx_gpu_range_prepare_fn fn);
 void rsx_draw_engine_set_display_query(int (*fn)(u32 offset));
 
 int  rsx_draw_engine_init(u32 width, u32 height);

@@ -97,6 +97,7 @@ enum {
     PS3_LIVE_C690_HOLES_NATIVE,         /* PS3RECOMP_C690_HOLES_NATIVE: fused 0x25/0x26 native sample-grid union */
     PS3_LIVE_FP_TXD,                    /* PS3RECOMP_FP_TXD: explicit-derivative fetches (TXD) and DDX/DDY */
     PS3_LIVE_FP_AA,                     /* PS3RECOMP_FP_AA: scale derivative LOD by the 2x1 AA sample grid */
+    PS3_LIVE_C690_GPU_2A,               /* PS3RECOMP_C690_GPU_2A: GPU ring resolver for the 32-byte 0x2A class */
     PS3_LIVE_COUNT
 };
 

@@ -1,0 +1,114 @@
+#version 450
+
+// c690 0x2A vertex assembler (SPU LS 0x10F78), position-first 32-byte class.
+//
+// The SPU pre-pass exports, per record, a source offset (u16, LS byte offset
+// into the four planar arrays) and the 4 index/attribute bytes it writes at
+// record +28..31.  This kernel writes only bytes 0..27 of each record:
+//
+//   +0..11   position xyz f32        (exact copy)
+//   +12..15  normal packed 11:11:10  (clamp(trunc(v*scale) - 1))
+//   +16..23  4 x s16 tangent         (clamp(trunc(v*32768) - 1))
+//   +24..27  2 x f16 uv              (u in the high half, v in the low)
+//   +28..31  untouched               (SPU pre-pass)
+//
+// The local store is big-endian per 32-bit lane; the storage buffer is the
+// raw LS byte image, so every value is byte-swapped on read/write.
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, binding = 0) readonly buffer InBuffer  { uint in_words[];  };
+layout(std430, binding = 1) readonly buffer OffBuffer { uint offsets[];   };  // 2 x u16 per word
+layout(std430, binding = 2) buffer OutBuffer { uint out_words[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint pos_base;
+    uint nrm_base;
+    uint tan_base;
+    uint uv_base;
+    uint out_base;
+    uint count;
+    uint pad0;
+    uint pad1;
+} pc;
+
+uint bswap32(uint v)
+{
+    return (v >> 24u) |
+           ((v >> 8u)  & 0x0000FF00u) |
+           ((v << 8u)  & 0x00FF0000u) |
+           (v << 24u);
+}
+
+float load_f32(uint byte_off)
+{
+    return uintBitsToFloat(bswap32(in_words[byte_off >> 2u]));
+}
+
+void store_word(uint byte_off, uint v)
+{
+    out_words[byte_off >> 2u] = bswap32(v);
+}
+
+int enc_fixed(float v, float scale, int lo, int hi)
+{
+    int x = int(v * scale) - 1;
+    return clamp(x, lo, hi);
+}
+
+uint f16_bits(float v)
+{
+    // IEEE half, round-to-nearest-even, the same conversion the lifted pack
+    // uses on this corpus (<= 1 LSB against the SPU).
+    return packHalf2x16(vec2(v, 0.0)) & 0xFFFFu;
+}
+
+void main()
+{
+    uint vid = gl_GlobalInvocationID.x;
+    if (vid >= pc.count)
+        return;
+
+    uint word = offsets[vid >> 1u];
+    uint off;
+    if ((vid & 1u) != 0u) off = word >> 16u;
+    else                  off = word & 0xFFFFu;
+
+    float px = load_f32(pc.pos_base + off + 0u);
+    float py = load_f32(pc.pos_base + off + 4u);
+    float pz = load_f32(pc.pos_base + off + 8u);
+
+    float nx = load_f32(pc.nrm_base + off + 0u);
+    float ny = load_f32(pc.nrm_base + off + 4u);
+    float nz = load_f32(pc.nrm_base + off + 8u);
+
+    float tx = load_f32(pc.tan_base + off + 0u);
+    float ty = load_f32(pc.tan_base + off + 4u);
+    float tz = load_f32(pc.tan_base + off + 8u);
+    float tw = load_f32(pc.tan_base + off + 12u);
+
+    float u = load_f32(pc.uv_base + off + 0u);
+    float v = load_f32(pc.uv_base + off + 4u);
+
+    int e0 = enc_fixed(nx, 1024.0, -1024, 1023);
+    int e1 = enc_fixed(ny, 1024.0, -1024, 1023);
+    int e2 = enc_fixed(nz,  512.0,  -512,  511);
+    uint nrm = (uint(e0) & 0x7FFu) | ((uint(e1) & 0x7FFu) << 11u) |
+               ((uint(e2) & 0x3FFu) << 22u);
+
+    int s0 = enc_fixed(tx, 32768.0, -32768, 32767);
+    int s1 = enc_fixed(ty, 32768.0, -32768, 32767);
+    int s2 = enc_fixed(tz, 32768.0, -32768, 32767);
+    int s3 = enc_fixed(tw, 32768.0, -32768, 32767);
+
+    uint uv = (f16_bits(u) << 16u) | f16_bits(v);
+
+    uint o = pc.out_base + vid * 32u;
+    store_word(o + 0u,  floatBitsToUint(px));
+    store_word(o + 4u,  floatBitsToUint(py));
+    store_word(o + 8u,  floatBitsToUint(pz));
+    store_word(o + 12u, nrm);
+    store_word(o + 16u, (uint(s0) & 0xFFFFu) << 16u | (uint(s1) & 0xFFFFu));
+    store_word(o + 20u, (uint(s2) & 0xFFFFu) << 16u | (uint(s3) & 0xFFFFu));
+    store_word(o + 24u, uv);
+}

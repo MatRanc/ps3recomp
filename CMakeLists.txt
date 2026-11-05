@@ -453,6 +453,23 @@ if(PS3RECOMP_BUILD_TESTS)
         "${CMAKE_CURRENT_SOURCE_DIR}/runtime/spu")
     add_test(NAME c690_holes_merge COMMAND test_c690_holes_merge)
 
+    # The 0x2A 32-byte GPU binding: A/B classifier, record-store suppression,
+    # exact SPU fallback and the ring-PUT range mapping.
+    add_executable(test_c690_gpu_2a
+        tests/test_c690_gpu_2a.c
+        runtime/spu/c690_gpu_2a.c
+        libs/video/ps3_live_ctl.c
+    )
+    target_include_directories(test_c690_gpu_2a PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/runtime/spu"
+        "${CMAKE_CURRENT_SOURCE_DIR}/libs/video"
+        "${CMAKE_CURRENT_SOURCE_DIR}/include"
+    )
+    if(TARGET Threads::Threads)
+        target_link_libraries(test_c690_gpu_2a PRIVATE Threads::Threads)
+    endif()
+    add_test(NAME c690_gpu_2a COMMAND test_c690_gpu_2a)
+
     # PS3_LOG_FIRST, the saturating counter behind the "first n times" log lines.
     add_executable(test_log_first tests/test_log_first.c)
     target_include_directories(test_log_first PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")

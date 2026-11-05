@@ -96,6 +96,8 @@ struct rsx_engine_replay {
     size_t nents;
     unsigned long long hits, misses;
     u32 words;
+    u8* gpu_bytes;       /* PS3RECOMP_GPU_RING: resolver range for this run */
+    u32 gpu_loc, gpu_off, gpu_size;
 };
 
 static const u8* cap_read(void* user, u32 location, u32 offset, u32 min_bytes)
@@ -236,6 +238,47 @@ rsx_engine_replay* rsx_engine_replay_create(const char* prefix, char* err, size_
     }
 
     rsx_draw_engine_set_guest_memory(cap_read, r);
+
+    /* PS3RECOMP_GPU_RING=loc:offset:path installs a GPU-produced range through
+     * the engine's resolver (not a .mem patch), so the offline gate exercises
+     * the same path the live walker uses. loc/offset accept 0x. */
+    {
+        const char* spec = getenv("PS3RECOMP_GPU_RING");
+        if (spec && *spec) {
+            char buf[1024];
+            snprintf(buf, sizeof buf, "%s", spec);
+            char* colon = strchr(buf, ':');
+            if (colon) {
+                *colon = 0;
+                char* colon2 = strchr(colon + 1, ':');
+                if (colon2) {
+                    *colon2 = 0;
+                    const char* path = colon2 + 1;
+                    FILE* f = fopen(path, "rb");
+                    if (f) {
+                        fseek(f, 0, SEEK_END); long sz = ftell(f); fseek(f, 0, SEEK_SET);
+                        if (sz > 0) {
+                            u8* p = (u8*)malloc((size_t)sz);
+                            if (p && fread(p, 1, (size_t)sz, f) == (size_t)sz) {
+                                r->gpu_bytes = p;
+                                r->gpu_size = (u32)sz;
+                                r->gpu_loc = (u32)strtoul(buf, NULL, 0);
+                                r->gpu_off = (u32)strtoul(colon + 1, NULL, 0);
+                                rsx_draw_engine_gpu_range_add_offset(
+                                    r->gpu_loc, r->gpu_off, r->gpu_size, p);
+                                fprintf(stderr, "[replay-engine] gpu range loc=%u "
+                                        "off=0x%X size=%u from %s\n",
+                                        r->gpu_loc, r->gpu_off, r->gpu_size, path);
+                            } else {
+                                free(p);
+                            }
+                        }
+                        fclose(f);
+                    }
+                }
+            }
+        }
+    }
     rsx_draw_engine_set_backend(replay_null_backend());
     rsx_draw_engine_set_default(1);
     if (rsx_draw_engine_init(r->state.width ? r->state.width : 1280,
@@ -301,6 +344,7 @@ void rsx_engine_replay_destroy(rsx_engine_replay* r)
     free(r->fifo);
     free(r->mem);
     free(r->ents);
+    free(r->gpu_bytes);
     free(r);
     vm_shutdown();
     ppu_vm_size = 0;
