@@ -452,6 +452,16 @@ if(PS3RECOMP_BUILD_TESTS)
     target_include_directories(test_c690_holes_merge PRIVATE
         "${CMAKE_CURRENT_SOURCE_DIR}/runtime/spu")
     add_test(NAME c690_holes_merge COMMAND test_c690_holes_merge)
+    # Native 0x2A field pack: supported layout runs and matches the documented
+    # rules; an unknown descriptor falls back to the lifted body.
+    add_executable(test_c690_native_2a
+        runtime/spu/tests/test_c690_native_2a.c
+        runtime/spu/c690_native_2a.c
+    )
+    target_include_directories(test_c690_native_2a PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/runtime/spu"
+        "${CMAKE_CURRENT_SOURCE_DIR}/libs/video")
+    add_test(NAME c690_native_2a COMMAND test_c690_native_2a)
 
     # PS3_LOG_FIRST, the saturating counter behind the "first n times" log lines.
     add_executable(test_log_first tests/test_log_first.c)

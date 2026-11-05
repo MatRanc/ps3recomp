@@ -68,3 +68,15 @@ void spu_indirect_branch_mt(spu_context* ctx)
     /* slow / special path: full resolver (diagnostics, intercepts, miss log) */
     __attribute__((musttail)) return spu_indirect_branch(ctx);
 }
+
+/* Native c690 0x2A field-pack link anchor.
+ *
+ * The generated c690 module references c690_native_2a_try() weakly so that a
+ * play/gpu tree without the hook still links and runs the lifted body.  A weak
+ * reference does not extract an archive member, so this game-only TU (already
+ * part of the executable) takes a strong reference to the hook's translation
+ * unit.  Trees that do not carry runtime/spu/c690_native_2a.c do not compile
+ * this file in the first place. */
+extern int c690_native_2a_enabled(void);
+static int (*const c690_native_2a_link_anchor)(void)
+    __attribute__((used)) = c690_native_2a_enabled;
