@@ -268,6 +268,15 @@ u64 hlsl_hash(const char* hlsl)
     return fnv1a64(hlsl, strlen(hlsl), seed);
 }
 
+/* Same text hash without the build stamp. PS3RECOMP_SHADER_CACHE_STABLE_KEY
+ * uses this so a rebuild of unrelated files does not invalidate the whole
+ * cache; RSX_SHADER_TRANSLATOR_VERSION and the glslang version in the file
+ * header remain the invalidation contract. */
+u64 hlsl_hash_stable(const char* hlsl)
+{
+    return fnv1a64(hlsl, strlen(hlsl), 0xcbf29ce484222325ull);
+}
+
 bool mkdir_p(const std::string& path)
 {
     if (path.empty()) return false;
@@ -291,6 +300,7 @@ struct DiskCache {
     std::mutex lock;
     bool env_read = false;
     bool on = false;
+    bool stable_key = false;
     std::string dir;
     u32 version = RSX_SHADER_TRANSLATOR_VERSION;
     RsxShaderDiskCacheStats stats = {};
@@ -367,6 +377,7 @@ void disk_env(DiskCache& c)
     if (c.env_read) return;
     c.env_read = true;
     c.on = false;
+    c.stable_key = false;
     c.dir.clear();
     const char* e = getenv("PS3RECOMP_SHADER_DISK_CACHE");
     if (!e || !*e || strcmp(e, "0") == 0) return;
@@ -385,10 +396,12 @@ void disk_env(DiskCache& c)
     }
     disk_sweep_tmp(c.dir);
     c.on = true;
+    c.stable_key = on_word(getenv("PS3RECOMP_SHADER_CACHE_STABLE_KEY"));
     static bool registered = false;
     if (!registered) { registered = true; atexit(disk_atexit); }
-    fprintf(stderr, "[shader-cache] %s (translator v%u)\n",
-            c.dir.c_str(), (unsigned)c.version);
+    fprintf(stderr, "[shader-cache] %s (translator v%u%s)\n",
+            c.dir.c_str(), (unsigned)c.version,
+            c.stable_key ? ", stable key" : "");
 }
 
 std::string disk_path(const DiskCache& c, u64 key, int stage)
@@ -423,15 +436,17 @@ void disk_header(u32 hdr[kDiskHeaderWords], u32 version, int stage, u64 key,
 bool disk_load(DiskCache& c, u64 key, int stage, const char* hlsl,
                u32* words, u32 max_words, u32* out_words)
 {
-    const u64 hash = hlsl_hash(hlsl);
     const size_t hlen = strlen(hlsl);
     std::string path;
     u32 want[kDiskHeaderWords];
+    bool stable = false;
     {
         std::lock_guard<std::mutex> guard(c.lock);
         disk_env(c);
         if (!c.on) return false;
+        stable = c.stable_key;
         path = disk_path(c, key, stage);
+        const u64 hash = stable ? hlsl_hash_stable(hlsl) : hlsl_hash(hlsl);
         disk_header(want, c.version, stage, key, hash, hlen, 0, 0);
     }
 
@@ -445,8 +460,17 @@ bool disk_load(DiskCache& c, u64 key, int stage, const char* hlsl,
     }
 
     u32 hdr[kDiskHeaderWords];
-    bool ok = fread(hdr, sizeof hdr, 1, f) == 1 &&
-              memcmp(hdr, want, 12 * sizeof(u32)) == 0 &&
+    /* Words 9 and 10 are the HLSL hash. The normal key seeds that hash with
+     * the binary's build stamp, so every rebuild invalidates the cache even
+     * when the translator did not change. The stable key (opt-in) compares
+     * everything else -- translator version, glslang, stage, guest key and
+     * HLSL length -- and accepts a file written by an older build. */
+    bool header_ok = fread(hdr, sizeof hdr, 1, f) == 1 &&
+                     memcmp(hdr, want, 9 * sizeof(u32)) == 0 &&
+                     hdr[11] == want[11];
+    if (header_ok && !stable)
+        header_ok = hdr[9] == want[9] && hdr[10] == want[10];
+    bool ok = header_ok &&
               hdr[12] != 0 && hdr[12] <= max_words &&
               hdr[12] <= (1u << 24);
     if (ok) {
@@ -498,7 +522,7 @@ void disk_store(DiskCache& c, u64 key, int stage, const char* hlsl,
     FILE* f = fopen(tmp.c_str(), "wb");
     if (!f) return;
 
-    const u64 hash = hlsl_hash(hlsl);
+    const u64 hash = c.stable_key ? hlsl_hash_stable(hlsl) : hlsl_hash(hlsl);
     const size_t hlen = strlen(hlsl);
     const u64 sum = fnv1a64(words, (size_t)nwords * sizeof(u32),
                             0xcbf29ce484222325ull);

@@ -68,6 +68,17 @@ static int translate_keyed(u64 key, const char* hlsl, int stage,
     return r;
 }
 
+/* Change one byte of a keyed cache header word (the file format is 15 u32). */
+static int corrupt_header_word(const char* path, int word, unsigned char byte)
+{
+    FILE* f = fopen(path, "r+b");
+    if (!f) return 0;
+    if (fseek(f, (long)word * 4, SEEK_SET) != 0) { fclose(f); return 0; }
+    int ok = fputc(byte, f) != EOF;
+    fclose(f);
+    return ok;
+}
+
 static RsxShaderDiskCacheStats disk_stats(void)
 {
     RsxShaderDiskCacheStats s;
@@ -310,6 +321,52 @@ int main(void)
           translate_keyed(0x1234u, kVS, RSX_SHADER_STAGE_VERTEX, g_b, &nb) == 0);
     ds = disk_stats();
     check("keyed: ... as a rejected miss", ds.hits == 0 && ds.rejected == 1);
+
+    /* Build-stamp invalidation (PS3RECOMP_SHADER_CACHE_STABLE_KEY). The
+     * normal key seeds the HLSL hash with the binary's build stamp, so a file
+     * written by a different build misses even when the translator, glslang,
+     * guest key and HLSL are identical. An older build's file is simulated by
+     * changing the stored hash word. */
+    unsetenv("PS3RECOMP_SHADER_CACHE_STABLE_KEY");
+    rsx_hlsl_to_spirv_disk_reset();
+    check("stable-key: normal key seeds the file",
+          translate_keyed(0x1234u, kVS, RSX_SHADER_STAGE_VERTEX, g_a, &na) == 0);
+    check("stable-key: old-build file prepared", corrupt_header_word(kpath, 9, 0x5A) == 1);
+    rsx_hlsl_to_spirv_disk_reset();
+    check("stable-key: normal key rejects an old-build file",
+          translate_keyed(0x1234u, kVS, RSX_SHADER_STAGE_VERTEX, g_b, &nb) == 0);
+    ds = disk_stats();
+    check("stable-key: ... as a rejected miss", ds.hits == 0 && ds.rejected == 1);
+    /* The miss above rewrote the file; make it look old again. */
+    check("stable-key: old-build file prepared again", corrupt_header_word(kpath, 9, 0x5A) == 1);
+    setenv("PS3RECOMP_SHADER_CACHE_STABLE_KEY", "1", 1);
+    rsx_hlsl_to_spirv_disk_reset();
+    check("stable-key: stable key accepts an old-build file",
+          translate_keyed(0x1234u, kVS, RSX_SHADER_STAGE_VERTEX, g_b, &nb) == 0);
+    ds = disk_stats();
+    check("stable-key: ... as a hit", ds.hits == 1 && ds.misses == 0 && ds.rejected == 0);
+    check("stable-key: ... with the same words", na == nb && memcmp(g_a, g_b, na * 4u) == 0);
+
+    /* A translator version bump must still invalidate with the stable key. */
+    rsx_hlsl_to_spirv_disk_reset();
+    rsx_hlsl_to_spirv_disk_set_version(old_version + 1u);
+    check("stable-key: version bump still misses",
+          translate_keyed(0x1234u, kVS, RSX_SHADER_STAGE_VERTEX, g_b, &nb) == 0);
+    ds = disk_stats();
+    check("stable-key: ... rejected", ds.hits == 0 && ds.rejected == 1);
+
+    /* A different HLSL length must still invalidate with the stable key. */
+    rsx_hlsl_to_spirv_disk_reset();
+    rsx_hlsl_to_spirv_disk_set_version(old_version);
+    check("stable-key: restore version",
+          translate_keyed(0x1234u, kVS, RSX_SHADER_STAGE_VERTEX, g_b, &nb) == 0);
+    check("stable-key: wrong length prepared", corrupt_header_word(kpath, 11, 0xFF) == 1);
+    rsx_hlsl_to_spirv_disk_reset();
+    check("stable-key: wrong HLSL length misses",
+          translate_keyed(0x1234u, kVS, RSX_SHADER_STAGE_VERTEX, g_b, &nb) == 0);
+    ds = disk_stats();
+    check("stable-key: ... rejected", ds.hits == 0 && ds.rejected == 1);
+    unsetenv("PS3RECOMP_SHADER_CACHE_STABLE_KEY");
 
     {
         DIR* d = opendir(kdir);
