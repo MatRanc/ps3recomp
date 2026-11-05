@@ -90,6 +90,7 @@ enum {
     PS3_LIVE_WALKER_MT_SNAPSHOT,        /* PS3RECOMP_WALKER_MT_SNAPSHOT: copy borrowed guest bytes */
     PS3_LIVE_WALKER_MT_TEX_RESOLVE,     /* PS3RECOMP_WALKER_MT_TEX_RESOLVE: plain guest texture resolver */
     PS3_LIVE_FLIP_TICK_OWN_STATE,       /* PS3RECOMP_FLIP_TICK_OWN_STATE: tick completes by our request state, age-bounded */
+    PS3_LIVE_C690_HOLES_NATIVE,         /* PS3RECOMP_C690_HOLES_NATIVE: fused 0x25/0x26 native sample-grid union */
     PS3_LIVE_COUNT
 };
 

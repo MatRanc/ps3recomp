@@ -3,6 +3,8 @@
  * See c690_native_screen.h and docs/edge-native-step4.md.
  */
 #include "c690_native_screen.h"
+#include "c690_holes.h"
+#include "c690_cull_fix.h"
 #include "spu_context.h"
 
 #include <stdint.h>
@@ -48,14 +50,18 @@ static unsigned long long s_native_calls, s_mode1_calls;
 static unsigned long long s_shadow_calls, s_shadow_mismatches;
 static unsigned long long s_shadow_ls_bad, s_shadow_gpr_bad;
 static unsigned long long s_lifted_ns, s_native_ns;
+static unsigned long long s_holes_calls, s_holes_runs, s_holes_added;
+static unsigned long long s_holes_cap_skipped, s_holes_skip_setup;
+static unsigned long long s_holes_fallback, s_holes_ns;
 static int s_env_read;
-static int s_env_mode, s_env_shadow;
+static int s_env_mode, s_env_shadow, s_env_holes;
 static int s_dumped;
 
 static SPU_THREAD_LOCAL spu_context* t_alt;      /* own LS, shadow native run */
 static SPU_THREAD_LOCAL uint8_t* t_entry_ls;     /* shadow entry image */
 static SPU_THREAD_LOCAL uint8_t* t_entry_gpr;
 static SPU_THREAD_LOCAL unsigned t_entry_mxcsr;
+static SPU_THREAD_LOCAL int t_holes_depth;
 
 static uint32_t be32(const uint8_t* p)
 {
@@ -107,11 +113,13 @@ static void c690_scr_read_env(void)
     s_env_read = 1;
     const char* m = getenv("PS3RECOMP_C690_NATIVE_SCREEN");
     const char* s = getenv("PS3RECOMP_C690_NATIVE_SCREEN_SHADOW");
+    const char* h = getenv("PS3RECOMP_C690_HOLES_NATIVE");
     s_env_mode = m && *m ? atoi(m) : 0;
     s_env_shadow = s && *s && s[0] != '0';
-    if (s_env_mode || s_env_shadow) {
-        fprintf(stderr, "[c690-screen] enabled mode=%d shadow=%d\n",
-                s_env_mode, s_env_shadow);
+    s_env_holes = h && *h && h[0] != '0';
+    if (s_env_mode || s_env_shadow || s_env_holes) {
+        fprintf(stderr, "[c690-screen] enabled mode=%d shadow=%d holes=%d\n",
+                s_env_mode, s_env_shadow, s_env_holes);
         fflush(stderr);
     }
 }
@@ -138,9 +146,24 @@ static int c690_scr_shadow(void)
     return s_env_shadow;
 }
 
+static int c690_scr_holes(void)
+{
+    c690_scr_read_env();
+#ifdef C690_SCR_HAVE_LIVE_CTL
+    if (ps3_live_ctl_get && ps3_live_ctl_enabled && ps3_live_ctl_enabled())
+        return ps3_live_ctl_get(PS3_LIVE_C690_HOLES_NATIVE) != 0;
+#endif
+    return s_env_holes;
+}
+
+int c690_native_screen_holes_active(void)
+{
+    return c690_scr_holes();
+}
+
 int c690_native_screen_enabled(void)
 {
-    return c690_scr_mode() != 0 || c690_scr_shadow();
+    return c690_scr_mode() != 0 || c690_scr_shadow() || c690_scr_holes();
 }
 
 int c690_native_screen_mode(void)
@@ -152,10 +175,15 @@ static void c690_scr_report(const char* tag)
 {
     fprintf(stderr, "[c690-screen] %s native=%llu mode1=%llu shadow=%llu "
                     "mismatches=%llu ls_bad=%llu gpr_bad=%llu "
-                    "lifted_ns=%llu native_ns=%llu\n",
+                    "lifted_ns=%llu native_ns=%llu "
+                    "holes_calls=%llu holes_runs=%llu holes_added=%llu "
+                    "holes_cap_skipped=%llu holes_skip_setup=%llu "
+                    "holes_fallback=%llu holes_ns=%llu\n",
             tag, s_native_calls, s_mode1_calls, s_shadow_calls,
             s_shadow_mismatches, s_shadow_ls_bad, s_shadow_gpr_bad,
-            s_lifted_ns, s_native_ns);
+            s_lifted_ns, s_native_ns, s_holes_calls, s_holes_runs,
+            s_holes_added, s_holes_cap_skipped, s_holes_skip_setup,
+            s_holes_fallback, s_holes_ns);
     fflush(stderr);
 }
 
@@ -173,6 +201,13 @@ void c690_native_screen_get_counters(c690_native_screen_counters* out)
     out->union_skipped = 0;
     out->lifted_ns = s_lifted_ns;
     out->native_ns = s_native_ns;
+    out->holes_calls = s_holes_calls;
+    out->holes_runs = s_holes_runs;
+    out->holes_added_tris = s_holes_added;
+    out->holes_cap_skipped = s_holes_cap_skipped;
+    out->holes_skip_setup = s_holes_skip_setup;
+    out->holes_fallback = s_holes_fallback;
+    out->holes_ns = s_holes_ns;
 }
 
 /* The subtree body (generated). */
@@ -225,6 +260,127 @@ static int shadow_alloc(void)
     if (!t_entry_ls) t_entry_ls = (uint8_t*)malloc(SPU_LS_SIZE);
     if (!t_entry_gpr) t_entry_gpr = (uint8_t*)malloc(C690_SCR_GPR_BYTES);
     return t_entry_ls && t_entry_gpr;
+}
+
+/* ---- fused native holes pass (0x25/0x26) ------------------------------
+ *
+ * The 0x132E0 caller passes the cull three things in r3/r4/r5:
+ *   r3  pointer to the u16 index buffer (candidates in, kept list out)
+ *   r4  pointer to a 16-byte stack slot; word 0 is the candidate count and
+ *       word 2 is overwritten by 0xD080 with the kept *triangle* count
+ *   r5  end of the index buffer (the first byte of the next allocation)
+ * After 0xD080 returns the caller reads word 2, multiplies it by 3 and writes
+ * that as +0x114 (the kept index count), then writes +0x118 and +0xA0.  The
+ * fused pass therefore leaves the caller's write untouched (the game-grid
+ * result, exactly as the lifted run) and merges the sample-only triangles
+ * into the list/count afterwards, in c690_cull_fix_end().  That is the same
+ * output as the proven union driver, but the command body runs once.
+ *
+ * The sample evaluation uses a private context (+0x1E0 cap from the caller)
+ * so the accepted game-grid LS/GPR state is never snapshot/restored. */
+
+#define C690_HOLES_MAX_TRIS (C690_SCR_LIST_MAX / 3u)
+
+static SPU_THREAD_LOCAL uint32_t t_holes_ptr;
+static SPU_THREAD_LOCAL uint32_t t_holes_sample_tris;
+static SPU_THREAD_LOCAL const uint8_t* t_holes_sample_ls;
+static SPU_THREAD_LOCAL c690_tri_set t_tri_set;
+
+/* Run the game-grid stage on the real context and stash the sample-grid list
+ * for the caller-side merge.  Returns 0 when the caller must run the lifted
+ * bracket (bad layout / no scratch), 1 when the native game result is final. */
+static int run_holes(spu_context* ctx)
+{
+    t_holes_sample_tris = 0;
+    t_holes_sample_ls = NULL;
+    if (t_holes_depth) return 0;      /* nested cull: let the lifted path run */
+
+    const uint32_t ptr = ctx->gpr[3]._u32[0] & SPU_LS_MASK;
+    const uint32_t slot = ctx->gpr[4]._u32[0] & SPU_LS_MASK;
+    const uint32_t end = ctx->gpr[5]._u32[0] & SPU_LS_MASK;
+    if (!ptr || (ptr & 0xFu) || (slot & 0xFu) || slot + 16u > SPU_LS_SIZE ||
+        (end & 0xFu) || end <= ptr || end > SPU_LS_SIZE) {
+        __atomic_fetch_add(&s_holes_skip_setup, 1ull, __ATOMIC_RELAXED);
+        return 0;
+    }
+    /* Slot word 0 is the candidate *triangle* count (word 2 is the kept
+     * triangle count); the caller's +0x114 holds index counts. */
+    const uint32_t cand = be32(ctx->ls + slot);
+    const uint32_t cap_indices = (end - ptr) / 2u;
+    if (cand > cap_indices / 3u || cand > C690_HOLES_MAX_TRIS) {
+        __atomic_fetch_add(&s_holes_skip_setup, 1ull, __ATOMIC_RELAXED);
+        return 0;
+    }
+
+    const long long t0 = now_ns();
+    __atomic_fetch_add(&s_holes_calls, 1ull, __ATOMIC_RELAXED);
+    t_holes_ptr = ptr;
+
+    spu_context* alt = alt_context();
+    int sample_ok = 0;
+    /* No transform block means the sample-grid run is identical to the game
+     * run (the union is inert), so skip the LS copy entirely. */
+    if (alt && alt->ls &&
+        c690_cull_fix_probe_transform(ctx, c690_cull_fix_holes_family())) {
+        memcpy(alt->ls, ctx->ls, SPU_LS_SIZE);
+        memcpy(alt->gpr, ctx->gpr, C690_SCR_GPR_BYTES);
+        alt->pc = ctx->pc;
+        alt->image_id = ctx->image_id;
+        alt->status = ctx->status;
+        alt->stop_code = ctx->stop_code;
+        alt->host_depth = 0;
+        const unsigned mx = _mm_getcsr();
+        if (c690_cull_fix_patch_2x(alt)) {
+            c690_scr_run_stage_mx(alt, mx);
+            const uint32_t n = be32(alt->ls + slot + 8);
+            if (n <= cap_indices / 3u) {
+                t_holes_sample_tris = n;
+                t_holes_sample_ls = alt->ls;
+                sample_ok = 1;
+            }
+            c690_cull_fix_leave(alt);
+            __atomic_fetch_add(&s_holes_runs, 1ull, __ATOMIC_RELAXED);
+        }
+    }
+
+    /* The accepted result: the exact game-grid run on the real context. */
+    t_holes_depth = 1;
+    c690_scr_run_stage(ctx);
+    t_holes_depth = 0;
+    __atomic_fetch_add(&s_native_calls, 1ull, __ATOMIC_RELAXED);
+    if (!sample_ok)
+        __atomic_fetch_add(&s_holes_fallback, 1ull, __ATOMIC_RELAXED);
+    __atomic_fetch_add(&s_holes_ns, (unsigned long long)(now_ns() - t0),
+                       __ATOMIC_RELAXED);
+    return 1;
+}
+
+/* Merge the stashed sample-grid list into the game list after the caller has
+ * written its count.  Canonical vertex-set membership, sample-list order, and
+ * the caller's +0x1E0 buffer cap, exactly like the lifted union driver. */
+uint32_t c690_native_screen_holes_merge(spu_context* ctx, uint32_t ptr,
+                                        uint32_t cnt_indices,
+                                        uint32_t cap_indices)
+{
+    const uint32_t sample_tris = t_holes_sample_tris;
+    const uint8_t* sample_ls = t_holes_sample_ls;
+    t_holes_sample_tris = 0;
+    t_holes_sample_ls = NULL;
+    if (!sample_tris || !sample_ls || ptr != t_holes_ptr ||
+        (cnt_indices % 3u) != 0u)
+        return 0;
+    const uint32_t game_tris = cnt_indices / 3u;
+    if (game_tris > cap_indices / 3u) return 0;
+
+    unsigned cap_skipped = 0;
+    const uint32_t added = c690_holes_merge_lists(
+        ctx->ls, sample_ls, ptr, game_tris, sample_tris, cap_indices,
+        &t_tri_set, &cap_skipped);
+    if (cap_skipped)
+        __atomic_fetch_add(&s_holes_cap_skipped, (unsigned long long)cap_skipped,
+                           __ATOMIC_RELAXED);
+    __atomic_fetch_add(&s_holes_added, (unsigned long long)added, __ATOMIC_RELAXED);
+    return added;
 }
 
 /* The lifted call bracket: 0x132E0 does host_depth++ / image save, calls
@@ -330,7 +486,8 @@ int c690_native_screen_try(spu_context* ctx, uint32_t ret_pc,
     if (!ctx || !ctx->ls || !lifted) return 0;
     const int mode = c690_scr_mode();
     const int shadow = c690_scr_shadow();
-    if (!mode && !shadow) return 0;
+    const int holes = c690_scr_holes();
+    if (!mode && !shadow && !holes) return 0;
 
     if (shadow) {
         if (!shadow_alloc()) return 0;
@@ -346,6 +503,16 @@ int c690_native_screen_try(spu_context* ctx, uint32_t ret_pc,
         return 1;
     }
 
+    /* Fused holes pass: one 0x132E0 body pass.  The D080 hook runs the game
+     * grid on the real context and the sample grid on a private copy; the
+     * caller then writes its kept count and c690_cull_fix_end appends the
+     * sample-only triangles and bumps +0x114. */
+    if (holes) {
+        const int r = run_holes(ctx);
+        if ((s_holes_calls & 0x3FFull) == 0ull) c690_scr_report("holes-progress");
+        return r;
+    }
+
     /* Mode 2 runs the exact stage here; c690_cull_fix's union driver (enabled
      * by the same key) wraps the command and does the 2x/original append. */
     run_mode0(ctx);
@@ -356,7 +523,7 @@ int c690_native_screen_try(spu_context* ctx, uint32_t ret_pc,
 #if defined(__GNUC__) || defined(__clang__)
 __attribute__((destructor)) static void c690_screen_dtor(void)
 {
-    if (!s_native_calls && !s_shadow_calls) return;
+    if (!s_native_calls && !s_shadow_calls && !s_holes_calls) return;
     c690_scr_report("exit");
 }
 #endif

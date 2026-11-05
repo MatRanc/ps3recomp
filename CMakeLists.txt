@@ -442,6 +442,17 @@ if(PS3RECOMP_BUILD_TESTS)
     endif()
     add_test(NAME mt_turns COMMAND test_mt_turns)
 
+    # The conservative c690 cull-union merge (fused native holes pass): the
+    # sample-grid list may add triangles but never remove or reorder one the
+    # game keeps.
+    add_executable(test_c690_holes_merge
+        tests/test_c690_holes_merge.c
+        runtime/spu/c690_holes.c
+    )
+    target_include_directories(test_c690_holes_merge PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/runtime/spu")
+    add_test(NAME c690_holes_merge COMMAND test_c690_holes_merge)
+
     # PS3_LOG_FIRST, the saturating counter behind the "first n times" log lines.
     add_executable(test_log_first tests/test_log_first.c)
     target_include_directories(test_log_first PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")

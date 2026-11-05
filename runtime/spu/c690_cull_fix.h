@@ -59,6 +59,21 @@ int c690_cull_fix_enter(struct spu_context* ctx, int family);
 /* Restore the saved transform words. */
 void c690_cull_fix_leave(struct spu_context* ctx);
 
+/* Patch every screen-transform copy in ctx->ls onto the 2x1 sample grid.
+ * Returns 1 when at least one block was patched.  The fused native holes pass
+ * uses this on its private sample-run context; the caller must either restore
+ * the snapshot or discard the context. */
+int c690_cull_fix_patch_2x(struct spu_context* ctx);
+
+/* True when this command needs the sample-grid run (no writes).  `family` is
+ * the cull family from the 0x132E0 entry (1 = 0x26, 0 = 0x25, <0 unknown).
+ * Used by the fused holes pass to skip the sample-run LS copy on layouts that
+ * have no transform block. */
+int c690_cull_fix_probe_transform(struct spu_context* ctx, int family);
+
+/* The cull family of the fused holes command being run (-1 when none). */
+int c690_cull_fix_holes_family(void);
+
 /* Union driver used by the 0x25/0x26 wrapper.
  *
  *   mode = c690_cull_fix_begin(ctx, family);
