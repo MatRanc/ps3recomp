@@ -688,6 +688,27 @@ if(UNIX)
                 glslang::glslang-default-resource-limits)
         endif()
         set_target_properties(test_shader_spirv PROPERTIES LINKER_LANGUAGE CXX)
+
+        # The "Better depth of field" patch: the generated 168-slot program
+        # decompiles, translates to SPIR-V, and (given an EBOOT path) applies
+        # to a real image with both program headers following it.
+        add_executable(test_dof_patch
+            libs/video/tests/test_dof_patch.cpp
+            libs/video/rsx_fp_decompiler.c
+            libs/video/rsx_dof_patch.c
+            libs/video/rsx_shader_spirv.cpp
+        )
+        target_include_directories(test_dof_patch PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}/libs/video"
+            "${CMAKE_CURRENT_SOURCE_DIR}/include"
+        )
+        target_link_libraries(test_dof_patch PRIVATE glslang::glslang glslang::SPIRV)
+        if(TARGET glslang::glslang-default-resource-limits)
+            target_link_libraries(test_dof_patch PRIVATE
+                glslang::glslang-default-resource-limits)
+        endif()
+        set_target_properties(test_dof_patch PROPERTIES LINKER_LANGUAGE CXX)
+        add_test(NAME dof_patch COMMAND test_dof_patch)
     endif()
 endif()
 

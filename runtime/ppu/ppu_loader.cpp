@@ -38,6 +38,7 @@
 #include "../spu/spu_coh_bitmap.h"   /* spu_coh_line_reserved, for the stores */
 #include "ps3emu/ps3_ftrace.h"   /* PS3_FTRACE timeline */
 #include "ps3emu/ps3_trace.h"    /* PS3RECOMP_TRACE timeline */
+#include "rsx_dof_patch.h"       /* PS3RECOMP_DOF_PATCH: blur program rewrite */
 #include "ps3emu/milestone.h"   /* ps3_ms / ps3_msf -- boot milestone log */     /* ppu_context, func decls, ppu_recomp_register */
 #include "../memory/vm.h"   /* vm_commit -- sys_mmapper_search_and_map maps for real */
 #include "../platform/win32_compat.h"      /* Win32 types, interlocked ops, Sleep/QPC on POSIX */
@@ -3597,6 +3598,17 @@ extern "C" uint32_t ppu_load_elf(const char* path)
     }
     free(file);
     fprintf(stderr, "[ppu] loaded %d PT_LOAD segments, entry OPD 0x%08X\n", loaded, entry);
+
+    /* PS3RECOMP_DOF_PATCH (default 0): the "Better depth of field" patch
+     * rewrites the title's blur fragment programs in the EBOOT. Apply it here,
+     * right after the image is in guest memory and before any RSX command is
+     * walked, so the draw engine and the shader caches only ever see the new
+     * bytes. A mismatch refuses the patch (and says why) rather than writing
+     * into a different EBOOT. */
+    { int dof = rsx_dof_patch_apply(vm_base, ppu_vm_size);
+      if (dof < 0)
+          fprintf(stderr, "[ppu] PS3RECOMP_DOF_PATCH requested but refused (%d); running unpatched\n",
+                  dof); }
 
     /* Arm PPU_GUARD_EA here as well as in lv2_syscall. The syscall path only
      * runs once the guest CRT is already going, which misses anything the CRT
