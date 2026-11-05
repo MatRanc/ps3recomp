@@ -87,6 +87,7 @@ static const char* const K_NAME[PS3_LIVE_COUNT] = {
     "PS3RECOMP_WALKER_MT_WORKERS",
     "PS3RECOMP_WALKER_MT_STAGES",
     "PS3RECOMP_WALKER_MT_SNAPSHOT",
+    "PS3RECOMP_WALKER_MT_TEX_RESOLVE",
 };
 
 static _Atomic int s_val[PS3_LIVE_COUNT];
@@ -246,6 +247,13 @@ int ps3_live_ctl_get(int key)
     if (key < 0 || key >= PS3_LIVE_COUNT) return 0;
     pthread_once(&s_once, init_once);
     return atomic_load_explicit(&s_val[key], memory_order_relaxed);
+}
+
+int ps3_live_ctl_file_set(int key)
+{
+    if (key < 0 || key >= PS3_LIVE_COUNT) return 0;
+    pthread_once(&s_once, init_once);
+    return atomic_load_explicit(&s_file_set[key], memory_order_relaxed);
 }
 
 const char* ps3_live_ctl_get_str(int key)

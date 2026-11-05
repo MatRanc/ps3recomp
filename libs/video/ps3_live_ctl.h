@@ -88,6 +88,7 @@ enum {
     PS3_LIVE_WALKER_MT_WORKERS,         /* PS3RECOMP_WALKER_MT_WORKERS: 0 inline, 1 record worker */
     PS3_LIVE_WALKER_MT_STAGES,          /* PS3RECOMP_WALKER_MT_STAGES: reserved pipeline stages mask */
     PS3_LIVE_WALKER_MT_SNAPSHOT,        /* PS3RECOMP_WALKER_MT_SNAPSHOT: copy borrowed guest bytes */
+    PS3_LIVE_WALKER_MT_TEX_RESOLVE,     /* PS3RECOMP_WALKER_MT_TEX_RESOLVE: plain guest texture resolver */
     PS3_LIVE_COUNT
 };
 
@@ -97,6 +98,10 @@ void ps3_live_ctl_refresh_env(void) PS3_LIVE_CTL_WEAK;
 
 /* Current value of a switch (0/1). Initialises the table on first use. */
 int ps3_live_ctl_get(int key) PS3_LIVE_CTL_WEAK;
+
+/* True once the control file has named the key. Lets a switch whose
+ * environment default is not 0 keep that default until the file sets it. */
+int ps3_live_ctl_file_set(int key) PS3_LIVE_CTL_WEAK;
 
 /* Current value of a string-valued switch (PS3RECOMP_PIN_LAYOUT), or NULL.
  * The returned buffer is written only by the walker thread's poll, so callers

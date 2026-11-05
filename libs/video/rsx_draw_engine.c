@@ -7110,6 +7110,11 @@ static struct {
 static int eng_tex_resolver_on(void)
 {
     if (!s_mt.on || s_mt.workers <= 0) return 0;
+    /* The control file may switch this per arm (live A/B); without it the
+     * environment keeps its historical default of on. */
+    if (ps3_live_ctl_file_set &&
+        ps3_live_ctl_file_set(PS3_LIVE_WALKER_MT_TEX_RESOLVE))
+        return ps3_live_ctl_get(PS3_LIVE_WALKER_MT_TEX_RESOLVE) != 0;
     const char* e = getenv("PS3RECOMP_WALKER_MT_TEX_RESOLVE");
     return !e || !*e || strcmp(e, "0") != 0;
 }
@@ -7237,7 +7242,8 @@ static void* eng_tex_resolver_main(void* arg)
 static int eng_tex_resolver_start(void)
 {
     if (s_texr.up) return 1;
-    if (!eng_tex_resolver_on()) return 0;
+    /* Start with the workers even when the resolver is currently off: the
+     * live control file can turn it on later without re-initialising MT. */
     memset(&s_texr, 0, sizeof s_texr);
     s_texr.jobs = (eng_tex_job*)calloc(ENG_TEX_JOBS, sizeof(eng_tex_job));
     if (!s_texr.jobs) return 0;
@@ -7780,7 +7786,8 @@ static void sink_end_work(void* user, const rsx_dispatch* r)
                 (u64)(sf.clip_w ? sf.clip_w : g.width) *
                     (sf.clip_h ? sf.clip_h : g.height) * 10ull >=
                 (u64)g.surfaces[target].w * g.surfaces[target].h * 9ull;
-    s_tex_async_draw = (workerable && s_mt.on && s_mt.workers > 0 && s_texr.up);
+    s_tex_async_draw = (workerable && s_mt.on && s_mt.workers > 0 &&
+                        s_texr.up && eng_tex_resolver_on());
     const u32 tex_mask = sink_bind_textures(targets, n_targets, zslot, tex_used,
                                             textures, samplers);
     s_tex_async_draw = 0;
