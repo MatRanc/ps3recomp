@@ -671,22 +671,28 @@ void rsx_draw_engine_set_guest_memory(rsx_vertex_guest_ptr_fn reader, void* user
  * ======================================================================== */
 
 static int s_wprof = -1;
-/* Frame sampling. PS3RECOMP_WALKER_PROF=1 keeps [walker-prof] lines and the
- * exact per-frame draw count, but fully instruments only every Nth frame
- * (PS3RECOMP_WALKER_PROF_SAMPLE, default 8, 1 = every frame). The dispatch
- * timestamps in the FIFO loop are per method, so sampling draws was not
- * enough; a sampled frame times every drain, draw and method, and the report
- * scales the phase sums by (frames since the last report / sampled frames)
- * before dividing by flips. The cost analysis is in docs/walker-remap.md. */
+/* Drain sampling. PS3RECOMP_WALKER_PROF=1 keeps [walker-prof] lines and the
+ * exact per-frame draw count, but fully instruments only every Nth drain
+ * (PS3RECOMP_WALKER_PROF_SAMPLE, default 8, 1 = every drain). The dispatch
+ * timestamps in the FIFO loop are per method, so they are what the sample
+ * skips. A drain, not a flip, is the unit that carries the timed work: the
+ * title can flip several times between drains, and a frame can take several
+ * drains, so a flip-sampled drain can be an empty pass with every draw in an
+ * unsampled one (that reported engine=0 with draws>0). The report scales the
+ * timed sums by (drains since the last report / sampled drains) and defers
+ * emission while the window has draws but none of them were sampled, so the
+ * phase numbers and the draw count describe the same drains. The cost
+ * analysis is in docs/walker-remap.md. */
 static int s_wprof_stride = -1;
 static int s_wprof_pass = 0;
-static unsigned long long s_wprof_frame_seq;
-static unsigned long long s_wp_frames_total, s_wp_frames_prof;
+static unsigned long long s_wprof_drain_seq;
+static unsigned long long s_wp_drains_total, s_wp_drains_prof;
 static unsigned long long s_wp_ns[RSX_WPROF_PHASES];
 static unsigned long long s_wp_n[RSX_WPROF_PHASES];
 static unsigned long long s_wp_drain_ns;
 static unsigned long long s_wp_dispatch_ns;
 static unsigned long long s_wp_draws;
+static unsigned long long s_wp_draws_prof;   /* draws in the timed drains */
 static unsigned long long s_wp_flips;
 static unsigned long long s_wp_frames;
 static int s_wp_flip;
@@ -808,16 +814,18 @@ static int rsx_wprof_sample_stride(void)
 int rsx_wprof_drain_begin(void)
 {
     if (rsx_wprof_enabled() <= 0) { s_wprof_pass = 0; return 0; }
+    /* Every drain is a sample candidate. A drain is the unit that actually
+     * carries the timed FIFO work, so sampling drains (rather than flips)
+     * keeps the timed subset and the draw count on the same work. The first
+     * drain is sampled (seq 0), so a one-frame replay still reports. */
+    s_wp_drains_total++;
     /* WALKER_PROF2 has its own exact per-draw timers (not sampled); do not
      * starve it of reports. */
     if (rsx_wprof2_enabled() > 0) { s_wprof_pass = 1; return 1; }
-    /* Sample whole frames, not drains: the FIFO and the flip can be handled
-     * by different drains, and a per-drain decision would mix a sampled
-     * drain's timers with an unsampled one's draws. The frame sequence is
-     * advanced by rsx_wprof_note_flip(), so every drain of a frame agrees. */
     const int stride = rsx_wprof_sample_stride();
     s_wprof_pass = stride <= 1 ||
-        (s_wprof_frame_seq % (unsigned long long)stride) == 0;
+        (s_wprof_drain_seq % (unsigned long long)stride) == 0;
+    s_wprof_drain_seq++;
     return s_wprof_pass;
 }
 
@@ -845,12 +853,6 @@ void rsx_wprof_note_flip(void)
         if (!s_wp_t0_ms && ps3_ms_now) s_wp_t0_ms = ps3_ms_now();
         s_wp_flip = 1;
         s_wp_flips++;
-        s_wp_frames_total++;
-        if (rsx_wprof2_enabled() > 0 ||
-            rsx_wprof_sample_stride() <= 1 ||
-            (s_wprof_frame_seq % (unsigned long long)rsx_wprof_sample_stride()) == 0)
-            s_wp_frames_prof++;
-        s_wprof_frame_seq++;
     }
 }
 
@@ -866,17 +868,29 @@ static void wprof_phase(int phase, unsigned long long ns)
 
 void rsx_wprof_drain_end(int profiled)
 {
-    if (s_wprof <= 0 || !profiled || !s_wp_flip) return;
+    if (s_wprof <= 0 || !profiled) return;
+    /* Count the timed drain even before the first flip: its timings are in
+     * the sums and the first report's scale must divide by them too. */
+    s_wp_drains_prof++;
+    if (!s_wp_flip) return;
+    /* A sampled drain can fall between two flips and process no method at
+     * all, while the draws in the window were handled by unsampled drains.
+     * Reporting here would print engine=0 next to a real draw count and
+     * leave the phases of that window uncounted. Keep the window open until
+     * a sampled drain has produced draws, or until the window has no draws
+     * at all (an idle report is consistent). */
+    if (s_wp2 <= 0 && s_wp_draws_prof == 0 && s_wp_draws > 0) return;
     /* A flip can land between two drain passes, so one report may cover
      * several flips. Divide by them: the printed values are per frame, and
      * the pitch window is many reports wide. */
     const double f = s_wp_flips ? (double)s_wp_flips : 1.0;
     /* Only every Nth drain is timed (per-method dispatch timestamps are the
      * expensive part); scale its sums back to the whole interval so the
-     * printed per-frame values still describe every frame. The draw counts
-     * are accumulated on every drain and are not scaled. */
-    const double scale = s_wp_frames_prof
-        ? (double)s_wp_frames_total / (double)s_wp_frames_prof : 1.0;
+     * printed per-frame values still describe every frame. Sampling and
+     * scaling are both per drain, so the draw count and the phases cover the
+     * same work. */
+    const double scale = s_wp_drains_prof
+        ? (double)s_wp_drains_total / (double)s_wp_drains_prof : 1.0;
     const double drain = (double)s_wp_drain_ns / 1e6 / f * scale;
     const double disp  = (double)s_wp_dispatch_ns / 1e6 / f * scale;
     double sum = 0.0;
@@ -1009,10 +1023,11 @@ void rsx_wprof_drain_end(int profiled)
     memset(s_wp_ns, 0, sizeof s_wp_ns);
     memset(s_wp_n, 0, sizeof s_wp_n);
     s_wp_drain_ns = s_wp_dispatch_ns = s_wp_draws = s_wp_flips = 0;
+    s_wp_draws_prof = 0;
     s_wp_main_draws = s_wp_mesh_draws = 0;
     s_wp_main_ns = s_wp_mesh_ns = 0;
     s_wp_pipe_create_ns = s_wp_pipe_create_n = 0;
-    s_wp_frames_total = s_wp_frames_prof = 0;
+    s_wp_drains_total = s_wp_drains_prof = 0;
     s_wp_flip = 0;
     s_wp_frames++;
 }
@@ -1022,6 +1037,11 @@ void rsx_wprof_drain_end(int profiled)
 /* Guest main memory is the only host-backed window (runtime/memory/vm.h maps
  * the rest PROT_NONE). A page outside it cannot be imaged and is reported. */
 #define WCAP_PAGE      4096u
+/* The GCM IO table maps main memory one MB at a time, so that is the unit
+ * whose mapping is known to be linear. Imaging a main-memory read at 4 KB
+ * granularity leaves the tail of a multi-MB mesh-ring span out whenever the
+ * live frame noted a narrower range than a cold replay reads. */
+#define WCAP_IO_PAGE   0x00100000u
 #define WCAP_MAX_BYTES (768u * 1024u * 1024u)
 
 typedef struct wcap_range { u32 location, offset, len, ea; } wcap_range;
@@ -1066,6 +1086,25 @@ static void wcap_note_cached_textures(void)
         if (!e->handle || !e->width || !e->height) continue;
         const u32 span = eng_texture_entry_span(e);
         if (span) rsx_wcap_note_texture(e->location, e->offset, span);
+    }
+}
+
+/* Image every mapped IO page at capture begin. The SPU mesh rings, their
+ * index buffers and the other vertices a replay re-resolves all live in
+ * IO-mapped main memory (the five 2 MB rings alone are 10 MB and the crowded
+ * frame's spans reach past them). A live frame can serve a draw from a warm
+ * plan whose span is narrower than the one a cold replay resolves from the
+ * same index buffer, so relying only on the pages the live frame named leaves
+ * the replay's tail out. This costs at most the title's mapped main memory
+ * (bounded by main RAM) and makes the capture independent of that difference.
+ * The 1 MB per-read expansion in wcap_write_mem is the fallback for offsets
+ * the IO table does not map. */
+static void wcap_note_mapped_main(void)
+{
+    for (u32 io_page = 0; io_page < 65536u; io_page++) {
+        const u32 off = io_page << 20;
+        if (cellGcmResolveIO(off))
+            rsx_wcap_note_texture(RSX_LOCATION_MAIN, off, WCAP_IO_PAGE);
     }
 }
 
@@ -1164,20 +1203,40 @@ static void wcap_write_state(void)
     fclose(f);
 }
 
+/* Where one imaged page lives in the host VM. The IO table maps main memory
+ * one MB at a time, so the EA of a page is resolved on its own; extrapolating
+ * the range head's EA is wrong as soon as a span crosses a mapping page (a
+ * 2 MB mesh ring does). The range's recorded EA stays as the fallback for a
+ * resolver-provided pointer. */
+static u32 wcap_page_ea(const wcap_range* r, u32 off)
+{
+    const u32 ea = cellGcmResolveLocated(r->location == RSX_LOCATION_LOCAL, off);
+    if (ea) return ea;
+    if (!r->ea) return 0;
+    return (u32)((long long)r->ea + ((long long)off - (long long)r->offset));
+}
+
 static void wcap_write_mem(void)
 {
-    /* Every range expanded to whole pages, deduplicated by (location, page). */
+    /* Every range expanded to whole image pages, deduplicated by
+     * (location, page). Main memory is imaged a whole IO-mapping page at a
+     * time: the walker read could be a 2 MB mesh-ring span and a cold replay
+     * may ask for pages the live range did not name. */
     for (size_t i = 0; i < s_wcap_nranges; i++) {
         const wcap_range* r = &s_wcap_ranges[i];
-        const u32 first = r->offset & ~(WCAP_PAGE - 1u);
-        const u32 last  = (r->offset + r->len + WCAP_PAGE - 1u) & ~(WCAP_PAGE - 1u);
-        for (u32 off = first; off < last; off += WCAP_PAGE) {
+        const u64 gran = (r->location == RSX_LOCATION_MAIN) ? WCAP_IO_PAGE : WCAP_PAGE;
+        const u64 lo = r->offset;
+        u64 hi = (u64)r->offset + r->len;
+        if (hi > 0x100000000ull) hi = 0x100000000ull;
+        const u64 first = lo & ~(gran - 1u);
+        const u64 last  = (hi + gran - 1u) & ~(gran - 1u);
+        for (u64 off = first; off < last; off += WCAP_PAGE) {
             if (!wcap_grow((void**)&s_wcap_pages, &s_wcap_cpages,
                            s_wcap_npages + 1, sizeof(wcap_page))) return;
             wcap_page* p = &s_wcap_pages[s_wcap_npages++];
             p->location = r->location;
-            p->page = off;
-            p->ea = r->ea ? r->ea - (r->offset - off) : 0;
+            p->page = (u32)off;
+            p->ea = wcap_page_ea(r, (u32)off);
         }
     }
     qsort(s_wcap_pages, s_wcap_npages, sizeof(wcap_page), wcap_page_cmp);
@@ -1293,17 +1352,22 @@ int rsx_wcap_begin_if_triggered(void)
 
     memset(&s_wcap_state, 0, sizeof s_wcap_state);
     if (rsx_draw_engine_state_snapshot(&s_wcap_state) != 0) return s_wcap_active;
-    /* Cold-start the frame the replay will see (see wcap_note_cached_textures). */
-    s_fast_epoch++;
-    wcap_note_cached_textures();
     s_wcap_state.io_addr = 0x00100000u;
     s_wcap_state.io_size = 0x00400000u;
+    /* Arm the window BEFORE noting the bytes the replay needs: the noters
+     * drop their input while s_wcap_active is clear, and a note that landed
+     * before these resets would be cleared. Both bugs made M3's cold-start
+     * notes no-ops. */
     s_wcap_nwords = 0;
     s_wcap_nranges = 0;
     s_wcap_npages = 0;
     s_wcap_finish = 0;
     s_wcap_active = 1;
     s_wcap = 2;
+    /* Cold-start the frame the replay will see (see wcap_note_cached_textures). */
+    s_fast_epoch++;
+    wcap_note_cached_textures();
+    wcap_note_mapped_main();
     fprintf(stderr, "[walker-cap] flip boundary reached; capturing this frame\n");
     fflush(stderr);
     return 1;
@@ -8018,7 +8082,12 @@ static void sink_end_work(void* user, const rsx_dispatch* r)
     (void)user; (void)r;
     const int wp = s_wprof > 0 && s_wprof_pass;
     unsigned long long wp_t0 = wp ? rsx_wprof_now() : 0;
-    if (s_wprof > 0) s_wp_draws++;   /* exact even when drains are sampled */
+    /* Exact on every drain; the timed subset is tracked separately so the
+     * report never pairs a window's draws with another drain's timings. */
+    if (s_wprof > 0) {
+        s_wp_draws++;
+        if (s_wprof_pass) s_wp_draws_prof++;
+    }
     if (s_wp2 > 0) s_wp2_draw_groups++;
     if (s_no_draw) return;
     if (!g.ready || !dc.n_packets || !dc.fetch_ok) return;

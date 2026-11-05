@@ -72,6 +72,8 @@ FIXTURES = {
     'test_color_feedback_engine': DISPATCH,
     'test_tex_memo': DISPATCH,
     'test_vpc_range': DISPATCH,
+    'test_walker_prof': DISPATCH,
+    'test_walker_capture': DISPATCH,
     'test_gcm_user_command': GCM,
     'test_gcm_fifo_user_command': GCM,
     'test_gcm_flip_wrap': [],
