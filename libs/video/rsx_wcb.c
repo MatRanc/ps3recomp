@@ -109,6 +109,7 @@ static int  td_page_wants_ro(uintptr_t page);       /* lock held */
 static void td_open_note_locked(uintptr_t lo, uintptr_t hi, int ro);
 static void td_forget_prot_locked(uintptr_t lo, uintptr_t hi);
 int  rsx_texdirty_on_fault(uintptr_t addr);
+static int td_late_fault(uintptr_t addr);
 static void td_install_faults(void);
 
 /* 0 on success. `open` restores read/write: render targets live in ordinary
@@ -651,7 +652,7 @@ static LONG WINAPI wcb_veh(EXCEPTION_POINTERS* ep)
     if (er->ExceptionCode != EXCEPTION_ACCESS_VIOLATION || er->NumberParameters < 2)
         return EXCEPTION_CONTINUE_SEARCH;
     const uintptr_t at = (uintptr_t)er->ExceptionInformation[1];
-    return (rsx_texdirty_on_fault(at) || rsx_wcb_on_fault(at))
+    return (rsx_texdirty_on_fault(at) || rsx_wcb_on_fault(at) || td_late_fault(at))
            ? EXCEPTION_CONTINUE_EXECUTION : EXCEPTION_CONTINUE_SEARCH;
 }
 static void wcb_install_handler(void)
@@ -690,7 +691,7 @@ static void wcb_signal(int sig, siginfo_t* si, void* uctx)
     const int saved = errno;
     if (si) {
         const uintptr_t at = (uintptr_t)si->si_addr;
-        if (rsx_texdirty_on_fault(at) || rsx_wcb_on_fault(at)) { errno = saved; return; }
+        if (rsx_texdirty_on_fault(at) || rsx_wcb_on_fault(at) || td_late_fault(at)) { errno = saved; return; }
     }
     errno = saved;
     wcb_chain(sig, si, uctx);
@@ -828,6 +829,7 @@ int rsx_wcb_attr_take_wait(uint32_t cookie, uint64_t* ns, uint32_t* n)
 #define TD_NPAGES   (1u << 20)                  /* 4 GB / 4K */
 #define TD_TEX_PROT 0x01u                       /* page is PROT_READ for us */
 #define TD_WCB_PROT 0x02u                       /* page is PROT_NONE for WCB */
+#define TD_WAS_PROT 0x04u                       /* we have protected it before */
 #define TD_RANGE_MAX 16u                        /* tracked source ranges     */
 
 typedef struct {
@@ -871,7 +873,7 @@ static void td_open_run_locked(uintptr_t lo, uintptr_t hi, int prot)
     const uint32_t b = td_index(hi - (uintptr_t)vm_base);
     for (uint32_t i = a; i < b && i < TD_NPAGES; i++) {
         s_td.page_flags[i] &= (uint8_t)~TD_WCB_PROT;
-        if (prot == 1) s_td.page_flags[i] |= TD_TEX_PROT;
+        if (prot == 1) s_td.page_flags[i] |= TD_TEX_PROT | TD_WAS_PROT;
         else           s_td.page_flags[i] &= (uint8_t)~TD_TEX_PROT;
     }
 }
@@ -900,7 +902,7 @@ static void td_open_note_locked(uintptr_t lo, uintptr_t hi, int ro)
     const uint32_t b = td_index(hi - (uintptr_t)vm_base);
     for (uint32_t i = a; i < b && i < TD_NPAGES; i++) {
         s_td.page_flags[i] &= (uint8_t)~TD_WCB_PROT;
-        if (ro) s_td.page_flags[i] |= TD_TEX_PROT;
+        if (ro) s_td.page_flags[i] |= TD_TEX_PROT | TD_WAS_PROT;
         else    s_td.page_flags[i] &= (uint8_t)~TD_TEX_PROT;
     }
 }
@@ -1234,6 +1236,25 @@ int rsx_texdirty_on_fault(uintptr_t addr)
     }
     wcb_unlock();
     return ours;
+}
+
+/* Last in line, after the WCB declined too: a page we protected before that
+ * another thread opened between the fault and our lock (a texture released
+ * or rewritten meanwhile). Retry the access. Declining it would chain to the
+ * default action, which resets SIGSEGV to SIG_DFL for the whole process and
+ * kills the next real fault. Bounded per thread, as in rsx_wcb_on_fault, so
+ * a fault that is genuinely someone else's still reaches them. */
+static int td_late_fault(uintptr_t addr)
+{
+    if (!s_td.on || !s_td.page_flags) return 0;
+    const uintptr_t off = addr - (uintptr_t)vm_base;
+    if (off >= ((uintptr_t)TD_NPAGES << 12)) return 0;
+    if (!(s_td.page_flags[off >> 12] & TD_WAS_PROT)) return 0;
+    static WCB_TLS uintptr_t last_addr;
+    static WCB_TLS unsigned  last_count;
+    if (addr == last_addr) { if (++last_count > 1000u) return 0; }
+    else { last_addr = addr; last_count = 0; }
+    return 1;
 }
 
 /* The runtime hook for a write into guest memory (see ps3emu/guest_access.h).
