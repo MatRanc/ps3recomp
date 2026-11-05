@@ -3140,10 +3140,40 @@ static void eng_cube_log_desc(const rsx_dsp_texture* t, const eng_cube_desc* d,
  * green/black geometry" (rsx_live_draw.c:2326-2334). */
 /* The g.textures index eng_texture_slot's last nonzero answer came from, or
  * ENG_INVALID. */
+/* PS3RECOMP_BINK_DMA_LOG=1: log SPU PUTs into the team-select logo planes
+ * (0x1594xxxx..0x1599xxxx): every all-zero PUT and every 32nd other one, with
+ * the same ms clock as [tex-zero] / [bink-ready]. Diagnostic for the green flash. */
+static void (*s_bink_dma_prev_hook)(uint32_t ea, uint32_t size);
+static void bink_dma_put_log(uint32_t ea, uint32_t size)
+{
+    if (s_bink_dma_prev_hook) s_bink_dma_prev_hook(ea, size);
+    if (ea >= 0x159A0000u || ea + size <= 0x15940000u) return;
+    extern unsigned long long ps3_ms_now(void);
+    extern u32 cellGcm_flip_request_count(void) __attribute__((weak));
+    const u8* p = vm_base + ea;
+    uint32_t nz = 0;
+    for (uint32_t i = 0; i < size; i++) nz += p[i] != 0;
+    static unsigned n, other;
+    if ((nz == 0 || (other++ % 32) == 0) && n++ < 6000)
+        fprintf(stderr, "[bink-dma] ms=%llu flip=%u ea=0x%08X size=%u nonzero=%u\n", ps3_ms_now(),
+                cellGcm_flip_request_count ? cellGcm_flip_request_count() : 0u, ea, size, nz);
+}
+/* Installed on the first texture upload, after cellGcmInit set its own PUT hook (chained). */
+static void bink_dma_put_log_install(void)
+{
+    static int done;
+    if (done) return;
+    done = 1;
+    const char* e = getenv("PS3RECOMP_BINK_DMA_LOG");
+    extern void (*g_spu_put_hook)(uint32_t ea, uint32_t size);
+    if (e && *e && *e != '0') { s_bink_dma_prev_hook = g_spu_put_hook; g_spu_put_hook = bink_dma_put_log; }
+}
+
 static u32 eng_texture_upload(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
                               u32 levels, u32 pitch, int cube, u32 remap, u32 depth,
                               u32 into)
 {
+    bink_dma_put_log_install();
     const unsigned long long wp2 = wp2_t0();
     const uint64_t _tr = ps3_trace_begin();
     const u32 handle = eng_texture_upload_work(location, offset, fmt, w, h, levels,
@@ -3154,6 +3184,29 @@ static u32 eng_texture_upload(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
                       levels ? levels : 1u);
     }
     if (wp2) { wp2_add(WPROF2_TEX_UPLOAD, wp2); s_wp2_tex_uploads++; }
+    /* PS3RECOMP_TEX_ZERO_LOG: name uploads whose guest bytes read all zero, with
+     * how many guest flips the walker is behind (team-select Bink green flash,
+     * mlb16-recomp/docs/bink-video.md). Diagnostic only. */
+    static int zlog = -1;
+    if (zlog < 0) { const char* e = getenv("PS3RECOMP_TEX_ZERO_LOG"); zlog = e && *e && *e != '0'; }
+    if (zlog && handle && w >= 64 && h >= 16) {
+        const u32 rp = pitch ? pitch : w;
+        const u8* src = eng_guest_ptr(NULL, location, offset, rp * h);
+        if (src) {
+            unsigned z = 0;
+            for (u32 r = 0; r < 64; r++) z += !src[(size_t)(r * h / 64) * rp + w / 2];
+            extern u32 cellGcm_flip_request_count(void) __attribute__((weak));
+            extern unsigned long long ps3_ms_now(void);
+            const u32 ea = (u32)(src - vm_base);
+            /* Every upload of the team-select logo planes (0x1594xxxx..0x1599xxxx), zero or not. */
+            const int logo = ea >= 0x15940000u && ea < 0x159A0000u;
+            static unsigned n;
+            if ((z == 64 || logo) && n++ < 3000)
+                fprintf(stderr, "[tex-zero] ms=%llu z=%u/64 frame=%u guest_flip=%u loc=%u off=0x%08X ea=0x%08X %ux%u fmt=0x%02X pitch=%u\n",
+                        ps3_ms_now(), z, g.frames, cellGcm_flip_request_count ? cellGcm_flip_request_count() : 0u,
+                        location, offset, ea, w, h, fmt, pitch);
+        }
+    }
     return handle;
 }
 
