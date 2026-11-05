@@ -839,6 +839,46 @@ unsigned long long rsx_wprof_now(void)
            (unsigned long long)t.tv_nsec;
 }
 
+/* PS3RECOMP_WALKER_WAITS: see rsx_draw_engine.h. */
+__thread int g_rsx_ww_walker;
+static int s_ww_on = -1;
+static unsigned long long s_ww_ns[RSX_WW_COUNT];
+static unsigned long long s_ww_n[RSX_WW_COUNT];
+static const char* const s_ww_name[RSX_WW_COUNT] = {
+    "fifo_lock", "wcb_lock", "qsubmit", "oneshot", "ebs_swap", "ebs_other",
+    "pres_done", "pres_gpu", "pres_mu", "acquire", "pipe_async", "pipe_create",
+    "tex_token", "mt_turn"
+};
+void rsx_ww_enter(void)
+{
+    if (s_ww_on < 0) {
+        const char* e = getenv("PS3RECOMP_WALKER_WAITS");
+        s_ww_on = e && *e && strcmp(e, "0") != 0;
+    }
+    g_rsx_ww_walker = s_ww_on;
+}
+void rsx_ww_leave(void) { g_rsx_ww_walker = 0; }
+void rsx_ww_add(int site, unsigned long long ns)
+{
+    __atomic_fetch_add(&s_ww_ns[site], ns, __ATOMIC_RELAXED);
+    __atomic_fetch_add(&s_ww_n[site], 1, __ATOMIC_RELAXED);
+}
+/* One line per walker-prof report, ms per frame (f = flips in the window).
+ * Unlike the phase sums these cover every drain, not the sampled ones. */
+static void rsx_ww_report(double f)
+{
+    if (s_ww_on <= 0) return;
+    char buf[512]; int o = 0; double tot = 0.0;
+    for (int i = 0; i < RSX_WW_COUNT; i++) {
+        const double ms = (double)__atomic_exchange_n(&s_ww_ns[i], 0, __ATOMIC_RELAXED) / 1e6 / f;
+        const double n = (double)__atomic_exchange_n(&s_ww_n[i], 0, __ATOMIC_RELAXED) / f;
+        if (i != RSX_WW_FIFO_LOCK) tot += ms;   /* fifo_lock is outside the drain timer */
+        o += snprintf(buf + o, sizeof buf - (size_t)o, " %s=%.3f(%.1f)", s_ww_name[i], ms, n);
+    }
+    fprintf(stderr, "[walker-waits] report=%llu flips=%llu in_drain_total=%.3fms |%s\n",
+            s_wp_frames, s_wp_flips, tot, buf);
+}
+
 void rsx_wprof_note_drain(unsigned long long ns)
 {
     if (s_wprof > 0) s_wp_drain_ns += ns;
@@ -936,6 +976,7 @@ void rsx_wprof_drain_end(int profiled)
             (double)s_wp_n[RSX_WPROF_PIPE] / f * scale,
             (double)s_wp_n[RSX_WPROF_BIND] / f * scale,
             (double)s_wp_n[RSX_WPROF_DRAW] / f * scale);
+    rsx_ww_report(f);
     if (eng_tex_stats_on()) {
         fprintf(stderr, "[tex-stats] frames=%.0f slots=%.1f memo=%llu full=%llu "
                 "new=%llu evict=%llu sv=%llu dsnap=%llu dguest=%llu reint=%llu "
@@ -7413,6 +7454,7 @@ static u32 eng_mt_alloc(u32 bytes)
 static void eng_mt_wait_turn(u64 seq)
 {
     int spins = 0;
+    const unsigned long long ww_t0 = rsx_ww_begin();
     while (atomic_load_explicit(&s_mt.next_commit, memory_order_acquire) != seq) {
         if (++spins < 20000) {
 #if defined(__x86_64__) || defined(__i386__)
@@ -7423,6 +7465,7 @@ static void eng_mt_wait_turn(u64 seq)
         spins = 0;
         sched_yield();
     }
+    rsx_ww_end(RSX_WW_MT_TURN, ww_t0);
 }
 
 static void eng_mt_take_turn(u64 seq)
@@ -7433,6 +7476,7 @@ static void eng_mt_take_turn(u64 seq)
 static void eng_mt_wait_upto(u64 upto)
 {
     int spins = 0;
+    const unsigned long long ww_t0 = rsx_ww_begin();
     while (atomic_load_explicit(&s_mt.next_commit, memory_order_acquire) <= upto) {
         if (++spins < 20000) {
 #if defined(__x86_64__) || defined(__i386__)
@@ -7443,6 +7487,7 @@ static void eng_mt_wait_upto(u64 upto)
         spins = 0;
         sched_yield();
     }
+    rsx_ww_end(RSX_WW_MT_TURN, ww_t0);
 }
 
 static int eng_mt_chunk_add(const void* rec, u32 bytes)
@@ -7754,6 +7799,7 @@ static u32 eng_tex_token_wait(u32 token)
     if (!s_texr.jobs || idx >= s_texr.n) return 0;
     eng_tex_job* j = &s_texr.jobs[idx];
     int spins = 0;
+    const unsigned long long ww_t0 = rsx_ww_begin();
     while (atomic_load_explicit(&j->state, memory_order_acquire) == 0) {
         if (++spins < 20000) {
 #if defined(__x86_64__) || defined(__i386__)
@@ -7764,6 +7810,7 @@ static u32 eng_tex_token_wait(u32 token)
         spins = 0;
         sched_yield();
     }
+    rsx_ww_end(RSX_WW_TEX_TOKEN, ww_t0);
     return j->handle;
 }
 

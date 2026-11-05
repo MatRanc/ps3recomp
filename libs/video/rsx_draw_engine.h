@@ -556,6 +556,39 @@ void rsx_wprof_note_drain(unsigned long long ns);
 void rsx_wprof_note_dispatch(unsigned long long ns);
 /* A FIFO flip word: the pass that contains it completes a frame. */
 void rsx_wprof_note_flip(void);
+/* PS3RECOMP_WALKER_WAITS=1 (default 0): wall time the walker thread spends in
+ * each blocking site, one [walker-waits] line per [walker-prof] report. Off, a
+ * site costs one thread-local load. Only the thread between rsx_ww_enter and
+ * rsx_ww_leave (the FIFO walker pass) is counted. docs/walker-waits.md. */
+enum {
+    RSX_WW_FIFO_LOCK,    /* s_gcm_fifo_lock acquire, before the drain timer starts */
+    RSX_WW_WCB_LOCK,     /* wcb_lock contention with a faulting guest thread */
+    RSX_WW_QSUBMIT,      /* queue_mu + vkQueueSubmit */
+    RSX_WW_ONESHOT,     /* vk_submit_and_wait: submit + fence (readback, create, snapshot) */
+    RSX_WW_EBS_SWAP,    /* pipelined batch: fence of the set about to be reused */
+    RSX_WW_EBS_OTHER,   /* pipelined batch: fences of every other set */
+    RSX_WW_PRES_DONE,   /* previous present's fence (vk_present_complete_locked) */
+    RSX_WW_PRES_GPU,    /* vk_present_wait_gpu */
+    RSX_WW_PRES_MU,     /* present_mu acquire */
+    RSX_WW_ACQUIRE,     /* vkAcquireNextImageKHR */
+    RSX_WW_PIPE_ASYNC,  /* vk_pa_wait: async shader translation */
+    RSX_WW_PIPE_CREATE, /* s_pipe_create_mu + vkCreateGraphicsPipelines */
+    RSX_WW_TEX_TOKEN,   /* eng_tex_token_wait spin (WALKER_MT texture resolver) */
+    RSX_WW_MT_TURN,     /* eng_mt_wait_turn / wait_upto spin (WALKER_MT) */
+    RSX_WW_COUNT
+};
+extern __thread int g_rsx_ww_walker;
+void rsx_ww_enter(void);
+void rsx_ww_leave(void);
+void rsx_ww_add(int site, unsigned long long ns);
+static inline unsigned long long rsx_ww_begin(void)
+{
+    return g_rsx_ww_walker ? rsx_wprof_now() : 0;
+}
+static inline void rsx_ww_end(int site, unsigned long long t0)
+{
+    if (t0) rsx_ww_add(site, rsx_wprof_now() - t0);
+}
 /* vkCreate*Pipelines time, reported as `pipecrt`/`pipems` in the next report. */
 void rsx_wprof_note_pipeline_create(unsigned long long ns);
 /* Log and reset the frame counters if a flip was seen in this pass.

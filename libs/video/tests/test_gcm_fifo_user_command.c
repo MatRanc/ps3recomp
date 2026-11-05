@@ -54,6 +54,10 @@ void rsx_wprof_note_flip(void) {}
 void rsx_wprof_note_drain(unsigned long long ns) { (void)ns; }
 void rsx_wprof_note_dispatch(unsigned long long ns) { (void)ns; }
 void rsx_wprof_drain_end(int profiled) { (void)profiled; }
+__thread int g_rsx_ww_walker;
+void rsx_ww_enter(void) {}
+void rsx_ww_leave(void) {}
+void rsx_ww_add(int site, unsigned long long ns) { (void)site; (void)ns; }
 void rsx_wcap_drain_end(void) {}
 int  rsx_wcap_begin_if_triggered(void) { return 0; }
 void rsx_wcap_word(u32 w) { (void)w; }

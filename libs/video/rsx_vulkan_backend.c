@@ -815,9 +815,11 @@ static void vk_invalidate(vk_buffer* b)
  * -------------------------------------------------------------------------*/
 static VkResult vk_queue_submit(const VkSubmitInfo* si, VkFence fence)
 {
+    const unsigned long long ww_t0 = rsx_ww_begin();
     pthread_mutex_lock(&s_vk.queue_mu);
     const VkResult r = pvkQueueSubmit(s_vk.queue, 1, si, fence);
     pthread_mutex_unlock(&s_vk.queue_mu);
+    rsx_ww_end(RSX_WW_QSUBMIT, ww_t0);
     return r;
 }
 
@@ -830,6 +832,13 @@ static VkResult vk_queue_present(const VkPresentInfoKHR* pi)
     const VkResult r = pvkQueuePresentKHR(s_vk.queue, pi);
     pthread_mutex_unlock(&s_vk.queue_mu);
     return r;
+}
+
+static void vk_present_mu_lock(void)
+{
+    const unsigned long long ww_t0 = rsx_ww_begin();
+    pthread_mutex_lock(&s_vk.present_mu);
+    rsx_ww_end(RSX_WW_PRES_MU, ww_t0);
 }
 
 static void vk_device_idle(void)
@@ -949,7 +958,9 @@ static int vk_submit_and_wait(void)
     VK_CHECK(pvkResetFences(s_vk.device, 1, &s_vk.fence), "vkResetFences");
     VK_CHECK(vk_queue_submit(&si, s_vk.fence), "vkQueueSubmit");
     {   const unsigned long long w0 = vk_now_us();
+        const unsigned long long ww_t0 = rsx_ww_begin();
         VK_CHECK(pvkWaitForFences(s_vk.device, 1, &s_vk.fence, VK_TRUE, UINT64_MAX), "vkWaitForFences");
+        rsx_ww_end(RSX_WW_ONESHOT, ww_t0);
         vk_ebs_wait_other();
         s_eb_wait_us[s_wait_tag] += vk_now_us() - w0; }
     return 0;
@@ -2642,8 +2653,10 @@ static void vk_present_window(void)
 
     u32 idx = 0;
     const unsigned long long st_aq0 = vk_stall_trace_on() ? vk_now_us() : 0;
+    const unsigned long long ww_aq0 = rsx_ww_begin();
     VkResult r = pvkAcquireNextImageKHR(s_vk.device, s_vk.swapchain, vk_acquire_timeout_ns(),
                                        s_vk.sem_acquire[slot], VK_NULL_HANDLE, &idx);
+    rsx_ww_end(RSX_WW_ACQUIRE, ww_aq0);
     if (st_aq0) {
         const unsigned long long dt = vk_now_us() - st_aq0;
         if (dt >= 200000ull) VK_LOG("stalltrace acquire=%.1fms\n", dt / 1000.0);
@@ -2847,7 +2860,9 @@ static void vk_dump_ppm(const unsigned char* rgba)
 static void vk_present_wait_gpu(void)
 {
     if (__atomic_load_n(&s_vk.present_inflight, __ATOMIC_ACQUIRE) && s_vk.present_fence)
+    {   const unsigned long long ww_t0 = rsx_ww_begin();
         pvkWaitForFences(s_vk.device, 1, &s_vk.present_fence, VK_TRUE, UINT64_MAX);
+        rsx_ww_end(RSX_WW_PRES_GPU, ww_t0); }
 }
 
 /* PS3RECOMP_PRESENT_DUMP_DIR=<dir>: write a small grayscale PGM of every
@@ -2912,7 +2927,9 @@ static void vk_present_complete_locked(void)
 {
     if (!s_vk.present_inflight) return;
     {   const unsigned long long w0 = vk_now_us();
+        const unsigned long long ww_t0 = rsx_ww_begin();
         pvkWaitForFences(s_vk.device, 1, &s_vk.present_fence, VK_TRUE, UINT64_MAX);
+        rsx_ww_end(RSX_WW_PRES_DONE, ww_t0);
         const unsigned long long dt = vk_now_us() - w0;
         s_eb_wait_us[9] += dt;
         if (dt >= 200000ull) VK_LOG("stalltrace present_fence=%.1fms\n", dt / 1000.0); }
@@ -2979,7 +2996,7 @@ static void vk_cb_present(void* ud, u32 buffer_id)
     (void)ud; (void)buffer_id;
     if (!s_vk.device) return;
     vk_pipe_async_frame();
-    pthread_mutex_lock(&s_vk.present_mu);
+    vk_present_mu_lock();
     VkCommandBuffer cb = vk_present_record_begin();
     if (cb) vk_present_record_end(cb);
     pthread_mutex_unlock(&s_vk.present_mu);
@@ -3388,7 +3405,7 @@ static void vk_eng_present(void* user, u32 surface)
     vk_pipe_async_frame();
     if (s_eb_pending) { s_eb_why = 6; vk_eng_flush_async(); }   /* the present records on its own buffer */
     vk_eng_obj* o = vk_eng_get(surface, VK_ENG_COLOR);
-    pthread_mutex_lock(&s_vk.present_mu);
+    vk_present_mu_lock();
     VkCommandBuffer cb = vk_present_record_begin();
     if (cb) {
         if (o) {
@@ -4320,6 +4337,7 @@ static int vk_pa_wait(vk_eng_pipe* P, unsigned long long* waited_ns)
         if (vk_pa_now() >= deadline) break;
     }
     pthread_mutex_unlock(&s_pa.mu);
+    rsx_ww_add(RSX_WW_PIPE_ASYNC, vk_pa_now() - start);
 
     *waited_ns = vk_pa_now() - start;
     return __atomic_load_n(&P->async_state, __ATOMIC_ACQUIRE) >= 2;
@@ -4923,10 +4941,12 @@ static VkPipeline vk_eng_variant(vk_eng_pipe* P, u32 topo_idx)
     }
 
     if (P->variant[topo_idx]) return P->variant[topo_idx];
+    const unsigned long long ww_t0 = rsx_ww_begin();
     pthread_mutex_lock(&s_pipe_create_mu);
     VkPipeline pipe = P->variant[topo_idx];
     if (!pipe) pipe = vk_eng_variant_create(P, topo_idx);
     pthread_mutex_unlock(&s_pipe_create_mu);
+    rsx_ww_end(RSX_WW_PIPE_CREATE, ww_t0);
     return pipe;
 }
 
@@ -5448,7 +5468,9 @@ static void vk_ebs_swap(void)
     vk_eb_set* n = &s_ebs[s_ebs_cur];
     if (n->inflight) {
         const unsigned long long w0 = vk_now_us();
+        const unsigned long long ww_t0 = rsx_ww_begin();
         pvkWaitForFences(s_vk.device, 1, &n->fence, VK_TRUE, UINT64_MAX);
+        rsx_ww_end(RSX_WW_EBS_SWAP, ww_t0);
         s_eb_wait_us[6] += vk_now_us() - w0;
         n->inflight = 0;
     }
@@ -5469,7 +5491,9 @@ static void vk_ebs_wait_other(void)
     for (int i = 0; i < VK_EB_SETS; i++) {
         vk_eb_set* o = &s_ebs[i];
         if (i == s_ebs_cur || !o->inflight) continue;
+        const unsigned long long ww_t0 = rsx_ww_begin();
         pvkWaitForFences(s_vk.device, 1, &o->fence, VK_TRUE, UINT64_MAX);
+        rsx_ww_end(RSX_WW_EBS_OTHER, ww_t0);
         o->inflight = 0;
     }
 }
@@ -6800,7 +6824,7 @@ void rsx_vulkan_backend_present_begin(void)
 void rsx_vulkan_backend_present_finish(void)
 {
     if (!s_vk.device) return;
-    pthread_mutex_lock(&s_vk.present_mu);
+    vk_present_mu_lock();
     vk_present_complete_locked();
     pthread_mutex_unlock(&s_vk.present_mu);
 }
