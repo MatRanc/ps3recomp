@@ -6,6 +6,7 @@
 #include <ps3emu/ps3types.h>
 #include "../libs/spurs/cellSpurs.c"
 #include <assert.h>
+#include <stdlib.h>
 
 uint8_t* vm_base;
 uint32_t ppu_vm_size = 0x20000;
@@ -86,6 +87,24 @@ int main(void)
     CloseHandle(t);
     assert(woken);
 
+    /* SPURS_READY_WAKE (env, default 0): a PPU ready publish (or explicit
+     * WakeUp) uses the same request-line kick an SPU commit does, instead of
+     * leaving the coordinator to find it on the 1 ms timed pass. */
+    take_kick();
+    unsetenv("SPURS_READY_WAKE");
+    s_ready_wake = -1;
+    spurs_ready_line_wake(si);
+    assert(take_kick() == 0);
+    setenv("SPURS_READY_WAKE", "1", 1);
+    s_ready_wake = -1;
+    spurs_ready_line_wake(si);
+    assert(take_kick() == 1);
+    setenv("SPURS_READY_WAKE", "0", 1);
+    s_ready_wake = -1;
+    spurs_ready_line_wake(si);
+    assert(take_kick() == 0);
+
     puts("PASS: an SPU commit to the SPURS request line kicks and wakes the coordinator");
+    puts("PASS: SPURS_READY_WAKE wakes the coordinator on a PPU ready publish");
     return 0;
 }

@@ -519,6 +519,29 @@ static void spurs_commit_hook(uint32_t line)
     ef_line_committed(line);
     spurs_line_committed(line);
 }
+
+/* SPURS_READY_WAKE (env, default 0): a PPU call that publishes ready work is
+ * the same request event as an SPU PUTLLC to the instance's request line.
+ * Today only the SPU commit path calls spurs_line_committed(); a PPU
+ * cellSpursReadyCountStore/Swap or an explicit cellSpursWakeUp leaves the
+ * coordinator to find the request on its 1 ms timed pass. Waking it at the
+ * store removes that poll latency from the lane's post-PM gap. The wake is
+ * only a kick: the coordinator still rescans and dispatches exactly as it
+ * does for an SPU commit, so no guest state or ordering changes. */
+static int s_ready_wake = -1;
+static int spurs_ready_wake_on(void)
+{
+    if (s_ready_wake < 0) {
+        const char* e = getenv("SPURS_READY_WAKE");
+        s_ready_wake = (e && *e && strcmp(e, "0") != 0) ? 1 : 0;
+    }
+    return s_ready_wake;
+}
+static void spurs_ready_line_wake(struct SpursInst* si)
+{
+    if (!si || !spurs_ready_wake_on()) return;
+    spurs_line_committed(si->ea & ~127u);
+}
 static SRWLOCK s_workload_registry_lock = SRWLOCK_INIT;
 
 static s32 spurs_scheduler_start(struct SpursInst* si);
@@ -2528,6 +2551,7 @@ s32 cellSpursReadyCountStore(CellSpurs* spurs, CellSpursWorkloadId wid,
         _n++;
     }
     spurs_api_unlock(si);
+    spurs_ready_line_wake(si);
     return CELL_OK;
 }
 
@@ -2542,15 +2566,18 @@ static s32 spurs_ready_exchange(CellSpurs* spurs, CellSpursWorkloadId wid,
     if (!s_workloads[wid].in_use || s_workloads[wid].spurs_ea != si->ea) {
         spurs_api_unlock(si); return CELL_SPURS_CORE_ERROR_SRCH;
     }
+    int stored = 0;
     spu_lockline_lock();
     u8 previous = vm_read8(si->ea + SPURS_WKL_READY1 + wid);
     if (!conditional || previous == compare) {
         vm_base[si->ea + SPURS_WKL_READY1 + wid] = (u8)value;
         s_workloads[wid].readyCount = value;
         ef_line_end(si->ea);
+        stored = 1;
     } else spu_lockline_unlock();
     vm_write32((u32)(uintptr_t)old, previous);
     spurs_api_unlock(si);
+    if (stored) spurs_ready_line_wake(si);
     return CELL_OK;
 }
 
@@ -2571,6 +2598,7 @@ s32 cellSpursWakeUp(CellSpurs* spurs)
     /* Work is admitted only by the coordinator, including explicit wakes. */
     memset(si->idle, 0, sizeof(si->idle));
     spurs_api_unlock(si);
+    spurs_ready_line_wake(si);
     return CELL_OK;
 }
 
