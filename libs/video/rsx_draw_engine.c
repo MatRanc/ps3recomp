@@ -686,7 +686,63 @@ static rsx_gpu_range_kick_fn s_gpu_kick;
 static rsx_gpu_range_done_fn s_gpu_done_fn;
 static int s_gpu_preparing;
 
+/* PS3RECOMP_GPU_STATS=1: count probe calls, scanned entries and outcomes.
+ * Off by default; the hot path pays one cached integer test. */
+static int s_gpu_stats = -1;
+static rsx_gpu_range_stats s_gpu_st;
+static int gpu_stats_on(void)
+{
+    if (s_gpu_stats < 0) {
+        const char* e = getenv("PS3RECOMP_GPU_STATS");
+        s_gpu_stats = (e && *e && *e != '0') ? 1 : 0;
+    }
+    return s_gpu_stats;
+}
+
+void rsx_draw_engine_gpu_range_stats_get(rsx_gpu_range_stats* out)
+{
+    if (out) *out = s_gpu_st;
+}
+void rsx_draw_engine_gpu_range_stats_reset(void)
+{
+    memset(&s_gpu_st, 0, sizeof s_gpu_st);
+}
+static void gpu_stats_merge(u32 bytes)
+{
+    if (gpu_stats_on()) { s_gpu_st.merges++; s_gpu_st.merge_bytes += bytes; }
+}
+
 static void eng_gpu_scratch_rewind(void);
+
+/* Page filters for the range map. The probe used to scan every installed
+ * range on every guest read: with one range per c690 job (~51 per drain) and
+ * ~5.6k reads/frame that is the resolver's dominant cost. A read can only
+ * overlap a range whose 4 KiB page it touches, so a page bitmap rejects the
+ * scan in O(1). The bitmaps are written only under the range write lock and
+ * cleared with the map; a torn read can only lose a shortcut (the guest bytes
+ * are the exact SPU output), never serve a wrong byte. */
+#define ENG_GPU_PAGE_SHIFT 12
+#define ENG_GPU_PAGE_COUNT (1u << (32 - ENG_GPU_PAGE_SHIFT))
+static u8 s_gpu_ea_page[ENG_GPU_PAGE_COUNT / 8];
+static u8 s_gpu_off_page[ENG_GPU_PAGE_COUNT / 8];
+static int s_gpu_has_ea, s_gpu_has_off;
+
+static int gpu_page_hit(const u8* bm, u32 lo, u32 hi)
+{
+    if (hi < lo) return 1;      /* wrapped span: let the scan decide */
+    u32 p0 = lo >> ENG_GPU_PAGE_SHIFT, p1 = hi >> ENG_GPU_PAGE_SHIFT;
+    if (p1 - p0 > 16u) return 1; /* huge read: the scan is not the problem */
+    for (u32 p = p0; p <= p1; p++)
+        if (bm[p >> 3] & (u8)(1u << (p & 7u))) return 1;
+    return 0;
+}
+static void gpu_page_mark(u8* bm, u32 lo, u32 hi)
+{
+    if (hi < lo) return;
+    u32 p0 = lo >> ENG_GPU_PAGE_SHIFT, p1 = hi >> ENG_GPU_PAGE_SHIFT;
+    for (u32 p = p0; p <= p1; p++)
+        bm[p >> 3] |= (u8)(1u << (p & 7u));
+}
 
 static void eng_gpu_range_wlock(void)
 {
@@ -704,6 +760,9 @@ void rsx_draw_engine_gpu_range_clear(void)
 {
     eng_gpu_range_wlock();
     s_gpu_rng_n = 0;
+    memset(s_gpu_ea_page, 0, sizeof s_gpu_ea_page);
+    memset(s_gpu_off_page, 0, sizeof s_gpu_off_page);
+    s_gpu_has_ea = s_gpu_has_off = 0;
     eng_gpu_range_wunlock();
     eng_gpu_scratch_rewind();
 }
@@ -729,6 +788,19 @@ static void gpu_range_set(u32 ea, u32 location, u32 offset, u32 size,
     e->ea = ea; e->location = location; e->offset = offset; e->size = size;
     e->bytes = bytes; e->fallback = fallback; e->ready = ready;
     e->by_offset = (u8)by_offset; e->pending = (u8)pending;
+    if (size) {
+        const u32 lo = by_offset ? offset : ea;
+        const u64 end64 = (u64)lo + size;
+        const u32 hi = end64 > 0x100000000ull ? 0xFFFFFFFFu
+                                              : (u32)(end64 - 1u);
+        if (by_offset) {
+            s_gpu_has_off = 1;
+            gpu_page_mark(s_gpu_off_page, lo, hi);
+        } else {
+            s_gpu_has_ea = 1;
+            gpu_page_mark(s_gpu_ea_page, lo, hi);
+        }
+    }
     /* A shadow buffer must outlive the map entry; the renderer owns it. */
     eng_gpu_range_wunlock();
 }
@@ -784,6 +856,31 @@ static int eng_gpu_range_probe(u32 location, u32 offset, u32 min_bytes,
                                eng_gpu_hit* hit, int depth)
 {
     if (!__atomic_load_n(&s_gpu_rng_n, __ATOMIC_RELAXED)) return ENG_GPU_MISS;
+    const int stats = gpu_stats_on();
+    if (stats) s_gpu_st.probes++;
+    /* Page fast path: resolve the read once and reject the scan unless one of
+     * the map's pages can overlap it. */
+    const int has_ea = __atomic_load_n(&s_gpu_has_ea, __ATOMIC_RELAXED);
+    const int has_off = __atomic_load_n(&s_gpu_has_off, __ATOMIC_RELAXED);
+    u32 req_ea = 0;
+    int have_ea = 0;
+    int page_may = 0;
+    const u32 req_hi = offset + min_bytes - 1u;
+    if (has_ea) {
+        req_ea = cellGcmResolveLocated(location == RSX_LOCATION_LOCAL, offset);
+        have_ea = 1;
+        if (req_ea) {
+            u32 hi = req_ea + min_bytes - 1u;
+            if (hi < req_ea) hi = 0xFFFFFFFFu;
+            page_may = gpu_page_hit(s_gpu_ea_page, req_ea, hi);
+        }
+    }
+    if (!page_may && has_off)
+        page_may = gpu_page_hit(s_gpu_off_page, offset, req_hi);
+    if (!page_may) {
+        if (stats) s_gpu_st.miss++;
+        return ENG_GPU_MISS;
+    }
     int n;
     unsigned g1;
     for (;;) {
@@ -792,19 +889,15 @@ static int eng_gpu_range_probe(u32 location, u32 offset, u32 min_bytes,
         n = __atomic_load_n(&s_gpu_rng_n, __ATOMIC_RELAXED);
         if (n > ENG_GPU_RANGES) n = ENG_GPU_RANGES;
         /* Scan in place; retry if a writer moved the generation. */
-        u32 req_ea = 0;
-        int have_ea = 0;
         for (int i = 0; i < n; i++) {
+        if (stats) s_gpu_st.entries++;
         const eng_gpu_range* e = &s_gpu_rng[i];
         u32 req_start;
         if (e->by_offset) {
             if (location != e->location) continue;
             req_start = offset;
         } else {
-            if (!have_ea) {
-                req_ea = cellGcmResolveLocated(location == RSX_LOCATION_LOCAL, offset);
-                have_ea = 1;
-            }
+            if (!have_ea) continue;
             if (!req_ea) continue;
             req_start = req_ea;
         }
@@ -815,6 +908,7 @@ static int eng_gpu_range_probe(u32 location, u32 offset, u32 min_bytes,
         if (__atomic_load_n(&s_gpu_rng_gen, __ATOMIC_ACQUIRE) != g1)
             break;      /* writer moved: rescan */
         if (e->pending) {
+            if (stats) s_gpu_st.pending++;
             if (depth == 0 && s_gpu_prepare &&
                 __atomic_exchange_n(&s_gpu_preparing, 1, __ATOMIC_ACQ_REL) == 0) {
                 s_gpu_prepare();
@@ -840,11 +934,19 @@ static int eng_gpu_range_probe(u32 location, u32 offset, u32 min_bytes,
         hit->req_start = req_start;
         hit->hit_start = (u32)lo;
         hit->hit_len = (u32)(hi - lo);
-        return (lo == rlo && hi == rhi) ? ENG_GPU_FULL : ENG_GPU_PARTIAL;
+        const int full = (lo == rlo && hi == rhi);
+        if (stats) {
+            if (full) s_gpu_st.full++;
+            else s_gpu_st.partial++;
         }
-        if (__atomic_load_n(&s_gpu_rng_gen, __ATOMIC_ACQUIRE) == g1)
+        return full ? ENG_GPU_FULL : ENG_GPU_PARTIAL;
+        }
+        if (__atomic_load_n(&s_gpu_rng_gen, __ATOMIC_ACQUIRE) == g1) {
+            if (stats) s_gpu_st.miss++;
             return ENG_GPU_MISS;
+        }
     }
+    if (stats) s_gpu_st.miss++;
     return ENG_GPU_MISS;
 }
 
@@ -1623,6 +1725,7 @@ static const u8* eng_guest_ptr_raw(u32 location, u32 offset, u32 min_bytes)
                 memcpy(m, p, min_bytes);
                 memcpy(m + (gh.hit_start - gh.req_start),
                        gh.bytes, gh.hit_len);
+                gpu_stats_merge(min_bytes);
                 return m;
             }
         }
@@ -1641,6 +1744,7 @@ static const u8* eng_guest_ptr_raw(u32 location, u32 offset, u32 min_bytes)
         if (m) {
             memcpy(m, vm_base + ea, min_bytes);
             memcpy(m + (gh.hit_start - gh.req_start), gh.bytes, gh.hit_len);
+            gpu_stats_merge(min_bytes);
             return m;
         }
     }

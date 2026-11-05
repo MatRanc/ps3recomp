@@ -264,11 +264,38 @@ rsx_engine_replay* rsx_engine_replay_create(const char* prefix, char* err, size_
                                 r->gpu_size = (u32)sz;
                                 r->gpu_loc = (u32)strtoul(buf, NULL, 0);
                                 r->gpu_off = (u32)strtoul(colon + 1, NULL, 0);
+                                /* PS3RECOMP_GPU_RING_FILL / _FILL_EA install
+                                 * extra one-byte ranges with no bytes, before
+                                 * the real range. They are scanned (and an EA
+                                 * filler forces the cellGcmResolveLocated the
+                                 * live path pays) but never serve anything, so
+                                 * the output is unchanged. Used to measure the
+                                 * probe's per-entry cost at a live range count. */
+                                const char* fs = getenv("PS3RECOMP_GPU_RING_FILL");
+                                const char* es = getenv("PS3RECOMP_GPU_RING_FILL_EA");
+                                const int nf = fs && *fs ? atoi(fs) : 0;
+                                const int ne = es && *es ? atoi(es) : 0;
+                                const u32 real_ea =
+                                    cellGcmResolveLocated(r->gpu_loc == 0,
+                                                          r->gpu_off);
+                                for (int i = 0; i < nf; i++)
+                                    rsx_draw_engine_gpu_range_add_offset(
+                                        r->gpu_loc, 1u + (u32)i * 4u, 1, NULL);
+                                /* EA fillers sit on the page the real range's
+                                 * reads resolve to, so they model live ranges
+                                 * on pages the draw actually touches (the
+                                 * page filter cannot skip those). */
+                                for (int i = 0; i < ne; i++)
+                                    rsx_draw_engine_gpu_range_add_ea(
+                                        real_ea ? real_ea + (u32)i * 0x1000u
+                                                : 0x11900000u + (u32)i * 0x1000u,
+                                        1, NULL);
                                 rsx_draw_engine_gpu_range_add_offset(
                                     r->gpu_loc, r->gpu_off, r->gpu_size, p);
                                 fprintf(stderr, "[replay-engine] gpu range loc=%u "
-                                        "off=0x%X size=%u from %s\n",
-                                        r->gpu_loc, r->gpu_off, r->gpu_size, path);
+                                        "off=0x%X size=%u ea=0x%X from %s (fill %d + %d ea)\n",
+                                        r->gpu_loc, r->gpu_off, r->gpu_size, real_ea,
+                                        path, nf, ne);
                             } else {
                                 free(p);
                             }

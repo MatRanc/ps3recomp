@@ -474,6 +474,22 @@ void rsx_draw_engine_gpu_range_set_prepare(rsx_gpu_range_prepare_fn fn);
 void rsx_draw_engine_gpu_range_set_kick(rsx_gpu_range_kick_fn fn);
 void rsx_draw_engine_gpu_range_kick(void);
 void rsx_draw_engine_gpu_range_set_done(rsx_gpu_range_done_fn fn);
+
+/* Diagnostic counters for the range probe (PS3RECOMP_GPU_STATS=1). Off by
+ * default; the probe's off path is one cached integer test. */
+typedef struct {
+    unsigned long long probes;        /* calls that scanned the map          */
+    unsigned long long entries;       /* range entries examined              */
+    unsigned long long full;          /* reads wholly inside a range         */
+    unsigned long long partial;       /* reads that also touch guest bytes   */
+    unsigned long long miss;          /* no range overlapped                 */
+    unsigned long long pending;       /* a pending range was hit             */
+    unsigned long long merges;        /* straddling reads merged into a copy */
+    unsigned long long merge_bytes;   /* bytes copied by those merges        */
+} rsx_gpu_range_stats;
+void rsx_draw_engine_gpu_range_stats_get(rsx_gpu_range_stats* out);
+void rsx_draw_engine_gpu_range_stats_reset(void);
+
 void rsx_draw_engine_set_display_query(int (*fn)(u32 offset));
 
 int  rsx_draw_engine_init(u32 width, u32 height);

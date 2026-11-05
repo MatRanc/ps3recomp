@@ -4836,9 +4836,12 @@ static unsigned s_c690_retain_n;
  *       stays empty, so the walker reads the exact guest bytes)
  *   2 = resolve only        (sink queues; prepare installs the exact SPU seed
  *       as a resolver range, no Vulkan object is created)
- * Any other value means 0. */
+ * Any other value means 0. It is a live control-file key so an A/B can rotate
+ * it; the environment value seeds it at init. */
 static int vk_c690_dbg(void)
 {
+    if (ps3_live_ctl_file_set(PS3_LIVE_C690_GPU_2A_DBG))
+        return ps3_live_ctl_get(PS3_LIVE_C690_GPU_2A_DBG);
     static int s_dbg = -1;
     if (s_dbg < 0) {
         const char* e = getenv("PS3RECOMP_C690_GPU_2A_DBG");
@@ -5398,9 +5401,24 @@ static void vk_c690_process(void)
 
 /* Drain boundary: submit what is queued and let it run while the walker
  * records the rest of the drain. */
+static int s_c690_was_on;
 static void vk_c690_kick(void)
 {
-    if (!ps3_live_ctl_get(PS3_LIVE_C690_GPU_2A)) return;
+    if (!ps3_live_ctl_get(PS3_LIVE_C690_GPU_2A)) {
+        /* Turning the key off must retire the ranges the last on-drain left
+         * installed, or the resolver keeps serving GPU/seed bytes into the
+         * off arm (the old A arm was contaminated this way). */
+        if (s_c690_was_on) {
+            pthread_mutex_lock(&s_c690_proc_mu);
+            rsx_draw_engine_gpu_range_clear();
+            c690_queue_free_all();
+            c690_retain_clear();
+            pthread_mutex_unlock(&s_c690_proc_mu);
+            s_c690_was_on = 0;
+        }
+        return;
+    }
+    s_c690_was_on = 1;
     pthread_mutex_lock(&s_c690_proc_mu);
     rsx_draw_engine_gpu_range_clear();
     c690_retain_clear();
@@ -5414,7 +5432,14 @@ static void vk_c690_kick(void)
 static void vk_c690_prepare(void)
 {
     pthread_mutex_lock(&s_c690_proc_mu);
-    vk_c690_process();
+    if (!ps3_live_ctl_get(PS3_LIVE_C690_GPU_2A)) {
+        rsx_draw_engine_gpu_range_clear();
+        c690_queue_free_all();
+        c690_retain_clear();
+        s_c690_was_on = 0;
+    } else {
+        vk_c690_process();
+    }
     pthread_mutex_unlock(&s_c690_proc_mu);
 }
 

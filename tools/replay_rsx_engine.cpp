@@ -50,6 +50,8 @@ int main(int argc, char** argv)
     rsx_engine_replay_stats st = {0};
     for (int i = 0; i < warmup; i++)
         if (rsx_engine_replay_run_frame(r, &st) != 0) { std::fprintf(stderr, "warmup walker failed\n"); return 1; }
+    const bool gpu_stats = std::getenv("PS3RECOMP_GPU_STATS") != nullptr;
+    if (gpu_stats) rsx_draw_engine_gpu_range_stats_reset();
 
     std::vector<double> us;
     us.reserve(frames);
@@ -103,6 +105,17 @@ int main(int argc, char** argv)
         rsx_draw_engine_walker_fast_stats(&fs);
         std::printf("fast path:    fetch %llu hit / %llu miss, pipeline %llu hit / %llu miss\n",
                     fs.fetch_hits, fs.fetch_misses, fs.pipeline_hits, fs.pipeline_misses);
+    }
+    if (gpu_stats) {
+        rsx_gpu_range_stats gs = {0};
+        rsx_draw_engine_gpu_range_stats_get(&gs);
+        std::printf("gpu range:    probes %llu (%.1f/frame), entries %llu (%.1f/probe), "
+                    "full %llu, partial %llu, miss %llu, pending %llu, "
+                    "merges %llu (%.1f bytes)\n",
+                    gs.probes, (double)gs.probes / frames,
+                    gs.entries, gs.probes ? (double)gs.entries / gs.probes : 0.0,
+                    gs.full, gs.partial, gs.miss, gs.pending,
+                    gs.merges, gs.merges ? (double)gs.merge_bytes / gs.merges : 0.0);
     }
 
     rsx_engine_replay_destroy(r);
