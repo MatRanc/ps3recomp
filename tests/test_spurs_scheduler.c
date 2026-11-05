@@ -81,6 +81,18 @@ static void held_policy(spu_context* c)
     while(!atomic_load(&gate)) Sleep(1);
     atomic_fetch_sub(&active_count,1);atomic_fetch_add(&done[w],1);finish(c);
 }
+static atomic_uint squat_active[16], squat_peak[16], squat_lanes[16][6], squat_gate;
+static void squat_policy(spu_context* c)
+{
+    unsigned w=spu_ls_read32(c,0x1DC),lane=spu_ls_read32(c,0x1C8);
+    assert(w<16 && lane<6);
+    atomic_fetch_add(&squat_lanes[w][lane],1);
+    unsigned n=atomic_fetch_add(&squat_active[w],1)+1, peak=atomic_load(&squat_peak[w]);
+    while(peak<n && !atomic_compare_exchange_weak(&squat_peak[w],&peak,n)) {}
+    while(!atomic_load(&squat_gate)) Sleep(1);
+    atomic_fetch_sub(&squat_active[w],1);
+    finish(c);
+}
 static atomic_uint fast_visits,late_seen;
 static void fast_policy(spu_context* c)
 {
@@ -512,6 +524,160 @@ int main(void)
             setenv("SPURS_PM_FAST_ACTIVE", "1", 1);
         }
         puts("SPURS lane 6 override only relaxes the mesh workloads' lane 5 PASS");
+
+        /* PS3RECOMP_C690_EXTRA_LANES: a hidden host lane starts the same
+         * mesh workload on a physical row that workload is not already using,
+         * consumes exactly one ready unit, and leaves guest-visible active and
+         * curcont alone. It never exceeds maxContention, never shares a
+         * (workload, lane) row, and parks when the live key is 0. */
+        {
+            struct SpursInst x;
+            const u32 e1 = 0x3000;
+            memset(&x, 0, sizeof x);
+            x.ea = e1; x.nspus = 6; x.extra_count = 2; x.cursor = 1;
+            x.slots[6].instance = &x; x.slots[6].extra = 1; x.slots[6].extra_index = 0;
+            x.slots[7].instance = &x; x.slots[7].extra = 1; x.slots[7].extra_index = 1;
+            memset(&s_workloads[1], 0, sizeof s_workloads[1]);
+            memset(&s_wkl_pm[1], 0, sizeof s_wkl_pm[1]);
+            s_workloads[1].in_use = 1;
+            s_workloads[1].spurs_ea = e1;
+            s_workloads[1].pm = (void*)(uintptr_t)0x9A00;
+            s_workloads[1].sizePm = 16;
+            register_pm(0x9A00, 0x99, fast_policy, 86);
+            vm_write32(e1 + SPURS_WKL_ENABLED, 0x80000000u | 0x40000000u);
+            vm_write8(e1 + SPURS_WKL_STATE1 + 1, 2);
+            for (u32 d = 0; d < 5; d++)
+                vm_write8(e1 + SPURS_WKL_INFO1 + SPURS_WKL_INFO_SZ + 0x18 + d, 4);
+            vm_write8(e1 + SPURS_WKL_INFO1 + SPURS_WKL_INFO_SZ + 0x18 + 5, 0);
+            vm_write8(e1 + SPURS_WKL_MAXCONT + 1, 5);
+            vm_write8(e1 + SPURS_WKL_READY1 + 1, 3);
+            vm_write8(e1 + SPURS_WKL_IDLE2 + 1, 0);
+            ef_w16(e1 + SPURS_WKL_SIGNAL1, 0);
+            setenv("SPURS_PM_NATIVE_DISPATCH", "2", 1);
+            setenv("PS3RECOMP_C690_EXTRA_LANES", "2", 1);
+            setenv("SPURS_READY_LEVEL", "0", 1);
+            AcquireSRWLockExclusive(&x.lock);
+            AcquireSRWLockExclusive(&s_workload_registry_lock);
+            int r = spurs_extra_dispatch_slot(&x, 0x40000000u, 0);
+            ReleaseSRWLockExclusive(&s_workload_registry_lock);
+            ReleaseSRWLockExclusive(&x.lock);
+            assert(r == 1);
+            assert(x.slots[6].busy && x.slots[6].spu_num == 0 && x.slots[6].extra);
+            assert(x.extra_active[1] == 1 && x.lane_wid[0] == 2);
+            assert(x.active[1] == 0);
+            assert(vm_read8(e1 + SPURS_WKL_READY1 + 1) == 2);
+            assert(vm_read8(e1 + SPURS_WKL_CURCONT + 1) == 0);
+            /* the second helper takes the next eligible row, not row 0 */
+            AcquireSRWLockExclusive(&x.lock);
+            AcquireSRWLockExclusive(&s_workload_registry_lock);
+            r = spurs_extra_dispatch_slot(&x, 0x40000000u, 1);
+            ReleaseSRWLockExclusive(&s_workload_registry_lock);
+            ReleaseSRWLockExclusive(&x.lock);
+            assert(r == 1);
+            assert(x.slots[7].busy && x.slots[7].spu_num == 1);
+            assert(x.extra_active[1] == 2 && x.lane_wid[1] == 2);
+            assert(vm_read8(e1 + SPURS_WKL_READY1 + 1) == 1);
+            /* at the guest's contention cap the coordinator may not start one
+             * more mesh instance (5 = maxContention, active + hidden) */
+            x.slots[6].busy = 0;
+            x.extra_active[1] = 1;
+            x.lane_wid[0] = 0;
+            x.active[1] = 4;
+            AcquireSRWLockExclusive(&x.lock);
+            AcquireSRWLockExclusive(&s_workload_registry_lock);
+            r = spurs_extra_dispatch_slot(&x, 0x40000000u, 0);
+            ReleaseSRWLockExclusive(&s_workload_registry_lock);
+            ReleaseSRWLockExclusive(&x.lock);
+            assert(r == 0 && !x.slots[6].busy);
+            /* and the live key 0 parks every helper without touching memory */
+            x.active[1] = 0;
+            x.extra_active[1] = 0;
+            setenv("PS3RECOMP_C690_EXTRA_LANES", "0", 1);
+            const u8 ready_before = vm_read8(e1 + SPURS_WKL_READY1 + 1);
+            AcquireSRWLockExclusive(&x.lock);
+            AcquireSRWLockExclusive(&s_workload_registry_lock);
+            r = spurs_extra_dispatch_slot(&x, 0x40000000u, 0);
+            ReleaseSRWLockExclusive(&s_workload_registry_lock);
+            ReleaseSRWLockExclusive(&x.lock);
+            assert(r == 0 && vm_read8(e1 + SPURS_WKL_READY1 + 1) == ready_before);
+            setenv("SPURS_PM_NATIVE_DISPATCH", "0", 1);
+            setenv("PS3RECOMP_C690_EXTRA_LANES", "0", 1);
+            memset(&s_workloads[1], 0, sizeof s_workloads[1]);
+            memset(&s_wkl_pm[1], 0, sizeof s_wkl_pm[1]);
+            /* the synthetic instance never runs the scheduler destructor */
+            if (x.lock) {
+                pthread_rwlock_destroy((pthread_rwlock_t*)x.lock); free(x.lock);
+            }
+            if (x.wake) {
+                ps3_condvar* cv = (ps3_condvar*)x.wake;
+                pthread_mutex_destroy(&cv->m); pthread_cond_destroy(&cv->c);
+                free(cv);
+            }
+            puts("SPURS hidden lanes fill a free row, respect maxContention and the key PASS");
+        }
+
+        /* N-worker queue semantics: while a 4-lane workload squats lanes 0-3,
+         * five concurrent MeshJobs instances (1 physical + 4 hidden) run on
+         * rows 0-4 with no duplicate (workload, row) and never exceed the
+         * guest's maxContention. The guest-visible contention byte of the mesh
+         * workload stays at its one physical lane. */
+        {
+            memset(&s_workloads[0], 0, sizeof s_workloads[0]);
+            memset(&s_workloads[1], 0, sizeof s_workloads[1]);
+            memset(&s_wkl_pm[0], 0, sizeof s_wkl_pm[0]);
+            memset(&s_wkl_pm[1], 0, sizeof s_wkl_pm[1]);
+            for (unsigned w=0; w<16; w++) {
+                atomic_store(&squat_active[w],0); atomic_store(&squat_peak[w],0);
+                for (unsigned l=0; l<6; l++) atomic_store(&squat_lanes[w][l],0);
+            }
+            atomic_store(&squat_gate,0);
+            register_pm(0x9B00, 0xAA, squat_policy, 87);
+            register_pm(0x9C00, 0xBB, squat_policy, 88);
+            for (unsigned d=0; d<8; d++)
+                vm_write8(0x8020 + d, d < 5 ? 4 : 0);
+            setenv("SPURS_PM_NATIVE_DISPATCH", "6", 1);
+            setenv("PS3RECOMP_C690_EXTRA_LANES", "4", 1);
+            setenv("SPURS_PM_FAST_RESCHED", "0", 1);
+            setenv("SPURS_READY_LEVEL", "0", 1);
+            assert(cellSpursInitialize((CellSpurs*)0x2000, 6, 0, 0, 0) == 0);
+            assert(cellSpursAddWorkload((CellSpurs*)0x2000, (u32*)0x8000,
+                                        (void*)0x9B00, 16, 0x1111,
+                                        (const u8*)0x8020, 1, 4) == 0);
+            const u32 w0 = vm_read32(0x8000);
+            assert(w0 == 0);
+            assert(cellSpursReadyCountStore((CellSpurs*)0x2000, w0, 8) == 0);
+            wait_for(&squat_peak[w0], 4, "four-lane squatter");
+            assert(cellSpursAddWorkload((CellSpurs*)0x2000, (u32*)0x8010,
+                                        (void*)0x9C00, 16, 0x2222,
+                                        (const u8*)0x8020, 1, 5) == 0);
+            const u32 w1 = vm_read32(0x8010);
+            assert(w1 == 1);
+            assert(cellSpursReadyCountStore((CellSpurs*)0x2000, w1, 5) == 0);
+            wait_for(&squat_peak[w1], 5, "five mesh instances (1 physical + 4 hidden)");
+            assert(atomic_load(&squat_peak[w0]) <= 4);
+            unsigned total = 0;
+            for (unsigned l=0; l<6; l++) {
+                unsigned n = atomic_load(&squat_lanes[w1][l]);
+                assert(n <= 1);                 /* one instance per (wid,row) */
+                total += n;
+            }
+            assert(total == 5);
+            struct SpursInst* si2 = NULL;
+            assert(spurs_api_lock(0x2000, &si2) == 0 && si2);
+            assert(si2->active[w1] == 1);       /* guest sees one physical lane */
+            assert(si2->extra_active[w1] == 4);
+            assert(vm_read8(0x2000 + SPURS_WKL_CURCONT + w1) == 1);
+            spurs_api_unlock(si2);
+            atomic_store(&squat_gate,1);
+            finalize(0x2000);
+            assert(atomic_load(&squat_active[w1]) == 0);
+            setenv("SPURS_PM_NATIVE_DISPATCH", "0", 1);
+            setenv("PS3RECOMP_C690_EXTRA_LANES", "0", 1);
+            setenv("SPURS_PM_FAST_ACTIVE", "1", 1);   /* restore the fixture */
+            memset(&s_workloads[0], 0, sizeof s_workloads[0]);
+            memset(&s_workloads[1], 0, sizeof s_workloads[1]);
+            puts("SPURS N workers: five mesh instances, unique rows, guest curcont 1 PASS");
+        }
 
         /* SPURS_PM_FAST_GEN: the slot's dispatch-time snapshot is trusted
          * while the registry epoch is unchanged, and refreshed (which then

@@ -470,7 +470,7 @@ enum {
  * whose *same* workload is not already running there. The guest-visible
  * active/curcont/maxContention/priority/ready/idle stay at the emulated
  * values; only the host thread count grows. */
-#define SPURS_EXTRA_LANES_MAX 6
+#define SPURS_EXTRA_LANES_MAX 4
 struct SpursInst;
 struct SpursPmSlot {
     struct SpursInst* instance;
@@ -478,6 +478,7 @@ struct SpursPmSlot {
     spu_lifted_entry_fn fn;
     int image_id, busy;
     int extra;          /* hidden host lane: not counted in active/curcont */
+    u32 extra_index;    /* 0..extra_count-1: which helper slot this is */
     const uint8_t* pm;
     u64 data;
     u32 reg_epoch;      /* SPURS_PM_FAST_GEN: workload-registry epoch at dispatch */
@@ -496,7 +497,7 @@ static struct SpursInst {
     /* Per-physical-lane bitmask of the wids currently running there (normal
      * and hidden lanes). Two hidden lanes may share a physical lane only for
      * different wids, whose job lists and per-SPU rows are separate. */
-    u8 lane_wid[6];
+    u16 lane_wid[6];
     u8 extra_active[16];
     u32 extra_count;    /* hidden threads created at start (live key may lower) */
     u32 cursor, pass_no;
@@ -1975,9 +1976,10 @@ static int spurs_lane6_for(u32 wid, u32 sn)
     return e && *e && strcmp(e, "0") != 0;
 }
 
-/* PS3RECOMP_C690_EXTRA_LANES: number of hidden host lanes to create at
- * instance start. The live key can lower the number used at run time; it
- * cannot create threads after start. */
+/* PS3RECOMP_C690_EXTRA_LANES: number of hidden host lanes allowed to hold a
+ * dispatched job at run time. The helper threads are created once at instance
+ * start (dormant when the key is 0) so a live A/B can raise and lower the
+ * number without restarting the game. */
 static int spurs_extra_lanes_requested(void)
 {
     int n = 0;
@@ -2004,6 +2006,16 @@ static int spurs_extra_lanes_enabled(struct SpursInst* si, u32 wid)
     int n = spurs_extra_lanes_requested();
     if (n > (int)si->extra_count) n = (int)si->extra_count;
     return n;
+}
+
+/* Is this particular helper slot still inside the live key's budget? A
+ * lowering of the key retires the highest-numbered helpers first, so the
+ * remaining set is stable and a switch to 0 parks every helper. */
+static int spurs_extra_slot_allowed(struct SpursInst* si, struct SpursPmSlot* slot)
+{
+    if (!slot->extra) return 1;
+    if (!spurs_extra_lanes_enabled(si, slot->wid)) return 0;
+    return slot->extra_index < (u32)spurs_extra_lanes_requested();
 }
 
 /* Everything a fast rerun must check except the ready/signal condition. The
@@ -2290,13 +2302,15 @@ static DWORD WINAPI spurs_pm_worker(LPVOID p)
     struct SpursPmSlot* slot = (struct SpursPmSlot*)p;
     ps3_thread_name("spurs pm");
 #if defined(__GNUC__) && !defined(_WIN32)
-    if (ps3_thread_pin_spurs_lane) ps3_thread_pin_spurs_lane((int)slot->spu_num);
+    if (!slot->extra && ps3_thread_pin_spurs_lane)
+        ps3_thread_pin_spurs_lane((int)slot->spu_num);
 #endif
     struct SpursInst* si = slot->instance;
 #ifdef _WIN32
     { ULONG g = 256 * 1024; SetThreadStackGuarantee(&g); }
 #endif
-    ps3_tprof_thread('S', (uint32_t)slot->spu_num);
+    ps3_tprof_thread('S', slot->extra ? 6u + slot->extra_index
+                                      : (uint32_t)slot->spu_num);
     AcquireSRWLockExclusive(&si->lock);
     for (;;) {
         while (!slot->busy && !si->stopping)
@@ -2315,6 +2329,9 @@ static DWORD WINAPI spurs_pm_worker(LPVOID p)
             if (ft_t0)   /* PS3_FTRACE: SPURS SPUs never block on a channel, so their busy time is the module run */
                 ps3_ft_span(PS3_FT_SPU_BUSY, slot->spu_num, (uint32_t)slot->image_id, slot->wid, ft_t0, ps3_ft_now());
             AcquireSRWLockExclusive(&si->lock);
+            /* A helper retires as soon as the live key no longer names it; the
+             * job it just ran stays complete and its counters are untouched. */
+            if (slot->extra && !spurs_extra_slot_allowed(si, slot)) break;
             if (native_runs < 256 && spurs_pm_native_try_rerun(si, slot)) {
                 __atomic_fetch_add(&s_pm_native_reruns, 1, __ATOMIC_RELAXED);
                 native_runs++;
@@ -2346,7 +2363,7 @@ static DWORD WINAPI spurs_pm_worker(LPVOID p)
              * releases its share of the physical lane and the per-wid budget. */
             if (si->extra_active[wid]) si->extra_active[wid]--;
             if (slot->spu_num < 6)
-                si->lane_wid[slot->spu_num] &= (u8)~(1u << wid);
+                si->lane_wid[slot->spu_num] &= (u16)~(1u << wid);
             if (polls) si->idle[wid] = 0;
             else if (si->idle[wid] < 4) si->idle[wid]++;
             slot->busy = 0;
@@ -2355,7 +2372,7 @@ static DWORD WINAPI spurs_pm_worker(LPVOID p)
         }
         if (si->active[wid]) si->active[wid]--;
         if (slot->spu_num < 6)
-            si->lane_wid[slot->spu_num] &= (u8)~(1u << wid);
+            si->lane_wid[slot->spu_num] &= (u16)~(1u << wid);
         spu_lockline_lock();
         vm_base[slot->ea + SPURS_WKL_CURCONT + wid] = si->active[wid];
         ef_line_end(slot->ea);
@@ -2366,6 +2383,78 @@ static DWORD WINAPI spurs_pm_worker(LPVOID p)
     }
     ReleaseSRWLockExclusive(&si->lock);
     ps3_tprof_thread_exit();
+    return 0;
+}
+
+/* One hidden host lane: find a mesh workload with published work and a
+ * physical lane row that the same workload is not already using, consume one
+ * ready unit / the signal bit exactly like the coordinator, and park the work
+ * on the helper slot. Called with si->lock and s_workload_registry_lock held.
+ * The helper never changes guest-visible active/curcont and never exceeds the
+ * guest's maxContention (five concurrent mesh instances). */
+static int spurs_extra_dispatch_slot(struct SpursInst* si, u32 enabled, u32 ex)
+{
+    if (ex >= si->extra_count) return 0;
+    struct SpursPmSlot* slot = &si->slots[si->nspus + ex];
+    if (slot->busy || !slot->extra) return 0;
+    if (slot->extra_index >= (u32)spurs_extra_lanes_requested()) return 0;
+    const u32 ea = si->ea;
+    for (u32 checked = 0; checked < 16; checked++) {
+        u32 wid = si->cursor;
+        si->cursor = (wid + 1) & 15;
+        if (!spurs_extra_lanes_enabled(si, wid)) continue;
+        if (!(enabled & (0x80000000u >> wid)) ||
+            vm_read8(ea + SPURS_WKL_STATE1 + wid) != 2 ||
+            !s_workloads[wid].in_use || s_workloads[wid].spurs_ea != ea ||
+            s_workloads[wid].shutting_down)
+            continue;
+        const u32 maxcont = vm_read8(ea + SPURS_WKL_MAXCONT + wid);
+        if (maxcont != 5) continue;          /* the c690 mesh protocol */
+        if ((u32)si->active[wid] + si->extra_active[wid] >= maxcont)
+            continue;
+        u32 signal = vm_read16(ea + SPURS_WKL_SIGNAL1);
+        u32 ready = vm_read8(ea + SPURS_WKL_READY1 + wid);
+        const u32 bit = 0x8000u >> wid;
+        if (!ready && !(signal & bit)) continue;
+        u32 donor = si->nspus;
+        for (u32 d = 0; d < si->nspus; d++) {
+            if (!vm_read8(ea + SPURS_WKL_INFO1 + wid * SPURS_WKL_INFO_SZ +
+                          0x18 + d))
+                continue;                /* priority zero (also lane 5 here) */
+            if (si->lane_wid[d] & (u16)(1u << wid)) continue;
+            donor = d;
+            break;
+        }
+        if (donor >= si->nspus) continue;
+        WklPm* pm = spurs_resolve_pm(wid);
+        if (!pm) continue;
+        spu_lockline_lock();
+        ready = vm_read8(ea + SPURS_WKL_READY1 + wid);
+        signal = vm_read16(ea + SPURS_WKL_SIGNAL1);
+        if (!ready && !(signal & bit)) { spu_lockline_unlock(); continue; }
+        const int ready_level = spurs_ready_level();
+        if (!ready && (signal & bit))
+            ef_w16(ea + SPURS_WKL_SIGNAL1, (u16)(signal & ~bit));
+        else if (ready && !ready_level)
+            vm_base[ea + SPURS_WKL_READY1 + wid] = (u8)(ready - 1);
+        ef_line_end(ea);
+        slot->fn = pm->fn; slot->image_id = pm->image_id;
+        slot->pm = vm_base + (u32)(uintptr_t)s_workloads[wid].pm;
+        slot->pm_size = s_workloads[wid].sizePm;
+        slot->data = vm_read64(ea + SPURS_WKL_INFO1 + wid * SPURS_WKL_INFO_SZ + 8);
+        slot->wid = wid; slot->ea = ea; slot->spu_num = donor;
+        slot->extra = 1; slot->extra_index = ex;
+        slot->reg_epoch = __atomic_load_n(&s_workload_epoch, __ATOMIC_ACQUIRE);
+        __atomic_fetch_add(&s_pm_extra_dispatches, 1, __ATOMIC_RELAXED);
+        si->extra_active[wid]++;
+        si->lane_wid[donor] |= (u16)(1u << wid);
+        si->idle[wid] = 0;
+        ps3_trace_instant(PS3_TR_SPURS_KICK, wid,
+                          donor | ((ready & 0xFFu) << 8) | 0x80u);
+        slot->busy = 1;
+        WakeAllConditionVariable(&si->wake);
+        return 1;
+    }
     return 0;
 }
 
@@ -2417,6 +2506,10 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
                 if (!vm_read8(ea + SPURS_WKL_INFO1 + wid * SPURS_WKL_INFO_SZ + 0x18 + sn) &&
                     !lane6)
                     continue; /* priority zero makes this physical lane ineligible */
+                /* A hidden lane may already own this (workload, lane) row.
+                 * Running a second instance there would share the resident PM
+                 * local store and the job list's per-SPU row. */
+                if (sn < 6 && (si->lane_wid[sn] & (u16)(1u << wid))) continue;
                 u32 maxcont = vm_read8(ea + SPURS_WKL_MAXCONT + wid);
                 if (lane6 && maxcont < 6) maxcont = 6;
                 if (!maxcont || si->active[wid] >= maxcont) continue;
@@ -2481,7 +2574,7 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
                  * with what ready count. */
                 ps3_trace_instant(PS3_TR_SPURS_KICK, wid,
                                   (uint32_t)sn | ((ready & 0xFFu) << 8));
-                if (sn < 6) si->lane_wid[sn] |= (u8)(1u << wid);
+                if (sn < 6) si->lane_wid[sn] |= (u16)(1u << wid);
                 slot->busy = 1;
                 WakeAllConditionVariable(&si->wake);
                 break;
@@ -2492,7 +2585,7 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
          * Each hidden lane runs a physical lane id (spu_num 0..nspus-1) whose
          * same workload is not already running there, so the PM's per-SPU
          * list state is never double-owned. Guest-visible active/curcont are
-         * untouched. */
+         * untouched, and the per-workload total never exceeds maxContention. */
         {
             int limit = spurs_extra_lanes_requested();
             if (limit > (int)si->extra_count) limit = (int)si->extra_count;
@@ -2500,66 +2593,7 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
             for (u32 ex = 0; ex < si->extra_count; ex++)
                 if (si->slots[si->nspus + ex].busy) used++;
             for (u32 ex = 0; ex < si->extra_count && used < limit; ex++) {
-                struct SpursPmSlot* slot = &si->slots[si->nspus + ex];
-                if (slot->busy) continue;
-                int dispatched = 0;
-                for (u32 checked = 0; checked < 16 && !dispatched; checked++) {
-                    u32 wid = si->cursor;
-                    si->cursor = (wid + 1) & 15;
-                    if (!spurs_extra_lanes_enabled(si, wid)) continue;
-                    if (!(enabled & (0x80000000u >> wid)) ||
-                        vm_read8(ea + SPURS_WKL_STATE1 + wid) != 2 ||
-                        !s_workloads[wid].in_use || s_workloads[wid].spurs_ea != ea ||
-                        s_workloads[wid].shutting_down)
-                        continue;
-                    u32 maxcont = vm_read8(ea + SPURS_WKL_MAXCONT + wid);
-                    if (maxcont != 5) continue;          /* the c690 mesh protocol */
-                    if ((u32)si->active[wid] + si->extra_active[wid] >= maxcont)
-                        continue;
-                    u32 signal = vm_read16(ea + SPURS_WKL_SIGNAL1);
-                    u32 ready = vm_read8(ea + SPURS_WKL_READY1 + wid);
-                    const u32 bit = 0x8000u >> wid;
-                    if (!ready && !(signal & bit)) continue;
-                    u32 donor = si->nspus;
-                    for (u32 d = 0; d < si->nspus; d++) {
-                        if (!vm_read8(ea + SPURS_WKL_INFO1 + wid * SPURS_WKL_INFO_SZ +
-                                      0x18 + d))
-                            continue;                /* priority zero */
-                        if (si->lane_wid[d] & (u8)(1u << wid)) continue;
-                        donor = d;
-                        break;
-                    }
-                    if (donor >= si->nspus) continue;
-                    WklPm* pm = spurs_resolve_pm(wid);
-                    if (!pm) continue;
-                    spu_lockline_lock();
-                    ready = vm_read8(ea + SPURS_WKL_READY1 + wid);
-                    signal = vm_read16(ea + SPURS_WKL_SIGNAL1);
-                    if (!ready && !(signal & bit)) { spu_lockline_unlock(); continue; }
-                    const int ready_level = spurs_ready_level();
-                    if (!ready && (signal & bit))
-                        ef_w16(ea + SPURS_WKL_SIGNAL1, (u16)(signal & ~bit));
-                    else if (ready && !ready_level)
-                        vm_base[ea + SPURS_WKL_READY1 + wid] = (u8)(ready - 1);
-                    ef_line_end(ea);
-                    slot->fn = pm->fn; slot->image_id = pm->image_id;
-                    slot->pm = vm_base + (u32)(uintptr_t)s_workloads[wid].pm;
-                    slot->pm_size = s_workloads[wid].sizePm;
-                    slot->data = vm_read64(ea + SPURS_WKL_INFO1 + wid * SPURS_WKL_INFO_SZ + 8);
-                    slot->wid = wid; slot->ea = ea; slot->spu_num = donor;
-                    slot->extra = 1;
-                    slot->reg_epoch = __atomic_load_n(&s_workload_epoch, __ATOMIC_ACQUIRE);
-                    __atomic_fetch_add(&s_pm_extra_dispatches, 1, __ATOMIC_RELAXED);
-                    si->extra_active[wid]++;
-                    si->lane_wid[donor] |= (u8)(1u << wid);
-                    si->idle[wid] = 0;
-                    ps3_trace_instant(PS3_TR_SPURS_KICK, wid,
-                                      donor | ((ready & 0xFFu) << 8) | 0x80u);
-                    slot->busy = 1;
-                    WakeAllConditionVariable(&si->wake);
-                    used++;
-                    dispatched = 1;
-                }
+                if (spurs_extra_dispatch_slot(si, enabled, ex)) used++;
             }
         }
         ReleaseSRWLockExclusive(&s_workload_registry_lock);
@@ -2579,7 +2613,10 @@ static s32 spurs_scheduler_start(struct SpursInst* si)
     memset(si->lane_wid, 0, sizeof(si->lane_wid));
     memset(si->extra_active, 0, sizeof(si->extra_active));
     memset(si->slots, 0, sizeof(si->slots));
-    si->extra_count = (u32)spurs_extra_lanes_requested();
+    /* Helpers are created once per instance and stay parked until the live
+     * key names them, so an in-run A/B can raise the count without restarting
+     * the game. The key never adds host threads after start. */
+    si->extra_count = SPURS_EXTRA_LANES_MAX;
     for (u32 sn = 0; sn < si->nspus; sn++) {
         struct SpursPmSlot* slot = &si->slots[sn];
         slot->instance = si; slot->spu_num = sn;
@@ -2589,6 +2626,7 @@ static s32 spurs_scheduler_start(struct SpursInst* si)
     for (u32 ex = 0; ex < si->extra_count; ex++) {
         struct SpursPmSlot* slot = &si->slots[si->nspus + ex];
         slot->instance = si; slot->spu_num = 0; slot->extra = 1;
+        slot->extra_index = ex;
         slot->thread = CreateThread(NULL, 1u << 20, spurs_pm_worker, slot, 0, NULL);
         if (!slot->thread) goto failed;
     }
@@ -2618,7 +2656,9 @@ static s32 spurs_scheduler_stop(struct SpursInst* si, u32 ea)
     if (si->ea != ea || !si->kernel_live) { ReleaseSRWLockExclusive(&si->lock); return CELL_SPURS_CORE_ERROR_STAT; }
     if (si->stopping || si->starting) { ReleaseSRWLockExclusive(&si->lock); return CELL_SPURS_CORE_ERROR_BUSY; }
     for (u32 wid = 0; wid < 16; wid++)
-        if (si->active[wid]) { ReleaseSRWLockExclusive(&si->lock); return CELL_SPURS_CORE_ERROR_BUSY; }
+        if (si->active[wid] || si->extra_active[wid]) {
+            ReleaseSRWLockExclusive(&si->lock); return CELL_SPURS_CORE_ERROR_BUSY;
+        }
     si->stopping = 1; WakeAllConditionVariable(&si->wake);
     ReleaseSRWLockExclusive(&si->lock);
     if (si->coordinator) { WaitForSingleObject(si->coordinator, INFINITE); CloseHandle(si->coordinator); si->coordinator = NULL; }
