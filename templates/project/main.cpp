@@ -266,9 +266,30 @@ static DWORD WINAPI frame_clock(LPVOID)
     const char* pump_env = getenv("PS3RECOMP_PUMP_MS");
     const int   pump_ms  = pump_env && atoi(pump_env) > 0 ? atoi(pump_env) : 0;
     ULONGLONG   last_pump = 0;
+    /* PS3RECOMP_STALL_TRACE=1: time each part of the frame-clock pass and
+     * print one line when the pass took >= STALL_TRACE_US (default 200 ms).
+     * Diagnostic only; default off. */
+    const char* stall_env = getenv("PS3RECOMP_STALL_TRACE");
+    const int   stall_tr  = stall_env && *stall_env == '1';
+    const char* stall_us_env = getenv("PS3RECOMP_STALL_TRACE_US");
+    const unsigned long long stall_lim_us =
+        stall_us_env && strtoull(stall_us_env, NULL, 0) > 0
+            ? strtoull(stall_us_env, NULL, 0) : 200000ull;
+    auto st_now_us = [&]() -> unsigned long long {
+        LARGE_INTEGER q; QueryPerformanceCounter(&q);
+        return (unsigned long long)((double)q.QuadPart * 1000000.0 / (double)qpf);
+    };
 
     for (;;) {
-        cellGcm_fifo_kick_wait(idle_ms);
+        unsigned long long st_loop0 = stall_tr ? st_now_us() : 0;
+        unsigned long long st_kick = 0, st_tickp = 0, st_tickd = 0;
+        unsigned long long st_present = 0, st_drain = 0, st_pump = 0;
+        int st_ticks = 0;
+        {
+            const unsigned long long a = stall_tr ? st_now_us() : 0;
+            cellGcm_fifo_kick_wait(idle_ms);
+            if (stall_tr) st_kick = st_now_us() - a;
+        }
         LARGE_INTEGER now_q;
         QueryPerformanceCounter(&now_q);
         ULONGLONG now = (ULONGLONG)now_q.QuadPart;
@@ -283,20 +304,29 @@ static DWORD WINAPI frame_clock(LPVOID)
              * after the drain races the guest's next-frame writes and shows a
              * mixed one. */
             if (rsx_ok && cellGcm_take_flip_pending()) {
+                const unsigned long long a = stall_tr ? st_now_us() : 0;
                 present_guest_frame();
+                if (stall_tr) st_tickp += st_now_us() - a;
                 last_flip = cellGcm_flip_request_count();
             }
             /* Drain the FIFO every tick. This is what writes the RSX sync-fence
              * labels the game's per-frame logic blocks on, so it has to keep
              * advancing at 60 Hz even while present() throttles. */
-            if (rsx_ok) cellGcm_rsx_process_fifo();
+            if (rsx_ok) {
+                const unsigned long long a = stall_tr ? st_now_us() : 0;
+                cellGcm_rsx_process_fifo();
+                if (stall_tr) st_tickd += st_now_us() - a;
+            }
             next_tick += tick_period_qpc();   /* default 16 ms; EXP_TICK_US */
             fired++;
             if (pump_ms && rsx_ok) {
                 const ULONGLONG t = GetTickCount64();
                 if (t - last_pump >= (ULONGLONG)pump_ms) {
                     last_pump = t;
-                    if (rsx_backend_pump() != 0) {
+                    const unsigned long long a = stall_tr ? st_now_us() : 0;
+                    const int q = rsx_backend_pump();
+                    if (stall_tr) st_pump += st_now_us() - a;
+                    if (q != 0) {
                         rsx_ok = 0;
                         ps3_host_quit("window closed");
                         break;
@@ -305,6 +335,7 @@ static DWORD WINAPI frame_clock(LPVOID)
             }
         }
         if (fired >= 240) next_tick = now;   /* fell too far behind -- resync */
+        st_ticks = fired;
 
         /* Drain at the outer cadence too, not only on the 16 ms tick: titles
          * fence every render pass on a label the drain writes, and one wave of
@@ -312,28 +343,55 @@ static DWORD WINAPI frame_clock(LPVOID)
          * The real RSX writes them in microseconds. */
         if (rsx_ok) {
             if (cellGcm_take_flip_pending()) {
+                const unsigned long long a = stall_tr ? st_now_us() : 0;
                 present_guest_frame();
+                if (stall_tr) st_present += st_now_us() - a;
                 last_flip = cellGcm_flip_request_count();
             }
-            cellGcm_rsx_process_fifo();
+            {
+                const unsigned long long a = stall_tr ? st_now_us() : 0;
+                cellGcm_rsx_process_fifo();
+                if (stall_tr) st_drain += st_now_us() - a;
+            }
 
             last_pump = GetTickCount64();
-            if (rsx_backend_pump() != 0) {
-                rsx_ok = 0;              /* window closed */
-                /* ...so quit, as the console's Quit Game does, instead of
-                 * leaving the game running with no window. */
-                ps3_host_quit("window closed");
-                continue;
+            {
+                const unsigned long long a = stall_tr ? st_now_us() : 0;
+                const int q = rsx_backend_pump();
+                if (stall_tr) st_pump += st_now_us() - a;
+                if (q != 0) {
+                    rsx_ok = 0;              /* window closed */
+                    /* ...so quit, as the console's Quit Game does, instead of
+                     * leaving the game running with no window. */
+                    ps3_host_quit("window closed");
+                    continue;
+                }
             }
             /* Present on a guest flip. A present on a fixed clock can catch the
              * drain mid-frame and flash a partial one. Before the first flip
              * present freely, so the window is not blank during boot. */
             unsigned fc = cellGcm_flip_request_count();
             if (fc != last_flip) {
+                const unsigned long long a = stall_tr ? st_now_us() : 0;
                 present_guest_frame();
+                if (stall_tr) st_present += st_now_us() - a;
                 last_flip = fc;
             } else if (fc == 0) {
+                const unsigned long long a = stall_tr ? st_now_us() : 0;
                 rsx_backend_present();
+                if (stall_tr) st_present += st_now_us() - a;
+            }
+        }
+        if (stall_tr) {
+            const unsigned long long total = st_now_us() - st_loop0;
+            if (total >= stall_lim_us) {
+                fprintf(stderr,
+                        "[stalltrace] loop total=%.1fms ticks=%d kick=%.1f "
+                        "tickp=%.1f tickd=%.1f present=%.1f drain=%.1f pump=%.1f\n",
+                        total / 1000.0, st_ticks, st_kick / 1000.0,
+                        st_tickp / 1000.0, st_tickd / 1000.0,
+                        st_present / 1000.0, st_drain / 1000.0,
+                        st_pump / 1000.0);
             }
         }
     }

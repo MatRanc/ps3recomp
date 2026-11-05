@@ -54,6 +54,7 @@
 #include "ps3_live_ctl.h"
 #include "ps3emu/ps3_trace.h"   /* PS3RECOMP_TIMELINE: present and fence events */
 #include "rsx_tex_miss.h"
+#include "vk_dump_queue.h"
 #include "ps3emu/thread_name.h"
 #include "vulkan/rsx_vk_fallback_vert.spv.h"
 #include "vulkan/rsx_vk_fallback_frag.spv.h"
@@ -2530,9 +2531,12 @@ static int vk_present_new_only_on(void)
 
 /* Blit the offscreen target into the next swapchain image and hand the
  * present to the presentation thread. */
+static int vk_stall_trace_on(void);
+
 static void vk_present_window(void)
 {
     if (!s_vk.windowed || !s_vk.swapchain) return;
+    const unsigned long long st_win0 = vk_stall_trace_on() ? vk_now_us() : 0;
 
     const u32 present_frame = cellGcm_flip_frame_count();
     if (vk_present_new_only_on()) {
@@ -2558,8 +2562,13 @@ static void vk_present_window(void)
     if (slot < 0) { VKW_ADD(noslot); return; }
 
     u32 idx = 0;
+    const unsigned long long st_aq0 = vk_stall_trace_on() ? vk_now_us() : 0;
     VkResult r = pvkAcquireNextImageKHR(s_vk.device, s_vk.swapchain, vk_acquire_timeout_ns(),
                                        s_vk.sem_acquire[slot], VK_NULL_HANDLE, &idx);
+    if (st_aq0) {
+        const unsigned long long dt = vk_now_us() - st_aq0;
+        if (dt >= 200000ull) VK_LOG("stalltrace acquire=%.1fms\n", dt / 1000.0);
+    }
     if (r == VK_NOT_READY || r == VK_TIMEOUT) {
         VKW_ADD(notready);
         vk_present_slot_release(slot);
@@ -2649,6 +2658,10 @@ static void vk_present_window(void)
     if (s_vk.present_thread_on) {
         vk_present_enqueue((u32)slot, idx, present_frame, pace_due, submit_us,
                            s_vk.sc_done[idx]);
+        if (st_win0) {
+            const unsigned long long dt = vk_now_us() - st_win0;
+            if (dt >= 200000ull) VK_LOG("stalltrace present_window=%.1fms\n", dt / 1000.0);
+        }
         return;
     }
 
@@ -2678,15 +2691,40 @@ static void vk_present_window(void)
     vk_present_slot_release(slot);
 }
 
+static int vk_stall_trace_on(void)
+{
+    static int on = -1;
+    if (on < 0) { const char* e = getenv("PS3RECOMP_STALL_TRACE"); on = e && *e == '1'; }
+    return on;
+}
+
+static int vk_dump_async_on(void)
+{
+    static int on = -1;
+    if (on < 0) { const char* e = getenv("PS3RECOMP_VK_DUMP_ASYNC"); on = e && *e == '1'; }
+    return on;
+}
+
 /* One write of a packed copy: a 3-byte fwrite per pixel cost the walker's
  * thread ~20% of its time at one dump every 10 frames. Written beside the
  * target and renamed over it, so a reader never sees half a frame. */
 static void vk_dump_ppm(const unsigned char* rgba)
 {
+    const unsigned long long st_t0 = vk_stall_trace_on() ? vk_now_us() : 0;
     const size_t n = (size_t)s_vk.width * s_vk.height;
     unsigned char* rgb = (unsigned char*)malloc(n * 3);
     if (!rgb) return;
     for (size_t i = 0; i < n; i++) memcpy(rgb + i * 3, rgba + i * 4, 3);
+    if (vk_dump_async_on() &&
+        vk_dump_queue_init(s_vk.dump_path) == 0 &&
+        vk_dump_queue_submit(rgb, n * 3, s_vk.width, s_vk.height) == 0) {
+        if (st_t0) {
+            const unsigned long long dt = vk_now_us() - st_t0;
+            if (dt >= 20000ull)
+                VK_LOG("stalltrace dump_handoff=%.1fms\n", dt / 1000.0);
+        }
+        return;
+    }
     char tmp[1024];
     snprintf(tmp, sizeof tmp, "%s.tmp", s_vk.dump_path);
     FILE* f = fopen(tmp, "wb");
@@ -2699,6 +2737,11 @@ static void vk_dump_ppm(const unsigned char* rgba)
     remove(s_vk.dump_path);   /* rename does not replace on Windows */
 #endif
     rename(tmp, s_vk.dump_path);
+    if (st_t0) {
+        const unsigned long long dt = vk_now_us() - st_t0;
+        if (dt >= 20000ull)
+            VK_LOG("stalltrace dump=%.1fms\n", dt / 1000.0);
+    }
 }
 
 /* ---------------------------------------------------------------------------
@@ -2791,7 +2834,9 @@ static void vk_present_complete_locked(void)
     if (!s_vk.present_inflight) return;
     {   const unsigned long long w0 = vk_now_us();
         pvkWaitForFences(s_vk.device, 1, &s_vk.present_fence, VK_TRUE, UINT64_MAX);
-        s_eb_wait_us[9] += vk_now_us() - w0; }
+        const unsigned long long dt = vk_now_us() - w0;
+        s_eb_wait_us[9] += dt;
+        if (dt >= 200000ull) VK_LOG("stalltrace present_fence=%.1fms\n", dt / 1000.0); }
     __atomic_store_n(&s_vk.present_inflight, 0, __ATOMIC_RELEASE);
 
     vk_invalidate(&s_vk.readback);
@@ -6194,6 +6239,7 @@ void rsx_vulkan_backend_shutdown(void)
         }
     }
     vk_present_thread_stop();        /* drains queued presents, then joins */
+    vk_dump_queue_shutdown();
     if (s_vk.windowed || s_vk.window) vk_window_drop(NULL);
     if (s_vk.device) {
         vk_device_idle();
