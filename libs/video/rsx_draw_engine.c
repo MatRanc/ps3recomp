@@ -672,6 +672,8 @@ void rsx_draw_engine_set_guest_memory(rsx_vertex_guest_ptr_fn reader, void* user
 typedef struct {
     u32 ea, location, offset, size;
     const u8* bytes;
+    const u8* fallback;         /* exact SPU bytes until `ready` completes */
+    unsigned long long ready;   /* renderer submission that produces `bytes` */
     u8 by_offset;
     u8 pending;
 } eng_gpu_range;
@@ -680,6 +682,8 @@ static int s_gpu_rng_n;
 static unsigned s_gpu_rng_gen;
 static pthread_mutex_t s_gpu_rng_mu = PTHREAD_MUTEX_INITIALIZER;
 static rsx_gpu_range_prepare_fn s_gpu_prepare;
+static rsx_gpu_range_kick_fn s_gpu_kick;
+static rsx_gpu_range_done_fn s_gpu_done_fn;
 static int s_gpu_preparing;
 
 static void eng_gpu_scratch_rewind(void);
@@ -705,7 +709,9 @@ void rsx_draw_engine_gpu_range_clear(void)
 }
 
 static void gpu_range_set(u32 ea, u32 location, u32 offset, u32 size,
-                          const u8* bytes, int by_offset, int pending)
+                          const u8* bytes, const u8* fallback,
+                          unsigned long long ready,
+                          int by_offset, int pending)
 {
     eng_gpu_range_wlock();
     int slot = -1;
@@ -721,27 +727,47 @@ static void gpu_range_set(u32 ea, u32 location, u32 offset, u32 size,
     }
     eng_gpu_range* e = &s_gpu_rng[slot];
     e->ea = ea; e->location = location; e->offset = offset; e->size = size;
-    e->bytes = bytes; e->by_offset = (u8)by_offset; e->pending = (u8)pending;
+    e->bytes = bytes; e->fallback = fallback; e->ready = ready;
+    e->by_offset = (u8)by_offset; e->pending = (u8)pending;
     /* A shadow buffer must outlive the map entry; the renderer owns it. */
     eng_gpu_range_wunlock();
 }
 
 void rsx_draw_engine_gpu_range_add_ea(u32 ea, u32 size, const u8* bytes)
 {
-    gpu_range_set(ea, 0, 0, size, bytes, 0, 0);
+    gpu_range_set(ea, 0, 0, size, bytes, NULL, 0, 0, 0);
+}
+void rsx_draw_engine_gpu_range_add_ea_ready(u32 ea, u32 size, const u8* bytes,
+                                            const u8* fallback,
+                                            unsigned long long ready)
+{
+    gpu_range_set(ea, 0, 0, size, bytes, fallback, ready, 0, 0);
 }
 void rsx_draw_engine_gpu_range_add_offset(u32 location, u32 offset, u32 size,
                                           const u8* bytes)
 {
-    gpu_range_set(0, location, offset, size, bytes, 1, 0);
+    gpu_range_set(0, location, offset, size, bytes, NULL, 0, 1, 0);
 }
 void rsx_draw_engine_gpu_range_pending(u32 ea, u32 size)
 {
-    gpu_range_set(ea, 0, 0, size, NULL, 0, 1);
+    gpu_range_set(ea, 0, 0, size, NULL, NULL, 0, 0, 1);
 }
 void rsx_draw_engine_gpu_range_set_prepare(rsx_gpu_range_prepare_fn fn)
 {
     s_gpu_prepare = fn;
+}
+void rsx_draw_engine_gpu_range_set_kick(rsx_gpu_range_kick_fn fn)
+{
+    s_gpu_kick = fn;
+}
+void rsx_draw_engine_gpu_range_kick(void)
+{
+    rsx_gpu_range_kick_fn k = __atomic_load_n(&s_gpu_kick, __ATOMIC_RELAXED);
+    if (k) k();
+}
+void rsx_draw_engine_gpu_range_set_done(rsx_gpu_range_done_fn fn)
+{
+    s_gpu_done_fn = fn;
 }
 
 typedef struct {
@@ -797,10 +823,20 @@ static int eng_gpu_range_probe(u32 location, u32 offset, u32 min_bytes,
             }
             return ENG_GPU_MISS;
         }
-        if (!e->bytes) continue;
+        /* CPU readers never block. Until the renderer reports the producing
+         * submission complete they take the exact SPU seed; afterwards they
+         * take the GPU bytes. If neither exists, fall through to the guest
+         * copy (also the exact SPU output). */
+        const u8* rbytes = e->bytes;
+        if (e->ready) {
+            rsx_gpu_range_done_fn d =
+                __atomic_load_n(&s_gpu_done_fn, __ATOMIC_RELAXED);
+            if (!d || d() < e->ready) rbytes = e->fallback;
+        }
+        if (!rbytes) continue;
         const u64 lo = rlo > glo ? rlo : glo;
         const u64 hi = rhi < ghi ? rhi : ghi;
-        hit->bytes = e->bytes + (lo - glo);
+        hit->bytes = rbytes + (lo - glo);
         hit->req_start = req_start;
         hit->hit_start = (u32)lo;
         hit->hit_len = (u32)(hi - lo);
@@ -997,6 +1033,10 @@ static int rsx_wprof_sample_stride(void)
 
 int rsx_wprof_drain_begin(void)
 {
+    /* Drain boundary: give the renderer a chance to put the jobs queued so
+     * far on the GPU without waiting. Runs even with the profiler off (the
+     * name is historical); the hook is NULL unless the backend enables it. */
+    rsx_draw_engine_gpu_range_kick();
     if (rsx_wprof_enabled() <= 0) { s_wprof_pass = 0; return 0; }
     /* WALKER_PROF2 has its own exact per-draw timers (not sampled); do not
      * starve it of reports. */
