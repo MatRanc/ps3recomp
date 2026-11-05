@@ -17,6 +17,14 @@
 #include <stdio.h>
 #include <stdlib.h>
 
+/* The generated c690 module references c690_native_21_try()/the capture hooks
+ * weakly so that a runtime without them still links and takes the lifted body.
+ * A weak reference does not extract an archive member, so anchor the native
+ * 0x21 object here (this TU is always linked into the game). */
+extern int c690_native_21_enabled(void);
+static int (*const c690_native_21_link_anchor)(void)
+    __attribute__((used)) = c690_native_21_enabled;
+
 typedef void (*spu_dispatch_fn)(spu_context*);
 spu_dispatch_fn spu_lookup(uint32_t addr, int image_id);  /* spu_channels.c (exported) */
 void spu_indirect_branch(spu_context* ctx);               /* full resolver in the lib */

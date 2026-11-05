@@ -453,6 +453,17 @@ if(PS3RECOMP_BUILD_TESTS)
         "${CMAKE_CURRENT_SOURCE_DIR}/runtime/spu")
     add_test(NAME c690_holes_merge COMMAND test_c690_holes_merge)
 
+    # Native whole-command 0x21 emit: hook wiring, key-off fallback and the
+    # trivial selector path.  The byte-level proof is the meter corpus gate.
+    add_executable(test_c690_native_21
+        runtime/spu/tests/test_c690_native_21.c
+        runtime/spu/c690_native_21.c
+    )
+    target_include_directories(test_c690_native_21 PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/runtime/spu"
+        "${CMAKE_CURRENT_SOURCE_DIR}/libs/video")
+    add_test(NAME c690_native_21 COMMAND test_c690_native_21)
+
     # PS3_LOG_FIRST, the saturating counter behind the "first n times" log lines.
     add_executable(test_log_first tests/test_log_first.c)
     target_include_directories(test_log_first PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
