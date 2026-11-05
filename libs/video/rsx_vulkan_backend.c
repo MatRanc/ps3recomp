@@ -2897,6 +2897,9 @@ typedef struct vk_eng_obj {
 } vk_eng_obj;
 
 static vk_eng_obj s_eobj[VK_ENG_MAX_OBJ];
+/* Highest handle handed out since init: the object-table scans stop here
+ * instead of at the (now 8192-entry) array end. */
+static u32 s_eobj_hi;
 
 /* Defined with the E2 pipeline state further down. */
 static void vk_eng_drop_framebuffers(void);
@@ -2956,7 +2959,10 @@ static u32 vk_max_dim(void) { return s_vk.max_dim ? s_vk.max_dim : 4096u; }
 static u32 vk_eng_alloc(void)
 {
     for (u32 i = 1; i < VK_ENG_MAX_OBJ; i++)
-        if (s_eobj[i].kind == VK_ENG_FREE) return i;
+        if (s_eobj[i].kind == VK_ENG_FREE) {
+            if (i > s_eobj_hi) s_eobj_hi = i;
+            return i;
+        }
     VK_LOG("engine: object table full (%d)\n", VK_ENG_MAX_OBJ);
     return 0;
 }
@@ -3072,6 +3078,7 @@ static int vk_eng_init(void* user, u32 width, u32 height)
 {
     (void)user; (void)width; (void)height;
     memset(s_eobj, 0, sizeof s_eobj);
+    s_eobj_hi = 0;
     memset(&s_eng_bound, 0, sizeof s_eng_bound);
     return s_vk.device ? 0 : -1;
 }
@@ -3084,7 +3091,7 @@ static void vk_eng_release(void* user, u32 handle)
     if (!handle || handle >= VK_ENG_MAX_OBJ || s_eobj[handle].kind == VK_ENG_FREE) return;
     if (!vk_t_user) vk_mt_wait_all();   /* no recorded chunk may still name it */
     if (s_eobj[handle].kind == VK_ENG_COLOR)
-        for (u32 i = 1; i < VK_ENG_MAX_OBJ; i++)
+        for (u32 i = 1; i <= s_eobj_hi; i++)
             if (s_eobj[i].kind == VK_ENG_VIEW && s_eobj[i].surface == handle) {
                 vk_destroy_image(&s_eobj[i].im);
                 memset(&s_eobj[i], 0, sizeof s_eobj[i]);
@@ -3113,7 +3120,8 @@ static void vk_eng_readback_tickets_drain(void);
 static void vk_eng_shutdown(void* user)
 {
     vk_eng2_shutdown(user);
-    for (u32 i = 1; i < VK_ENG_MAX_OBJ; i++) vk_eng_release(user, i);
+    for (u32 i = 1; i <= s_eobj_hi; i++) vk_eng_release(user, i);
+    s_eobj_hi = 0;
     vk_eng_snapshot_pool_drain();
     vk_eb_release();
     vk_eng_readback_tickets_drain();
@@ -3547,7 +3555,7 @@ static u32 vk_eng_surface_view(void* user, u32 surface, u32 remap, u32 rsx_forma
             s_eobj[mh].rsx_fmt == rsx_format)
             return mh;
     }
-    for (u32 i = 1; i < VK_ENG_MAX_OBJ; i++)
+    for (u32 i = 1; i <= s_eobj_hi; i++)
         if (s_eobj[i].kind == VK_ENG_VIEW && s_eobj[i].surface == surface &&
             s_eobj[i].remap == remap && s_eobj[i].rsx_fmt == rsx_format) {
             if (memo) s_view_memo[ms] = (typeof(s_view_memo[0])){ surface, remap, rsx_format, i };
