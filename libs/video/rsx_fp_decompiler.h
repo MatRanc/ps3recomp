@@ -71,6 +71,14 @@ extern unsigned long long g_rsx_fp_nonfinite_constants;
 #define RSX_FP_CTRL_AUTO 0xFFFFFFFFu
 int rsx_fp_decompile(const u8* ucode, u32 max_bytes, u32 ctrl, char* out, u32 out_size);
 
+/* PS3RECOMP_FP_TXD (live key PS3_LIVE_FP_TXD, default off): translate the
+ * explicit-derivative fetch (TXD) and the DDX/DDY instructions it reads its
+ * derivatives from. Off, TXD stays an unhandled opcode and a gamma-state TXD
+ * rejects the whole program (the shader is dropped); on, TXD emits
+ * SampleGrad(coord, ddx, ddy) and gamma/sign-expand wraps it like the other
+ * fetches. Every one of the title's character shaders uses this pair. */
+int rsx_fp_txd_enabled(void);
+
 /* Apply the NV4097 fixed-function alpha test to an already-decompiled pixel
  * shader. D3D12 has no fixed-function alpha test, so the comparison is
  * emitted immediately before the shader's final color return. `func` uses

@@ -4907,6 +4907,13 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
         key = eng_fnv1a(&unnorm_mask, sizeof unnorm_mask, key);
         if (unnorm_mask) key = eng_fnv1a(unnorm_dim, sizeof unnorm_dim, key);
         if (wpos_scaled) key = eng_fnv1a(wpos_grid, sizeof wpos_grid, key);
+        /* PS3RECOMP_FP_TXD changes the generated program (a TXD gamma program
+         * that used to be rejected now translates), so a live flip must not
+         * reuse a pipeline built under the other setting. */
+        if (rsx_fp_txd_enabled()) {
+            static const u32 txd_tag = 0x44585446u;   /* "FTXD" */
+            key = eng_fnv1a(&txd_tag, sizeof txd_tag, key);
+        }
     }
     key = eng_fnv1a(&layout->mask, sizeof layout->mask, key);
     key = eng_fnv1a(&layout->stride, sizeof layout->stride, key);
@@ -5005,17 +5012,20 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
         const char* dir = getenv("RSX_ENGINE_SHADER_DUMP");
         if (dir && *dir) {
             char path[1024];
+            char stem[64];
             FILE* f;
-            snprintf(path, sizeof path, "%s/pipe%u.vs.hlsl", dir, handle);
+            if (handle) snprintf(stem, sizeof stem, "pipe%u", handle);
+            else snprintf(stem, sizeof stem, "fail%016llx", (unsigned long long)fp_hash);
+            snprintf(path, sizeof path, "%s/%s.vs.hlsl", dir, stem);
             if ((f = fopen(path, "w"))) { fputs(s_vs_hlsl, f); fclose(f); }
-            snprintf(path, sizeof path, "%s/pipe%u.ps.hlsl", dir, handle);
+            snprintf(path, sizeof path, "%s/%s.ps.hlsl", dir, stem);
             if ((f = fopen(path, "w"))) { fputs(s_ps_hlsl, f); fclose(f); }
             if (!fixed && fp_uc && fp_size) {
                 u32 fp_loc = 0;
                 const u32 fp_off = rsx_dsp_fragment_program(&g.rsx, &fp_loc);
-                snprintf(path, sizeof path, "%s/pipe%u.fp.bin", dir, handle);
+                snprintf(path, sizeof path, "%s/%s.fp.bin", dir, stem);
                 if ((f = fopen(path, "wb"))) { fwrite(fp_uc, 1, fp_size, f); fclose(f); }
-                snprintf(path, sizeof path, "%s/pipe%u.fp.txt", dir, handle);
+                snprintf(path, sizeof path, "%s/%s.fp.txt", dir, stem);
                 if ((f = fopen(path, "w"))) {
                     fprintf(f, "location %u offset 0x%08X size %u ctrl 0x%08X\n"
                                "fp %016llx\n",
@@ -6328,6 +6338,11 @@ static int pd_capturing(void)
     if (s_pd.state == 1 && s_pd.after_s &&
         difftime(time(NULL), s_pd.start) >= (double)s_pd.after_s && pd_open_index())
         fprintf(s_pd.index, "from a draw of frame %u, %u s in\n", g.frames, s_pd.after_s);
+    /* RSX_ENGINE_PASS_DUMP_NOW=1: arm at the first draw. The offline replay
+     * has no present, so the "first presented frame" trigger never fires and
+     * a captured frame's passes could not be dumped without a live run. */
+    if (s_pd.state == 1 && getenv("RSX_ENGINE_PASS_DUMP_NOW") && pd_open_index())
+        fprintf(s_pd.index, "from a draw of frame %u (armed at first draw)\n", g.frames);
     return s_pd.state == 2;
 }
 
@@ -8049,11 +8064,11 @@ static void sink_end_work(void* user, const rsx_dispatch* r)
                                           n_targets, &pipeline_is_fixed, &tex_used,
                                           &fp_hash);
     if (wp) wprof_phase(RSX_WPROF_PIPE, rsx_wprof_now() - wp_t0);
-    if (!pipeline) return;
     { const unsigned long long w2 = wp2_t0();
       const int dbg = fp_hash && eng_debug_fp(fp_hash, pipeline);
       wp2_add(WPROF2_PIPE_DEBUG, w2);
       if (dbg) return; }
+    if (!pipeline) return;
 
     u32 textures[RSX_BE_MAX_TEXTURES];
     rsx_be_sampler_desc samplers[RSX_BE_MAX_TEXTURES];

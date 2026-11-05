@@ -14,6 +14,22 @@
 #include <stdio.h>
 #include <string.h>
 #include "ps3emu/log_first.h"
+#include "ps3_live_ctl.h"
+
+/* Explicit-derivative fetches. The RSX/NV40 TXD instruction carries three
+ * source vectors: the texture coordinate (SRC0), its partial derivative along
+ * the window x axis (SRC1) and along y (SRC2). The title's character shaders
+ * compute those with DDX/DDY and then sample a normal map (EXP_TEX) and a
+ * gamma-flagged colour map from the same pair, so without TXD the whole
+ * program is rejected and the character torso is never drawn. */
+int rsx_fp_txd_enabled(void)
+{
+#if defined(__GNUC__) && !defined(_WIN32)
+    if (ps3_live_ctl_get) return ps3_live_ctl_get(PS3_LIVE_FP_TXD);
+#endif
+    const char* e = getenv("PS3RECOMP_FP_TXD");
+    return e && *e && strcmp(e, "0") != 0;
+}
 
 /* ---- DWORD 0 (OPDEST) --------------------------------------------------- */
 #define FP_END              (1u << 0)
@@ -873,7 +889,8 @@ static int rsx_fp_decompile_internal(
         }
 
         if (gamma_masks && gamma_masks[tex_unit] && !(w0 & (1u << 21)) &&
-            (opcode == OP_TXD || opcode == OP_TEXBEM || opcode == OP_TXPBEM)) {
+            (opcode == OP_TXD || opcode == OP_TEXBEM || opcode == OP_TXPBEM) &&
+            !(opcode == OP_TXD && rsx_fp_txd_enabled())) {
             static u32 reported;
             if (PS3_LOG_FIRST(reported, 32))
                 fprintf(stderr, "[RSX fp] gamma fetch opcode %u unsupported on unit %u\n", opcode, tex_unit);
@@ -980,6 +997,43 @@ static int rsx_fp_decompile_internal(
                 snprintf(rhs, sizeof(rhs),
                          "rsx_tex[%u].Sample(rsx_samp[%u], (%s).xy)", tex_unit, tex_unit, a);
             break;
+        case OP_DDX: case OP_DDY:
+            if (!rsx_fp_txd_enabled()) {
+                /* Keep the old text byte for byte when the key is off. */
+                char todo[160];
+                snprintf(todo, sizeof todo,
+                         "    /* TODO: unhandled FP opcode 0x%02X (%s) words %08X %08X %08X %08X */\n",
+                         opcode, rsx_fp_opcode_name(opcode), w0, w1, w2, w3);
+                out_puts(&o, todo);
+                handled = 0;
+            } else {
+                snprintf(rhs, sizeof(rhs), "%s(%s)",
+                         opcode == OP_DDX ? "ddx" : "ddy", a);
+            }
+            break;
+        case OP_TXD:
+            if (!rsx_fp_txd_enabled()) {
+                char todo[160];
+                snprintf(todo, sizeof todo,
+                         "    /* TODO: unhandled FP opcode 0x%02X (%s) words %08X %08X %08X %08X */\n",
+                         opcode, rsx_fp_opcode_name(opcode), w0, w1, w2, w3);
+                out_puts(&o, todo);
+                handled = 0;
+                break;
+            }
+            if ((tex_sep_mask >> tex_unit) & 1u)
+                snprintf(rhs, sizeof(rhs),
+                         "rsx_tex%u.SampleGrad(rsx_samp[%u], (%s).xyz, (%s).xyz, (%s).xyz)",
+                         tex_unit, tex_unit, a, b, c);
+            else if (tex_sep_mask)
+                snprintf(rhs, sizeof(rhs),
+                         "rsx_tex%u.SampleGrad(rsx_samp[%u], (%s).xy, (%s).xy, (%s).xy)",
+                         tex_unit, tex_unit, a, b, c);
+            else
+                snprintf(rhs, sizeof(rhs),
+                         "rsx_tex[%u].SampleGrad(rsx_samp[%u], (%s).xy, (%s).xy, (%s).xy)",
+                         tex_unit, tex_unit, a, b, c);
+            break;
         case OP_TXP:
             if (shadow && shadow[tex_unit].enabled) {
                 snprintf(rhs, sizeof(rhs), "_rsx_shadow%u((%s).xyz / (%s).w)", tex_unit, a, a);
@@ -1049,7 +1103,8 @@ static int rsx_fp_decompile_internal(
         }
 
         if (gamma_masks && gamma_masks[tex_unit] && !(w0 & (1u << 21)) &&
-            (opcode == OP_TEX || opcode == OP_TXP || opcode == OP_TXB || opcode == OP_TXL)) {
+            (opcode == OP_TEX || opcode == OP_TXP || opcode == OP_TXB || opcode == OP_TXL ||
+             (opcode == OP_TXD && rsx_fp_txd_enabled()))) {
             char sample[sizeof rhs]; memcpy(sample, rhs, sizeof sample);
             const int length = snprintf(rhs, sizeof rhs, "_rsx_gamma_input(%s, %uu)",
                                         sample, gamma_masks[tex_unit] & 15u);
@@ -1064,7 +1119,8 @@ static int rsx_fp_decompile_internal(
          * A comparison fetch has nothing to expand. */
         if (((w0 & (1u << 21)) || (expand_masks && expand_masks[tex_unit])) &&
             !(shadow && shadow[tex_unit].enabled) &&
-            (opcode == OP_TEX || opcode == OP_TXP || opcode == OP_TXB || opcode == OP_TXL)) {
+            (opcode == OP_TEX || opcode == OP_TXP || opcode == OP_TXB || opcode == OP_TXL ||
+             (opcode == OP_TXD && rsx_fp_txd_enabled()))) {
             const int bx2 = (w0 & (1u << 21)) != 0;
             u32 mask = bx2 ? 15u : (expand_masks[tex_unit] & 0x1Fu);
             if (!bx2 && gamma_masks) mask &= ~(gamma_masks[tex_unit] & 15u);

@@ -591,6 +591,43 @@ int main(void)
 
     }
 
+    /* PS3RECOMP_FP_TXD: the character shader's DDX/DDY + TXD pair. Off, a
+     * gamma-state TXD rejects the program (the draw is dropped) and DDX/DDY
+     * stay unhandled. On, TXD samples with the explicit derivatives the
+     * program computed and the gamma wrapper is applied to the result. The
+     * words are a real meter-frame character program (fp 4e49b63161c5f0f7),
+     * shortened to DDX + TXD. */
+    {
+        u8 prog[32];
+        u8 gamma[16] = {0};
+        u8 expand[16] = {0};
+        u32 nk = 0;
+        put_word(prog + 0, 0x15400680);   /* DDX h0.xy, h1 (xyzw) */
+        put_word(prog + 4, 0x1C9DC904);
+        put_word(prog + 8, 0x0001C800);
+        put_word(prog + 12, 0x0001C800);
+        put_word(prog + 16, 0x19081E9D);  /* TXD h14, unit 4, END */
+        put_word(prog + 20, 0x1C9D5D0C);  /* coord h3.zwzz */
+        put_word(prog + 24, 0x00015D08);  /* ddx   h2.zwzz */
+        put_word(prog + 28, 0x0001C90C);  /* ddy   h3.xyzw */
+        gamma[4] = 7;
+        unsetenv("PS3RECOMP_FP_TXD");
+        int off = rsx_fp_decompile_buffered_shadow_color_expand_vol_ex(
+            prog, sizeof prog, CTRL_32BIT, 0, 0, NULL, gamma, expand,
+            hlsl, sizeof hlsl, &nk);
+        check_true("txd_gamma_off_rejects", off < 0);
+        setenv("PS3RECOMP_FP_TXD", "1", 1);
+        int on = rsx_fp_decompile_buffered_shadow_color_expand_vol_ex(
+            prog, sizeof prog, CTRL_32BIT, 0, 0, NULL, gamma, expand,
+            hlsl, sizeof hlsl, &nk);
+        check_true("txd_gamma_on_translates", on > 0);
+        check("txd_sample_grad", hlsl,
+              "rsx_tex[4].SampleGrad(rsx_samp[4], ((h[3]).zwzz).xy, ((h[2]).zwzz).xy, ((h[3]).xyzw).xy)");
+        check("txd_ddx", hlsl, "ddx((h[1]).xyzw)");
+        check("txd_gamma_wrap", hlsl, "_rsx_gamma_input(");
+        unsetenv("PS3RECOMP_FP_TXD");
+    }
+
     printf("\n===========================================\n");
     printf("Results: %d passed, %d failed\n", g_pass, g_fail);
     return g_fail ? 1 : 0;
