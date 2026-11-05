@@ -589,6 +589,11 @@ static inline void rsx_ww_end(int site, unsigned long long t0)
 {
     if (t0) rsx_ww_add(site, rsx_wprof_now() - t0);
 }
+void rsx_ww_add_tag(int site, unsigned long long ns, const char* who);
+static inline void rsx_ww_end_tag(int site, unsigned long long t0, const char* who)
+{
+    if (t0) rsx_ww_add_tag(site, rsx_wprof_now() - t0, who);
+}
 /* vkCreate*Pipelines time, reported as `pipecrt`/`pipems` in the next report. */
 void rsx_wprof_note_pipeline_create(unsigned long long ns);
 /* Log and reset the frame counters if a flip was seen in this pass.

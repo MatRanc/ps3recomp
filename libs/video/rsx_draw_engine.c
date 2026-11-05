@@ -863,6 +863,20 @@ void rsx_ww_add(int site, unsigned long long ns)
     __atomic_fetch_add(&s_ww_ns[site], ns, __ATOMIC_RELAXED);
     __atomic_fetch_add(&s_ww_n[site], 1, __ATOMIC_RELAXED);
 }
+/* Per-caller split of the one-shot waits. Keyed by the __func__ pointer (one per
+ * function); only the walker thread adds, the report runs on it too. */
+#define WW_TAGS 48
+static struct { const char* who; unsigned long long ns, n; } s_ww_tag[WW_TAGS];
+void rsx_ww_add_tag(int site, unsigned long long ns, const char* who)
+{
+    rsx_ww_add(site, ns);
+    for (int i = 0; i < WW_TAGS; i++) {
+        if (s_ww_tag[i].who == who || !s_ww_tag[i].who) {
+            s_ww_tag[i].who = who; s_ww_tag[i].ns += ns; s_ww_tag[i].n++;
+            return;
+        }
+    }
+}
 /* One line per walker-prof report, ms per frame (f = flips in the window).
  * Unlike the phase sums these cover every drain, not the sampled ones. */
 static void rsx_ww_report(double f)
@@ -877,6 +891,14 @@ static void rsx_ww_report(double f)
     }
     fprintf(stderr, "[walker-waits] report=%llu flips=%llu in_drain_total=%.3fms |%s\n",
             s_wp_frames, s_wp_flips, tot, buf);
+    char tb[WW_TAGS * 56]; o = 0; tb[0] = 0;
+    for (int i = 0; i < WW_TAGS && s_ww_tag[i].who; i++) {
+        if (s_ww_tag[i].n)
+            o += snprintf(tb + o, sizeof tb - (size_t)o, " %s=%.3f(%.1f)",
+                          s_ww_tag[i].who, (double)s_ww_tag[i].ns / 1e6 / f, (double)s_ww_tag[i].n / f);
+        s_ww_tag[i].ns = s_ww_tag[i].n = 0;
+    }
+    fprintf(stderr, "[oneshot-by] report=%llu%s\n", s_wp_frames, tb);
 }
 
 void rsx_wprof_note_drain(unsigned long long ns)

@@ -947,7 +947,7 @@ static unsigned long long vk_now_us(void)
     struct timespec ts; timespec_get(&ts, TIME_UTC);
     return (unsigned long long)ts.tv_sec * 1000000ull + (unsigned long long)ts.tv_nsec / 1000ull;
 }
-static int vk_submit_and_wait(void)
+static int vk_submit_and_wait_at(const char* who)
 {
     if (vk_t_user) return vk_mt_oneshot_submit(vk_t_user);
     vk_pass_close();
@@ -960,11 +960,27 @@ static int vk_submit_and_wait(void)
     {   const unsigned long long w0 = vk_now_us();
         const unsigned long long ww_t0 = rsx_ww_begin();
         VK_CHECK(pvkWaitForFences(s_vk.device, 1, &s_vk.fence, VK_TRUE, UINT64_MAX), "vkWaitForFences");
-        rsx_ww_end(RSX_WW_ONESHOT, ww_t0);
+        rsx_ww_end_tag(RSX_WW_ONESHOT, ww_t0, who);
         vk_ebs_wait_other();
         s_eb_wait_us[s_wait_tag] += vk_now_us() - w0; }
     return 0;
 }
+/* Callers are attributed by function name in [oneshot-by] (PS3RECOMP_WALKER_WAITS). */
+#define vk_submit_and_wait() vk_submit_and_wait_at(__func__)
+
+/* PS3RECOMP_VK_BATCH_CREATES (default 0, live): a create/snapshot whose result the CPU does not
+ * read records its barrier/clear/copy into the open draw batch instead of a submit+wait. A
+ * one-shot also waits for every pipelined frame set (vk_ebs_wait_other), so each one stalls
+ * frames in flight. Later uses are queue-ordered after it in the same or a later submit. */
+static int vk_batch_creates(void)
+{
+    if (vk_t_user || !vk_eb_active()) return 0;
+    if (ps3_live_ctl_get) return ps3_live_ctl_get(PS3_LIVE_VK_BATCH_CREATES);
+    const char* e = getenv("PS3RECOMP_VK_BATCH_CREATES");
+    return e && *e && strcmp(e, "0") != 0;
+}
+#define vk_begin_j(j) (((j) && s_eb_pending) ? 0 : vk_begin())
+#define vk_end_j(j) ((j) ? (vk_eb_recorded(), 0) : vk_submit_and_wait())
 
 /* Order this command buffer's use of an image after everything submitted
  * before it; from UNDEFINED it is also the one-time move to GENERAL. */
@@ -3301,12 +3317,13 @@ static u32 vk_eng_color_target_create(void* user, rsx_be_format fmt, u32 w, u32 
     o->kind = VK_ENG_COLOR; o->fmt = vf; o->bpp = bpp; o->w = w; o->h = h;
     /* UNDEFINED -> GENERAL, then the guest's own bytes when the engine could
      * resolve them, else transparent black so the contents are defined. */
-    if (vk_begin()) { vk_eng_release(user, hd); return 0; }
+    const int jn = vk_batch_creates();
+    if (vk_begin_j(jn)) { vk_eng_release(user, hd); return 0; }
     vk_barrier_image(o->im.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_UNDEFINED);
     VkClearColorValue zero = { .float32 = { 0.0f, 0.0f, 0.0f, 0.0f } };
     VkImageSubresourceRange r = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
     pvkCmdClearColorImage(s_vk.cmd, o->im.img, VK_IMAGE_LAYOUT_GENERAL, &zero, 1, &r);
-    if (vk_submit_and_wait()) { vk_eng_release(user, hd); return 0; }
+    if (vk_end_j(jn)) { vk_eng_release(user, hd); return 0; }
     if (seed && seed_row_bytes)
         vk_eng_upload(o->im.img, 0, 0, w, h, bpp, seed, seed_row_bytes);
     return hd;
@@ -3327,12 +3344,13 @@ static u32 vk_eng_depth_target_create(void* user, u32 w, u32 h)
     }
     o->kind = VK_ENG_DEPTH; o->fmt = s_vk.depth_format; o->w = w; o->h = h;
     /* Far plane, for the reason the display depth starts there. */
-    if (vk_begin()) { vk_eng_release(user, hd); return 0; }
+    const int jn = vk_batch_creates();
+    if (vk_begin_j(jn)) { vk_eng_release(user, hd); return 0; }
     vk_barrier_image(o->im.img, s_vk.depth_aspect, VK_IMAGE_LAYOUT_UNDEFINED);
     VkClearDepthStencilValue far_plane = { 1.0f, 0 };
     VkImageSubresourceRange r = { s_vk.depth_aspect, 0, 1, 0, 1 };
     pvkCmdClearDepthStencilImage(s_vk.cmd, o->im.img, VK_IMAGE_LAYOUT_GENERAL, &far_plane, 1, &r);
-    if (vk_submit_and_wait()) { vk_eng_release(user, hd); return 0; }
+    if (vk_end_j(jn)) { vk_eng_release(user, hd); return 0; }
     return hd;
 }
 
@@ -3635,9 +3653,10 @@ static u32 vk_eng_texture_create(void* user, rsx_be_format fmt, u32 w, u32 h,
     o->kind = VK_ENG_TEXTURE; o->fmt = vf; o->w = w; o->h = h; o->cube = (u8)cube; o->mips = mips;
     o->bpp = bc ? 0 : bpp; o->block = bc ? bpp : 0;
     /* UNDEFINED -> GENERAL for every level and face before the uploads arrive. */
-    if (vk_begin()) goto fail;
+    const int jn = vk_batch_creates();
+    if (vk_begin_j(jn)) goto fail;
     vk_barrier_image(o->im.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_UNDEFINED);
-    if (vk_submit_and_wait()) goto fail;
+    if (vk_end_j(jn)) goto fail;
     return hd;
 fail:
     vk_destroy_image(&o->im);
@@ -3907,7 +3926,9 @@ static u32 vk_eng_color_snapshot(void* user, u32 surface)
     }
     o->kind = VK_ENG_COLOR; o->snapshot = 1;
     o->fmt = t->fmt; o->bpp = t->bpp; o->w = t->w; o->h = t->h;
-    if (vk_begin()) { vk_eng_release(user, hd); return 0; }
+    const int jn = vk_batch_creates();
+    if (vk_begin_j(jn)) { vk_eng_release(user, hd); return 0; }
+    if (jn) vk_cmd_after_everything(s_vk.cmd);
     vk_barrier_image(o->im.img, VK_IMAGE_ASPECT_COLOR_BIT,
                      reused ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_UNDEFINED);
     vk_barrier_image(t->im.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL);
@@ -3920,7 +3941,7 @@ static u32 vk_eng_color_snapshot(void* user, u32 surface)
                     o->im.img, VK_IMAGE_LAYOUT_GENERAL, 1, &c);
     /* The copy, made visible to whatever samples it next. */
     vk_barrier_image(o->im.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL);
-    if (vk_submit_and_wait()) { vk_eng_release(user, hd); return 0; }
+    if (vk_end_j(jn)) { vk_eng_release(user, hd); return 0; }
     return hd;
 }
 
@@ -3953,13 +3974,14 @@ static u32 vk_eng_depth_constant(void* user, float value)
         vk_destroy_image(&t->im); memset(t, 0, sizeof *t); return 0;
     }
     t->kind = VK_ENG_TEXTURE; t->fmt = VK_FORMAT_R32_SFLOAT; t->bpp = 4; t->w = 1; t->h = 1;
-    if (vk_begin()) { vk_eng_release(user, hd); return 0; }
+    const int jn = vk_batch_creates();
+    if (vk_begin_j(jn)) { vk_eng_release(user, hd); return 0; }
     vk_barrier_image(t->im.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_UNDEFINED);
     VkClearColorValue cv = { .float32 = { value, 0.0f, 0.0f, 0.0f } };
     VkImageSubresourceRange r = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
     pvkCmdClearColorImage(s_vk.cmd, t->im.img, VK_IMAGE_LAYOUT_GENERAL, &cv, 1, &r);
     vk_barrier_image(t->im.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL);
-    if (vk_submit_and_wait()) { vk_eng_release(user, hd); return 0; }
+    if (vk_end_j(jn)) { vk_eng_release(user, hd); return 0; }
     s_dconst[slot].v = value; s_dconst[slot].h = hd;
     return hd;
 }
@@ -3995,9 +4017,10 @@ static u32 vk_eng_depth_snapshot(void* user, u32 depth, u32 w, u32 h)
         t->kind = VK_ENG_TEXTURE; t->fmt = VK_FORMAT_R32_SFLOAT; t->bpp = 4; t->w = w; t->h = h;
         z = vk_eng_get(depth, VK_ENG_DEPTH);          /* same slot; reload for clarity */
         z->surface = snap;
-        if (vk_begin()) return 0;
+        const int jn = vk_batch_creates();
+        if (vk_begin_j(jn)) return 0;
         vk_barrier_image(t->im.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_UNDEFINED);
-        if (vk_submit_and_wait()) return 0;
+        if (vk_end_j(jn)) return 0;
     }
 
     /* The bounce buffer stays (device-local when the device has it, grown as
@@ -5619,7 +5642,10 @@ static void vk_eng_flush(void)
         s_wait_tag = s_eb_why & 7;
         s_eb_why = 0; }
     s_eb_pending = 0;               /* first: the submit below must not re-enter */
-    vk_submit_and_wait();
+    {   /* [oneshot-by] splits a blocking flush by why (the same codes as VK_EB_STATS) */
+        static const char* const nm[9] = { "flush:other", "flush:ring", "flush:unbatched", "flush:max",
+            "flush:engine", "flush:destroy", "flush:present", "flush:begin", "flush:own" };
+        vk_submit_and_wait_at(nm[s_wait_tag < 9 ? s_wait_tag : 8]); }
     s_eb_batch_id++;
     ps3_trace_instant(PS3_TR_DRAW_SUBMIT, s_eb_batch_id, (uint32_t)s_eb.flushes);
     s_wait_tag = 8;

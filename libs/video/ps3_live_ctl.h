@@ -103,6 +103,7 @@ enum {
     PS3_LIVE_VK_PASS_KEEP,              /* PS3RECOMP_VK_PASS_KEEP: consecutive draws to the same targets share a render pass and one barrier */
     PS3_LIVE_VK_DRAW_STATE,             /* PS3RECOMP_VK_DRAW_STATE: skip re-binding unchanged pipeline / viewport / scissor / stencil */
     PS3_LIVE_VK_VTX_PRE,                /* PS3RECOMP_VK_VTX_PRE (needs PASS_KEEP): vertex-unpack dispatches go to a pre command buffer */
+    PS3_LIVE_VK_BATCH_CREATES,          /* PS3RECOMP_VK_BATCH_CREATES: target/texture/snapshot creates join the open draw batch instead of a submit+wait */
     PS3_LIVE_COUNT
 };
 
