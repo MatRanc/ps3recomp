@@ -32,6 +32,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdatomic.h>
+#include <sched.h>
 #include <time.h>
 #include "ps3emu/log_first.h"
 #include "../../runtime/memory/vm.h"   /* vm_commit: the capture images pages */
@@ -895,6 +896,32 @@ static rsx_wcap_state s_wcap_state;
 
 static u32*   s_wcap_words;
 static size_t s_wcap_nwords, s_wcap_cwords;
+
+/* The replay restores the captured register file and then walks the captured
+ * FIFO with *cold* engine caches, while the live capture frame ran with warm
+ * ones. Two consequences break the M0 gate:
+ *   - the fetch-plan memo turns a draw's span read (the note that images its
+ *     guest pages) into a memo hit, so the frame never notes the vertex bytes
+ *     it is about to draw; a replay of it then drops those draws as
+ *     untransformable (1,278 of 1,705 backend draws, 23k read misses).
+ *   - a cached texture is not re-read on every bind, but a cold replay may
+ *     validate it, so its span must be imaged even if this frame only served
+ *     it from the cache.
+ * Flush the plan memos and note every cached texture span at the capture
+ * boundary. The captured frame then performs (and notes) the same guest reads
+ * a cold replay will, without changing what it renders. */
+static u32 eng_texture_entry_span(const eng_texture* e);
+
+static void wcap_note_cached_textures(void)
+{
+    for (u32 i = 0; i < g.n_textures; i++) {
+        const eng_texture* e = &g.textures[i];
+        if (!e->handle || !e->width || !e->height) continue;
+        const u32 span = eng_texture_entry_span(e);
+        if (span) rsx_wcap_note_texture(e->location, e->offset, span);
+    }
+}
+
 static wcap_range* s_wcap_ranges;
 static size_t s_wcap_nranges, s_wcap_cranges;
 static wcap_page*  s_wcap_pages;
@@ -1119,6 +1146,9 @@ int rsx_wcap_begin_if_triggered(void)
 
     memset(&s_wcap_state, 0, sizeof s_wcap_state);
     if (rsx_draw_engine_state_snapshot(&s_wcap_state) != 0) return s_wcap_active;
+    /* Cold-start the frame the replay will see (see wcap_note_cached_textures). */
+    s_fast_epoch++;
+    wcap_note_cached_textures();
     s_wcap_state.io_addr = 0x00100000u;
     s_wcap_state.io_size = 0x00400000u;
     s_wcap_nwords = 0;
@@ -5218,7 +5248,7 @@ static int dc_remap_memo_restore(const eng_remap_memo* m)
  * than fetching a phantom vertex wherever the restart sentinel appears, then
  * collapse repeated references and fetch each unique vertex once.
  * rsx_live_draw.c's fetch_batches_hoisted (4165-4292). */
-static void dc_fetch(const rsx_vertex_layout_plan* layout, int allow_remap)
+static void dc_fetch(const rsx_vertex_layout_plan* layout, int allow_remap, int refs_only)
 {
     const unsigned long long wp2_refs = wp2_t0();
     if (dc.n_immediate) {
@@ -5286,6 +5316,14 @@ static void dc_fetch(const rsx_vertex_layout_plan* layout, int allow_remap)
     const unsigned long long wp2_plan = wp2_t0();
     dc.n_source_refs = dc.n_refs;
     dc.layout = *layout;
+    if (refs_only) {
+        /* M3: stop after the reference build. The worker does the remap,
+         * span resolve, topology/index rebuild and conversion from these
+         * references. */
+        rsx_vertex_fetch_plan_init(&dc.fetch_plan, &g.rsx, layout, NULL, NULL);
+        wp2_add(WPROF2_FETCH_PLAN, wp2_plan);
+        return;
+    }
 
     /* Cut 1. An inline stream has no plan to reuse and an immediate group
      * never reaches here, so both keep the old path. The plan is initialized
@@ -6357,28 +6395,30 @@ static u64 s_eng_other_layout = 0;
 
 static u32 s_gpu_remap_buf[65536];
 
-static void eng_check_gpu_vertex_offload(rsx_vtx_gpu_desc* desc, u32 uploaded)
+static void eng_check_gpu_vertex_offload_ex(rsx_vtx_gpu_desc* desc, u32 uploaded,
+                                            int deferred,
+                                            const rsx_vertex_layout_plan* l,
+                                            const rsx_vertex_fetch_plan* p,
+                                            const rsx_vertex_ref* refs,
+                                            u32* remap_buf)
 {
     memset(desc, 0, sizeof(*desc));
     desc->vertex_count = uploaded;
-    s_eng_calls++;
-    if (!uploaded || !dc.fetch_deferred || !dc.refs || uploaded > 65536) {
-        s_eng_not_deferred++;
+    __atomic_fetch_add(&s_eng_calls, 1, __ATOMIC_RELAXED);
+    if (!uploaded || !deferred || !refs || uploaded > 65536) {
+        __atomic_fetch_add(&s_eng_not_deferred, 1, __ATOMIC_RELAXED);
         return;
     }
 
-    const rsx_vertex_layout_plan* l = &dc.layout;
-    const rsx_vertex_fetch_plan* p = &dc.fetch_plan;
-
     if (l->count == 0 || l->count > 8) {
-        s_eng_other_layout++;
+        __atomic_fetch_add(&s_eng_other_layout, 1, __ATOMIC_RELAXED);
         return;
     }
 
     /* Check that all active attributes have valid stable_base and consistent stride */
     const rsx_vertex_fetch_attr* a0 = &p->attr[l->attrs[0]];
     if (!a0->stable_base || !a0->stride) {
-        s_eng_other_layout++;
+        __atomic_fetch_add(&s_eng_other_layout, 1, __ATOMIC_RELAXED);
         return;
     }
 
@@ -6387,7 +6427,7 @@ static void eng_check_gpu_vertex_offload(rsx_vtx_gpu_desc* desc, u32 uploaded)
     for (u32 i = 1; i < l->count; i++) {
         const rsx_vertex_fetch_attr* a = &p->attr[l->attrs[i]];
         if (!a->stable_base || a->stride != src_stride) {
-            s_eng_other_layout++;
+            __atomic_fetch_add(&s_eng_other_layout, 1, __ATOMIC_RELAXED);
             return;
         }
         if (a->stable_base < min_base) {
@@ -6400,7 +6440,7 @@ static void eng_check_gpu_vertex_offload(rsx_vtx_gpu_desc* desc, u32 uploaded)
         const rsx_vertex_fetch_attr* a = &p->attr[l->attrs[i]];
         ptrdiff_t diff = a->stable_base - min_base;
         if (diff < 0 || diff >= (ptrdiff_t)src_stride) {
-            s_eng_other_layout++;
+            __atomic_fetch_add(&s_eng_other_layout, 1, __ATOMIC_RELAXED);
             return;
         }
     }
@@ -6458,10 +6498,10 @@ static void eng_check_gpu_vertex_offload(rsx_vtx_gpu_desc* desc, u32 uploaded)
     /* Check contiguous refs */
     int contiguous = 1;
     if (uploaded > 1) {
-        const u32 f = dc.refs[0].vertex_id;
-        const u32 b = dc.refs[0].base_index;
+        const u32 f = refs[0].vertex_id;
+        const u32 b = refs[0].base_index;
         for (u32 i = 1; i < uploaded; i++) {
-            if (dc.refs[i].vertex_id != f + i || dc.refs[i].base_index != b) {
+            if (refs[i].vertex_id != f + i || refs[i].base_index != b) {
                 contiguous = 0;
                 break;
             }
@@ -6476,16 +6516,16 @@ static void eng_check_gpu_vertex_offload(rsx_vtx_gpu_desc* desc, u32 uploaded)
         desc->dst_stride = dst_stride;
         desc->raw_data = min_base;
         desc->raw_bytes = uploaded * src_stride;
-        if (mode == 0) s_eng_eligible_m0++;
-        else if (mode == 1) s_eng_eligible_m1++;
-        else if (mode == 2) s_eng_eligible_m2++;
-        else s_eng_eligible_m3++;
+        if (mode == 0) __atomic_fetch_add(&s_eng_eligible_m0, 1, __ATOMIC_RELAXED);
+        else if (mode == 1) __atomic_fetch_add(&s_eng_eligible_m1, 1, __ATOMIC_RELAXED);
+        else if (mode == 2) __atomic_fetch_add(&s_eng_eligible_m2, 1, __ATOMIC_RELAXED);
+        else __atomic_fetch_add(&s_eng_eligible_m3, 1, __ATOMIC_RELAXED);
         return;
     }
 
     /* Non-contiguous / indexed vertex remap offload */
     if (a0->stable_last < a0->stable_first) {
-        s_eng_not_contiguous++;
+        __atomic_fetch_add(&s_eng_not_contiguous, 1, __ATOMIC_RELAXED);
         return;
     }
 
@@ -6493,19 +6533,19 @@ static void eng_check_gpu_vertex_offload(rsx_vtx_gpu_desc* desc, u32 uploaded)
     const u32 raw_bytes = span * src_stride;
     /* Safety bounds: reject if span exceeds 4 MB or is excessively sparse */
     if (raw_bytes > 4u * 1024u * 1024u || (span > 4096u && span > uploaded * 8u)) {
-        s_eng_not_contiguous++;
+        __atomic_fetch_add(&s_eng_not_contiguous, 1, __ATOMIC_RELAXED);
         return;
     }
 
     const u32 first = a0->stable_first;
     const u32 max_elem = span - 1u;
     for (u32 i = 0; i < uploaded; i++) {
-        const u32 elem = ((dc.refs[i].vertex_id + dc.refs[i].base_index) & 0x000FFFFFu) - first;
+        const u32 elem = ((refs[i].vertex_id + refs[i].base_index) & 0x000FFFFFu) - first;
         if (elem > max_elem) {
-            s_eng_not_contiguous++;
+            __atomic_fetch_add(&s_eng_not_contiguous, 1, __ATOMIC_RELAXED);
             return;
         }
-        s_gpu_remap_buf[i] = elem;
+        remap_buf[i] = elem;
     }
 
     desc->gpu_eligible = 1;
@@ -6516,11 +6556,17 @@ static void eng_check_gpu_vertex_offload(rsx_vtx_gpu_desc* desc, u32 uploaded)
     desc->raw_data = min_base;
     desc->raw_bytes = raw_bytes;
     desc->remap_indices = s_gpu_remap_buf;
-    s_eng_eligible_remap++;
-    if (mode == 0) s_eng_eligible_m0++;
-    else if (mode == 1) s_eng_eligible_m1++;
-    else if (mode == 2) s_eng_eligible_m2++;
-    else s_eng_eligible_m3++;
+    __atomic_fetch_add(&s_eng_eligible_remap, 1, __ATOMIC_RELAXED);
+    if (mode == 0) __atomic_fetch_add(&s_eng_eligible_m0, 1, __ATOMIC_RELAXED);
+    else if (mode == 1) __atomic_fetch_add(&s_eng_eligible_m1, 1, __ATOMIC_RELAXED);
+    else if (mode == 2) __atomic_fetch_add(&s_eng_eligible_m2, 1, __ATOMIC_RELAXED);
+    else __atomic_fetch_add(&s_eng_eligible_m3, 1, __ATOMIC_RELAXED);
+}
+
+static void eng_check_gpu_vertex_offload(rsx_vtx_gpu_desc* desc, u32 uploaded)
+{
+    eng_check_gpu_vertex_offload_ex(desc, uploaded, dc.fetch_deferred, &dc.layout,
+                                    &dc.fetch_plan, dc.refs, s_gpu_remap_buf);
 }
 
 /* ---- multi-threaded draw packets (PS3RECOMP_WALKER_MT) ------------------
@@ -6604,6 +6650,19 @@ typedef struct {
     u32 off_remap, n_remap;
     u32 off_inline, inline_bytes;
 
+    /* M3 worker packet: the state thread ships the source references, the
+     * post-init fetch plan (guest pointer filled in by the worker) and the
+     * draw's primitive/rebuild flags. The worker does remap, span resolve,
+     * topology/index rebuild and conversion in its own scratch. */
+    u32 prim;
+    u32 rebuild;
+    u32 allow_remap;
+    u32 n_src;
+    u32 off_src;
+    u32 n_cuts;
+    u32 off_cuts;
+    rsx_vertex_fetch_plan plan_init;
+
     /* Vertex plan snapshot (pointers replaced by span offsets). */
     rsx_vertex_layout_plan plan_layout;
     u32 plan_base_offset, plan_divider_mask;
@@ -6618,17 +6677,60 @@ typedef struct {
     rsx_dsp_surface track_sf;
 } eng_draw_pkt;
 
+#define ENG_MT_MAX_WORKERS 4
+#define ENG_MT_ARENA_BYTES (32u * 1024u * 1024u)
+#define ENG_MT_CHUNK_PKTS  16u
+
+/* Results of one packet's preparation, committed later in turn order. The
+ * pointed-to bytes live in the worker's chunk arena. */
+typedef struct {
+    const u8* verts;
+    const u32* idx;
+    rsx_vtx_gpu_desc gpu;
+    int ok, deferred, indexed;
+    u32 n_draw, uploaded, topology;
+} eng_prep;
+
+/* Per-worker preparation state. The state thread hands each worker a chunk of
+ * immutable packets; the worker does everything that needs no guest ordering
+ * (remap, span resolve, topology/index rebuild, conversion) and then waits for
+ * each packet's global turn to record the backend calls. The turn counter is
+ * the ordered commit: packet `seq` may only touch the backend when
+ * next_commit == seq, so the backend sees them in guest order on one thread
+ * at a time while the expensive preparation runs on N threads. */
+typedef struct {
+    int id;
+    rsx_vertex_remap remap;
+    rsx_vertex_ref* refs; u32 refs_cap, n_unique, n_source;
+    u32* remap_buf; u32 remap_cap;
+    rsx_vertex_fetch_plan plan;
+    u8* arena; u64 arena_cap, arena_used;
+    eng_prep prep[ENG_MT_CHUNK_PKTS];
+} eng_worker;
+
 static struct {
     int inited;
     int on;
     int workers;
-    rsx_record_queue* q;
+    rsx_record_queue* q[ENG_MT_MAX_WORKERS];
+    eng_worker w[ENG_MT_MAX_WORKERS];
+    eng_worker inline_w;
     u8* scratch;
     u32 cap, used;
-    u64 seq, enqueued, inline_fallbacks, syncs, snapshots, snapshot_fail;
+    /* The chunk being filled by the state thread: [u32 count][u32 pad] and
+     * then whole packet records back to back. */
+    u8* chunk;
+    u32 chunk_cap, chunk_used, chunk_pkts;
+    u64 chunk_id, seq, pushed_seq;
+    _Atomic u64 next_commit;
+    u64 enqueued, inline_fallbacks, syncs, snapshots, snapshot_fail, chunks;
 } s_mt;
 
-static void eng_mt_record_exec(void* ctx, const void* rec, u32 size);
+static void eng_mt_worker_exec(void* ctx, const void* rec, u32 size);
+static void eng_mt_sync(void);
+static int  eng_mt_prepare_one(const eng_draw_pkt* p, eng_worker* w, eng_prep* out);
+static void eng_mt_commit_packet(const eng_draw_pkt* p, const eng_prep* r);
+static void eng_mt_run_packet_inline(const eng_draw_pkt* p);
 
 static int eng_mt_env_int(const char* name, int def)
 {
@@ -6648,25 +6750,83 @@ static int eng_mt_workers(void)
     int n = ps3_live_ctl_get ? ps3_live_ctl_get(PS3_LIVE_WALKER_MT_WORKERS)
                              : eng_mt_env_int("PS3RECOMP_WALKER_MT_WORKERS", 0);
     if (n < 0) n = 0;
-    if (n > 1) n = 1;    /* M2: one record worker */
+    if (n > ENG_MT_MAX_WORKERS) n = ENG_MT_MAX_WORKERS;
     return n;
+}
+
+static int eng_mt_snapshot_on(void)
+{
+    const char* e = getenv("PS3RECOMP_WALKER_MT_SNAPSHOT");
+    if (!e || !*e) return 1;               /* conservative default */
+    return strcmp(e, "0") != 0;
+}
+
+static int eng_w_reserve(void** p, u32* cap, u32 n, size_t elem)
+{
+    if (n <= *cap) return 1;
+    u32 next = *cap ? *cap : 4096u;
+    while (next < n) next *= 2u;
+    void* q = realloc(*p, (size_t)next * elem);
+    if (!q) return 0;
+    *p = q; *cap = next;
+    return 1;
+}
+
+static int eng_w_reserve64(void** p, u64* cap, u64 n)
+{
+    if (n <= *cap) return 1;
+    u64 next = *cap ? *cap : 1u << 20;
+    while (next < n) next *= 2u;
+    void* q = realloc(*p, (size_t)next);
+    if (!q) return 0;
+    *p = q; *cap = next;
+    return 1;
+}
+
+static u8* eng_w_bump(eng_worker* w, u64 bytes)
+{
+    bytes = (bytes + 15u) & ~15ull;
+    if (w->arena_used + bytes > w->arena_cap) return NULL;
+    u8* p = w->arena + w->arena_used;
+    w->arena_used += bytes;
+    return p;
+}
+
+static void eng_worker_free(eng_worker* w)
+{
+    free(w->refs); free(w->remap_buf);
+    free(w->remap.occurrence_to_unique); free(w->remap.slots);
+    free(w->arena);
+    memset(w, 0, sizeof *w);
+}
+
+static void eng_mt_worker_ready(eng_worker* w, int id)
+{
+    memset(w, 0, sizeof *w);
+    w->id = id;
+    /* Reserved once; never reallocated while a chunk's outputs point into it. */
+    if (!eng_w_reserve64((void**)&w->arena, &w->arena_cap, ENG_MT_ARENA_BYTES))
+        fprintf(stderr, "[walker-mt] worker %d: arena allocation failed\n", id);
 }
 
 static void eng_mt_reset(void)
 {
-    if (s_mt.q) rsx_record_queue_destroy(s_mt.q);
+    for (int i = 0; i < ENG_MT_MAX_WORKERS; i++) {
+        if (s_mt.q[i]) rsx_record_queue_destroy(s_mt.q[i]);
+        eng_worker_free(&s_mt.w[i]);
+    }
+    eng_worker_free(&s_mt.inline_w);
+    free(s_mt.chunk);
     free(s_mt.scratch);
     memset(&s_mt, 0, sizeof s_mt);
 }
 
-/* Make sure the scratch packet arena and (if asked) the record worker exist. */
+/* Make sure the scratch packet arena, chunk buffer and record workers exist. */
 static int eng_mt_ensure(void)
 {
     const int on = eng_mt_on();
     if (!on) {
-        /* A live switch back to the old path must not leave records the old
-         * path would overtake. */
-        if (s_mt.q) eng_mt_sync();
+        if (s_mt.q[0] || s_mt.on) eng_mt_sync();
         s_mt.on = 0;
         return 0;
     }
@@ -6675,9 +6835,7 @@ static int eng_mt_ensure(void)
     s_mt.inited = 1;
     s_mt.workers = eng_mt_workers();
     /* The packet arena never reallocates while a packet is being built: every
-     * offset in the packet is relative to this one block, and the record
-     * worker reads it after the walker has moved on. A draw that does not fit
-     * falls back to the inline packet path. */
+     * offset in the packet is relative to this one block. */
     s_mt.cap = 64u * 1024u * 1024u;
     s_mt.scratch = (u8*)malloc(s_mt.cap);
     if (!s_mt.scratch) {
@@ -6685,17 +6843,36 @@ static int eng_mt_ensure(void)
         s_mt.on = 0;
         return 0;
     }
+    s_mt.chunk_cap = (u32)eng_mt_env_int("PS3RECOMP_WALKER_MT_CHUNK_KB", 4096) * 1024u;
+    if (s_mt.chunk_cap < 64u * 1024u) s_mt.chunk_cap = 64u * 1024u;
+    s_mt.chunk = (u8*)malloc(s_mt.chunk_cap);
+    if (!s_mt.chunk) {
+        free(s_mt.scratch); s_mt.scratch = NULL; s_mt.cap = 0; s_mt.on = 0;
+        return 0;
+    }
+    s_mt.chunk_used = 8;
+    s_mt.next_commit = 1;
+    eng_mt_worker_ready(&s_mt.inline_w, -1);
     if (s_mt.workers > 0) {
         const int mb = eng_mt_env_int("PS3RECOMP_WALKER_MT_QUEUE_MB", 16);
-        s_mt.q = rsx_record_queue_new((u32)(mb > 0 ? mb : 16) * 1024u * 1024u);
-        if (!s_mt.q || rsx_record_queue_start(s_mt.q, eng_mt_record_exec, NULL) != 0) {
-            if (s_mt.q) rsx_record_queue_destroy(s_mt.q);
-            s_mt.q = NULL;
-            s_mt.workers = 0;
-            fprintf(stderr, "[walker-mt] record worker did not start; serial packet path\n");
-        } else {
-            fprintf(stderr, "[walker-mt] record worker up (queue %d MB)\n", mb > 0 ? mb : 16);
+        const u32 qcap = (u32)(mb > 0 ? mb : 16) * 1024u * 1024u;
+        int up = 0;
+        for (int i = 0; i < s_mt.workers; i++) {
+            eng_mt_worker_ready(&s_mt.w[i], i);
+            s_mt.q[i] = rsx_record_queue_new(qcap);
+            if (!s_mt.q[i] || rsx_record_queue_start(s_mt.q[i], eng_mt_worker_exec,
+                                                     &s_mt.w[i]) != 0) {
+                if (s_mt.q[i]) { rsx_record_queue_destroy(s_mt.q[i]); s_mt.q[i] = NULL; }
+                break;
+            }
+            up++;
         }
+        s_mt.workers = up;
+        if (!up)
+            fprintf(stderr, "[walker-mt] record workers did not start; serial packet path\n");
+        else
+            fprintf(stderr, "[walker-mt] %d record workers up (queue %d MB, chunk %u KB)\n",
+                    up, mb > 0 ? mb : 16, s_mt.chunk_cap / 1024u);
     }
     return 1;
 }
@@ -6710,12 +6887,104 @@ static u32 eng_mt_alloc(u32 bytes)
     return off;
 }
 
-/* Drain every published record. Called before any backend call the state
- * thread makes itself, and at every guest-visible sync point. */
+static void eng_mt_wait_turn(u64 seq)
+{
+    int spins = 0;
+    while (atomic_load_explicit(&s_mt.next_commit, memory_order_acquire) != seq) {
+        if (++spins < 20000) {
+#if defined(__x86_64__) || defined(__i386__)
+            __builtin_ia32_pause();
+#endif
+            continue;
+        }
+        spins = 0;
+        sched_yield();
+    }
+}
+
+static void eng_mt_take_turn(u64 seq)
+{
+    atomic_store_explicit(&s_mt.next_commit, seq + 1, memory_order_release);
+}
+
+static void eng_mt_wait_upto(u64 upto)
+{
+    int spins = 0;
+    while (atomic_load_explicit(&s_mt.next_commit, memory_order_acquire) <= upto) {
+        if (++spins < 20000) {
+#if defined(__x86_64__) || defined(__i386__)
+            __builtin_ia32_pause();
+#endif
+            continue;
+        }
+        spins = 0;
+        sched_yield();
+    }
+}
+
+static int eng_mt_chunk_add(const void* rec, u32 bytes)
+{
+    if (s_mt.chunk_pkts >= ENG_MT_CHUNK_PKTS) return 0;
+    if (s_mt.chunk_used + bytes > s_mt.chunk_cap) return 0;
+    memcpy(s_mt.chunk + s_mt.chunk_used, rec, bytes);
+    s_mt.chunk_used += bytes;
+    s_mt.chunk_pkts++;
+    return 1;
+}
+
+static void eng_mt_chunk_close(void)
+{
+    if (!s_mt.chunk || s_mt.chunk_pkts == 0) return;
+    memcpy(s_mt.chunk, &s_mt.chunk_pkts, sizeof(u32));
+    const u32 bytes = s_mt.chunk_used;
+    if (s_mt.workers > 0) {
+        const int w = (int)(s_mt.chunk_id % (u64)s_mt.workers);
+        if (!rsx_record_queue_push(s_mt.q[w], s_mt.chunk, bytes)) {
+            /* The worker's ring is full: wait for everything already pushed
+             * to commit (the ring drains as it runs), never for this chunk. */
+            eng_mt_wait_upto(s_mt.pushed_seq);
+            if (!rsx_record_queue_push(s_mt.q[w], s_mt.chunk, bytes)) {
+                /* Still no room (a chunk bigger than the queue): run it here,
+                 * packet by packet, after the drain left the turn here. */
+                const u8* q = s_mt.chunk + 8;
+                for (u32 i = 0; i < s_mt.chunk_pkts; i++) {
+                    const eng_draw_pkt* p = (const eng_draw_pkt*)q;
+                    eng_mt_run_packet_inline(p);
+                    q += p->total_bytes;
+                }
+                s_mt.pushed_seq = s_mt.seq;
+                s_mt.chunk_pkts = 0;
+                s_mt.chunk_used = 8;
+                s_mt.chunk_id++;
+                return;
+            }
+        }
+        s_mt.pushed_seq = s_mt.seq;
+        s_mt.enqueued++;
+    } else {
+        /* Serial packet path: run inline in packet order. */
+        const u8* q = s_mt.chunk + 8;
+        for (u32 i = 0; i < s_mt.chunk_pkts; i++) {
+            const eng_draw_pkt* p = (const eng_draw_pkt*)q;
+            eng_mt_run_packet_inline(p);
+            q += p->total_bytes;
+        }
+    }
+    s_mt.chunk_pkts = 0;
+    s_mt.chunk_used = 8;
+    s_mt.chunk_id++;
+    s_mt.chunks++;
+}
+
+/* Drain every published chunk. Called before any backend call the state
+ * thread makes itself, and at every guest-visible sync point. Closes the open
+ * chunk first so a sync point is also a chunk boundary. */
 static void eng_mt_sync(void)
 {
-    if (!s_mt.q) return;
-    rsx_record_queue_sync(s_mt.q);
+    if (!s_mt.on) return;
+    eng_mt_chunk_close();
+    if (!s_mt.workers) return;
+    eng_mt_wait_upto(s_mt.seq);
     s_mt.syncs++;
 }
 
@@ -6724,19 +6993,144 @@ void rsx_draw_engine_mt_sync(void)
     eng_mt_sync();
 }
 
-/* The packet's fill callback: identical conversion to dc_fill_verts, but from
- * the packet-owned plan and reference list. */
+/* Snapshot every stable source span into the worker arena and repoint the
+ * plan at the copy. This is the conservative path (default): the c690 mesh
+ * rings can be rewritten while a packet waits in the queue. */
+static int eng_mt_snapshot_spans(eng_worker* w)
+{
+    for (u32 a = 0; a < RSX_DSP_NUM_VERTEX_ATTR; a++) {
+        rsx_vertex_fetch_attr* s = &w->plan.attr[a];
+        if (!s->stable_base) continue;
+        const u64 bytes = (u64)(s->stable_last - s->stable_first) * s->stride +
+                          s->elem_size;
+        if (!bytes) continue;
+        if (bytes > 32u * 1024u * 1024u) return 0;
+        u8* dst = eng_w_bump(w, bytes);
+        if (!dst) return 0;
+        memcpy(dst, s->stable_base, (size_t)bytes);
+        s->stable_base = dst;
+    }
+    return 1;
+}
+
+/* Worker-side guest reads: raw host pointer (live) or the replay harness's
+ * cap_read. Never the WCB access hook -- WCB is serviced on the owner thread. */
+static const u8* eng_guest_ptr_worker(void* user, u32 location, u32 offset,
+                                      u32 min_bytes)
+{
+    (void)user;
+    return eng_guest_ptr_raw(location, offset, min_bytes);
+}
+
+/* Reproduce dc_fetch's post-reference work on the worker: remap, span
+ * resolve, topology/index rebuild, GPU descriptor and conversion. All output
+ * lives in the worker arena (no realloc between packets), so a whole chunk
+ * can be prepared before the first packet takes its commit turn. Returns 0
+ * to drop the packet (nothing has touched the backend yet). */
+static int eng_mt_prepare_one(const eng_draw_pkt* p, eng_worker* w, eng_prep* out)
+{
+    memset(out, 0, sizeof *out);
+    const rsx_vertex_layout_plan* L = &p->plan_init.layout;
+    const u32 n = p->n_src;
+    w->n_source = n;
+    w->n_unique = n;
+    if (!n) return 0;
+    if (!eng_w_reserve((void**)&w->refs, &w->refs_cap, n, sizeof(rsx_vertex_ref)))
+        return 0;
+    memcpy(w->refs, (const u8*)p + p->off_src, (size_t)n * sizeof(rsx_vertex_ref));
+
+    u32 unique = n;
+    int remapped = 0;
+    if (s_vtx_remap && p->allow_remap && n > 1) {
+        if (rsx_vertex_remap_build(&w->remap, w->refs, n, &unique))
+            remapped = unique < n;
+        else
+            return 0;
+    }
+    w->n_unique = unique;
+    w->plan = p->plan_init;
+    w->plan.guest_ptr = eng_guest_ptr_worker;
+    w->plan.guest_user = NULL;
+    rsx_vertex_fetch_plan_prepare(&w->plan, w->refs, unique);
+
+    const int deferred = g.be->draw_fill && s_vtx_direct && L->stride &&
+                         !rsx_vertex_fetch_plan_can_fail(&w->plan);
+    out->deferred = deferred;
+
+    const u32* cuts = p->n_cuts ? (const u32*)((const u8*)p + p->off_cuts) : NULL;
+    int indexed = 0;
+    u32 n_draw = n;
+    u32 topology = p->topology;
+    if (p->rebuild) {
+        if (!eng_topology_rebuild(p->prim, remapped, &indexed)) return 0;
+        n_draw = indexed
+            ? rsx_draw_engine_topology_index_count(p->prim, n, cuts, p->n_cuts)
+            : n - n % 3u;
+    } else {
+        const rsx_topology topo = rsx_primitive_topology(p->prim);
+        if (topo == RSX_TOPOLOGY_UNSUPPORTED) return 0;
+        topology = (u32)topo;
+    }
+    if (!n_draw) return 0;
+    out->indexed = indexed;
+    out->n_draw = n_draw;
+    out->uploaded = indexed ? unique : n_draw;
+    out->topology = topology;
+
+    if (indexed) {
+        u32* idx = (u32*)eng_w_bump(w, (u64)n_draw * sizeof(u32));
+        if (!idx) return 0;
+        rsx_draw_engine_write_topology_indices(
+            p->prim, n, cuts, p->n_cuts,
+            remapped ? w->remap.occurrence_to_unique : NULL, idx);
+        out->idx = idx;
+    }
+
+    if (eng_mt_snapshot_on()) {
+        if (!eng_mt_snapshot_spans(w)) { __atomic_fetch_add(&s_mt.snapshot_fail, 1, __ATOMIC_RELAXED); return 0; }
+        __atomic_fetch_add(&s_mt.snapshots, 1, __ATOMIC_RELAXED);
+    }
+
+    if (!eng_w_reserve((void**)&w->remap_buf, &w->remap_cap, out->uploaded, sizeof(u32)))
+        return 0;
+    eng_check_gpu_vertex_offload_ex(&out->gpu, out->uploaded, deferred, L,
+                                    &w->plan, w->refs, w->remap_buf);
+
+    const u64 vbytes = (u64)unique * L->stride;
+    if (!vbytes) return 0;
+    u8* verts = eng_w_bump(w, vbytes);
+    if (!verts) return 0;
+    const int ok = deferred
+        ? rsx_vertex_fetch_many_stream(&w->plan, w->refs, unique, verts)
+        : rsx_vertex_fetch_many(&w->plan, w->refs, unique, verts);
+    if (!ok) return 0;
+    out->verts = verts;
+    out->ok = 1;
+    return 1;
+}
+
 typedef struct {
     rsx_vtx_gpu_desc gpu;          /* must stay first: the backend reads it */
-    rsx_vertex_fetch_plan plan;
-    const rsx_vertex_ref* refs;
-    u32 n;
-} eng_pkt_fill_ctx;
+    const u8* verts;
+    u32 bytes;
+} eng_mt_fill_ctx;
 
-static int eng_pkt_fill(void* ctx, void* dst)
+static int eng_mt_copy_fill(void* ctx, void* dst)
 {
-    const eng_pkt_fill_ctx* c = (const eng_pkt_fill_ctx*)ctx;
-    return rsx_vertex_fetch_many_stream(&c->plan, c->refs, c->n, (u8*)dst);
+    eng_mt_fill_ctx* c = (eng_mt_fill_ctx*)ctx;
+    memcpy(dst, c->verts, c->bytes);
+    s_fill_ok = 1;
+    return 1;
+}
+
+static void eng_mt_run_packet_inline(const eng_draw_pkt* p)
+{
+    eng_prep pr;
+    const int ok = eng_mt_prepare_one(p, &s_mt.inline_w, &pr);
+    eng_mt_wait_turn(p->seq);
+    if (ok && pr.ok) eng_mt_commit_packet(p, &pr);
+    eng_mt_take_turn(p->seq);
+    s_mt.inline_fallbacks++;
 }
 
 static void eng_pkt_binds(const eng_draw_pkt* p)
@@ -6748,14 +7142,12 @@ static void eng_pkt_binds(const eng_draw_pkt* p)
 }
 
 /* Execute a packet from the walker, with the draw payload still in dc /
- * g.indices (the serial packet path). */
+ * g.indices (the serial packet path, workers==0). */
 static void eng_pkt_commit_live(eng_draw_pkt* p)
 {
     eng_pkt_binds(p);
     g.be->bind_targets(g.be->user, p->targets, p->n_targets, p->depth_handle);
     g.be->bind_pipeline(g.be->user, p->pipeline);
-    /* The live path keeps the walker's constant block; the packet owns a copy
-     * of the same rows for the worker. */
     if (p->vpc_range) {
         g.be->bind_vs_constants_range(g.be->user, g.rsx.constants, p->vpc_lo,
                                       p->vpc_n, s_mt.scratch + p->off_tail,
@@ -6798,12 +7190,27 @@ static void eng_pkt_commit_live(eng_draw_pkt* p)
     }
 }
 
-/* Execute a packet copied into the ring, with packet-owned payload. */
-static void eng_pkt_commit_snapshot(const u8* base, const eng_draw_pkt* p)
+static void eng_pkt_track(const eng_draw_pkt* p)
+{
+    if (p->track_color_mask) {
+        eng_surfaces_wrote(p->track_targets, p->n_targets);
+        for (u32 i = 0; i < p->n_targets; i++) {
+            g.surfaces[p->track_targets[i]].last_writer_fp = s_miss_fp_hash;
+            g.surfaces[p->track_targets[i]].last_writer_pipe = s_miss_pipeline;
+        }
+    }
+    if (p->track_depth_write && p->zslot != ENG_INVALID) {
+        g.zdepths[p->zslot].had_write = 1;
+        eng_zdepth_wrote(p->zslot, &p->track_sf);
+    }
+}
+
+static void eng_mt_commit_packet(const eng_draw_pkt* p, const eng_prep* r)
 {
     eng_pkt_binds(p);
     g.be->bind_targets(g.be->user, p->targets, p->n_targets, p->depth_handle);
     g.be->bind_pipeline(g.be->user, p->pipeline);
+    const u8* base = (const u8*)p;
     if (p->vpc_range)
         g.be->bind_vs_constants_range(g.be->user, base + p->off_rows, p->vpc_lo,
                                       p->vpc_n, base + p->off_tail, p->tail_bytes,
@@ -6823,178 +7230,52 @@ static void eng_pkt_commit_snapshot(const u8* base, const eng_draw_pkt* p)
     if (g.be->set_depth_bias && p->has_bias)
         g.be->set_depth_bias(g.be->user, p->bias[0], p->bias[1], p->bias_bits);
 
-    const u32* idx = p->off_idx ? (const u32*)(base + p->off_idx) : NULL;
-    if (p->deferred) {
-        eng_pkt_fill_ctx ctx;
-        memset(&ctx, 0, sizeof ctx);
-        ctx.gpu = p->gpu_desc;
-        ctx.gpu.raw_data = p->off_raw ? base + p->off_raw : NULL;
-        ctx.gpu.remap_indices = p->off_remap
-            ? (const u32*)(base + p->off_remap) : NULL;
-        ctx.plan.layout = p->plan_layout;
-        ctx.plan.base_offset = p->plan_base_offset;
-        ctx.plan.divider_mask = p->plan_divider_mask;
-        ctx.plan.inline_stride = p->plan_inline_stride;
-        memcpy(ctx.plan.inline_off, p->plan_inline_off,
-               sizeof ctx.plan.inline_off);
-        ctx.plan.inline_data = p->off_inline ? base + p->off_inline : NULL;
-        ctx.plan.inline_bytes = p->inline_bytes;
-        for (u32 a = 0; a < RSX_DSP_NUM_VERTEX_ATTR; a++) {
-            const eng_pkt_attr* s = &p->plan_attr[a];
-            rsx_vertex_fetch_attr* d = &ctx.plan.attr[a];
-            d->desc = s->desc;
-            d->elem_size = s->elem_size;
-            d->stride = s->stride;
-            memcpy(d->default_value, s->def, sizeof d->default_value);
-            d->stable_base = s->has_span ? base + s->span_off : NULL;
-            d->stable_first = s->stable_first;
-            d->stable_last = s->stable_last;
-        }
-        ctx.refs = (const rsx_vertex_ref*)(base + p->off_refs);
-        ctx.n = p->n_refs;
-        g.be->draw_fill(g.be->user, (rsx_topology)p->topology, eng_pkt_fill,
-                        &ctx, p->uploaded, p->stride, idx,
-                        p->indexed ? p->n_draw : 0);
+    const u32* idx = r->indexed ? r->idx : NULL;
+    if (r->deferred) {
+        eng_mt_fill_ctx ctx;
+        ctx.gpu = r->gpu;
+        ctx.verts = r->verts;
+        ctx.bytes = (u32)((u64)r->uploaded * p->stride);
+        g.be->draw_fill(g.be->user, (rsx_topology)r->topology, eng_mt_copy_fill,
+                        &ctx, r->uploaded, p->stride, idx,
+                        r->indexed ? r->n_draw : 0);
     } else {
-        g.be->draw(g.be->user, (rsx_topology)p->topology, base + p->off_verts,
-                   p->uploaded, p->stride, idx, p->indexed ? p->n_draw : 0);
+        g.be->draw(g.be->user, (rsx_topology)r->topology, r->verts, r->uploaded,
+                   p->stride, idx, r->indexed ? r->n_draw : 0);
     }
 }
 
-static void eng_pkt_track(const eng_draw_pkt* p)
+static void eng_mt_worker_exec(void* ctx, const void* rec, u32 size)
 {
-    if (p->track_color_mask) {
-        eng_surfaces_wrote(p->track_targets, p->n_targets);
-        for (u32 i = 0; i < p->n_targets; i++) {
-            g.surfaces[p->track_targets[i]].last_writer_fp = s_miss_fp_hash;
-            g.surfaces[p->track_targets[i]].last_writer_pipe = s_miss_pipeline;
-        }
-    }
-    if (p->track_depth_write && p->zslot != ENG_INVALID) {
-        g.zdepths[p->zslot].had_write = 1;
-        eng_zdepth_wrote(p->zslot, &p->track_sf);
-    }
-}
+    eng_worker* w = (eng_worker*)ctx;
+    if (size < 8) return;
+    u32 n = 0;
+    memcpy(&n, rec, sizeof n);
+    const u8* q = (const u8*)rec + 8;
+    const u8* end = (const u8*)rec + size;
+    if (n > ENG_MT_CHUNK_PKTS) n = ENG_MT_CHUNK_PKTS;
 
-static void eng_mt_record_exec(void* ctx, const void* rec, u32 size)
-{
-    (void)ctx;
-    if (size < sizeof(eng_draw_pkt)) return;
-    const eng_draw_pkt* p = (const eng_draw_pkt*)rec;
-    if (p->magic != ENG_MT_PKT_MAGIC) return;
-    eng_pkt_commit_snapshot((const u8*)rec, p);
-}
-
-/* Copy every byte the worker will read into the packet arena. Returns 0 when
- * some guest array has no stable span (the packet then runs inline). */
-static int eng_pkt_snapshot(eng_draw_pkt* p)
-{
-    p->snapshot_ok = 0;
-    s_mt.snapshots++;
-
-    if (p->indexed) {
-        p->off_idx = eng_mt_alloc(p->n_draw * 4u);
-        if (p->off_idx) memcpy(s_mt.scratch + p->off_idx, g.indices,
-                               (size_t)p->n_draw * 4u);
-        else return 0;
-    }
-    p = (eng_draw_pkt*)s_mt.scratch;   /* the arena may have moved */
-
-    if (!p->deferred) {
-        const u32 vbytes = p->uploaded * p->stride;
-        p->off_verts = eng_mt_alloc(vbytes);
-        if (!p->off_verts) return 0;
-        p = (eng_draw_pkt*)s_mt.scratch;
-        memcpy(s_mt.scratch + p->off_verts, dc.verts, vbytes);
-        p->snapshot_ok = 1;
-        p->total_bytes = s_mt.used;
-        return 1;
+    /* Pass 1: prepare the whole chunk. The arena is reserved once, and its
+     * outputs point into it, so nothing may realloc during this pass. */
+    const u8* qq = q;
+    u32 prepared = 0;
+    w->arena_used = 0;
+    for (u32 i = 0; i < n && qq + sizeof(eng_draw_pkt) <= end; i++) {
+        const eng_draw_pkt* p = (const eng_draw_pkt*)qq;
+        if (p->magic != ENG_MT_PKT_MAGIC || !p->total_bytes) break;
+        eng_mt_prepare_one(p, w, &w->prep[i]);
+        prepared++;
+        qq += p->total_bytes;
     }
 
-    const rsx_vertex_fetch_plan* plan = &dc.fetch_plan;
-    p->plan_layout = plan->layout;
-    p->plan_base_offset = plan->base_offset;
-    p->plan_divider_mask = plan->divider_mask;
-    p->plan_inline_stride = plan->inline_stride;
-    memcpy(p->plan_inline_off, plan->inline_off, sizeof p->plan_inline_off);
-
-    if (plan->inline_data && plan->inline_bytes) {
-        p->off_inline = eng_mt_alloc(plan->inline_bytes);
-        if (!p->off_inline) return 0;
-        p = (eng_draw_pkt*)s_mt.scratch;
-        memcpy(s_mt.scratch + p->off_inline, plan->inline_data,
-               plan->inline_bytes);
-        p->inline_bytes = plan->inline_bytes;
+    /* Pass 2: commit in global packet order. */
+    for (u32 i = 0; i < prepared; i++) {
+        const eng_draw_pkt* p = (const eng_draw_pkt*)q;
+        eng_mt_wait_turn(p->seq);
+        if (w->prep[i].ok) eng_mt_commit_packet(p, &w->prep[i]);
+        eng_mt_take_turn(p->seq);
+        q += p->total_bytes;
     }
-
-    for (u32 a = 0; a < RSX_DSP_NUM_VERTEX_ATTR; a++) {
-        const rsx_vertex_fetch_attr* s = &plan->attr[a];
-        eng_pkt_attr* d = &p->plan_attr[a];
-        d->desc = s->desc;
-        d->elem_size = s->elem_size;
-        d->stride = s->stride;
-        memcpy(d->def, s->default_value, sizeof d->def);
-        d->has_span = 0;
-        d->span_off = 0;
-        d->stable_first = s->stable_first;
-        d->stable_last = s->stable_last;
-        if (!s->stable_base) continue;
-        /* An INLINE_ARRAY span lives in the stream already copied once. */
-        if (plan->inline_data && s->stable_base >= plan->inline_data &&
-            s->stable_base <= plan->inline_data + plan->inline_bytes) {
-            d->has_span = 1;
-            d->span_off = p->off_inline +
-                          (u32)(s->stable_base - plan->inline_data);
-            continue;
-        }
-        const u64 bytes = (u64)(s->stable_last - s->stable_first) * s->stride +
-                          s->elem_size;
-        if (bytes > 16u * 1024u * 1024u) return 0;
-        const u32 off = eng_mt_alloc((u32)bytes);
-        if (!off) return 0;
-        p = (eng_draw_pkt*)s_mt.scratch;
-        memcpy(s_mt.scratch + off, s->stable_base, (size_t)bytes);
-        p->plan_attr[a].has_span = 1;
-        p->plan_attr[a].span_off = off;
-    }
-
-    /* Every active attribute must be one the worker can read. A plan that
-     * needed a per-element guest lookup cannot be handed over safely. */
-    for (u32 slot = 0; slot < p->plan_layout.count; slot++) {
-        const u32 a = p->plan_layout.attrs[slot];
-        const eng_pkt_attr* d = &p->plan_attr[a];
-        if (d->desc.type && d->desc.size && !d->has_span) {
-            s_mt.snapshot_fail++;
-            return 0;
-        }
-    }
-
-    p->n_refs = p->uploaded;
-    p->off_refs = eng_mt_alloc(p->n_refs * (u32)sizeof(rsx_vertex_ref));
-    if (!p->off_refs) return 0;
-    p = (eng_draw_pkt*)s_mt.scratch;
-    memcpy(s_mt.scratch + p->off_refs, dc.refs,
-           (size_t)p->n_refs * sizeof(rsx_vertex_ref));
-
-    eng_check_gpu_vertex_offload(&p->gpu_desc, p->uploaded);
-    if (p->gpu_desc.gpu_eligible && p->gpu_desc.raw_data && p->gpu_desc.raw_bytes) {
-        p->raw_bytes = p->gpu_desc.raw_bytes;
-        p->off_raw = eng_mt_alloc(p->raw_bytes);
-        if (!p->off_raw) return 0;
-        p = (eng_draw_pkt*)s_mt.scratch;
-        memcpy(s_mt.scratch + p->off_raw, p->gpu_desc.raw_data, p->raw_bytes);
-        if (p->gpu_desc.flags & 1u) {
-            p->n_remap = p->uploaded;
-            p->off_remap = eng_mt_alloc(p->n_remap * 4u);
-            if (!p->off_remap) return 0;
-            p = (eng_draw_pkt*)s_mt.scratch;
-            memcpy(s_mt.scratch + p->off_remap, p->gpu_desc.remap_indices,
-                   (size_t)p->n_remap * 4u);
-        }
-    }
-    p->snapshot_ok = 1;
-    p->total_bytes = s_mt.used;
-    return 1;
 }
 
 static void sink_end_work(void* user, const rsx_dispatch* r)
@@ -7020,6 +7301,10 @@ static void sink_end_work(void* user, const rsx_dispatch* r)
     }
 
     const int mt = eng_mt_ensure();
+    /* Worker draws: no immediate/inline stream (those create their vertices
+     * from the FIFO on the state thread) and at least one record worker. */
+    const int workerable = mt && s_mt.workers > 0 &&
+                           !dc.n_immediate && !dc.inl_bytes;
     eng_draw_pkt* p = NULL;
     if (mt) {
         s_mt.used = (u32)((sizeof(eng_draw_pkt) + 15u) & ~15u);
@@ -7027,7 +7312,6 @@ static void sink_end_work(void* user, const rsx_dispatch* r)
         p = (eng_draw_pkt*)s_mt.scratch;
         memset(p, 0, sizeof *p);
         p->magic = ENG_MT_PKT_MAGIC;
-        p->seq = ++s_mt.seq;
     }
 
     rsx_vertex_layout_plan layout;
@@ -7035,14 +7319,15 @@ static void sink_end_work(void* user, const rsx_dispatch* r)
       eng_vertex_layout(&layout);
       wp2_add(WPROF2_LAYOUT, w2); }
     if (wp) wp_t0 = rsx_wprof_now();
-    dc_fetch(&layout, rebuild);
+    dc_fetch(&layout, rebuild, workerable);
     if (wp) wprof_phase(RSX_WPROF_FETCH, rsx_wprof_now() - wp_t0);
-    if (!dc.n_verts || !dc.fetch_ok) return;
+    if (!dc.fetch_ok) return;
+    if (!workerable && !dc.n_verts) return;
 
     int indexed = 0;
     u32 n_draw = dc.n_source_refs;
     const unsigned long long w2_index = wp2_t0();
-    if (rebuild) {
+    if (!workerable && rebuild) {
         if (!eng_topology_rebuild(prim, dc.refs_remapped, &indexed)) {
             wp2_add(WPROF2_INDEX, w2_index);
             return;
@@ -7210,12 +7495,34 @@ static void sink_end_work(void* user, const rsx_dispatch* r)
         /* Fill the packet. Everything the worker reads is either by value in
          * the packet or copied into its arena. */
         p = (eng_draw_pkt*)s_mt.scratch;
+        p->prim = prim;
+        p->rebuild = (u32)rebuild;
+        p->allow_remap = (u32)rebuild;
         p->topology = (u32)topology;
-        p->indexed = (u32)indexed;
-        p->n_draw = indexed ? n_draw : 0;
-        p->uploaded = indexed ? dc.n_verts : n_draw;
         p->stride = layout.stride;
-        p->deferred = (u32)dc.fetch_deferred;
+        if (workerable) {
+            /* The worker resolves the remap/plan/index/convert itself. */
+            p->n_src = dc.n_source_refs;
+            p->plan_init = dc.fetch_plan;
+            p->plan_init.guest_ptr = NULL;
+            p->plan_init.guest_user = NULL;
+            p->off_src = eng_mt_alloc(dc.n_source_refs * (u32)sizeof(rsx_vertex_ref));
+            if (!p->off_src) return;   /* arena exhausted: drop, nothing touched */
+            memcpy(s_mt.scratch + p->off_src, dc.refs,
+                   (size_t)dc.n_source_refs * sizeof(rsx_vertex_ref));
+            if (dc.n_cuts) {
+                p->n_cuts = dc.n_cuts;
+                p->off_cuts = eng_mt_alloc(dc.n_cuts * (u32)sizeof(u32));
+                if (!p->off_cuts) return;
+                memcpy(s_mt.scratch + p->off_cuts, dc.cuts,
+                       (size_t)dc.n_cuts * sizeof(u32));
+            }
+        } else {
+            p->indexed = (u32)indexed;
+            p->n_draw = indexed ? n_draw : 0;
+            p->uploaded = indexed ? dc.n_verts : n_draw;
+            p->deferred = (u32)dc.fetch_deferred;
+        }
         p->n_targets = n_targets;
         memcpy(p->track_targets, targets, sizeof p->track_targets);
         for (u32 i = 0; i < n_targets; i++) p->targets[i] = g.surfaces[targets[i]].handle;
@@ -7276,36 +7583,37 @@ static void sink_end_work(void* user, const rsx_dispatch* r)
         memcpy(s_mt.scratch + p->off_fp, g.fp_cb, p->fp_bytes);
         p->total_bytes = s_mt.used;
 
-        if (s_mt.workers > 0 && eng_pkt_snapshot(p)) {
-            p = (eng_draw_pkt*)s_mt.scratch;
-            if (rsx_record_queue_push(s_mt.q, p, p->total_bytes)) {
-                s_mt.enqueued++;
-                eng_pkt_track(p);
-                if (!pipeline_is_fixed) g.guest_draws++;
-                wp2_add(WPROF2_BIND_BE, w2_const);
-                if (wp) wprof_phase(RSX_WPROF_DRAW, rsx_wprof_now() - wp_t0);
-                return;
+        if (workerable) {
+            /* The finalize point for a worker packet: no early return may
+             * follow, or the ordered turn would never advance. */
+            p->seq = ++s_mt.seq;
+            if (!eng_mt_chunk_add(p, p->total_bytes)) {
+                eng_mt_chunk_close();
+                if (!eng_mt_chunk_add(p, p->total_bytes)) {
+                    eng_mt_run_packet_inline(p);
+                    goto mt_done;
+                }
             }
-            /* Full: drain and retry once, then run the packet here. */
-            eng_mt_sync();
-            if (rsx_record_queue_push(s_mt.q, p, p->total_bytes)) {
-                s_mt.enqueued++;
-                eng_pkt_track(p);
-                if (!pipeline_is_fixed) g.guest_draws++;
-                wp2_add(WPROF2_BIND_BE, w2_const);
-                if (wp) wprof_phase(RSX_WPROF_DRAW, rsx_wprof_now() - wp_t0);
-                return;
-            }
-            s_mt.inline_fallbacks++;
-        } else if (s_mt.workers > 0) {
-            s_mt.inline_fallbacks++;
+            eng_pkt_track(p);
+            if (!pipeline_is_fixed) g.guest_draws++;
+            wp2_add(WPROF2_BIND_BE, w2_const);
+            if (wp) wprof_phase(RSX_WPROF_DRAW, rsx_wprof_now() - wp_t0);
+            return;
         }
 
-        /* Serial packet path: commit on the walker, in packet order. */
+        /* State-thread packet path (workers==0, or a draw with an immediate /
+         * inline stream): drain every earlier packet, then commit this one in
+         * order and take its turn so later worker packets can proceed. */
+        if (s_mt.workers > 0) eng_mt_sync();
+        p->seq = ++s_mt.seq;
         eng_pkt_commit_live(p);
+        eng_mt_take_turn(p->seq);
         p = (eng_draw_pkt*)s_mt.scratch;
-        eng_pkt_track(p);
-        if (!pipeline_is_fixed) g.guest_draws++;
+mt_done:
+        if (p) {
+            eng_pkt_track(p);
+            if (!pipeline_is_fixed) g.guest_draws++;
+        }
         wp2_add(WPROF2_BIND_BE, w2_const);
         if (wp) wprof_phase(RSX_WPROF_DRAW, rsx_wprof_now() - wp_t0);
         return;
