@@ -156,6 +156,10 @@ uint64_t rsx_texdirty_max_seq(uint32_t ea, uint32_t span);
 void     rsx_texdirty_reprotect(uint32_t ea, uint32_t span);
 void     rsx_texdirty_note_write(uint32_t ea, uint32_t len);
 void     rsx_texdirty_note_write_host(const void* host, size_t len);
+/* PS3RECOMP_BINK_GREEN_FIX: open the pages of a coming host write without
+ * charging it, so the caller can copy first and note after (see the .c). */
+void     rsx_texdirty_prepare_write_host(const void* host, size_t len);
+int      rsx_texdirty_write_ordered(void);
 int      rsx_texdirty_on_fault(uintptr_t addr);
 void     rsx_texdirty_publish_hook(void);
 

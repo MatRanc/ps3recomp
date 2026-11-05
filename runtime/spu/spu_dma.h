@@ -33,6 +33,25 @@ extern "C" {
 
 extern uint8_t* vm_base;
 
+/* PS3RECOMP_BINK_GREEN_FIX: an ordered host write (open pages, copy, then
+ * charge the write). Declared weak so the SPU fixtures that link without the
+ * draw engine keep their own write stubs; the env is read once per TU. */
+#if defined(__GNUC__) || defined(__clang__)
+extern void rsx_texdirty_prepare_write_host(const void* host, size_t len) __attribute__((weak));
+#else
+extern void rsx_texdirty_prepare_write_host(const void* host, size_t len);
+#endif
+
+static inline int spu_bink_green_ordered(void)
+{
+    static int s = -1;
+    if (s < 0) {
+        const char* e = getenv("PS3RECOMP_BINK_GREEN_FIX");
+        s = (e && *e && strcmp(e, "0") != 0) ? 1 : 0;
+    }
+    return s;
+}
+
 /* Guard against a guest DMA whose effective address lands in reserved-but-
  * uncommitted guest memory (the 4 GB VM is MEM_RESERVE; only main mem / RSX /
  * SPU / lv2-heap / stack pages are committed). A garbage EA must be treated
@@ -453,8 +472,15 @@ static inline int mfc_do_transfer_fast(spu_context* spu, uint32_t lsa, uint64_t 
               extern void dxt_capture_dma(const spu_context*, int, uint32_t, uint64_t, uint32_t, const uint8_t*);
               dxt_capture_dma(spu, 1, lsa, ea, size, ls_ptr);
           } }
-        ps3_guest_write(ea_ptr, size);
-        mfc_put_coherent(spu, ea_ptr, ls_ptr, ea, size);
+        if (spu_bink_green_ordered() && rsx_texdirty_prepare_write_host) {
+            ps3_guest_access(ea_ptr, size);
+            rsx_texdirty_prepare_write_host(ea_ptr, size);
+            mfc_put_coherent(spu, ea_ptr, ls_ptr, ea, size);
+            ps3_guest_write(ea_ptr, size);
+        } else {
+            ps3_guest_write(ea_ptr, size);
+            mfc_put_coherent(spu, ea_ptr, ls_ptr, ea, size);
+        }
         { extern void (*g_spu_put_hook)(uint32_t ea, uint32_t size);
           if (g_spu_put_hook) g_spu_put_hook((uint32_t)ea, size); }
         const uint32_t e = (uint32_t)ea;
@@ -992,8 +1018,15 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
               extern void dxt_capture_dma(const spu_context*, int, uint32_t, uint64_t, uint32_t, const uint8_t*);
               dxt_capture_dma(spu, 1, lsa, ea, size, ls_ptr);
           } }
-        ps3_guest_write(ea_ptr, size);
-        mfc_put_coherent(spu, ea_ptr, (const uint8_t*)ls_ptr, ea, size);
+        if (spu_bink_green_ordered() && rsx_texdirty_prepare_write_host) {
+            ps3_guest_access(ea_ptr, size);
+            rsx_texdirty_prepare_write_host(ea_ptr, size);
+            mfc_put_coherent(spu, ea_ptr, (const uint8_t*)ls_ptr, ea, size);
+            ps3_guest_write(ea_ptr, size);
+        } else {
+            ps3_guest_write(ea_ptr, size);
+            mfc_put_coherent(spu, ea_ptr, (const uint8_t*)ls_ptr, ea, size);
+        }
         /* Tell whoever is listening where this PUT landed.
          *
          * A title whose SPUs build the RSX command stream never tells libgcm

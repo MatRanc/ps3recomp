@@ -3166,6 +3166,22 @@ static int s_texdirty_paranoid;
 static u64 s_texdirty_stale, s_texdirty_checked;
 static u32 s_texdirty_log_frame;
 
+/* PS3RECOMP_BINK_GREEN_FIX (env, default 0): revalidate a dirty-tracked
+ * texture on a second bind in the same presented frame. The default skips
+ * every bind after the first per frame, so a decoder write that lands between
+ * the movie quad's upload and the GPU's sampling is only seen one frame
+ * later. Hardware samples the live bytes. */
+static int s_bink_green_env = -1;
+static u32 s_bink_green_same, s_bink_green_logs;
+static int eng_bink_green_fix(void)
+{
+    if (s_bink_green_env < 0) {
+        const char* e = getenv("PS3RECOMP_BINK_GREEN_FIX");
+        s_bink_green_env = e && *e && strcmp(e, "0") != 0 ? 1 : 0;
+    }
+    return s_bink_green_env;
+}
+
 static int eng_texdirty_env_on(void)
 {
     if (s_texdirty_env < 0) {
@@ -3318,7 +3334,9 @@ static u32 eng_texture_slot_work(u32 location, u32 offset, u32 fmt, u32 w, u32 h
 #undef ENG_TEXTURE_KEY_MATCHES
     if (hit) {
         eng_texture* e = hit;
-        if (e->handle && e->last_hash_frame != g.frames) {
+        const int same_frame = e->last_hash_frame == g.frames;
+        if (e->handle && (!same_frame ||
+                          (eng_bink_green_fix() && s_texdirty_live && e->dirty_covered))) {
             if (s_texdirty_live && e->dirty_covered) {
                 /* Generation check: any page written since the sequence this
                  * upload sampled makes it stale. No bytes are read here. */
@@ -3331,6 +3349,13 @@ static u32 eng_texture_slot_work(u32 location, u32 offset, u32 fmt, u32 w, u32 h
                     need = 1;
                 }
                 const int gen_need = need;
+                if (same_frame && need) {
+                    s_bink_green_same++;
+                    if (PS3_LOG_FIRST(s_bink_green_logs, 16))
+                        fprintf(stderr, "[bink-green] same-frame reupload "
+                                "0x%08X %ux%u fmt=0x%02X loc=%u\n",
+                                offset, w, h, fmt, location);
+                }
                 /* Debug: prove the generations are not missing writes. The
                  * content hash is only taken here and at upload, so the
                  * steady-state cost is unchanged. */
@@ -6087,6 +6112,16 @@ static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
                          !eng_target_at(t.location, t.offset));
         else
             memo_live = s_texmemo_on && memo_regs && mm->gen == s_tex_gen;
+        if (memo_live && eng_bink_green_fix() && s_texdirty_live &&
+            mm->entry < g.n_textures) {
+            /* A decoder write can land after this frame's upload and before
+             * the GPU's sampling. Do not answer a same-frame repeat from the
+             * memo when the entry's write generation has moved since. */
+            eng_texture* me = &g.textures[mm->entry];
+            if (me->dirty_covered &&
+                rsx_texdirty_max_seq(me->ea, eng_texture_entry_span(me)) > me->dirty_seq)
+                memo_live = 0;
+        }
         if (memo_live) {
             mm->wgen = g.rsx.tex_wgen[u];
             samplers[u] = mm->samp;
@@ -8852,6 +8887,8 @@ int rsx_draw_engine_init(u32 width, u32 height)
     /* Re-read PS3RECOMP_TEX_DIRTY at each engine up (the fixtures change the
      * environment between engine sessions in one process). */
     s_texdirty_env = -1;
+    s_bink_green_env = -1;
+    s_bink_green_same = 0;
     s_texdirty_paranoid = 0;
     s_texdirty_live = 0;
     s_texmemo_local = -1;
@@ -8929,6 +8966,9 @@ int rsx_draw_engine_init(u32 width, u32 height)
 void rsx_draw_engine_shutdown(void)
 {
     if (!g.be) return;
+    if (eng_bink_green_fix() && s_bink_green_same)
+        fprintf(stderr, "[bink-green] %u same-frame texture reupload(s) "
+                        "this engine session\n", s_bink_green_same);
     eng_mt_sync();
     if (g.ready && s_wcb_live) {
         /* Armed targets go to guest memory and their pages reopen: the guest

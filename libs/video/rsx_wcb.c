@@ -919,6 +919,35 @@ static void td_ranges_reset_locked(void)
     memset(s_td.ranges, 0, sizeof s_td.ranges);
 }
 
+/* Open the protected runs of `ea..ea+len` read/write without charging a new
+ * write generation. Used by the ordered host-write path (PS3RECOMP_BINK_GREEN_FIX):
+ * the caller opens the pages, copies the bytes, and only then calls
+ * td_note_write_locked, so a concurrent texture bind can never sample the new
+ * generation while the old bytes are still in place. Lock held. */
+static void td_open_write_locked(uint32_t ea, uint32_t len)
+{
+    if (!s_td.on || !s_td.page_flags) return;
+    if (!len) len = 1;
+    uint64_t end = (uint64_t)ea + len;
+    if (end > ((uint64_t)TD_NPAGES << 12)) end = (uint64_t)TD_NPAGES << 12;
+    if ((uint64_t)ea >= end) return;
+    const uint32_t p0 = ea >> 12, p1 = (uint32_t)((end - 1) >> 12);
+    uintptr_t run = 0;
+    for (uint32_t i = p0; i <= p1 && i < TD_NPAGES; i++) {
+        const int prot = (s_td.page_flags[i] & TD_TEX_PROT) != 0;
+        if (prot && !run) run = (uintptr_t)vm_base + ((uintptr_t)i << 12);
+        if (!prot && run) {
+            td_open_run_locked(run, (uintptr_t)vm_base + ((uintptr_t)i << 12), 2);
+            __atomic_add_fetch(&s_td.serial, 1, __ATOMIC_RELAXED);
+            run = 0;
+        }
+    }
+    if (run) {
+        td_open_run_locked(run, (uintptr_t)vm_base + (((uintptr_t)p1 + 1) << 12), 2);
+        __atomic_add_fetch(&s_td.serial, 1, __ATOMIC_RELAXED);
+    }
+}
+
 /* Charge `ea..ea+len` to every page, opening protected runs. Lock held. */
 static void td_note_write_locked(uint32_t ea, uint32_t len)
 {
@@ -947,20 +976,7 @@ static void td_note_write_locked(uint32_t ea, uint32_t len)
         }
 
     /* Open runs of pages we had write-protected. */
-    uintptr_t run = 0;
-    for (uint32_t i = p0; i <= p1 && i < TD_NPAGES; i++) {
-        const int prot = (s_td.page_flags[i] & TD_TEX_PROT) != 0;
-        if (prot && !run) run = (uintptr_t)vm_base + ((uintptr_t)i << 12);
-        if (!prot && run) {
-            td_open_run_locked(run, (uintptr_t)vm_base + ((uintptr_t)i << 12), 2);
-            __atomic_add_fetch(&s_td.serial, 1, __ATOMIC_RELAXED);
-            run = 0;
-        }
-    }
-    if (run) {
-        td_open_run_locked(run, (uintptr_t)vm_base + (((uintptr_t)p1 + 1) << 12), 2);
-        __atomic_add_fetch(&s_td.serial, 1, __ATOMIC_RELAXED);
-    }
+    td_open_write_locked(ea, len);
 }
 
 /* Protect the covered pages of [ea,ea+span) that are not already protected.
@@ -1219,6 +1235,36 @@ void rsx_texdirty_note_write_host(const void* host, size_t len)
     const uintptr_t off = (uintptr_t)host - (uintptr_t)vm_base;
     if (off >= ((uintptr_t)TD_NPAGES << 12)) return;
     rsx_texdirty_note_write((uint32_t)off, (uint32_t)len);
+}
+
+/* PS3RECOMP_BINK_GREEN_FIX (env, default 0): order a host write as
+ * open-pages -> copy -> note. The default path notes the write before the
+ * bytes land, so a texture bind racing the copy can sample the new generation
+ * while the old (often all-zero) bytes are still there and then store that
+ * generation as up to date, pinning the stale image until some later,
+ * unrelated write. */
+int rsx_texdirty_write_ordered(void)
+{
+    static int s = -1;
+    if (s < 0) {
+        const char* e = getenv("PS3RECOMP_BINK_GREEN_FIX");
+        s = (e && *e && strcmp(e, "0") != 0) ? 1 : 0;
+    }
+    return s;
+}
+
+/* Open the tracked pages of the coming host write without charging it. */
+void rsx_texdirty_prepare_write_host(const void* host, size_t len)
+{
+    if (!s_td.on || !host || !len) return;
+    const uintptr_t off = (uintptr_t)host - (uintptr_t)vm_base;
+    if (off >= ((uintptr_t)TD_NPAGES << 12)) return;
+    uint64_t end = (uint64_t)(uint32_t)off + len;
+    if (end > ((uint64_t)TD_NPAGES << 12)) end = (uint64_t)TD_NPAGES << 12;
+    if ((uint64_t)(uint32_t)off >= end) return;
+    wcb_lock();
+    td_open_write_locked((uint32_t)off, (uint32_t)(end - (uint64_t)(uint32_t)off));
+    wcb_unlock();
 }
 
 int rsx_texdirty_on_fault(uintptr_t addr)

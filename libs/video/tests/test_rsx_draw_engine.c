@@ -16,6 +16,7 @@
 #include "rsx_primitives.h"   /* RSX_PRIMITIVE_* */
 #include "rsx_tex_miss.h"     /* RSX_TEX_MISS_* */
 #include "rsx_test_programs.h"
+#include "rsx_wcb.h"
 #include "ps3emu/guest_access.h"
 
 #include <stdio.h>
@@ -939,6 +940,56 @@ static void test_texture_dirty_generation(void)
           stub.n_texture_create);
 
     engine_down();
+    setenv("PS3RECOMP_TEX_DIRTY", "0", 1);
+}
+
+/* PS3RECOMP_BINK_GREEN_FIX: a decoder write that lands after a texture's
+ * first bind in a presented frame must be visible to a later bind in the SAME
+ * frame (hardware samples live guest memory). The ordered host-write helper
+ * opens the pages first and charges the write only after the copy, so a bind
+ * can never sample a new generation while the old bytes are still there. */
+static void test_bink_green_fix(void)
+{
+    printf("-- bink green fix (same-frame revalidation)\n");
+    setenv("PS3RECOMP_TEX_DIRTY", "1", 1);
+    setenv("PS3RECOMP_BINK_GREEN_FIX", "1", 1);
+    engine_up();
+    memset(vm_base + TEX_OFFSET, 0, 4 * 4 * 4);
+    bind_texture_unit(RSX_LOCATION_MAIN, TEX_OFFSET);
+    draw_triangle();
+    const int created = stub.n_texture_create;
+    CHECK(created == 1, "first bind uploads the zeroed plane");
+
+    /* Same frame: open, copy, charge. A second bind with no present between
+     * them must see the new bytes. */
+    rsx_texdirty_prepare_write_host(vm_base + TEX_OFFSET, 16);
+    memset(vm_base + TEX_OFFSET, 0x5a, 16);
+    ps3_guest_write(vm_base + TEX_OFFSET, 16);
+    bind_texture_unit(RSX_LOCATION_MAIN, TEX_OFFSET);
+    draw_triangle();
+    CHECK(stub.n_texture_create == created + 1,
+          "a post-bind write is re-uploaded within the same frame (%d creates)",
+          stub.n_texture_create);
+
+    /* Opening the pages must not charge a write by itself. */
+    const int before = stub.n_texture_create;
+    rsx_texdirty_prepare_write_host(vm_base + TEX_OFFSET, 16);
+    bind_texture_unit(RSX_LOCATION_MAIN, TEX_OFFSET);
+    draw_triangle();
+    CHECK(stub.n_texture_create == before,
+          "prepare alone does not invalidate the texture (%d creates)",
+          stub.n_texture_create);
+
+    /* Charging it after the copy does. */
+    ps3_guest_write(vm_base + TEX_OFFSET, 16);
+    bind_texture_unit(RSX_LOCATION_MAIN, TEX_OFFSET);
+    draw_triangle();
+    CHECK(stub.n_texture_create == before + 1,
+          "the note after the copy invalidates it (%d creates)",
+          stub.n_texture_create);
+
+    engine_down();
+    setenv("PS3RECOMP_BINK_GREEN_FIX", "0", 1);
     setenv("PS3RECOMP_TEX_DIRTY", "0", 1);
 }
 
@@ -3073,6 +3124,7 @@ int main(void)
     test_texture_cache();
     test_texture_lookup_memo();
     test_texture_dirty_generation();
+    test_bink_green_fix();
     test_texture_sparse_rehash();
     test_pipeline_key();
     test_restart_expansion();
