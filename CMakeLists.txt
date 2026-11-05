@@ -64,6 +64,8 @@ if(PS3RECOMP_RSX_VULKAN)
             "-DPS3RECOMP_VULKAN_INCLUDE_DIR=<dir containing vulkan/vulkan.h>")
     endif()
     list(APPEND HLE_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/libs/video/rsx_vulkan_backend.c")
+    # The bounded worker queue behind PS3RECOMP_PIPE_ASYNC.
+    list(APPEND HLE_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/libs/video/vk_pipe_queue.c")
     # HLSL -> SPIR-V for guest programs: a stub unless glslang is found below.
     list(APPEND HLE_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/libs/video/rsx_shader_spirv.cpp")
 endif()

@@ -114,6 +114,13 @@ void rsx_hlsl_to_spirv_disk_reset(void);
 u32  rsx_hlsl_to_spirv_disk_version(void);
 void rsx_hlsl_to_spirv_disk_set_version(u32 version);   /* tests */
 
+/* Read every file of the guest-keyed disk cache into memory without keeping
+ * it, so the first translations of a run do not wait on the filesystem. Runs
+ * on the pipeline worker at boot (PS3RECOMP_PIPE_ASYNC). Returns the number
+ * of files read and stores their total size in *bytes (may be NULL); a cache
+ * that is off or absent is zero files and not an error. */
+u32 rsx_hlsl_to_spirv_disk_prefetch(unsigned long long* bytes);
+
 #ifdef __cplusplus
 }
 #endif

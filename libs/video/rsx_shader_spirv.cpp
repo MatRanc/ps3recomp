@@ -30,6 +30,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <ctype.h>
 #include <errno.h>
 #include <sys/stat.h>
 #include <time.h>
@@ -520,7 +521,94 @@ void disk_store(DiskCache& c, u64 key, int stage, const char* hlsl,
                 (unsigned)c.stats.misses);
 }
 
+/* Read the guest-keyed files once to bring them into the page cache. The
+ * pipeline worker does this at boot, before it has any work: the bytes are
+ * not kept, so memory stays bounded and a store/store race is impossible. */
+u32 disk_prefetch(unsigned long long* bytes)
+{
+    DiskCache& c = disk_cache();
+    std::string dir;
+    {
+        std::lock_guard<std::mutex> guard(c.lock);
+        disk_env(c);
+        if (!c.on) { if (bytes) *bytes = 0; return 0; }
+        dir = c.dir;
+    }
+#ifdef _WIN32
+    WIN32_FIND_DATAA fd;
+    const std::string pattern = dir + "/*.spv";
+    HANDLE h = FindFirstFileA(pattern.c_str(), &fd);
+    if (h == INVALID_HANDLE_VALUE) { if (bytes) *bytes = 0; return 0; }
+    u32 files = 0;
+    unsigned long long total = 0;
+    const unsigned long long cap = 64ull << 20;
+    do {
+        const char* name = fd.cFileName;
+        const size_t len = strlen(name);
+        if (len != 22 || name[16] != '_' || (name[17] != '0' && name[17] != '1') ||
+            strcmp(name + 18, ".spv") != 0) continue;
+        for (int i = 0; i < 16; i++) if (!isxdigit((unsigned char)name[i])) goto next;
+        {
+            const std::string path = dir + "/" + name;
+            FILE* f = fopen(path.c_str(), "rb");
+            if (!f) goto next;
+            char buf[65536];
+            size_t n;
+            while ((n = fread(buf, 1, sizeof buf, f)) != 0) {
+                total += n;
+                if (total >= cap) { fclose(f); goto done; }
+            }
+            fclose(f);
+            files++;
+        }
+    next:;
+    } while (FindNextFileA(h, &fd));
+done:
+    FindClose(h);
+    if (bytes) *bytes = total;
+    return files;
+#else
+    DIR* d = opendir(dir.c_str());
+    if (!d) { if (bytes) *bytes = 0; return 0; }
+    u32 files = 0;
+    unsigned long long total = 0;
+    const unsigned long long cap = 64ull << 20;
+    struct dirent* e;
+    while ((e = readdir(d))) {
+        const char* name = e->d_name;
+        const size_t len = strlen(name);
+        if (len != 22 || name[16] != '_' || (name[17] != '0' && name[17] != '1') ||
+            strcmp(name + 18, ".spv") != 0) continue;
+        bool hex = true;
+        for (int i = 0; i < 16; i++)
+            if (!isxdigit((unsigned char)name[i])) { hex = false; break; }
+        if (!hex) continue;
+        const std::string path = dir + "/" + name;
+        FILE* f = fopen(path.c_str(), "rb");
+        if (!f) continue;
+        char buf[65536];
+        size_t n;
+        bool stop = false;
+        while ((n = fread(buf, 1, sizeof buf, f)) != 0) {
+            total += n;
+            if (total >= cap) { stop = true; break; }
+        }
+        fclose(f);
+        if (stop) break;
+        files++;
+    }
+    closedir(d);
+    if (bytes) *bytes = total;
+    return files;
+#endif
+}
+
 } // namespace
+
+extern "C" u32 rsx_hlsl_to_spirv_disk_prefetch(unsigned long long* bytes)
+{
+    return disk_prefetch(bytes);
+}
 
 extern "C" int rsx_hlsl_to_spirv_available(void) { return 1; }
 
@@ -684,5 +772,10 @@ extern "C" void rsx_hlsl_to_spirv_disk_stats(RsxShaderDiskCacheStats* out)
 extern "C" void rsx_hlsl_to_spirv_disk_reset(void) {}
 extern "C" u32 rsx_hlsl_to_spirv_disk_version(void) { return RSX_SHADER_TRANSLATOR_VERSION; }
 extern "C" void rsx_hlsl_to_spirv_disk_set_version(u32 version) { (void)version; }
+extern "C" u32 rsx_hlsl_to_spirv_disk_prefetch(unsigned long long* bytes)
+{
+    if (bytes) *bytes = 0;
+    return 0;
+}
 
 #endif

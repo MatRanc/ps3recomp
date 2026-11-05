@@ -55,6 +55,7 @@
 #include "ps3emu/ps3_trace.h"   /* PS3RECOMP_TIMELINE: present and fence events */
 #include "rsx_tex_miss.h"
 #include "vk_dump_queue.h"
+#include "vk_pipe_queue.h"
 #include "ps3emu/thread_name.h"
 #include "vulkan/rsx_vk_fallback_vert.spv.h"
 #include "vulkan/rsx_vk_fallback_frag.spv.h"
@@ -81,6 +82,9 @@
  * scene-change stutter can be attributed. */
 extern unsigned long long ps3_ms_now(void);
 static void vk_pipe_cache_tick(void);
+static void vk_pipe_async_stop(void);
+static void vk_pipe_async_shutdown(void);
+static void vk_pipe_async_frame(void);
 static void vk_pipe_create_done(const char* what, unsigned long long t0)
 {
     const unsigned long long ns = rsx_wprof_now() - t0;
@@ -403,7 +407,15 @@ static int vk_pipe_cache_on(void)
     static int on = -1;
     if (on < 0) {
         const char* e = getenv("PS3RECOMP_VK_PIPELINE_CACHE");
-        on = e && *e && strcmp(e, "0") != 0;
+        if (e && *e) {
+            on = strcmp(e, "0") != 0;
+        } else {
+            /* The async pipeline path is the first-use fix; its driver
+             * pipelines are worth keeping too, so it turns the persistent
+             * cache on unless the user says otherwise. */
+            const char* a = getenv("PS3RECOMP_PIPE_ASYNC");
+            on = a && *a && strcmp(a, "0") != 0;
+        }
     }
     return on;
 }
@@ -2899,6 +2911,7 @@ static void vk_cb_present(void* ud, u32 buffer_id)
 {
     (void)ud; (void)buffer_id;
     if (!s_vk.device) return;
+    vk_pipe_async_frame();
     pthread_mutex_lock(&s_vk.present_mu);
     VkCommandBuffer cb = vk_present_record_begin();
     if (cb) vk_present_record_end(cb);
@@ -3305,6 +3318,7 @@ static void vk_eng_present(void* user, u32 surface)
 {
     (void)user;
     if (!s_vk.device) return;
+    vk_pipe_async_frame();
     if (s_eb_pending) { s_eb_why = 6; vk_eng_flush_async(); }   /* the present records on its own buffer */
     vk_eng_obj* o = vk_eng_get(surface, VK_ENG_COLOR);
     pthread_mutex_lock(&s_vk.present_mu);
@@ -3983,9 +3997,17 @@ typedef struct vk_eng_pipe {
     VkFormat            rt_fmt;          /* picks the render pass it is built against */
     u32                 cube_mask;       /* TextureCube units: the split set layout */
     VkPipeline          variant[VK_ENG_TOPOLOGIES];
+    /* PS3RECOMP_PIPE_ASYNC (docs/pipeline-async.md): 0 synchronous/none,
+     * 1 worker translating, 2 modules ready, 3 translation failed. Zero in
+     * the synchronous path, so its behaviour is unchanged. */
+    int                 async_state;
 } vk_eng_pipe;
 
 static vk_eng_pipe s_epipe[VK_ENG_MAX_PIPE];
+
+static VkPipeline vk_eng_variant_create(vk_eng_pipe* P, u32 topo_idx);
+static int vk_eng_pipe_modules(vk_eng_pipe* P, const char* vs_hlsl, const char* ps_hlsl,
+                               u64 key, u32* spv, u32 spv_max, char* log, u32 log_size);
 
 #define VK_ENG_SAMP_CACHE 64
 
@@ -4088,6 +4110,228 @@ static void vk_bind_user(void* user)
         vk_mt_ctx* c = (vk_mt_ctx*)user;
         s_e2_tls = &c->e2;
         s_bound_tls = &c->bound;
+    }
+}
+
+/* ---------------------------------------------------------------------------
+ * Asynchronous pipeline compilation (PS3RECOMP_PIPE_ASYNC, default off)
+ *
+ * A first-use pipeline used to translate its two HLSL programs and then wait
+ * for vkCreateGraphicsPipelines on the RSX walker: 1-2 s in one drain at the
+ * meter start (docs/present-stalls.md) and 2.9 s in the match load. With the
+ * key on, pipeline_create copies the HLSL and returns a slot at once; one
+ * worker thread translates both stages and creates the shader modules. A
+ * draw that needs a pipeline still in flight waits until a small per-frame
+ * budget is spent (PS3RECOMP_PIPE_ASYNC_WAIT_US, default 2000) and is
+ * otherwise skipped for the frame; every skip is counted and logged.
+ *
+ * The engine keeps its own pipeline map; this block only touches the
+ * backend's slot table (allocated by the walker, freed after this thread is
+ * joined). The VkPipeline is still built by the draw's own thread under
+ * s_pipe_create_mu: a first-use driver build measured at most 6.7 ms, under
+ * one frame, and it keeps every graphics-pipeline object on the context that
+ * records the draw.
+ * -------------------------------------------------------------------------*/
+#define VK_PA_QUEUE 256
+#define VK_PA_LOG   4096
+
+typedef struct vk_pa_job {
+    int       kind;        /* 0 modules, 1 boot warm-up */
+    u32       slot;
+    u64       key;
+    char*     vs;
+    char*     ps;
+} vk_pa_job;
+
+static struct {
+    vk_pipe_queue*   q;
+    pthread_mutex_t  mu;
+    pthread_cond_t   cv;
+    int              started;
+    int              closing;
+    u32*             spv;
+    char*            log;
+    unsigned long long deadline_ns;        /* this frame's wait budget end */
+    unsigned long long skipped, skip_modules, skip_failed;
+    unsigned long long modules_jobs;
+} s_pa;
+
+static int s_pa_env = -1;
+
+static int vk_pipe_async_env(void)
+{
+    if (s_pa_env < 0) {
+        const char* e = getenv("PS3RECOMP_PIPE_ASYNC");
+        s_pa_env = e && *e && strcmp(e, "0") != 0;
+    }
+    return s_pa_env;
+}
+
+static int vk_pipe_async_on(void)
+{
+    if (ps3_live_ctl_get) return ps3_live_ctl_get(PS3_LIVE_PIPE_ASYNC) != 0;
+    return vk_pipe_async_env();
+}
+
+static unsigned vk_pipe_async_wait_us(void)
+{
+    static int us = -1;
+    if (us < 0) {
+        const char* e = getenv("PS3RECOMP_PIPE_ASYNC_WAIT_US");
+        us = e && *e ? atoi(e) : 2000;
+        if (us < 0) us = 0;
+        if (us > 50000) us = 50000;
+    }
+    return (unsigned)us;
+}
+
+static unsigned long long vk_pa_now(void) { return ps3_trace_now(); }
+
+static void vk_pa_note_skip(vk_eng_pipe* P, u32 topo, int reason,
+                            unsigned long long waited_ns)
+{
+    static const char* const why[] = { "modules", "failed" };
+    __atomic_add_fetch(&s_pa.skipped, 1ull, __ATOMIC_RELAXED);
+    if (reason == 0) __atomic_add_fetch(&s_pa.skip_modules, 1ull, __ATOMIC_RELAXED);
+    else __atomic_add_fetch(&s_pa.skip_failed, 1ull, __ATOMIC_RELAXED);
+    fprintf(stderr, "[pipe-async] skip draw pipeline=%u topo=%u reason=%s waited=%.2f ms total=%llu\n",
+            (unsigned)((P - s_epipe) + 1), topo,
+            why[reason == 0 ? 0 : 1],
+            (double)waited_ns / 1e6,
+            (unsigned long long)__atomic_load_n(&s_pa.skipped, __ATOMIC_RELAXED));
+}
+
+/* Wait for async_state >= 2 (the worker made both modules). Returns 1 when
+ * ready, 0 when the frame budget ran out. */
+static int vk_pa_wait(vk_eng_pipe* P, unsigned long long* waited_ns)
+{
+    const unsigned long long start = vk_pa_now();
+    const unsigned long long deadline =
+        __atomic_load_n(&s_pa.deadline_ns, __ATOMIC_ACQUIRE);
+    *waited_ns = 0;
+    if (!deadline || start >= deadline)
+        return __atomic_load_n(&P->async_state, __ATOMIC_ACQUIRE) >= 2;
+
+    struct timespec ts;
+    ts.tv_sec  = (time_t)(deadline / 1000000000ull);
+    ts.tv_nsec = (long)(deadline % 1000000000ull);
+
+    pthread_mutex_lock(&s_pa.mu);
+    for (;;) {
+        if (__atomic_load_n(&P->async_state, __ATOMIC_ACQUIRE) >= 2) break;
+        if (pthread_cond_timedwait(&s_pa.cv, &s_pa.mu, &ts) != 0) break;
+        if (vk_pa_now() >= deadline) break;
+    }
+    pthread_mutex_unlock(&s_pa.mu);
+
+    *waited_ns = vk_pa_now() - start;
+    return __atomic_load_n(&P->async_state, __ATOMIC_ACQUIRE) >= 2;
+}
+
+static void vk_pa_run(void* job, void* user)
+{
+    (void)user;
+    vk_pa_job* j = (vk_pa_job*)job;
+
+    if (j->kind == 1) {
+        unsigned long long bytes = 0;
+        const unsigned long long t0 = vk_pa_now();
+        const u32 files = rsx_hlsl_to_spirv_disk_prefetch(&bytes);
+        fprintf(stderr, "[pipe-async] warm-up: %u shader-cache files, %.1f MiB in %.1f ms\n",
+                files, (double)bytes / (1024.0 * 1024.0),
+                (double)(vk_pa_now() - t0) / 1e6);
+        free(j);
+        return;
+    }
+
+    vk_eng_pipe* P = &s_epipe[j->slot];
+    const int ok = vk_eng_pipe_modules(P, j->vs, j->ps, j->key,
+                                       s_pa.spv, VK_SPV_WORDS,
+                                       s_pa.log, VK_PA_LOG);
+    pthread_mutex_lock(&s_pa.mu);
+    __atomic_store_n(&P->async_state, ok ? 2 : 3, __ATOMIC_RELEASE);
+    pthread_cond_broadcast(&s_pa.cv);
+    pthread_mutex_unlock(&s_pa.mu);
+    free(j->vs);
+    free(j->ps);
+    free(j);
+}
+
+static void vk_pa_drop_job(void* job)
+{
+    vk_pa_job* j = (vk_pa_job*)job;
+    if (!j) return;
+    free(j->vs);
+    free(j->ps);
+    free(j);
+}
+
+static int vk_pipe_async_init(void)
+{
+    if (s_pa.started) return 0;
+    s_pa.closing = 0;
+    if (!s_pa.spv) {
+        s_pa.spv = (u32*)malloc(VK_SPV_WORDS * sizeof(u32));
+        s_pa.log = (char*)malloc(VK_PA_LOG);
+        if (!s_pa.spv || !s_pa.log) { free(s_pa.spv); free(s_pa.log); s_pa.spv = NULL; s_pa.log = NULL; return -1; }
+        pthread_mutex_init(&s_pa.mu, NULL);
+        pthread_condattr_t ca;
+        pthread_condattr_init(&ca);
+        pthread_condattr_setclock(&ca, CLOCK_MONOTONIC);
+        pthread_cond_init(&s_pa.cv, &ca);
+        pthread_condattr_destroy(&ca);
+    }
+    s_pa.deadline_ns = vk_pa_now() + (unsigned long long)vk_pipe_async_wait_us() * 1000ull;
+    s_pa.q = vk_pipe_queue_create(vk_pa_run, NULL, VK_PA_QUEUE, "pipe-compile");
+    if (!s_pa.q) return -1;
+    s_pa.started = 1;
+    VK_LOG("pipeline worker started (queue %u, wait budget %u us)\n",
+           (unsigned)VK_PA_QUEUE, vk_pipe_async_wait_us());
+    vk_pa_job* warm = (vk_pa_job*)calloc(1, sizeof *warm);
+    if (warm) {
+        warm->kind = 1;
+        if (vk_pipe_queue_push(s_pa.q, warm) != 0) free(warm);
+    }
+    return 0;
+}
+
+/* Stop the worker before the engine releases its pipelines; the mutex and
+ * scratch stay alive until vk_pipe_async_shutdown so a record worker still
+ * finishing a draw cannot use freed state. */
+static void vk_pipe_async_stop(void)
+{
+    s_pa.closing = 1;
+    if (s_pa.q) {
+        vk_pipe_queue_destroy(s_pa.q, vk_pa_drop_job);
+        s_pa.q = NULL;
+    }
+    s_pa.started = 0;
+}
+
+static void vk_pipe_async_frame(void)
+{
+    if (!s_pa.started) return;
+    const unsigned long long d =
+        vk_pa_now() + (unsigned long long)vk_pipe_async_wait_us() * 1000ull;
+    __atomic_store_n(&s_pa.deadline_ns, d, __ATOMIC_RELEASE);
+}
+
+static void vk_pipe_async_shutdown(void)
+{
+    vk_pipe_async_stop();
+    if (s_pa.spv) {
+        fprintf(stderr, "[pipe-async] %llu module jobs, %llu draws skipped "
+                "(%llu modules, %llu failed)\n",
+                (unsigned long long)s_pa.modules_jobs,
+                (unsigned long long)s_pa.skipped,
+                (unsigned long long)s_pa.skip_modules,
+                (unsigned long long)s_pa.skip_failed);
+        pthread_cond_destroy(&s_pa.cv);
+        pthread_mutex_destroy(&s_pa.mu);
+        free(s_pa.spv);
+        free(s_pa.log);
+        s_pa.spv = NULL;
+        s_pa.log = NULL;
     }
 }
 
@@ -4205,18 +4449,70 @@ static void vk_eng_set_pipeline_key(void* user, u64 key)
     s_eng_pipe_key = key;
 }
 
-static int vk_eng_translate(u64 guest_key, const char* hlsl, int stage, VkShaderModule* out)
+/* Translate one stage into a shader module, using caller-owned SPIR-V/log
+ * buffers so the compile worker does not share the walker's s_g scratch. */
+static int vk_eng_translate_scratch(u64 guest_key, const char* hlsl, int stage,
+                                    VkShaderModule* out, u32* spv, u32 spv_max,
+                                    char* log, u32 log_size)
 {
+    static int timing = -1;
+    if (timing < 0) {
+        const char* e = getenv("PS3RECOMP_PIPE_TIMING");
+        timing = e && *e && strcmp(e, "0") != 0;
+    }
+    RsxShaderDiskCacheStats db = { 0 }, da = { 0 };
+    RsxSpirvCacheStats mb = { 0 }, ma = { 0 };
+    if (timing) {
+        rsx_hlsl_to_spirv_disk_stats(&db);
+        rsx_hlsl_to_spirv_cache_stats(&mb);
+    }
     u32 words = 0;
-    if (rsx_hlsl_to_spirv_keyed(guest_key, hlsl, stage, s_g.spv, VK_SPV_WORDS,
-                                &words, s_g.log, sizeof s_g.log) || !words) {
+    const unsigned long long t_start = rsx_wprof_now();
+    const uint64_t _t = ps3_trace_begin();
+    const int rc = rsx_hlsl_to_spirv_keyed(guest_key, hlsl, stage, spv, spv_max,
+                                           &words, log, log_size);
+    const unsigned long long t_translated = rsx_wprof_now();
+    if (_t) ps3_trace_end(_t, PS3_TR_SHADER_COMPILE,
+                          stage == RSX_SHADER_STAGE_VERTEX ? 0u : 1u,
+                          (uint32_t)strlen(hlsl));
+    if (rc || !words) {
         VK_LOG("engine: %s translation failed: %s\n",
-               stage == RSX_SHADER_STAGE_VERTEX ? "vertex" : "fragment", s_g.log);
+               stage == RSX_SHADER_STAGE_VERTEX ? "vertex" : "fragment", log);
         return -1;
     }
     VkShaderModuleCreateInfo ci = { .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
-                                    .codeSize = (size_t)words * 4u, .pCode = s_g.spv };
-    return pvkCreateShaderModule(s_vk.device, &ci, NULL, out) == VK_SUCCESS ? 0 : -1;
+                                    .codeSize = (size_t)words * 4u, .pCode = spv };
+    const VkResult vr = pvkCreateShaderModule(s_vk.device, &ci, NULL, out);
+    if (timing) {
+        rsx_hlsl_to_spirv_disk_stats(&da);
+        rsx_hlsl_to_spirv_cache_stats(&ma);
+        const char* src = da.hits > db.hits ? "disk"
+                        : ma.disk_hits > mb.disk_hits ? "disk"
+                        : ma.translations > mb.translations ? "glslang"
+                        : "mem";
+        fprintf(stderr, "[pipe-timing] key=%016llx stage=%d translate=%.1f us "
+                        "module=%.1f us src=%s\n",
+                (unsigned long long)guest_key, stage,
+                (double)(t_translated - t_start) / 1000.0,
+                (double)(rsx_wprof_now() - t_translated) / 1000.0, src);
+    }
+    return vr == VK_SUCCESS ? 0 : -1;
+}
+
+static int vk_eng_pipe_modules(vk_eng_pipe* P, const char* vs_hlsl, const char* ps_hlsl,
+                               u64 key, u32* spv, u32 spv_max, char* log, u32 log_size)
+{
+    P->vs = P->fs = VK_NULL_HANDLE;
+    if (vk_eng_translate_scratch(key, vs_hlsl, RSX_SHADER_STAGE_VERTEX,
+                                 &P->vs, spv, spv_max, log, log_size))
+        return -1;
+    if (vk_eng_translate_scratch(key, ps_hlsl, RSX_SHADER_STAGE_FRAGMENT,
+                                 &P->fs, spv, spv_max, log, log_size)) {
+        pvkDestroyShaderModule(s_vk.device, P->vs, NULL);
+        P->vs = VK_NULL_HANDLE;
+        return -1;
+    }
+    return 0;
 }
 
 /* A pixel program with a cube unit declares all sixteen units one by one
@@ -4301,28 +4597,47 @@ static u32 vk_eng_pipeline_create(void* user, const char* vs_hlsl, const char* p
     }
     vk_eng_pipe* P = &s_epipe[slot];
     memset(P, 0, sizeof *P);
-    {
-        const uint64_t _t = ps3_trace_begin();
-        const int _rc = vk_eng_translate(s_eng_pipe_key, vs_hlsl, RSX_SHADER_STAGE_VERTEX, &P->vs);
-        if (_t) ps3_trace_end(_t, PS3_TR_SHADER_COMPILE, 0,
-                              (uint32_t)strlen(vs_hlsl));
-        if (_rc) return 0;
-    }
-    {
-        const uint64_t _t = ps3_trace_begin();
-        const int _rc = vk_eng_translate(s_eng_pipe_key, ps_hlsl, RSX_SHADER_STAGE_FRAGMENT, &P->fs);
-        if (_t) ps3_trace_end(_t, PS3_TR_SHADER_COMPILE, 1,
-                              (uint32_t)strlen(ps_hlsl));
-        if (_rc) {
-            pvkDestroyShaderModule(s_vk.device, P->vs, NULL); memset(P, 0, sizeof *P); return 0;
-        }
-    }
     P->rs = *rs;
     P->nslots = layout->count;
     P->stride = vertex_stride;
     P->rt_count = rt_count;
     P->rt_fmt = cf;
     P->cube_mask = vk_eng_cube_units(ps_hlsl);
+
+    /* Asynchronous path: hand the two programs to the worker and return the
+     * slot now. The draw that binds it waits for a bounded time and is then
+     * skipped, never translated here. If the queue is full (or the worker
+     * cannot start) fall through to the old synchronous build. */
+    if (vk_pipe_async_on() && vk_pipe_async_init() == 0) {
+        const size_t vn = strlen(vs_hlsl) + 1u, pn = strlen(ps_hlsl) + 1u;
+        vk_pa_job* j = (vk_pa_job*)calloc(1, sizeof *j);
+        char* vs = (char*)malloc(vn);
+        char* ps = (char*)malloc(pn);
+        if (j && vs && ps) {
+            memcpy(vs, vs_hlsl, vn);
+            memcpy(ps, ps_hlsl, pn);
+            j->kind = 0;
+            j->slot = slot;
+            j->key = s_eng_pipe_key;
+            j->vs = vs;
+            j->ps = ps;
+            if (vk_pipe_queue_push(s_pa.q, j) == 0) {
+                __atomic_store_n(&P->async_state, 1, __ATOMIC_RELEASE);
+                P->used = 1;
+                s_pa.modules_jobs++;
+                return slot + 1u;
+            }
+        }
+        free(j);
+        free(vs);
+        free(ps);
+    }
+
+    if (vk_eng_pipe_modules(P, vs_hlsl, ps_hlsl, s_eng_pipe_key,
+                            s_g.spv, VK_SPV_WORDS, s_g.log, sizeof s_g.log)) {
+        memset(P, 0, sizeof *P);
+        return 0;
+    }
     P->used = 1;
     return slot + 1u;
 }
@@ -4484,6 +4799,27 @@ static VkPipeline vk_eng_variant_create(vk_eng_pipe* P, u32 topo_idx)
  * externally synchronised, so serialise creation and re-check. */
 static VkPipeline vk_eng_variant(vk_eng_pipe* P, u32 topo_idx)
 {
+    /* A pipeline created by the async path carries async_state != 0; one
+     * built before the key was turned on stays on the synchronous path.
+     * The worker translates the two programs and makes the modules; the
+     * VkPipeline itself is created here, on the thread that owns the draw
+     * context (a first-use build measured <= 6.7 ms, under one frame). */
+    if (__atomic_load_n(&P->async_state, __ATOMIC_ACQUIRE)) {
+        unsigned long long waited = 0;
+        if (__atomic_load_n(&P->async_state, __ATOMIC_ACQUIRE) == 1) {
+            vk_pa_wait(P, &waited);
+            if (__atomic_load_n(&P->async_state, __ATOMIC_ACQUIRE) < 2) {
+                vk_pa_note_skip(P, topo_idx, 0, waited);
+                return VK_NULL_HANDLE;
+            }
+        }
+        if (__atomic_load_n(&P->async_state, __ATOMIC_ACQUIRE) == 3) {
+            vk_pa_note_skip(P, topo_idx, 3, waited);
+            return VK_NULL_HANDLE;
+        }
+        if (P->variant[topo_idx]) return P->variant[topo_idx];
+    }
+
     if (P->variant[topo_idx]) return P->variant[topo_idx];
     pthread_mutex_lock(&s_pipe_create_mu);
     VkPipeline pipe = P->variant[topo_idx];
@@ -6123,6 +6459,7 @@ static int vk_init_all(u32 width, u32 height, const char* title)
         s_vk.present_queue = s_vk.queue;
     }
     vk_pipe_cache_init();
+    if (vk_pipe_async_env()) vk_pipe_async_init();
 
     VkCommandPoolCreateInfo pci = { .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
                                     .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT,
@@ -6225,6 +6562,7 @@ int rsx_vulkan_backend_init(u32 width, u32 height, const char* title)
 
 void rsx_vulkan_backend_shutdown(void)
 {
+    vk_pipe_async_stop();                    /* before any pipeline is released */
     rsx_vulkan_backend_present_finish();   /* a host that began one and quit */
     if (rsx_get_backend() == &s_vulkan_backend) rsx_set_backend(NULL);
     if (s_vk.eng_active) { rsx_draw_engine_shutdown(); s_vk.eng_active = 0; }
@@ -6277,6 +6615,7 @@ void rsx_vulkan_backend_shutdown(void)
     }
     if (s_vk.instance && pvkDestroyInstance) pvkDestroyInstance(s_vk.instance, NULL);
     if (s_vk.lib) dlclose(s_vk.lib);
+    vk_pipe_async_shutdown();               /* report and free the worker state */
     free(s_vk.cpu_verts);
     pthread_mutex_destroy(&s_vk.queue_mu);
     pthread_mutex_destroy(&s_vk.present_mu);

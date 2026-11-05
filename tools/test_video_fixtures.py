@@ -80,6 +80,7 @@ FIXTURES = {
     'test_gcm_tick_in_drain': GCM,
     'test_nv3089_engine_read': [],
     'test_vk_dump_queue': [V + 'vk_dump_queue.c'],
+    'test_vk_pipe_queue': [V + 'vk_pipe_queue.c'],
 }
 
 
