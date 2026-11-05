@@ -12,6 +12,12 @@
 #include "../libs/video/cellGcmSys.c"
 #include "../../runtime/memory/vm.h"
 
+/* PS3RECOMP_REPLAY_VK=1 replays through the real Vulkan backend instead of
+ * the null one. The backend is linked into this tool by the CMake target. */
+int rsx_vulkan_backend_init(u32 width, u32 height, const char* title);
+void rsx_vulkan_backend_shutdown(void);
+u32 rsx_vulkan_backend_guest_draws(void);
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -48,6 +54,7 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
 int rsx_process_vp_run(rsx_state* state, u32 method, const u8* src, u32 count)
 { (void)state; (void)method; (void)src; (void)count; return 0; }
 rsx_backend* rsx_get_backend(void) { return NULL; }
+void rsx_set_backend(rsx_backend* b) { (void)b; }
 
 void rsx_live_draw_set_display_buffer(u32 id, u32 loc, u32 off, u32 w, u32 h, u32 p)
 { (void)id; (void)loc; (void)off; (void)w; (void)h; (void)p; }
@@ -96,6 +103,7 @@ struct rsx_engine_replay {
     size_t nents;
     unsigned long long hits, misses;
     u32 words;
+    int vk;
 };
 
 static const u8* cap_read(void* user, u32 location, u32 offset, u32 min_bytes)
@@ -236,11 +244,31 @@ rsx_engine_replay* rsx_engine_replay_create(const char* prefix, char* err, size_
     }
 
     rsx_draw_engine_set_guest_memory(cap_read, r);
-    rsx_draw_engine_set_backend(replay_null_backend());
-    rsx_draw_engine_set_default(1);
-    if (rsx_draw_engine_init(r->state.width ? r->state.width : 1280,
-                             r->state.height ? r->state.height : 720) != 0) {
-        set_err(err, errlen, "rsx_draw_engine_init"); goto fail;
+    {
+        const char* v = getenv("PS3RECOMP_REPLAY_VK");
+        r->vk = v && *v && strcmp(v, "0") != 0;
+    }
+    if (r->vk) {
+        /* The engine path is the one that records real Vulkan commands; the
+         * fixed-function vtable would bypass it. Guest programs are what turn
+         * the engine on, so default it for this tool only. */
+        if (!getenv("PS3RECOMP_VK_GUEST_PROGRAMS"))
+            setenv("PS3RECOMP_VK_GUEST_PROGRAMS", "1", 0);
+        if (rsx_vulkan_backend_init(r->state.width ? r->state.width : 1280,
+                                    r->state.height ? r->state.height : 720,
+                                    "replay") != 0) {
+            set_err(err, errlen, "rsx_vulkan_backend_init"); goto fail;
+        }
+        if (!rsx_draw_engine_enabled()) {
+            set_err(err, errlen, "Vulkan guest programs unavailable"); goto fail;
+        }
+    } else {
+        rsx_draw_engine_set_backend(replay_null_backend());
+        rsx_draw_engine_set_default(1);
+        if (rsx_draw_engine_init(r->state.width ? r->state.width : 1280,
+                                 r->state.height ? r->state.height : 720) != 0) {
+            set_err(err, errlen, "rsx_draw_engine_init"); goto fail;
+        }
     }
     rsx_draw_engine_state_restore(&r->state);
 
@@ -264,7 +292,7 @@ int rsx_engine_replay_run_frame(rsx_engine_replay* r, rsx_engine_replay_stats* o
     if (!r) return -1;
     rsx_draw_engine_mt_sync();
     rsx_draw_engine_state_restore(&r->state);
-    replay_null_reset();
+    if (!r->vk) replay_null_reset();
     r->hits = r->misses = 0;
 
     s_fifo_getoff = r->stream_start;
@@ -284,12 +312,18 @@ int rsx_engine_replay_run_frame(rsx_engine_replay* r, rsx_engine_replay_stats* o
     rsx_draw_engine_mt_sync();
     rsx_draw_engine_replay_advance_frame();
     if (out) {
-        out->draws = replay_null_draws();
-        out->vertices = replay_null_draw_vertices();
+        if (r->vk) {
+            out->draws = rsx_vulkan_backend_guest_draws();
+            out->vertices = 0;
+            out->frame_hash = 0;
+        } else {
+            out->draws = replay_null_draws();
+            out->vertices = replay_null_draw_vertices();
+            out->frame_hash = replay_null_hash();
+        }
         out->read_hits = r->hits;
         out->read_misses = r->misses;
         out->words = r->words;
-        out->frame_hash = replay_null_hash();
     }
     return (s_fifo_getoff == r->stream_end) ? 0 : -2;
 }
@@ -297,7 +331,8 @@ int rsx_engine_replay_run_frame(rsx_engine_replay* r, rsx_engine_replay_stats* o
 void rsx_engine_replay_destroy(rsx_engine_replay* r)
 {
     if (!r) return;
-    if (rsx_draw_engine_enabled()) rsx_draw_engine_shutdown();
+    if (r->vk) rsx_vulkan_backend_shutdown();
+    else if (rsx_draw_engine_enabled()) rsx_draw_engine_shutdown();
     free(r->fifo);
     free(r->mem);
     free(r->ents);

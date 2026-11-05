@@ -3734,6 +3734,16 @@ static int eng_zdepth_store(u32 slot, int forced)
 
 static int eng_zdepth_to_guest(u32 slot)
 {
+    /* Profiling switch (exp/crowd-prof): pretend the guest copy is unavailable
+     * so the texture-bind depth fallback is skipped. The bind then takes the
+     * dummy, which changes the image; use only to measure what the readback
+     * and its GPU waits cost. */
+    static int s_noguest = -1;
+    if (s_noguest < 0) {
+        const char* e = getenv("PS3RECOMP_ENG_DEPTH_NOGUEST");
+        s_noguest = e && *e && strcmp(e, "0") != 0;
+    }
+    if (s_noguest) return 0;
     eng_zdepth* z = &g.zdepths[slot];
     if (z->wcb_pending && rsx_wcb_resolve_cookie(0x10000u | slot, RSX_WCB_REASON_EXPLICIT)) return 1;
     if (!z->guest_dirty) return 1;
