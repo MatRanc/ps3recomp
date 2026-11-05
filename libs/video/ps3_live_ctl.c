@@ -93,6 +93,7 @@ static const char* const K_NAME[PS3_LIVE_COUNT] = {
     "PS3RECOMP_VK_VIEW_MEMO",
     "PS3RECOMP_ENG_TEXCACHE",
     "PS3RECOMP_ENG_TARGET_BLOOM",
+    "PS3RECOMP_C690_HOLES_NATIVE",
 };
 
 static _Atomic int s_val[PS3_LIVE_COUNT];

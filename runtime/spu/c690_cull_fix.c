@@ -58,15 +58,29 @@ static SPU_THREAD_LOCAL uint32_t t_save_pc;
 static SPU_THREAD_LOCAL uint32_t t_save_status;
 static SPU_THREAD_LOCAL uint32_t t_save_stop;
 static SPU_THREAD_LOCAL int t_save_image;
-static SPU_THREAD_LOCAL int t_union_mode;   /* 0 none, 1 union, 2 simple */
+static SPU_THREAD_LOCAL int t_union_mode;   /* 0 none, 1 union, 2 simple, 3 fused holes */
+static SPU_THREAD_LOCAL int t_holes_family = -1;  /* gpr[4] at 0x132E0 entry: 1 = 0x26 */
 static SPU_THREAD_LOCAL int t_union_depth;
 
 /* The native screen key's mode 2 selects this union driver with the native
  * 0xD080 stage in place of the lifted one. */
 extern int c690_native_screen_mode(void) __attribute__((weak));
+extern int c690_native_screen_holes_active(void) __attribute__((weak));
+extern uint32_t c690_native_screen_holes_merge(spu_context*, uint32_t,
+                                               uint32_t, uint32_t)
+    __attribute__((weak));
 static int native_screen_union(void)
 {
     return c690_native_screen_mode && c690_native_screen_mode() == 2;
+}
+
+/* The fused holes key: the 0xD080 hook runs the native stage and stashes the
+ * sample list; this driver merges it after the caller's count write.  A mode-3
+ * wrapper branch calls the body once and then c690_cull_fix_end(). */
+static int native_screen_holes(void)
+{
+    return c690_native_screen_holes_active &&
+           c690_native_screen_holes_active();
 }
 
 static int cull_live_get(int key, int fallback)
@@ -103,7 +117,8 @@ int c690_cull_fix_enabled(int family)
     cull_read_env();
     if (family == 2)
         return cull_live_get(PS3_LIVE_C690_CULL_FIX_2C, s_env_fix_2c);
-    return cull_live_get(PS3_LIVE_C690_CULL_FIX, s_env_fix) || native_screen_union();
+    return cull_live_get(PS3_LIVE_C690_CULL_FIX, s_env_fix) ||
+           native_screen_union() || native_screen_holes();
 }
 
 /* MLB16_CULL_BYPASS: the generated c690 module calls this for every 0x25/0x26
@@ -129,6 +144,7 @@ int c690_cull_fix_maybe(void)
 {
     cull_read_env();
     if (native_screen_union()) return 1;
+    if (native_screen_holes()) return 1;
     if (s_env_fix || s_env_fix_2c) return 1;
 #ifdef C690_CULL_HAVE_LIVE_CTL
     if (ps3_live_ctl_enabled) return ps3_live_ctl_enabled() != 0;
@@ -215,16 +231,18 @@ static void cull_scan(const struct spu_context* ctx)
     }
 }
 
-/* Patch every screen-transform copy onto the 2x1 sample grid.  The cull reads
- * the highest-address copy; the others are harmless duplicates. */
-static int cull_apply_patch(struct spu_context* ctx)
+/* Refresh the cached transform-block addresses and return 1 when this image
+ * has at least one.  The job context is rebuilt per job, so the addresses
+ * move: rescan when the cached addresses no longer look like a transform
+ * (and every 256 calls as a cheap drift check).
+ *
+ * A cached negative is *not* kept: a later command in the same image can add
+ * the transform, and the union driver must see it.  The fused holes probe
+ * (c690_cull_fix_probe_transform) is the one caller allowed to skip the
+ * rescan, and only for the 0x25 family. */
+static int cull_ensure_scan(struct spu_context* ctx)
 {
     if (!ctx || !ctx->ls) return 0;
-
-    /* The job context is rebuilt per job, so the block addresses move.  Rescan
-     * when the cached addresses no longer look like a transform in this image
-     * (and every 256 calls as a cheap drift check).  A job with no transform
-     * rescans each call; that only happens while the fix is switched on. */
     int need_scan = !t_scanned || ((++t_scan_tick & 0xFFu) == 0u);
     if (!need_scan && t_nblocks) {
         int any = 0;
@@ -232,11 +250,51 @@ static int cull_apply_patch(struct spu_context* ctx)
             if (looks_like_screen_xform(ctx->ls, t_blocks[i])) { any = 1; break; }
         if (!any) need_scan = 1;
     } else if (!need_scan && !t_nblocks) {
+        /* A negative result is never cached: the job context is rebuilt per
+         * job and a later cull in the same image may carry the transform.
+         * Caching this for the 256-call drift tick silently skipped the
+         * sample-grid run on the first command of a job (the offline gate
+         * caught it: 64 transform pairs scored as inert). */
         need_scan = 1;
     }
     if (need_scan) cull_scan(ctx);
-    if (!t_nblocks) {
-        __atomic_fetch_add(&s_no_block, 1ull, __ATOMIC_RELAXED);
+    for (int i = 0; i < t_nblocks; i++)
+        if (looks_like_screen_xform(ctx->ls, t_blocks[i])) return 1;
+    return 0;
+}
+
+/* True when this command needs the sample-grid run.  The fused holes pass
+ * calls this before paying for its sample-run LS copy.
+ *
+ * A cached positive is revalidated in place (no scan).  A cached negative is
+ * only trusted for the 0x25 family: every captured 0x25 job carries no screen
+ * transform, while every 0x26 job does, so a full negative scan per 0x25 call
+ * would be pure overhead.  If a 0x26 call in the same image has already found
+ * the transform, the cached positive is honored for 0x25 as well.  family < 0
+ * means "not known": always scan. */
+int c690_cull_fix_probe_transform(struct spu_context* ctx, int family)
+{
+    if (!ctx || !ctx->ls) return 0;
+    if (t_scanned) {
+        for (int i = 0; i < t_nblocks; i++)
+            if (looks_like_screen_xform(ctx->ls, t_blocks[i])) return 1;
+        if (!t_nblocks && family == 0) return 0;
+    }
+    return cull_ensure_scan(ctx);
+}
+
+int c690_cull_fix_holes_family(void)
+{
+    return t_holes_family;
+}
+
+/* Patch every screen-transform copy onto the 2x1 sample grid.  The cull reads
+ * the highest-address copy; the others are harmless duplicates. */
+static int cull_apply_patch(struct spu_context* ctx)
+{
+    if (!cull_ensure_scan(ctx)) {
+        if (ctx && ctx->ls)
+            __atomic_fetch_add(&s_no_block, 1ull, __ATOMIC_RELAXED);
         return 0;
     }
 
@@ -268,6 +326,12 @@ static int cull_apply_patch(struct spu_context* ctx)
     __atomic_fetch_add(&s_patched, 1ull, __ATOMIC_RELAXED);
     __atomic_fetch_add(&s_blocks, (unsigned long long)t_nsaved, __ATOMIC_RELAXED);
     return 1;
+}
+
+int c690_cull_fix_patch_2x(struct spu_context* ctx)
+{
+    if (!ctx || !ctx->ls) return 0;
+    return cull_apply_patch(ctx);
 }
 
 int c690_cull_fix_enter(struct spu_context* ctx, int family)
@@ -363,6 +427,28 @@ int c690_cull_fix_begin(struct spu_context* ctx, int family)
 
     __atomic_fetch_add(&s_calls, 1ull, __ATOMIC_RELAXED);
 
+    /* Fused native holes: no LS/GPR snapshot and no transform patch here.
+     * The D080 hook evaluates both grids; expose the entry list extent for
+     * the post-command merge. */
+    if (family == 1 && native_screen_holes()) {
+        uint32_t ptr, cnt, cap;
+        t_cull_ctx = ctx->gpr[3]._u32[0] & SPU_LS_MASK;
+        /* The 0x26 handler sets r4 = 1 and the 0x25 handler r4 = 0 right
+         * before the call; the body overwrites r4 later, so capture it here.
+         * The sample-grid rule is only needed by the family whose captured
+         * jobs carry the screen-transform block (all 0x26, none 0x25). */
+        t_holes_family = (int)(ctx->gpr[4]._u32[0] & 1u);
+        if (!cull_list_capacity(ctx, &ptr, &cnt, &cap)) {
+            __atomic_fetch_add(&s_union_skip_setup, 1ull, __ATOMIC_RELAXED);
+            return 0;
+        }
+        t_entry_ptr = ptr;
+        t_cap_entries = cap;
+        t_union_mode = 3;
+        t_union_depth = 1;
+        return 3;
+    }
+
     if (!union_ensure_buffers()) {
         __atomic_fetch_add(&s_union_skip_setup, 1ull, __ATOMIC_RELAXED);
         return 0;
@@ -429,6 +515,30 @@ void c690_cull_fix_mid(struct spu_context* ctx)
 
 void c690_cull_fix_end(struct spu_context* ctx)
 {
+    if (ctx && t_union_mode == 3) {
+        const uint32_t ptr = be32(ctx->ls + t_cull_ctx + 0x110) & SPU_LS_MASK;
+        const uint32_t cnt = be32(ctx->ls + t_cull_ctx + 0x114);
+        uint32_t cap = t_cap_entries;
+        if (ptr != t_entry_ptr || cnt > cap) {
+            __atomic_fetch_add(&s_union_skip_range, 1ull, __ATOMIC_RELAXED);
+            cap = cnt;
+        }
+        if (cap > C690_CULL_LIST_MAX) cap = C690_CULL_LIST_MAX;
+        if (ptr + (size_t)cap * 2u > SPU_LS_SIZE)
+            cap = (SPU_LS_SIZE - ptr) / 2u;
+        uint32_t added = 0;
+        if (ptr == t_entry_ptr && c690_native_screen_holes_merge)
+            added = c690_native_screen_holes_merge(ctx, ptr, cnt, cap);
+        if (added) {
+            put32(ctx->ls + t_cull_ctx + 0x114, cnt + 3u * added);
+            __atomic_fetch_add(&s_union_added_tris, (unsigned long long)added,
+                               __ATOMIC_RELAXED);
+        }
+        __atomic_fetch_add(&s_union_runs, 1ull, __ATOMIC_RELAXED);
+        t_union_mode = 0;
+        t_union_depth = 0;
+        return;
+    }
     if (!ctx || t_union_mode != 1) {
         t_union_mode = 0;
         t_union_depth = 0;

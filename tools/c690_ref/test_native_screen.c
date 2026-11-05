@@ -111,8 +111,12 @@ void __probe_fn(unsigned addr) { g_fncount[(addr >> 2) & 0xFFFFu]++; }
 
 /* Generated module hooks not used by the direct-body test. */
 int g_c690_corpus_on = 0;
+int g_c690_tail_on = 0;
 void c690_corpus_cull_enter(const spu_context* c, uint32_t l) { (void)c; (void)l; }
 void c690_corpus_cull_exit(const spu_context* c, uint32_t l) { (void)c; (void)l; }
+void c690_corpus_tail_cmd_enter(const spu_context* c, uint32_t l, uint32_t op)
+{ (void)c; (void)l; (void)op; }
+void c690_corpus_tail_cmd_exit(const spu_context* c) { (void)c; }
 void c690_corpus_stage_enter(const spu_context* c, uint32_t l) { (void)c; (void)l; }
 void c690_corpus_stage_exit(const spu_context* c, uint32_t l) { (void)c; (void)l; }
 int c690_native_cull_maybe(void) { return 0; }
@@ -198,9 +202,9 @@ int main(int argc, char** argv)
         "/home/m/Documents/mlb16-online/recomp-work/corpus_edge3s2";
     if (argc > 3) g_max_dispatch = atol(argv[3]);
 
-    char files[64][1200];
+    char files[1024][1200];
     int nfiles = 0;
-    for (int i = 0; i < 64; i++) {
+    for (int i = 0; i < 1024; i++) {
         snprintf(files[nfiles], sizeof files[0], "%s/cull_%03d.bin", corpus, i);
         FILE* f = fopen(files[nfiles], "rb");
         if (!f) break;
@@ -264,7 +268,8 @@ int main(int argc, char** argv)
             const uint32_t cull_ctx = ctx.gpr[3]._u32[0] & SPU_LS_MASK;
 
             const long long t0 = now_ns();
-            if (!strcmp(mode, "fix") || !strcmp(mode, "union"))
+            if (!strcmp(mode, "fix") || !strcmp(mode, "union") ||
+                !strcmp(mode, "holes"))
                 jobmod_c690c2f7b09a_eF5B8_spu_func_000132E0(&ctx);
             else
                 jobmod_c690c2f7b09a_eF5B8_spu_func_000132E0_body(&ctx);
@@ -283,9 +288,12 @@ int main(int argc, char** argv)
                 if (memcmp(ctx.ls + a, cap_ls + a, 16) != 0) { bad = 1; break; }
             if (bad) bad_exit++;
 
-            printf("PAIR %s %llu %u 0x%05X %016llX %016llX 0x%05X %u %u %u\n",
+            const uint32_t raw_cnt = get_be32(ctx.ls + cull_ctx + 0x114);
+            const uint32_t buf_end = get_be32(ctx.ls + cull_ctx + 0x1E0) & SPU_LS_MASK;
+            printf("PAIR %s %llu %u 0x%05X %016llX %016llX 0x%05X %u %u %u %u 0x%05X\n",
                    mode, pairs, seq, cull_ctx, (unsigned long long)hls,
-                   (unsigned long long)hgpr, ctx.pc, ptr, ln, (unsigned)bad);
+                   (unsigned long long)hgpr, ctx.pc, ptr, ln, (unsigned)bad,
+                   raw_cnt, buf_end);
             printf("LIST %s %llu", mode, pairs);
             for (uint32_t i = 0; i < ln; i++) printf(" %u", g_list[i]);
             printf("\n");

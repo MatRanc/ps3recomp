@@ -59,12 +59,29 @@ typedef struct {
     unsigned long long union_skipped;
     unsigned long long lifted_ns;
     unsigned long long native_ns;
+    /* fused holes pass (PS3RECOMP_C690_HOLES_NATIVE) */
+    unsigned long long holes_calls;
+    unsigned long long holes_runs;          /* sample-grid stage evaluations */
+    unsigned long long holes_added_tris;
+    unsigned long long holes_cap_skipped;
+    unsigned long long holes_skip_setup;
+    unsigned long long holes_fallback;
+    unsigned long long holes_ns;
 } c690_native_screen_counters;
 
 void c690_native_screen_get_counters(c690_native_screen_counters* out);
 
 /* Test hook: run the native stage once on the context (no switches). */
 void c690_native_screen_run_once(struct spu_context* ctx);
+
+/* Fused holes pass (PS3RECOMP_C690_HOLES_NATIVE).  The 0xD080 hook stashes
+ * the sample-grid list; c690_cull_fix_end() calls the merge after the caller
+ * has written the game-grid count.  Returns the number of triangles appended;
+ * the caller adds 3*added to the kept index count. */
+int c690_native_screen_holes_active(void);
+uint32_t c690_native_screen_holes_merge(struct spu_context* ctx, uint32_t ptr,
+                                        uint32_t cnt_indices,
+                                        uint32_t cap_indices);
 
 #ifdef __cplusplus
 }

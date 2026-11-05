@@ -94,6 +94,7 @@ enum {
     PS3_LIVE_VK_VIEW_MEMO,              /* PS3RECOMP_VK_VIEW_MEMO: O(1) backend surface-view cache */
     PS3_LIVE_ENG_TEXCACHE,              /* PS3RECOMP_ENG_TEXCACHE: 4096-entry texture cache instead of 1024 */
     PS3_LIVE_ENG_TARGET_BLOOM,          /* PS3RECOMP_ENG_TARGET_BLOOM: skip target-table scans for non-target addresses */
+    PS3_LIVE_C690_HOLES_NATIVE,         /* PS3RECOMP_C690_HOLES_NATIVE: fused 0x25/0x26 native sample-grid union */
     PS3_LIVE_COUNT
 };
 

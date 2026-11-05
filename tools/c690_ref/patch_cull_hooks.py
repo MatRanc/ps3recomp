@@ -65,6 +65,13 @@ void {name}(spu_context* ctx) {{
             /* Exit snapshot is the game's real output, before the union. */
             if (g_c690_corpus_on) c690_corpus_cull_exit(ctx, 0x{lsa:05X}u);
             c690_cull_fix_end(ctx);    /* append sample-grid-only triangles */
+        }} else if (mode == 3) {{
+            /* Fused native holes: one command pass; the D080 hook ran the
+             * sample-grid stage on a private context and stashed its list.
+             * The body writes the game list/count, then the merge appends. */
+            {name}_body(ctx);
+            if (g_c690_corpus_on) c690_corpus_cull_exit(ctx, 0x{lsa:05X}u);
+            c690_cull_fix_end(ctx);
         }} else {{
             {name}_body(ctx);
             if (mode == 2) c690_cull_fix_leave(ctx);
