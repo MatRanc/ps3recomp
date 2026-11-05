@@ -32,6 +32,46 @@ sys_fs_fd_info  g_sys_fs_fds[SYS_FS_FD_MAX];
 sys_fs_dir_info g_sys_fs_dirs[SYS_FS_DIR_MAX];
 char            g_sys_fs_root[512] = ".";
 
+/* ---- cellFs fd bridge -------------------------------------------------------
+ *
+ * On hardware, cellFsOpen and the raw sys_fs_* calls share ONE kernel fd
+ * space: a title may open a file with cellFs and read it with sys_fs_read.
+ * Our runtime has two tables (runtime/ppu/ppu_fs.cpp for cellFs, this file
+ * for sys_fs), so that mix returned EBADF. MLB The Show 16's Bink SDK does
+ * exactly this: the game opens the .BIK with cellFsOpen (ppu_fs), the Bink
+ * default PS3 IO then calls sys_fs_lseek/sys_fs_read on that same fd
+ * (EBOOT 0x00ee7d00 opens with sys_fs_open only when BINK_OPEN flag 0x800000
+ * is clear; 0x00ee8690 seeks/reads with 0x00a41f1c/0x00a420a0 ->
+ * sys_fs_lseek/sys_fs_read). The lookup missed, the header read returned
+ * nothing, and BinkOpen reported "Not a Bink file." -- no Fs log, no read,
+ * movie abandoned. Bridge only when the fd is not ours; the sys_fs table
+ * stays authoritative for its own descriptors.
+ *
+ * Weak so the standalone filesystem fixtures (tools/test_cellfs_vfs_root.py)
+ * that compile this file without ppu_fs still link. */
+#if defined(__GNUC__) && !defined(_WIN32)
+extern FILE* ppu_cellfs_file_for_fd(int fd) __attribute__((weak));
+#else
+extern FILE* ppu_cellfs_file_for_fd(int fd);
+#endif
+
+static FILE* sys_fs_bridge_file(int fd)
+{
+#if defined(__GNUC__) && !defined(_WIN32)
+    if (!ppu_cellfs_file_for_fd) return NULL;
+#endif
+    return ppu_cellfs_file_for_fd(fd);
+}
+
+/* Exposed to ppu_fs so its allocator does not hand out a number this table
+ * already owns (and vice versa in sys_fs_open below): two live fds with one
+ * number are exactly the split this bridge papers over. */
+int sys_fs_fd_active(int fd)
+{
+    int slot = fd - 3;
+    return slot >= 0 && slot < SYS_FS_FD_MAX && g_sys_fs_fds[slot].active;
+}
+
 static void write_be32(uint32_t addr, uint32_t val)
 {
     uint32_t* p = (uint32_t*)vm_to_host(addr);
@@ -357,10 +397,11 @@ int64_t sys_fs_open(ppu_context* ctx)
       const char* use = edat_resolve(host_path, dec_path, sizeof dec_path);
       if (use != host_path) snprintf(host_path, sizeof host_path, "%s", use); }
 
-    /* Find free fd slot */
+    /* Find free fd slot. Skip numbers the cellFs table owns: one kernel fd
+     * space on hardware, two tables here (see the bridge note at the top). */
     int slot = -1;
     for (int i = 0; i < SYS_FS_FD_MAX; i++) {
-        if (!g_sys_fs_fds[i].active) { slot = i; break; }
+        if (!g_sys_fs_fds[i].active && !sys_fs_bridge_file(i + 3)) { slot = i; break; }
     }
     if (slot < 0)
         return (int64_t)(int32_t)CELL_ENOMEM;
@@ -498,15 +539,15 @@ int64_t sys_fs_read(ppu_context* ctx)
     uint32_t nread_addr = LV2_ARG_PTR(ctx, 3);
 
     int slot = fd - 3;
-    if (slot < 0 || slot >= SYS_FS_FD_MAX)
-        return (int64_t)(int32_t)CELL_EBADF;
-
-    sys_fs_fd_info* f = &g_sys_fs_fds[slot];
-    if (!f->active || !f->fp)
+    sys_fs_fd_info* f = (slot >= 0 && slot < SYS_FS_FD_MAX) ? &g_sys_fs_fds[slot] : NULL;
+    /* Own table first; otherwise the same fd opened through cellFs (one fd
+     * space on hardware; see the bridge note at the top of this file). */
+    FILE* fp = (f && f->active) ? f->fp : sys_fs_bridge_file(fd);
+    if (!fp)
         return (int64_t)(int32_t)CELL_EBADF;
 
     void* buf = vm_to_host(buf_addr);
-    long pos_before = ftell(f->fp);
+    long pos_before = ftell(fp);
     /* The VM commits pages on first user-mode touch; a read the CRT hands to
      * the kernel (anything past its 4 KB buffer) into a still-reserved page
      * fails instead, and fread comes back short. GH3's Bink reader saw that
@@ -514,7 +555,7 @@ int64_t sys_fs_read(ppu_context* ctx)
      * video. ppu_fs.cpp fs_prefault is the same fix for cellFs. */
     if (size) vm_commit(buf_addr, (uint32_t)size);
     ps3_guest_write(buf, (size_t)size);
-    size_t nread = fread(buf, 1, (size_t)size, f->fp);
+    size_t nread = fread(buf, 1, (size_t)size, fp);
 
     /* PS3_FSTRACE=<n>: every nth read, the fd and the file offset it came from.
      *
@@ -544,7 +585,8 @@ int64_t sys_fs_read(ppu_context* ctx)
         const unsigned char* b = (const unsigned char*)buf;
         fprintf(stderr, "[FSDBG] read fd=%d '%s' pos=%ld want=%llu got=%zu"
                         " head=%02X%02X%02X%02X lr=0x%08X\n",
-                fd, f->path, pos_before, (unsigned long long)size, nread,
+                fd, (f && f->active) ? f->path : "<cellFs fd>", pos_before,
+                (unsigned long long)size, nread,
                 nread > 0 ? b[0] : 0, nread > 1 ? b[1] : 0,
                 nread > 2 ? b[2] : 0, nread > 3 ? b[3] : 0,
                 (uint32_t)ctx->lr);
@@ -636,16 +678,11 @@ int64_t sys_fs_lseek(ppu_context* ctx)
     uint32_t pos_addr  = LV2_ARG_PTR(ctx, 3);
 
     int slot = fd - 3;
-    if (slot < 0 || slot >= SYS_FS_FD_MAX) {
+    sys_fs_fd_info* f = (slot >= 0 && slot < SYS_FS_FD_MAX) ? &g_sys_fs_fds[slot] : NULL;
+    FILE* fp = (f && f->active) ? f->fp : sys_fs_bridge_file(fd);
+    if (!fp) {
         /* Invalid fd — return position 0 instead of EBADF.
          * The CRT may call lseek on uninitialized FILE structures. */
-        if (pos_addr)
-            write_be64(pos_addr, 0);
-        return 0;
-    }
-
-    sys_fs_fd_info* f = &g_sys_fs_fds[slot];
-    if (!f->active || !f->fp) {
         if (pos_addr)
             write_be64(pos_addr, 0);
         return 0;
@@ -660,11 +697,11 @@ int64_t sys_fs_lseek(ppu_context* ctx)
     }
 
 #ifdef _WIN32
-    _fseeki64(f->fp, offset, origin);
-    int64_t pos = _ftelli64(f->fp);
+    _fseeki64(fp, offset, origin);
+    int64_t pos = _ftelli64(fp);
 #else
-    fseeko(f->fp, (off_t)offset, origin);
-    int64_t pos = (int64_t)ftello(f->fp);
+    fseeko(fp, (off_t)offset, origin);
+    int64_t pos = (int64_t)ftello(fp);
 #endif
 
     if (pos_addr != 0) {
@@ -751,19 +788,17 @@ int64_t sys_fs_fstat(ppu_context* ctx)
     uint32_t stat_addr = LV2_ARG_PTR(ctx, 1);
 
     int slot = fd - 3;
-    if (slot < 0 || slot >= SYS_FS_FD_MAX)
-        return (int64_t)(int32_t)CELL_EBADF;
-
-    sys_fs_fd_info* f = &g_sys_fs_fds[slot];
-    if (!f->active || !f->fp)
+    sys_fs_fd_info* f = (slot >= 0 && slot < SYS_FS_FD_MAX) ? &g_sys_fs_fds[slot] : NULL;
+    FILE* fp = (f && f->active) ? f->fp : sys_fs_bridge_file(fd);
+    if (!fp)
         return (int64_t)(int32_t)CELL_EBADF;
 
     struct stat st;
 #ifdef _WIN32
-    int fno = _fileno(f->fp);
+    int fno = _fileno(fp);
     if (_fstat64(fno, (struct _stat64*)&st) != 0)
 #else
-    int fno = fileno(f->fp);
+    int fno = fileno(fp);
     if (fstat(fno, &st) != 0)
 #endif
     {
