@@ -164,7 +164,7 @@ int main(void)
     assert(s_flip_direct_pending == 1);
 
     /* Inside the bound it completes, once. */
-    s_flip_req_us = gcm_us_now() - 16999ull;
+    s_flip_req_us = gcm_us_now() - 16000ull;   /* 1 ms of margin: the tick reads the clock later */
     cellGcmTickFlip();
     ppu_gcm_pump();
     assert(flips == before + 2);
@@ -206,7 +206,7 @@ int main(void)
     assert(flips == before + 4);
     assert(cellGcmGetFlipStatus() == CELL_GCM_FLIP_STATUS_WAITING);
     assert(s_flip_direct_pending == 1);
-    s_flip_req_us = gcm_us_now() - 33365ull; /* still inside the second wait */
+    s_flip_req_us = gcm_us_now() - 32366ull; /* still inside the second wait (1 ms margin) */
     cellGcmTickFlip();
     ppu_gcm_pump();
     assert(flips == before + 5);
