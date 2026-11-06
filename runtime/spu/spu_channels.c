@@ -2583,8 +2583,30 @@ int spu_overlay_code_get_noop(spu_context* ctx, uint32_t ea, uint32_t lsa,
         /* O(1) path: the whole source range is unchanged since the last full
          * byte comparison, and the span is still verified. */
         if (ctx->resident_code_src_seq[slot] &&
-            spu_overlay_src_unchanged(src_ea, span, ctx->resident_code_src_seq[slot]))
+            spu_overlay_src_unchanged(src_ea, span, ctx->resident_code_src_seq[slot])) {
+            /* SPU_CODE_DMA_MEMO_AUDIT=1: the O(1) path does not see the job's
+             * own stores into its image, so compare anyway, count, and copy
+             * on a mismatch. Diagnostic: it pays the compare it was skipping. */
+            static int s_audit = -1;
+            if (s_audit < 0) { const char* e = getenv("SPU_CODE_DMA_MEMO_AUDIT"); s_audit = e && *e && *e != '0'; }
+            if (s_audit) {
+                static unsigned long long s_hit, s_bad;
+                const int bad = memcmp(ctx->ls + lsa, src, size) != 0;
+                const unsigned long long h = __atomic_add_fetch(&s_hit, 1, __ATOMIC_RELAXED);
+                const unsigned long long b = bad ? __atomic_add_fetch(&s_bad, 1, __ATOMIC_RELAXED)
+                                                 : __atomic_load_n(&s_bad, __ATOMIC_RELAXED);
+                if (bad || (h & 0x3FFFu) == 0)
+                    fprintf(stderr, "[code-dma-audit] o1 hits %llu mismatches %llu%s\n", h, b,
+                            bad ? " (this one: lsa/size below)" : "");
+                if (bad) {
+                    fprintf(stderr, "[code-dma-audit] mismatch lsa=0x%05X size=%u ea=0x%08X\n",
+                            lsa, size, ea);
+                    ctx->resident_code_src_seq[slot] = 0;
+                    return 0;
+                }
+            }
             return 1;
+        }
         uint64_t g0 = 0;
         const int tracked = spu_overlay_src_track(src_ea, span, &g0);
         const int eq = memcmp(ctx->ls + lsa, src, size) == 0;
