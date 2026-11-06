@@ -130,6 +130,66 @@ extern void spu_register_function_var(uint32_t, void (*)(spu_context*), int)
     __attribute__((weak));
 """
 
+# Opt-in extras for the _approx twin only (flags default off; the default output is unchanged).
+# --fast-cfl: cflts/cfltu as one scale multiply + cvttps2dq (+ saturation fixups) instead of the
+# integer shift emulation. Bit-exact for every input when the thread runs FTZ|DAZ (checked against
+# spu_cflts_ref by tools/spu_cfl_check.c).
+APPROX_FAST_CFL = r"""
+#if defined(__FMA__) && (defined(__SSE__) || defined(__AVX__))
+/* x * 2^(173 - i8) is exact (power of two; FTZ drops only results < 1 that truncate to 0). Out-of-range
+ * and Inf/NaN lanes make cvttps2dq return 0x80000000: positive lanes saturate to 0x7FFFFFFF. */
+static inline __m128 spu_ap_pow2(int p) { return _mm_castsi128_ps(_mm_set1_epi32((p + 127) << 23)); }   /* p in [-126, 127] */
+static inline __m128 spu_ap_cfl_scale(__m128 x, int i8) {
+    const int k = 173 - (i8 & 0xFF);
+    if (k > 127) return _mm_mul_ps(_mm_mul_ps(x, spu_ap_pow2(k / 2)), spu_ap_pow2(k - k / 2));
+    return _mm_mul_ps(x, spu_ap_pow2(k));
+}
+static inline u128 spu_ap_cflts(u128 a, int i8) {
+    const __m128 x = spu_ap_ld(a);
+    const __m128i c = _mm_cvttps_epi32(spu_ap_cfl_scale(x, i8));
+    const __m128i neg = _mm_srai_epi32(_mm_castps_si128(x), 31);
+    const __m128i oor = _mm_cmpeq_epi32(c, _mm_set1_epi32((int)0x80000000u));
+    u128 r; _mm_storeu_si128((__m128i*)r._u32, _mm_xor_si128(c, _mm_andnot_si128(neg, oor))); return r;
+}
+static inline u128 spu_ap_cfltu(u128 a, int i8) {
+    const __m128 x = spu_ap_ld(a);
+    const __m128 y = spu_ap_cfl_scale(x, i8);
+    const __m128i neg = _mm_srai_epi32(_mm_castps_si128(x), 31);
+    const __m128i lo = _mm_cvttps_epi32(y);
+    const __m128i hi = _mm_xor_si128(_mm_cvttps_epi32(_mm_sub_ps(y, _mm_set1_ps(2147483648.0f))),
+                                     _mm_set1_epi32((int)0x80000000u));
+    const __m128i big = _mm_castps_si128(_mm_cmpnlt_ps(y, _mm_set1_ps(2147483648.0f)));   /* NaN counts as big */
+    const __m128i huge = _mm_castps_si128(_mm_cmpnlt_ps(y, _mm_set1_ps(4294967296.0f)));
+    const __m128i v = _mm_or_si128(_mm_blendv_epi8(lo, hi, big), huge);
+    u128 r; _mm_storeu_si128((__m128i*)r._u32, _mm_andnot_si128(neg, v)); return r;
+}
+#undef spu_cflts
+#undef spu_cfltu
+#define spu_cflts spu_ap_cflts
+#define spu_cfltu spu_ap_cfltu
+#endif
+"""
+
+# --rcp-est (NOT bit-exact): frest/frsqest from rcpps/rsqrtps (12-bit, like the SPU estimate) instead
+# of a full-precision divide / sqrt+divide; the lifted Newton step after them still converges.
+APPROX_RCP_EST = r"""
+#if defined(__FMA__) && (defined(__SSE__) || defined(__AVX__))
+static inline u128 spu_ap_frest_rcp(u128 a) {
+    const __m128 x = spu_ap_ld(a);
+    return spu_ap_st(spu_ap_zsel(x, _mm_rcp_ps(x), 0x7F800000u | (spu_frest_fraction_lut[0] & 0x7FFFFFu), 1));
+}
+static inline u128 spu_ap_frsqest_rcp(u128 a) {
+    const __m128 x = spu_ap_ld(a);
+    return spu_ap_st(spu_ap_zsel(x, _mm_rsqrt_ps(_mm_andnot_ps(_mm_set1_ps(-0.0f), x)),
+                                 0x7F800000u | (spu_frsqest_fraction_lut[0] & 0x7FFFFFu), 0));
+}
+#undef spu_frest
+#undef spu_frsqest
+#define spu_frest spu_ap_frest_rcp
+#define spu_frsqest spu_ap_frsqest_rcp
+#endif
+"""
+
 FTZ_PREAMBLE_LAZY = r"""
 /* PS3RECOMP_SPU_FTZ twin (v4 --lazy-zero): SPU float on a host thread running MXCSR
  * FTZ|DAZ. SPU has no denormals and every zero result is +0, so the hardware
@@ -390,14 +450,14 @@ def lead_end(text: str) -> int:
 
 
 def twin_module(name: str, src: str, hdr: str, lazy: bool = False,
-                suffix: str = "_ftz", variant: int = 1):
+                suffix: str = "_ftz", variant: int = 1, extras: str = ""):
     prefix = name + "_"
     tprefix = name + suffix + "_"
     c = src.replace(prefix, tprefix)
     h = hdr.replace(prefix, tprefix)
     if suffix == "_approx":
         c = HELPER_RE.sub(lambda m: "spu_ap_" + m.group(1) + "(", c)
-        pre = APPROX_PREAMBLE
+        pre = APPROX_PREAMBLE + extras
     elif lazy:
         c = rewrite_helpers(c)
         c = lazy_canonicalize(c)
@@ -549,7 +609,14 @@ def main() -> int:
                          "the sign of zero only where a value is observed (default off).")
     ap.add_argument("--approx", action="store_true",
                     help="write the variant-2 <name>_approx twins (not bit-exact, default off).")
+    ap.add_argument("--fast-cfl", action="store_true",
+                    help="with --approx: cflts/cfltu via scale + cvttps2dq (exact under FTZ|DAZ; default off).")
+    ap.add_argument("--rcp-est", action="store_true",
+                    help="with --approx: frest/frsqest via rcpps/rsqrtps (not exact; default off).")
     args = ap.parse_args()
+    extras = (APPROX_FAST_CFL if args.fast_cfl else "") + (APPROX_RCP_EST if args.rcp_est else "")
+    if extras and not args.approx:
+        raise SystemExit("--fast-cfl/--rcp-est need --approx")
     suffix, variant = ("_approx", 2) if args.approx else ("_ftz", 1)
 
     root = args.spu_dir
@@ -574,7 +641,7 @@ def main() -> int:
             src = f.read()
         with open(os.path.join(d, "spu_recomp.h"), "r", encoding="utf-8") as f:
             hdr = f.read()
-        c, h = twin_module(name, src, hdr, args.lazy_zero, suffix, variant)
+        c, h = twin_module(name, src, hdr, args.lazy_zero, suffix, variant, extras)
         tdir = os.path.join(root, name + suffix)
         if write_if_changed(os.path.join(tdir, "spu_recomp.c"), c):
             made += 1
