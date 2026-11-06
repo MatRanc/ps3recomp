@@ -27,8 +27,13 @@ a dataflow pass that canonicalises the sign of zero only where a value is
 observed. It is exact but measured neutral (see the v4 section of
 docs/spu-codegen-v2.md in the game port), so it is not the default.
 
+`--approx` writes the variant-2 twins (`<name>_approx/`, PS3RECOMP_SPU_FLOAT_APPROX)
+instead, also from the base module: native float ops with no sign-of-zero
+canonicalisation, and full-precision frest/frsqest/fi. It is NOT bit-exact and is
+default off; the ftz output is unaffected by this mode.
+
 Usage:
-  tools/spu_ftz_twin.py --spu-dir recomp-work/spu_lifted [--lazy-zero] [--remove]
+  tools/spu_ftz_twin.py --spu-dir recomp-work/spu_lifted [--lazy-zero|--approx] [--remove]
 """
 import argparse
 import os
@@ -62,6 +67,64 @@ static inline u128 spu_hw_fnms(u128 a, u128 b, u128 c) { return spu_hw_st(_mm_fn
 #define spu_hw_fma spu_fma
 #define spu_hw_fms spu_fms
 #define spu_hw_fnms spu_fnms
+#endif
+extern void spu_register_function_var(uint32_t, void (*)(spu_context*), int)
+    __attribute__((weak));
+"""
+
+APPROX_PREAMBLE = r"""
+/* PS3RECOMP_SPU_FLOAT_APPROX twin: SPU float on a host thread running MXCSR
+ * FTZ|DAZ, NOT bit-exact. Float results keep the host sign of zero (SPU zero
+ * is +0), frest/frsqest are full-precision (the lifted Newton step after them
+ * then converges) and fi passes the estimate through. */
+#if defined(__FMA__) && (defined(__SSE__) || defined(__AVX__))
+#include <immintrin.h>
+static inline __m128 spu_ap_ld(u128 a) { return _mm_loadu_ps((const float*)a._u32); }
+static inline u128 spu_ap_st(__m128 v) { u128 r; _mm_storeu_ps((float*)r._u32, v); return r; }
+static inline u128 spu_ap_fa(u128 a, u128 b) { return spu_ap_st(_mm_add_ps(spu_ap_ld(a), spu_ap_ld(b))); }
+static inline u128 spu_ap_fs(u128 a, u128 b) { return spu_ap_st(_mm_sub_ps(spu_ap_ld(a), spu_ap_ld(b))); }
+static inline u128 spu_ap_fm(u128 a, u128 b) { return spu_ap_st(_mm_mul_ps(spu_ap_ld(a), spu_ap_ld(b))); }
+static inline u128 spu_ap_fma(u128 a, u128 b, u128 c)  { return spu_ap_st(_mm_fmadd_ps(spu_ap_ld(a), spu_ap_ld(b), spu_ap_ld(c))); }
+static inline u128 spu_ap_fms(u128 a, u128 b, u128 c)  { return spu_ap_st(_mm_fmsub_ps(spu_ap_ld(a), spu_ap_ld(b), spu_ap_ld(c))); }
+static inline u128 spu_ap_fnms(u128 a, u128 b, u128 c) { return spu_ap_st(_mm_fnmadd_ps(spu_ap_ld(a), spu_ap_ld(b), spu_ap_ld(c))); }
+/* A zero input keeps the exact helpers' result (exponent 255, the SPU "huge"
+ * sentinel the lifted code compares against); the fi pass-through keeps that
+ * lane's estimate with its interpolation bits cleared, as spu_fi does for it. */
+static inline __m128 spu_ap_zsel(__m128 x, __m128 v, uint32_t bits, int keep_sign) {
+    const __m128 d = _mm_or_ps(_mm_castsi128_ps(_mm_set1_epi32((int)bits)),
+                               keep_sign ? _mm_and_ps(x, _mm_set1_ps(-0.0f)) : _mm_setzero_ps());
+    return _mm_blendv_ps(v, d, _mm_cmpeq_ps(x, _mm_setzero_ps()));
+}
+static inline u128 spu_ap_frest(u128 a) {
+    const __m128 x = spu_ap_ld(a);
+    return spu_ap_st(spu_ap_zsel(x, _mm_div_ps(_mm_set1_ps(1.0f), x),
+                                 0x7F800000u | (spu_frest_fraction_lut[0] & 0x7FFFFFu), 1));
+}
+static inline u128 spu_ap_frsqest(u128 a) {
+    const __m128 x = spu_ap_ld(a);
+    const __m128 m = _mm_andnot_ps(_mm_set1_ps(-0.0f), x);
+    return spu_ap_st(spu_ap_zsel(x, _mm_div_ps(_mm_set1_ps(1.0f), _mm_sqrt_ps(m)),
+                                 0x7F800000u | (spu_frsqest_fraction_lut[0] & 0x7FFFFFu), 0));
+}
+static inline u128 spu_ap_fi(u128 a, u128 b) {
+    (void)a;
+    const __m128i e = _mm_loadu_si128((const __m128i*)b._u32);
+    const __m128i huge = _mm_cmpeq_epi32(_mm_and_si128(_mm_srli_epi32(e, 23), _mm_set1_epi32(0xFF)), _mm_set1_epi32(0xFF));
+    u128 r; _mm_storeu_si128((__m128i*)r._u32, _mm_andnot_si128(_mm_and_si128(huge, _mm_set1_epi32(0x3FF)), e));
+    return r;
+}
+/* The base helpers stay defined above; these shadow the names from here on. */
+#define spu_frest spu_ap_frest
+#define spu_frsqest spu_ap_frsqest
+#define spu_fi spu_ap_fi
+#else
+/* No FMA: fall back to the exact helpers; the twin is then identical. */
+#define spu_ap_fa spu_fa
+#define spu_ap_fs spu_fs
+#define spu_ap_fm spu_fm
+#define spu_ap_fma spu_fma
+#define spu_ap_fms spu_fms
+#define spu_ap_fnms spu_fnms
 #endif
 extern void spu_register_function_var(uint32_t, void (*)(spu_context*), int)
     __attribute__((weak));
@@ -326,12 +389,16 @@ def lead_end(text: str) -> int:
     return pos
 
 
-def twin_module(name: str, src: str, hdr: str, lazy: bool = False):
+def twin_module(name: str, src: str, hdr: str, lazy: bool = False,
+                suffix: str = "_ftz", variant: int = 1):
     prefix = name + "_"
-    tprefix = name + "_ftz_"
+    tprefix = name + suffix + "_"
     c = src.replace(prefix, tprefix)
     h = hdr.replace(prefix, tprefix)
-    if lazy:
+    if suffix == "_approx":
+        c = HELPER_RE.sub(lambda m: "spu_ap_" + m.group(1) + "(", c)
+        pre = APPROX_PREAMBLE
+    elif lazy:
         c = rewrite_helpers(c)
         c = lazy_canonicalize(c)
         pre = FTZ_PREAMBLE_LAZY
@@ -345,7 +412,7 @@ def twin_module(name: str, src: str, hdr: str, lazy: bool = False):
     c = c.replace(REG_LINE,
                   "    if (!spu_register_function_var) return;   /* play tree: no variants */\n"
                   "    for (const spu_func_entry* e = spu_function_table; e->func; ++e)\n"
-                  "        spu_register_function_var(e->addr, e->func, 1);")
+                  "        spu_register_function_var(e->addr, e->func, %d);" % variant)
     return c, h
 
 
@@ -373,7 +440,7 @@ def add_extern(text: str, decl: str, anchor: str) -> str:
     return "".join(out)
 
 
-def patch_registration(path: str, twin_names) -> bool:
+def patch_registration(path: str, twin_names, suffix: str = "_ftz") -> bool:
     """Call each twin module's register function next to its base one."""
     if not os.path.exists(path):
         return False
@@ -381,10 +448,10 @@ def patch_registration(path: str, twin_names) -> bool:
         text = f.read()
     orig = text
     for name in twin_names:
-        text = add_extern(text, f"extern void {name}_ftz_spu_recomp_register(void);",
+        text = add_extern(text, f"extern void {name}{suffix}_spu_recomp_register(void);",
                           f"{name}_spu_recomp_register(void);")
         base = name + "_spu_recomp_register();"
-        twin = name + "_ftz_spu_recomp_register();"
+        twin = name + suffix + "_spu_recomp_register();"
         if twin in text:
             continue
         # Insert the twin call after the line holding the base registration,
@@ -408,40 +475,42 @@ def patch_registration(path: str, twin_names) -> bool:
     return False
 
 
-def patch_workloads(path: str, twin_names) -> bool:
+def patch_workloads(path: str, twin_names, suffix: str = "_ftz") -> bool:
     """Add the twin entry registration (weak) to spu_workloads.c."""
     if not os.path.exists(path):
         return False
     with open(path, "r", encoding="utf-8") as f:
         text = f.read()
     orig = text
-    if "spu_workload_register_img_ftz" not in text:
+    reg_img = "spu_workload_register_img" + suffix
+    if reg_img not in text:
         marker = '#include "spu_workload.h"'
+        what = "PS3RECOMP_SPU_FLOAT_APPROX" if suffix == "_approx" else "PS3RECOMP_SPU_FTZ"
         decl = (marker + "\n"
-                "/* PS3RECOMP_SPU_FTZ twin entry (weak: the play runtime has no\n"
+                "/* " + what + " twin entry (weak: the play runtime has no\n"
                 " * variant registry and ignores it). */\n"
-                "extern void spu_workload_register_img_ftz(uint64_t, void (*)(spu_context*))\n"
+                "extern void " + reg_img + "(uint64_t, void (*)(spu_context*))\n"
                 "    __attribute__((weak));\n")
         text = text.replace(marker, decl, 1)
     for name in twin_names:
-        text = add_extern(text, f"extern void {name}_ftz_spu_recomp_register(void);",
+        text = add_extern(text, f"extern void {name}{suffix}_spu_recomp_register(void);",
                           f"{name}_spu_recomp_register(void);")
         # The twin entry function has the same suffix as the base one.
         for line in text.splitlines():
             m = re.search(r"extern void (" + re.escape(name) + r"_spu_func_[0-9A-Fa-f]+)\(spu_context\*\);", line)
             if m:
-                twin_fn = m.group(1).replace(name + "_spu_func_", name + "_ftz_spu_func_", 1)
+                twin_fn = m.group(1).replace(name + "_spu_func_", name + suffix + "_spu_func_", 1)
                 text = add_extern(text, f"extern void {twin_fn}(spu_context*);", m.group(1) + "(spu_context*);")
                 break
-    already_fp = set(re.findall(r"spu_workload_register_img_ftz\(\s*([^,]+),", text))
+    already_fp = set(re.findall(re.escape(reg_img) + r"\(\s*([^,]+),", text))
     for name in twin_names:
         base = name + "_spu_func_"
-        twin = name + "_ftz_spu_func_"
+        twin = name + suffix + "_spu_func_"
         out = []
         pat = re.compile(r"spu_workload_register_img\(\s*([^,]+),\s*(" +
                          re.escape(base) + r"[0-9A-Fa-f]+)")
         regbase = name + "_spu_recomp_register();"
-        regtwin = name + "_ftz_spu_recomp_register();"
+        regtwin = name + suffix + "_spu_recomp_register();"
         have_reg = regtwin in text
         for line in text.splitlines(keepends=True):
             out.append(line)
@@ -459,8 +528,8 @@ def patch_workloads(path: str, twin_names) -> bool:
                 entry = m.group(2).replace(base, twin, 1)
                 fp = m.group(1).strip()
                 already_fp.add(fp)
-                out.append(f"{indent}if (spu_workload_register_img_ftz) "
-                           f"spu_workload_register_img_ftz({fp}, {entry});\n")
+                out.append(f"{indent}if ({reg_img}) "
+                           f"{reg_img}({fp}, {entry});\n")
         text = "".join(out)
     if text != orig:
         with open(path, "w", encoding="utf-8") as f:
@@ -478,14 +547,17 @@ def main() -> int:
     ap.add_argument("--lazy-zero", action="store_true",
                     help="v4 experiment: keep float results raw and canonicalise "
                          "the sign of zero only where a value is observed (default off).")
+    ap.add_argument("--approx", action="store_true",
+                    help="write the variant-2 <name>_approx twins (not bit-exact, default off).")
     args = ap.parse_args()
+    suffix, variant = ("_approx", 2) if args.approx else ("_ftz", 1)
 
     root = args.spu_dir
     names = sorted(d for d in os.listdir(root)
                    if os.path.isfile(os.path.join(root, d, "spu_recomp.c")))
     if args.remove:
         for name in names:
-            if not name.endswith("_ftz"):
+            if not name.endswith(suffix):
                 continue
             d = os.path.join(root, name)
             for f in os.listdir(d):
@@ -494,7 +566,7 @@ def main() -> int:
         print("removed twin directories")
         return 0
 
-    base_names = [n for n in names if not n.endswith("_ftz")]
+    base_names = [n for n in names if not n.endswith(("_ftz", "_approx"))]
     made = 0
     for name in base_names:
         d = os.path.join(root, name)
@@ -502,17 +574,17 @@ def main() -> int:
             src = f.read()
         with open(os.path.join(d, "spu_recomp.h"), "r", encoding="utf-8") as f:
             hdr = f.read()
-        c, h = twin_module(name, src, hdr, args.lazy_zero)
-        tdir = os.path.join(root, name + "_ftz")
+        c, h = twin_module(name, src, hdr, args.lazy_zero, suffix, variant)
+        tdir = os.path.join(root, name + suffix)
         if write_if_changed(os.path.join(tdir, "spu_recomp.c"), c):
             made += 1
         write_if_changed(os.path.join(tdir, "spu_recomp.h"), h)
 
-    twins = [n for n in base_names if os.path.isdir(os.path.join(root, n + "_ftz"))]
+    twins = [n for n in base_names if os.path.isdir(os.path.join(root, n + suffix))]
     for reg in ("jobmods_register.c", "jobmods_register_dxt.c"):
-        if patch_registration(os.path.join(root, reg), twins):
+        if patch_registration(os.path.join(root, reg), twins, suffix):
             print(f"patched {reg}")
-    if patch_workloads(os.path.join(root, "spu_workloads.c"), twins):
+    if patch_workloads(os.path.join(root, "spu_workloads.c"), twins, suffix):
         print("patched spu_workloads.c")
     print(f"twins: {len(twins)} modules, {made} rewritten")
     return 0

@@ -311,6 +311,22 @@ int spu_ftz_key_on(void)
     return s_env;
 }
 
+/* PS3RECOMP_SPU_FLOAT_APPROX (live key, default 0): variant 2, the approximate
+ * float twin (tools/spu_ftz_twin.py --approx). It runs under MXCSR FTZ|DAZ like
+ * variant 1 and takes precedence over PS3RECOMP_SPU_FTZ. */
+int spu_float_approx_key_on(void)
+{
+    static int s_env = -1;
+    if (s_env < 0) {
+        const char* e = getenv("PS3RECOMP_SPU_FLOAT_APPROX");
+        s_env = e && e[0] != '0' && e[0] != '\0';
+    }
+#ifdef SPU_HAVE_LIVE_CTL
+    if (ps3_live_ctl_get) return ps3_live_ctl_get(PS3_LIVE_SPU_FLOAT_APPROX) != 0;
+#endif
+    return s_env;
+}
+
 typedef struct { uint32_t mxcsr; int prev_variant; } spu_ftz_state;
 #define SPU_FTZ_STATE_NONE ((spu_ftz_state){ 0xFFFFFFFFu, 0 })
 
@@ -319,10 +335,11 @@ static spu_ftz_state spu_ftz_mode_enter(void)
     spu_ftz_state st = SPU_FTZ_STATE_NONE;
     st.prev_variant = g_spu_ftz_variant;
 #if defined(__x86_64__) || defined(__i386__)
-    const int on = spu_ftz_key_on();
+    const int approx = spu_float_approx_key_on();
+    const int on = approx || spu_ftz_key_on();
     if (!on) { g_spu_ftz_variant = 0; return st; }
     const uint32_t v = (uint32_t)_mm_getcsr();
-    g_spu_ftz_variant = 1;
+    g_spu_ftz_variant = approx ? 2 : 1;
     if ((v & 0x8040u) == 0x8040u) return st;   /* nested/already set */
     _mm_setcsr(v | 0x8040u);                    /* FTZ | DAZ */
     st.mxcsr = v;
@@ -1826,7 +1843,7 @@ typedef struct {
     uint32_t addr;
     spu_fn   fn;
     int      image_id;   /* which recompiled image this function belongs to */
-    int      variant;    /* 0 = exact/default helpers, 1 = MXCSR FTZ|DAZ twin */
+    int      variant;    /* 0 = exact/default helpers, 1 = MXCSR FTZ|DAZ twin, 2 = approx twin */
 } spu_reg_entry;
 
 /* One entry per lifted SPU function across EVERY registered image, and a game
@@ -1969,11 +1986,15 @@ spu_fn spu_lookup(uint32_t addr, int image_id)   /* exported: clang-built fast-p
     /* Match the context's active image; image_id 0 (context or entry) matches
      * any, for back-compat with single-image contexts. With PS3RECOMP_SPU_FTZ
      * on for this run, prefer the variant-1 (MXCSR FTZ|DAZ) function and fall
-     * back to the default one if this image has no twin. With the key off only
+     * back to the default one if this image has no twin. Variant 2 (approx)
+     * falls back to variant 1 first (valid: it runs under the same FTZ|DAZ),
+     * then to 0. With the key off only
      * variant 0 is ever returned, on its first match, regardless of the order
      * the twin and base were registered in. */
     spu_fn fallback = NULL;
     int fallback_image = 0;
+    spu_fn fb1 = NULL;
+    int fb1_image = 0;
     const int want_variant = g_spu_ftz_variant;
     for (uint32_t n = s_hash_head[spu_fn_hash(addr)]; n; n = s_hash_next[n - 1]) {
         const spu_reg_entry* e = &s_registry[n - 1];
@@ -1986,8 +2007,10 @@ spu_fn spu_lookup(uint32_t addr, int image_id)   /* exported: clang-built fast-p
                 spu_report_cross_image(addr, image_id, e->image_id);
             return e->fn;
         }
+        if (want_variant == 2 && !fb1 && e->variant == 1) { fb1 = e->fn; fb1_image = e->image_id; }
         if (!fallback && !e->variant) { fallback = e->fn; fallback_image = e->image_id; }
     }
+    if (fb1) { fallback = fb1; fallback_image = fb1_image; }
     if (fallback && fallback_image != image_id)
         spu_report_cross_image(addr, image_id, fallback_image);
     return fallback;
