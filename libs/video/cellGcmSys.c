@@ -3005,7 +3005,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
     rsx_draw_engine_set_refs_hash_fast(gcm_live_get(PS3_LIVE_REFS_HASH_FAST,
                                                     "PS3RECOMP_REFS_HASH_FAST"));
     rsx_draw_engine_set_no_draw(gcm_live_get(PS3_LIVE_EXP_NO_DRAW, "EXP_NO_DRAW"));
-    const int wcap = rsx_wcap_begin_if_triggered();
+    int wcap = rsx_wcap_begin_if_triggered();
     const int wdiag = gcm_word_diag(), wmirror = gcm_word_mirror_only();
     /* NOP runs are skipped unless a switch looks at each NOP word: the
      * per-word ones, and with an engine on (where the skip is new) the two
@@ -3318,6 +3318,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
                 FLIP_UNLOCK();
                 s_flip_request_count++;
                 gcm_fifo_dump_flip(w);
+                rsx_wcap_flip(w);
                 /* Not past `queued`: a resync may already have written off
                  * this flip. */
                 if (s_fifo_flips_reached != s_fifo_flips_queued) {
@@ -3343,6 +3344,9 @@ static void gcm_rsx_process_fifo_unlocked(void)
              * commands ahead of it. */
             if (gcm_fifo_backlog(put, s_fifo_getoff) < GCM_FIFO_CATCHUP_BYTES)
                 { why = "flip"; break; }
+            /* Backlogged: the next frame is drained in this pass, so an armed
+             * capture has to start here, not at the next drain. */
+            wcap = rsx_wcap_begin_if_triggered();
             continue;
         }
 
@@ -4216,10 +4220,12 @@ static s32 gcm_flip_request(u32 bufferId, int in_fifo)
     if (!s_display_buffer_set[bufferId])
         return CELL_GCM_ERROR_INVALID_VALUE;
 
-    rsx_wcap_flip(0xFEAD0000u | (bufferId & 7u));
-
-    if (!in_fifo)
+    /* An in-FIFO flip bounds the walker capture where the drain reaches the
+     * marker, not here: the walker can be a frame or more behind the request. */
+    if (!in_fifo) {
+        rsx_wcap_flip(0xFEAD0000u | (bufferId & 7u));
         gcm_fifo_dump_flip(0xFEAD0000u | (bufferId & 7u));
+    }
 
     /* in_fifo: the flip sits in the command stream as a GCM_FLIP_MARKER, and
      * the drain does this half when it reaches it (see the 0xFEAD case). */
