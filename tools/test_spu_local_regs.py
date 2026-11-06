@@ -338,9 +338,10 @@ void spurs_pm_build_context(spu_context* c, uint32_t a, uint32_t b, uint32_t d) 
 }
 uint32_t g_spu_image_src_ea, g_spu_image_ls_start, g_spu_image_span;
 """
-RUNTIME = ['spu_channels.c', 'c690_stats.c', 'spu_drain.c', 'spu_lockstep.c', 'spu_coherency.c',
-           'spu_workload.c', 'spurs_policy.c', 'spurs_job.c', 'spu_tsp_weak.c',
-           'spu_vm_pagemap.c', 'spurs_policy_blob_weak.c', 'spu_interp.c']
+RUNTIME = ['spu_channels.c', 'c690_stats.c', 'c690_corpus.c', 'dxt_capture.c', 'spu_drain.c',
+           'spu_lockstep.c', 'spu_coherency.c', 'spu_workload.c', 'spurs_policy.c',
+           'spurs_job.c', 'spu_tsp_weak.c', 'spu_vm_pagemap.c', 'spurs_policy_blob_weak.c',
+           'spu_interp.c']
 FLAG_SETS = ([], ['--merge-chunks'], ['--const-bi'], ['--merge-chunks', '--const-bi'],
              ['--merge-chunks', '--ib-known-targets', '--ib-goto'])
 _STORE_RE = re.compile(r"(ctx->gpr\[(\d+)\] = spu_v2u\(sr\2\));")
@@ -368,8 +369,9 @@ def run_program(tmp, cc, cflags, objs, prog, failed, totals):
               .replace('MARK', hex(MARK)))
     for extra in FLAG_SETS:
         results, counts = {}, ''
-        for local in (False, True):
-            flags = extra + (['--local-regs'] if local else [])
+        for label, base_flags in (('plain', []), ('local', ['--local-regs']),
+                                  ('precise', ['--local-regs', '--precise-regs'])):
+            flags = extra + base_flags
             out = pdir / ('_'.join(f.strip('-') for f in flags) or 'plain')
             subprocess.run([sys.executable, str(TOOLS / 'spu_lifter.py'), str(pdir / 'prog.bin'),
                             '--base', hex(base), '--functions', str(pdir / 'funcs.json'),
@@ -392,23 +394,26 @@ def run_program(tmp, cc, cflags, objs, prog, failed, totals):
                 ran = subprocess.run([str(exe)], capture_output=True, text=True,
                                      timeout=20, env=env)
                 assert ran.returncode == 0, ran.stderr[-2000:]
-                results[(local, direct)] = ran.stdout
-                if local:
+                results[(label, direct)] = ran.stdout
+                if label != 'plain':
                     d_st, d_ld = (int(x) for x in re.search(r'lr-count (\d+) (\d+)',
                                                             ran.stderr).groups())
-                    counts += f' D{direct}:{d_st}/{d_ld}'
-                    totals[(name, ' '.join(extra) or 'plain', direct)] = (
+                    counts += f' {label} D{direct}:{d_st}/{d_ld}'
+                    totals[(name, ' '.join(extra) or 'plain', label, direct)] = (
                         n_st if direct == '1' else 0, n_ld if direct == '1' else 0, d_st, d_ld)
-            if local:
-                counts = f'  stores/reloads static {n_st}/{n_ld} run' + counts
+            if label != 'plain':
+                counts = f'  [{label}] stores/reloads static {n_st}/{n_ld} run' + counts
         for direct in ('1', '0'):
-            plain, local = results[(False, direct)], results[(True, direct)]
+            plain = results[('plain', direct)]
+            local = results[('local', direct)]
+            precise = results[('precise', direct)]
             lines = plain.splitlines()
             tag = f"{name}: {' '.join(extra) or 'plain'}"
             ok = ok_fn(lines)
-            same = plain == local
+            same = plain == local == precise
             print(f'{tag:50s} SPU_DIRECT={direct}: plain {"ok" if ok else "WRONG"}, '
-                  f'--local-regs {"identical" if same else "DIFFERS"}'
+                  f'--local-regs {"identical" if plain == local else "DIFFERS"}, '
+                  f'--precise-regs {"identical" if plain == precise else "DIFFERS"}'
                   + (counts if direct == '0' else ''))
             if not ok:
                 print('    ' + '\n    '.join(lines[:1] + lines[1:-1][3:32] + lines[-1:]))
@@ -418,6 +423,9 @@ def run_program(tmp, cc, cflags, objs, prog, failed, totals):
                     for a, b in zip(lines, local.splitlines()):
                         if a != b:
                             print(f'    plain: {a}\n    local: {b}')
+                    for a, b in zip(lines, precise.splitlines()):
+                        if a != b:
+                            print(f'    plain: {a}\n  precise: {b}')
 
 
 def main():

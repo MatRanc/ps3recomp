@@ -347,6 +347,20 @@ def _lr_writes(s: str) -> int:
     return _lr_mask(a or b for a, b in _GPR_WRITE_RE.findall(s))
 
 
+# The destination of a plain assignment (`ctx->gpr[N] = ...`), removed before
+# counting reads so a write-only register is not mistaken for a live-in.
+_GPR_ASSIGN_RE = re.compile(r"ctx->gpr\[(\d+)\](?:\._\w+\[\d+\])?\s*=(?!=)")
+
+
+def _lr_read_mask(s: str) -> int:
+    """Registers a pure line reads from its locals: every ctx->gpr reference
+    except the destination of its (single) plain assignment."""
+    m = _GPR_ASSIGN_RE.search(s)
+    if m:
+        s = s[:m.start()] + s[m.end():]
+    return _lr_mask(_GPR_RE.findall(s))
+
+
 def _lr_plan(lines: list[str]):
     """Classify each line: raw (a label), pure, cond_exit, exit, bare_exit or
     sync. Returns (plan, registers used, registers written)."""
@@ -486,7 +500,55 @@ def callee_summaries(bodies: dict) -> dict:
     return summ
 
 
-def localize_registers(lines: list[str], summaries=None) -> list[str]:
+def _lr_live_in(plan, labels, used_mask, summaries, dirty):
+    """Registers whose local may be read before it is defined, per plan entry
+    (`--precise-regs`). A sync defines locals only through its reload: the
+    call line itself writes ctx->gpr, not the caller's C locals. Write-backs
+    read locals, so they count as uses."""
+    n = len(plan)
+    reads = [0] * n
+    defs = [0] * n
+    for i, (kind, v) in enumerate(plan):
+        if kind == "pure":
+            reads[i] = _lr_read_mask(v)
+            defs[i] = _lr_writes(v)
+        elif kind == "sync":
+            reads[i] = dirty[i]
+            changes = _lr_sync_changes(v, summaries)
+            defs[i] = used_mask if changes is None else (changes & used_mask)
+        elif kind == "cond_exit":
+            reads[i] = _lr_read_mask(v[1]) | dirty[i]
+        elif kind in ("exit", "bare_exit"):
+            reads[i] = dirty[i]
+    live = [0] * (n + 1)
+    changed = True
+    while changed:
+        changed = False
+        for i in range(n - 1, -1, -1):
+            kind, v = plan[i]
+            if kind in ("exit", "bare_exit"):
+                succ = []
+            elif kind != "pure":
+                succ = [i + 1]
+            else:
+                try:
+                    succ = [labels[t] for t in _GOTO_RE.findall(v)]
+                except KeyError:
+                    succ = []
+                if not _UNCOND_GOTO_RE.fullmatch(v):
+                    succ = succ + [i + 1]
+            out = 0
+            for j in succ:
+                if j <= n:
+                    out |= live[j]
+            new = reads[i] | (out & ~defs[i])
+            if new != live[i]:
+                live[i] = new
+                changed = True
+    return live
+
+
+def localize_registers(lines: list[str], summaries=None, precise=False) -> list[str]:
     plan, used, written = _lr_plan(lines)
     if not used:
         return lines
@@ -523,10 +585,18 @@ def localize_registers(lines: list[str], summaries=None) -> list[str]:
                 dirty[j] |= out
                 work.append(j)
 
+    live = _lr_live_in(plan, labels, used_mask, summaries, dirty) if precise else None
+
     def wb(mask):
         return " ".join(f"ctx->gpr[{r}] = spu_v2u(sr{r});" for r in sorted(written) if (mask >> r) & 1)
 
-    out = ["    " + " ".join(f"spu_v4u sr{r} = spu_u2v(ctx->gpr[{r}]);" for r in sorted(used))]
+    # --precise-regs: only load a register the body may read before writing it.
+    # The rest are declared uninitialised; every path that reaches a read
+    # defines them first (a statement write or a post-sync reload).
+    entry = live[0] & used_mask if live is not None else used_mask
+    decl = [f"spu_v4u sr{r} = spu_u2v(ctx->gpr[{r}]);" for r in sorted(used) if (entry >> r) & 1]
+    decl += [f"spu_v4u sr{r};" for r in sorted(used) if not (entry >> r) & 1]
+    out = ["    " + " ".join(decl)]
     for i, (kind, v) in enumerate(plan):
         if kind == "raw":
             out.append(v)
@@ -549,6 +619,8 @@ def localize_registers(lines: list[str], summaries=None) -> list[str]:
             out.append(v)
             changes = _lr_sync_changes(v, summaries)
             reload = used_mask if changes is None else changes & used_mask
+            if live is not None:
+                reload &= live[i + 1]
             if reload:
                 out.append("    " + " ".join(f"sr{r} = spu_u2v(ctx->gpr[{r}]);"
                                              for r in sorted(used) if (reload >> r) & 1))
@@ -962,10 +1034,29 @@ class SPULifter:
         self.const_bi: dict = {}
         self.const_bi_unsafe: set = set()
         self.ib_goto = False
+        self.ib_goto_starts = False
+        self.precise_regs = False
 
     def _ib_near(self, addr: int) -> list:
         return sorted((t for t in self.ib_entries if abs(t - addr) <= 0x800),
                       key=lambda t: abs(t - addr))[:6]
+
+    def _ib_near_goto(self, addr: int) -> list:
+        """Candidates for a --ib-goto test. --ib-goto-starts widens the set from
+        the il/ila-loaded entries to every function start within reach, so a
+        back edge whose target is built arithmetically (ilhu/iohl) still gets a
+        goto. Every candidate is an exact compare, so a miss falls through to
+        the resolver exactly as before."""
+        if not self.ib_goto_starts:
+            return self._ib_near(addr)
+        # Only backward entries are added: a computed branch already gets the
+        # il/ila entries in both directions, and a loop back edge is where a
+        # write-back/tail-call/reload repeats on every iteration. Adding every
+        # forward start too would grow every computed branch in the module.
+        near = {t for t in self.func_starts if t <= addr and addr - t <= 0x800}
+        near.update(self.ib_entries)
+        return sorted((t for t in near if abs(t - addr) <= 0x800),
+                      key=lambda t: abs(t - addr))[:8]
 
     def _ib_goto(self, insn, reg: str, func, cond: str = "") -> list:
         """--ib-goto: a computed branch whose target turns out to be one of the
@@ -983,7 +1074,7 @@ class SPULifter:
             return []
         if (reg == "0" and insn.addr not in self.bi_r0_jump) or insn.addr in self.link_return:
             return []                                               # a return, not a jump
-        return [t for t in self._ib_near(insn.addr) if start <= t < end and t not in CONST_BI_UNSAFE]
+        return [t for t in self._ib_near_goto(insn.addr) if start <= t < end and t not in CONST_BI_UNSAFE]
 
     def _ib_known(self, addr: int) -> str:
         """Direct branches for a computed branch at `addr` to the nearest
@@ -1890,7 +1981,8 @@ class SPULifter:
                      if local and not weak else None)
         for f in self.functions:
             lines.append(f"void {weak}{f.name}(spu_context* ctx) {{")
-            body = localize_registers(f.body_lines, summaries) if local else f.body_lines
+            body = localize_registers(f.body_lines, summaries,
+                                       getattr(self, "precise_regs", False)) if local else f.body_lines
             for b in body:
                 lines.append(b if b.endswith(":") else f"    {b}")
             lines.append("}")
@@ -2005,6 +2097,14 @@ def main() -> None:
                    help="With --ib-known-targets: a known target inside the "
                         "current function is reached with a goto (registers stay "
                         "in --local-regs locals) instead of a tail call.")
+    p.add_argument("--ib-goto-starts", action="store_true",
+                   help="With --ib-goto: also test every function entry within "
+                        "reach as a goto target, not only entries the image "
+                        "loads with il/ila. A computed loop back edge whose "
+                        "target is built with ilhu/iohl (or arrives in a "
+                        "register) then stays inside the function. Each target "
+                        "is an exact address compare; anything else still takes "
+                        "the resolver.")
     p.add_argument("--const-bi", action="store_true",
                    help="Branch directly at a `bi $rN` whose rN was just loaded "
                         "with il/ila: a goto for a forward target inside the "
@@ -2015,6 +2115,12 @@ def main() -> None:
                    help="Keep each function's registers in C locals between the "
                         "statements that hand ctx to the runtime (calls, channel "
                         "ops, stops, exits); clang/gcc only (localize_registers).")
+    p.add_argument("--precise-regs", action="store_true",
+                   help="With --local-regs: load a register in the prologue only "
+                        "if the body can read it before writing it, and reload "
+                        "after a call only registers that are read before being "
+                        "overwritten. Exit write-backs stay complete (ABI state "
+                        "must be exact when an interrupt is taken).")
     p.add_argument("--inline-direct", action="store_true",
                    help="Before --local-regs, fold acyclic direct callees into "
                         "their caller so one register file spans the former call "
@@ -2148,6 +2254,8 @@ def main() -> None:
 
     lifter = SPULifter(trace=args.trace, prefix=args.symbol_prefix)
     lifter.local_regs = args.local_regs
+    lifter.precise_regs = args.precise_regs
+    lifter.ib_goto_starts = args.ib_goto_starts
     lifter.inline_direct = args.inline_direct
     lifter.bi_r0_jump = compute_bi_r0_jumps(insns, bounds)
     if lifter.bi_r0_jump:

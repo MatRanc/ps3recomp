@@ -68,3 +68,29 @@ for on in (False, True):
     assert gotos == (2 if on else 0), body
     assert "ctx->gpr[7]._u32[0] != 0 && (ctx->gpr[5]._u32[0] & SPU_LS_MASK) == 0x4" in body or not on, body
 print("ib-goto: ok")
+
+# --ib-goto-starts: a computed backward `bi` whose target is a function entry
+# built without il/ila (here 0x100 + 4) gets a goto too. Every candidate is an
+# exact compare, so a miss still takes the resolver.
+BASE = 0x100
+PROGRAM = [
+    ri18(0x21, BASE, 5),        # 0x100 ila $5, 0x100
+    rr(0x0C0, 5, 5, 5) | (4 << 14),  # 0x104 ai $5, $5, 4   (target 0x104, not an il/ila entry)
+    rr(0x1A8, 0, 5, 0),         # 0x108 bi $5
+    rr(0x1A8, 0, 0, 0),         # 0x10C bi $0
+]
+data = b"".join(w.to_bytes(4, "big") for w in PROGRAM)
+insns = disassemble_spu(data, BASE)
+starts = {BASE, BASE + 4, BASE + 0x10}
+assert ib_known_entries(insns, starts) == [BASE], ib_known_entries(insns, starts)
+for on in (False, True):
+    lifter = SPULifter()
+    lifter.func_starts = starts
+    lifter.ib_entries = ib_known_entries(insns, starts)
+    lifter.ib_goto = True
+    lifter.ib_goto_starts = on
+    lifter.lift_function(insns, BASE, BASE + 0x10)
+    body = "\n".join(lifter.functions[0].body_lines)
+    hit = body.count("SPU_GOTO_OK(ctx, 0x104)) goto loc_00000104;")
+    assert hit == (1 if on else 0), body
+print("ib-goto-starts: ok")

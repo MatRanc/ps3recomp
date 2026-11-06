@@ -30,6 +30,8 @@ static unsigned g_n_llar, g_n_putllc, g_n_get, g_n_tagupd;
 
 volatile int g_spu_wrch_slow = 1;
 int g_c690_stats = 0;
+volatile int g_spu_direct = 1;
+uint8_t g_spu_stack_reset_hint[1024];
 SPU_THREAD_LOCAL void (*g_spu_trampoline_fn)(spu_context*) = NULL;
 
 static uint32_t mem_addr(uint32_t ea) { return ea & (MEM_SIZE - 1u); }

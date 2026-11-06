@@ -385,6 +385,11 @@ def main():
                     help="Pass --const-bi to spu_lifter.py.")
     ap.add_argument("--local-regs", action="store_true",
                     help="Pass --local-regs to spu_lifter.py.")
+    ap.add_argument("--precise-regs", action="store_true",
+                    help="Pass --precise-regs to spu_lifter.py (lazy prologue, "
+                         "live-out reload filter).")
+    ap.add_argument("--ib-goto-starts", action="store_true",
+                    help="Pass --ib-goto-starts to spu_lifter.py.")
     ap.add_argument("--inline-direct", action="store_true",
                     help="Pass --inline-direct to spu_lifter.py: fold acyclic "
                          "direct callees into their caller before --local-regs.")
@@ -414,6 +419,10 @@ def main():
         LIFTER_FLAGS.append("--const-bi")
     if args.local_regs:
         LIFTER_FLAGS.append("--local-regs")
+    if args.precise_regs:
+        LIFTER_FLAGS.append("--precise-regs")
+    if args.ib_goto_starts:
+        LIFTER_FLAGS.append("--ib-goto-starts")
     if args.inline_direct:
         LIFTER_FLAGS.append("--inline-direct")
     OUTDIR  = args.out
