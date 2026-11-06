@@ -184,6 +184,8 @@ typedef struct {
     u32 snap_w, snap_h;    /* the region that copy holds                    */
     int cleared;
     int had_write;
+    int const_ok;          /* last depth op was a whole clear to const_val, no write since */
+    float const_val;
     int snapshot_valid;
     u64 depth_serial;      /* g.write_serial of the last depth write or clear */
     int guest_dirty;       /* written since guest memory last got a copy     */
@@ -837,6 +839,69 @@ unsigned long long rsx_wprof_now(void)
            (unsigned long long)t.tv_nsec;
 }
 
+/* PS3RECOMP_WALKER_WAITS: see rsx_draw_engine.h. */
+__thread int g_rsx_ww_walker;
+const char* g_rsx_ww_ctx;
+static int s_ww_on = -1;
+static unsigned long long s_ww_ns[RSX_WW_COUNT];
+static unsigned long long s_ww_n[RSX_WW_COUNT];
+static const char* const s_ww_name[RSX_WW_COUNT] = {
+    "fifo_lock", "wcb_lock", "qsubmit", "oneshot", "ebs_swap", "ebs_other",
+    "pres_done", "pres_gpu", "pres_mu", "acquire", "pipe_async", "pipe_create",
+    "tex_token", "mt_turn"
+};
+void rsx_ww_enter(void)
+{
+    if (s_ww_on < 0) {
+        const char* e = getenv("PS3RECOMP_WALKER_WAITS");
+        s_ww_on = e && *e && strcmp(e, "0") != 0;
+    }
+    g_rsx_ww_walker = s_ww_on;
+}
+void rsx_ww_leave(void) { g_rsx_ww_walker = 0; }
+void rsx_ww_add(int site, unsigned long long ns)
+{
+    __atomic_fetch_add(&s_ww_ns[site], ns, __ATOMIC_RELAXED);
+    __atomic_fetch_add(&s_ww_n[site], 1, __ATOMIC_RELAXED);
+}
+/* Per-caller split of the one-shot waits. Keyed by the __func__ pointer (one per
+ * function); only the walker thread adds, the report runs on it too. */
+#define WW_TAGS 48
+static struct { const char* who; unsigned long long ns, n; } s_ww_tag[WW_TAGS];
+void rsx_ww_add_tag(int site, unsigned long long ns, const char* who)
+{
+    rsx_ww_add(site, ns);
+    for (int i = 0; i < WW_TAGS; i++) {
+        if (s_ww_tag[i].who == who || !s_ww_tag[i].who) {
+            s_ww_tag[i].who = who; s_ww_tag[i].ns += ns; s_ww_tag[i].n++;
+            return;
+        }
+    }
+}
+/* One line per walker-prof report, ms per frame (f = flips in the window).
+ * Unlike the phase sums these cover every drain, not the sampled ones. */
+static void rsx_ww_report(double f)
+{
+    if (s_ww_on <= 0) return;
+    char buf[512]; int o = 0; double tot = 0.0;
+    for (int i = 0; i < RSX_WW_COUNT; i++) {
+        const double ms = (double)__atomic_exchange_n(&s_ww_ns[i], 0, __ATOMIC_RELAXED) / 1e6 / f;
+        const double n = (double)__atomic_exchange_n(&s_ww_n[i], 0, __ATOMIC_RELAXED) / f;
+        if (i != RSX_WW_FIFO_LOCK) tot += ms;   /* fifo_lock is outside the drain timer */
+        o += snprintf(buf + o, sizeof buf - (size_t)o, " %s=%.3f(%.1f)", s_ww_name[i], ms, n);
+    }
+    fprintf(stderr, "[walker-waits] report=%llu flips=%llu in_drain_total=%.3fms |%s\n",
+            s_wp_frames, s_wp_flips, tot, buf);
+    char tb[WW_TAGS * 56]; o = 0; tb[0] = 0;
+    for (int i = 0; i < WW_TAGS && s_ww_tag[i].who; i++) {
+        if (s_ww_tag[i].n)
+            o += snprintf(tb + o, sizeof tb - (size_t)o, " %s=%.3f(%.1f)",
+                          s_ww_tag[i].who, (double)s_ww_tag[i].ns / 1e6 / f, (double)s_ww_tag[i].n / f);
+        s_ww_tag[i].ns = s_ww_tag[i].n = 0;
+    }
+    fprintf(stderr, "[oneshot-by] report=%llu%s\n", s_wp_frames, tb);
+}
+
 void rsx_wprof_note_drain(unsigned long long ns)
 {
     if (s_wprof > 0) s_wp_drain_ns += ns;
@@ -934,6 +999,7 @@ void rsx_wprof_drain_end(int profiled)
             (double)s_wp_n[RSX_WPROF_PIPE] / f * scale,
             (double)s_wp_n[RSX_WPROF_BIND] / f * scale,
             (double)s_wp_n[RSX_WPROF_DRAW] / f * scale);
+    rsx_ww_report(f);
     if (eng_tex_stats_on()) {
         fprintf(stderr, "[tex-stats] frames=%.0f slots=%.1f memo=%llu full=%llu "
                 "new=%llu evict=%llu sv=%llu dsnap=%llu dguest=%llu reint=%llu "
@@ -2471,7 +2537,7 @@ void rsx_draw_engine_guest_read(u32 location, u32 offset, u32 pitch, u32 w, u32 
         }
     }
     if (!streamed) {
-        g.be->submit_and_wait(g.be->user, RSX_BE_FLUSH_GUEST_REFERENCE);
+        (g_rsx_ww_ctx = "eng:guest_read", g.be->submit_and_wait)(g.be->user, RSX_BE_FLUSH_GUEST_REFERENCE);
         g.be->readback(g.be->user, s->handle, x, y, n, h, rows, n * bpp);
     }
     if (eng_coherence_log())
@@ -2644,6 +2710,7 @@ static u32 eng_zdepth_get(u32 location, u32 offset, u32 rt_w, u32 rt_h)
     z->snapshot = 0;
     z->cleared = 0;
     z->had_write = 0;
+    z->const_ok = 0;
     z->snapshot_valid = 0;
     z->depth_serial = 0;
     z->guest_dirty = 0;
@@ -2660,11 +2727,67 @@ static u32 eng_zdepth_get(u32 location, u32 offset, u32 rt_w, u32 rt_h)
  * a depth-WRITING draw: a write-enable bit alone does not prove the pass
  * produced a usable depth map, and a clear-only zeta falls through to guest
  * memory instead (rsx_live_draw.c:6016-6018, 6265-6269). */
+/* PS3RECOMP_ENG_DEPTH_GPU=1: a depth target cleared and not drawn into since
+ * (a shadow map with no casters) is snapshotted on the GPU too, while its
+ * guest copy is still unstored (guest_dirty). Its texels are the clear
+ * value, which the guest store would only have read back from the device, so
+ * the bind needs no submit_and_wait + readback + decode + upload; the store
+ * stays lazy (guest_dirty) for any guest reader. Once the copy has been
+ * stored, guest memory is the truth again and the old path applies. */
+static int s_depth_gpu = -1;      /* env cache */
+static int s_depth_gpu_force = -1;    /* unit tests: 0/1 beats the key */
+
+void rsx_draw_engine_set_depth_gpu(int on)
+{
+    s_depth_gpu_force = on;
+}
+
+static int eng_depth_gpu(void)
+{
+    if (s_depth_gpu_force >= 0) return s_depth_gpu_force;
+#if defined(__GNUC__) && !defined(_WIN32)
+    if (ps3_live_ctl_get) return ps3_live_ctl_get(PS3_LIVE_ENG_DEPTH_GPU);
+#endif
+    if (s_depth_gpu < 0) {
+        const char* e = getenv("PS3RECOMP_ENG_DEPTH_GPU");
+        s_depth_gpu = e && *e && strcmp(e, "0") != 0;
+    }
+    return s_depth_gpu;
+}
+
+/* PS3RECOMP_ENG_SHADOW_CONST=1 (needs DEPTH_GPU): a zeta whose last depth op
+ * was a whole clear and that nothing drew into since binds one shared
+ * constant texture holding the clear value instead of a per-frame copy of the
+ * (identical) device depth. */
+static int s_shadow_const = -1, s_shadow_const_force = -1;
+
+void rsx_draw_engine_set_shadow_const(int on)
+{
+    s_shadow_const_force = on;
+}
+
+static int eng_shadow_const(void)
+{
+    if (s_shadow_const_force >= 0) return s_shadow_const_force;
+#if defined(__GNUC__) && !defined(_WIN32)
+    if (ps3_live_ctl_get) return ps3_live_ctl_get(PS3_LIVE_ENG_SHADOW_CONST);
+#endif
+    if (s_shadow_const < 0) {
+        const char* e = getenv("PS3RECOMP_ENG_SHADOW_CONST");
+        s_shadow_const = e && *e && strcmp(e, "0") != 0;
+    }
+    return s_shadow_const;
+}
+
 static u32 eng_zdepth_snapshot(u32 slot, u32 tex_w, u32 tex_h)
 {
     eng_mt_sync();
     eng_zdepth* z = &g.zdepths[slot];
-    if (!z->handle || !z->had_write) return 0;
+    if (!z->handle || !(z->had_write || (eng_depth_gpu() && z->guest_dirty))) return 0;
+    if (!z->had_write && z->const_ok && eng_depth_gpu() && eng_shadow_const() && g.be->depth_constant) {
+        const u32 c = g.be->depth_constant(g.be->user, z->const_val);
+        if (c) return c;
+    }
     /* The texture covers the top-left tex_w x tex_h of the zeta. The host
      * depth target is at least canvas-sized (eng_zdepth_get), so a 128x160
      * shadow map lives in the corner of a 1280x720 image; resolving all of it
@@ -3736,7 +3859,7 @@ static int eng_zdepth_store(u32 slot, int forced)
         s_depth_rows = n;
         s_depth_cap = w * h;
     }
-    g.be->submit_and_wait(g.be->user, RSX_BE_FLUSH_GUEST_REFERENCE);
+    (g_rsx_ww_ctx = "eng:zdepth_store", g.be->submit_and_wait)(g.be->user, RSX_BE_FLUSH_GUEST_REFERENCE);
     if (g.be->depth_readback(g.be->user, z->handle, 0, 0, w, h, s_depth_rows,
                              w * (u32)sizeof(float)) != 0)
         return 0;
@@ -3787,6 +3910,16 @@ static int eng_zdepth_store(u32 slot, int forced)
 
 static int eng_zdepth_to_guest(u32 slot)
 {
+    /* Profiling switch (exp/crowd-prof): pretend the guest copy is unavailable
+     * so the texture-bind depth fallback is skipped. The bind then takes the
+     * dummy, which changes the image; use only to measure what the readback
+     * and its GPU waits cost. */
+    static int s_noguest = -1;
+    if (s_noguest < 0) {
+        const char* e = getenv("PS3RECOMP_ENG_DEPTH_NOGUEST");
+        s_noguest = e && *e && strcmp(e, "0") != 0;
+    }
+    if (s_noguest) return 0;
     eng_zdepth* z = &g.zdepths[slot];
     if (z->wcb_pending && rsx_wcb_resolve_cookie(0x10000u | slot, RSX_WCB_REASON_EXPLICIT)) return 1;
     if (!z->guest_dirty) return 1;
@@ -3799,6 +3932,7 @@ static void eng_zdepth_wrote(u32 slot, const rsx_dsp_surface* sf)
 {
     eng_zdepth* z = &g.zdepths[slot];
     z->depth_serial = ++g.write_serial;
+    if (eng_depth_gpu()) z->snapshot_valid = 0;     /* a draw after the copy was taken */
     if (!z->guest_dirty) WCB_COUNT(marked_dirty, 1);
     z->guest_dirty = 1;
     z->zfmt = sf->depth_format;
@@ -3960,7 +4094,7 @@ static int eng_wcb_copy_surface(u32 slot, int use_ticket)
     if (!from_ticket && !streamed) {
         eng_wcb_drop_ticket(s);
         if (!g.be->readback) return 0;
-        g.be->submit_and_wait(g.be->user, RSX_BE_FLUSH_GUEST_REFERENCE);
+        (g_rsx_ww_ctx = "eng:wcb_copy_surface", g.be->submit_and_wait)(g.be->user, RSX_BE_FLUSH_GUEST_REFERENCE);
         g.be->readback(g.be->user, s->handle, rx, ry, rw, rh, rows, rw * bpp);
     }
     eng_color_rows_store(bpp, s->location, s->offset + ry * s->pitch + rx * bpp,
@@ -6540,7 +6674,7 @@ static void pd_write_surface(u32 slot, const char* path)
     FILE* f = (raw && rgb) ? fopen(path, "wb") : NULL;
     if (f) {
         memset(raw, 0, (size_t)s->w * s->h * bpp);
-        g.be->submit_and_wait(g.be->user, RSX_BE_FLUSH_GUEST_REFERENCE);
+        (g_rsx_ww_ctx = "eng:pd_write_surface", g.be->submit_and_wait)(g.be->user, RSX_BE_FLUSH_GUEST_REFERENCE);
         g.be->readback(g.be->user, s->handle, 0, 0, s->w, s->h, raw, s->w * bpp);
         for (size_t i = 0; i < (size_t)s->w * s->h; i++) {
             const u8* p = raw + i * bpp;
@@ -6584,7 +6718,7 @@ static void pd_write_depth(u32 zslot, const char* path, float* lo_out, float* hi
     u8* px = (u8*)malloc((size_t)w * h);
     FILE* f = (d && px) ? fopen(path, "wb") : NULL;
     if (f) {
-        g.be->submit_and_wait(g.be->user, RSX_BE_FLUSH_GUEST_REFERENCE);
+        (g_rsx_ww_ctx = "eng:pd_write_depth", g.be->submit_and_wait)(g.be->user, RSX_BE_FLUSH_GUEST_REFERENCE);
         if (g.be->depth_readback(g.be->user, z->handle, 0, 0, w, h, d, w * 4u) == 0) {
             float lo = 1.0f, hi = 0.0f;
             for (size_t i = 0; i < (size_t)w * h; i++) {
@@ -7396,6 +7530,7 @@ static u32 eng_mt_alloc(u32 bytes)
 static void eng_mt_wait_turn(u64 seq)
 {
     int spins = 0;
+    const unsigned long long ww_t0 = rsx_ww_begin();
     while (atomic_load_explicit(&s_mt.next_commit, memory_order_acquire) != seq) {
         if (++spins < 20000) {
 #if defined(__x86_64__) || defined(__i386__)
@@ -7406,6 +7541,7 @@ static void eng_mt_wait_turn(u64 seq)
         spins = 0;
         sched_yield();
     }
+    rsx_ww_end(RSX_WW_MT_TURN, ww_t0);
 }
 
 static void eng_mt_take_turn(u64 seq)
@@ -7416,6 +7552,7 @@ static void eng_mt_take_turn(u64 seq)
 static void eng_mt_wait_upto(u64 upto)
 {
     int spins = 0;
+    const unsigned long long ww_t0 = rsx_ww_begin();
     while (atomic_load_explicit(&s_mt.next_commit, memory_order_acquire) <= upto) {
         if (++spins < 20000) {
 #if defined(__x86_64__) || defined(__i386__)
@@ -7426,6 +7563,7 @@ static void eng_mt_wait_upto(u64 upto)
         spins = 0;
         sched_yield();
     }
+    rsx_ww_end(RSX_WW_MT_TURN, ww_t0);
 }
 
 static int eng_mt_chunk_add(const void* rec, u32 bytes)
@@ -7737,6 +7875,7 @@ static u32 eng_tex_token_wait(u32 token)
     if (!s_texr.jobs || idx >= s_texr.n) return 0;
     eng_tex_job* j = &s_texr.jobs[idx];
     int spins = 0;
+    const unsigned long long ww_t0 = rsx_ww_begin();
     while (atomic_load_explicit(&j->state, memory_order_acquire) == 0) {
         if (++spins < 20000) {
 #if defined(__x86_64__) || defined(__i386__)
@@ -7747,6 +7886,7 @@ static u32 eng_tex_token_wait(u32 token)
         spins = 0;
         sched_yield();
     }
+    rsx_ww_end(RSX_WW_TEX_TOKEN, ww_t0);
     return j->handle;
 }
 
@@ -7988,7 +8128,7 @@ static void eng_pkt_track(const eng_draw_pkt* p)
         }
     }
     if (p->track_depth_write && p->zslot != ENG_INVALID) {
-        g.zdepths[p->zslot].had_write = 1;
+        g.zdepths[p->zslot].had_write = 1; g.zdepths[p->zslot].const_ok = 0;
         eng_zdepth_wrote(p->zslot, &p->track_sf);
     }
 }
@@ -8321,6 +8461,7 @@ static void sink_end_work(void* user, const rsx_dispatch* r)
     if (do_clear_depth) {
         g.zdepths[zslot].cleared = 1;
         g.zdepths[zslot].had_write = 0;
+        g.zdepths[zslot].const_ok = 0;
     }
 
     u32 sc[4];
@@ -8583,7 +8724,7 @@ mt_done:
         }
     }
     if (zslot != ENG_INVALID && rs.depth_test && rs.depth_write) {
-        g.zdepths[zslot].had_write = 1;
+        g.zdepths[zslot].had_write = 1; g.zdepths[zslot].const_ok = 0;
         eng_zdepth_wrote(zslot, &sf);
     }
     wp2_add(WPROF2_SURFTRACK, w2_surftrack);
@@ -8723,6 +8864,8 @@ static void sink_clear(void* user, const rsx_dispatch* r, u32 mask)
              * texture consumer resolves the newly written pass exactly once.
              * Past a partial clear the rest still holds what was drawn. */
             if (!partial) g.zdepths[zslot].had_write = 0;
+            g.zdepths[zslot].const_ok = !partial;
+            g.zdepths[zslot].const_val = depth;
             g.zdepths[zslot].snapshot_valid = 0;
             eng_zdepth_wrote(zslot, &sf);
         }
@@ -8867,6 +9010,20 @@ void rsx_draw_engine_replay_advance_frame(void)
     g.frames++;
 }
 
+/* Replay image check (PS3RECOMP_VK_DUMP): the capture has no display buffer, so
+ * present the colour surface written last. */
+void rsx_draw_engine_replay_present_last(void)
+{
+    eng_mt_sync();
+    if (!g.ready || !g.be->present) return;
+    u32 best = ENG_INVALID;
+    for (u32 i = 0; i < g.n_surfaces; i++)
+        if (g.surfaces[i].handle &&
+            (best == ENG_INVALID || g.surfaces[i].last_write_serial > g.surfaces[best].last_write_serial))
+            best = i;
+    if (best != ENG_INVALID) g.be->present(g.be->user, g.surfaces[best].handle);
+}
+
 /* ---- public API ---------------------------------------------------------- */
 
 void rsx_draw_engine_set_backend(const rsx_draw_backend* backend)
@@ -8992,7 +9149,7 @@ void rsx_draw_engine_shutdown(void)
         s_wcb_live = 0;
     }
     if (g.ready && g.be->submit_and_wait)
-        g.be->submit_and_wait(g.be->user, RSX_BE_FLUSH_SHUTDOWN);
+        (g_rsx_ww_ctx = "eng:shutdown", g.be->submit_and_wait)(g.be->user, RSX_BE_FLUSH_SHUTDOWN);
     for (u32 i = 0; i < g.n_textures; i++)
         if (g.textures[i].handle) g.be->texture_release(g.be->user, g.textures[i].handle);
     for (u32 i = 0; i < g.n_pipelines; i++)
@@ -9063,7 +9220,7 @@ void rsx_draw_engine_flush(void)
     eng_mt_sync();
     rsx_draw_engine_flush_dirty_to_guest();
     if (g.ready && g.be->submit_and_wait)
-        g.be->submit_and_wait(g.be->user, RSX_BE_FLUSH_GUEST_REFERENCE);
+        (g_rsx_ww_ctx = "eng:flush", g.be->submit_and_wait)(g.be->user, RSX_BE_FLUSH_GUEST_REFERENCE);
 }
 
 void rsx_draw_engine_present(void)

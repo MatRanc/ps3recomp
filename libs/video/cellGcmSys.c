@@ -2671,7 +2671,10 @@ void cellGcm_rsx_process_fifo(void)
     { static int wake_set;
       if (!wake_set) { wake_set = 1; rsx_draw_engine_wcb_set_wake(gcm_wcb_wake); } }
     const uint64_t ft_t0 = PS3_FT_ON() ? ps3_ft_now() : 0;
+    rsx_ww_enter();   /* PS3RECOMP_WALKER_WAITS: count blocking sites on this pass */
+    const unsigned long long ww_t0 = rsx_ww_begin();
     AcquireSRWLockExclusive(&s_gcm_fifo_lock);
+    rsx_ww_end(RSX_WW_FIFO_LOCK, ww_t0);
     if (rsx_draw_engine_enabled()) rsx_draw_engine_wcb_service();
     const uint64_t tr_t0 = ps3_trace_begin();
     if (tr_t0) {
@@ -2686,6 +2689,7 @@ void cellGcm_rsx_process_fifo(void)
         gcm_rsx_process_fifo_unlocked();
     }
     ReleaseSRWLockExclusive(&s_gcm_fifo_lock);
+    rsx_ww_leave();
     if (ft_t0) {
         const uint64_t t1 = ps3_ft_now();
         if (t1 - ft_t0 >= ps3_ft_min_ns())

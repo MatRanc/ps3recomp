@@ -505,6 +505,38 @@ if(PS3RECOMP_BUILD_TESTS)
     if(TARGET Threads::Threads)
         target_link_libraries(replay_rsx_engine PRIVATE Threads::Threads)
     endif()
+    # PS3RECOMP_REPLAY_VK=1: the same replay through the real Vulkan backend
+    # (headless, offscreen) instead of the null one. The backend is the
+    # shipping file; nothing else in this target changes.
+    if(PS3RECOMP_RSX_VULKAN AND NOT WIN32 AND NOT APPLE)
+        target_sources(replay_rsx_engine PRIVATE
+            libs/video/rsx_vulkan_backend.c
+            libs/video/vk_pipe_queue.c
+            libs/video/vk_dump_queue.c
+            libs/video/rsx_shader_spirv.cpp)
+        target_include_directories(replay_rsx_engine PRIVATE
+            "${PS3RECOMP_VULKAN_INCLUDE_DIR}")
+        target_compile_definitions(replay_rsx_engine PRIVATE PS3RECOMP_RSX_VULKAN)
+        if(PS3RECOMP_SPIRV_TRANSLATION)
+            target_compile_definitions(replay_rsx_engine PRIVATE
+                PS3RECOMP_HAVE_SPIRV_TRANSLATION=1)
+            target_link_libraries(replay_rsx_engine PRIVATE
+                glslang::glslang glslang::SPIRV)
+            if(TARGET glslang::glslang-default-resource-limits)
+                target_link_libraries(replay_rsx_engine PRIVATE
+                    glslang::glslang-default-resource-limits)
+            endif()
+        endif()
+        if(SDL2_FOUND)
+            if(TARGET SDL2::SDL2)
+                target_link_libraries(replay_rsx_engine PRIVATE SDL2::SDL2)
+            else()
+                target_include_directories(replay_rsx_engine PRIVATE ${SDL2_INCLUDE_DIRS})
+                target_link_libraries(replay_rsx_engine PRIVATE ${SDL2_LIBRARIES})
+            endif()
+        endif()
+        target_link_libraries(replay_rsx_engine PRIVATE ${CMAKE_DL_LIBS})
+    endif()
 
     if(NOT WIN32)
         # The vector single-precision ops against the exact per-lane references.

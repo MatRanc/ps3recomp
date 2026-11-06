@@ -190,7 +190,10 @@ static int wcb_owner(void)
 static void wcb_lock(void)
 {
     unsigned spin = 0;
-    while (!wcb_cas_lock(&s_wcbm.lock)) wcb_yield(spin++ < 64 ? spin : 64);
+    if (wcb_cas_lock(&s_wcbm.lock)) return;
+    const unsigned long long ww_t0 = rsx_ww_begin();
+    do wcb_yield(spin++ < 64 ? spin : 64); while (!wcb_cas_lock(&s_wcbm.lock));
+    rsx_ww_end(RSX_WW_WCB_LOCK, ww_t0);
 }
 static void wcb_unlock(void) { wcb_unlock_word(&s_wcbm.lock); }
 
