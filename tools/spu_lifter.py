@@ -164,6 +164,45 @@ INLINE_PREAMBLE = """
 #endif
 """
 
+# --spu-ftz-hw: emit the SPU float helpers on the assumption that the host
+# thread runs with MXCSR FTZ|DAZ (the runtime sets it around a lifted run when
+# a module built with this flag registers itself). SPU has no denormals and any
+# zero result is +0, so the hardware can flush denormal operands/results and
+# only the sign of zero has to be canonicalised. This is the same helper body
+# as spu_helpers.h's SPU_FF_FTZ_HW path, emitted here so the mode does not
+# depend on which copy of the runtime header a generated tree resolves.
+FTZ_HW_PREAMBLE = r"""
+/* --spu-ftz-hw: SPU float with MXCSR FTZ|DAZ (see the lifter flag). */
+#if defined(__FMA__) && (defined(__SSE__) || defined(__AVX__))
+static inline __m128 spu_hw_ftz(__m128 v) {
+    return _mm_andnot_ps(_mm_cmpeq_ps(v, _mm_setzero_ps()), v);
+}
+static inline __m128 spu_hw_ld(u128 a) { return _mm_loadu_ps((const float*)a._u32); }
+static inline u128 spu_hw_st(__m128 v) {
+    u128 r; _mm_storeu_ps((float*)r._u32, spu_hw_ftz(v)); return r;
+}
+static inline u128 spu_hw_fa(u128 a, u128 b) { return spu_hw_st(_mm_add_ps(spu_hw_ld(a), spu_hw_ld(b))); }
+static inline u128 spu_hw_fs(u128 a, u128 b) { return spu_hw_st(_mm_sub_ps(spu_hw_ld(a), spu_hw_ld(b))); }
+static inline u128 spu_hw_fm(u128 a, u128 b) { return spu_hw_st(_mm_mul_ps(spu_hw_ld(a), spu_hw_ld(b))); }
+static inline u128 spu_hw_fma(u128 a, u128 b, u128 c)  { return spu_hw_st(_mm_fmadd_ps(spu_hw_ld(a), spu_hw_ld(b), spu_hw_ld(c))); }
+static inline u128 spu_hw_fms(u128 a, u128 b, u128 c)  { return spu_hw_st(_mm_fmsub_ps(spu_hw_ld(a), spu_hw_ld(b), spu_hw_ld(c))); }
+static inline u128 spu_hw_fnms(u128 a, u128 b, u128 c) { return spu_hw_st(_mm_fnmadd_ps(spu_hw_ld(a), spu_hw_ld(b), spu_hw_ld(c))); }
+extern void spu_ftz_hw_enable(void) __attribute__((weak));
+__attribute__((constructor)) static void spu_hw_ftz_ctor(void) {
+    if (spu_ftz_hw_enable) spu_ftz_hw_enable();
+}
+#else
+/* No FMA: keep the exact per-operand helpers, and do not ask the runtime for
+ * FTZ|DAZ mode (it would only add a second flush). */
+#define spu_hw_fa spu_fa
+#define spu_hw_fs spu_fs
+#define spu_hw_fm spu_fm
+#define spu_hw_fma spu_fma
+#define spu_hw_fms spu_fms
+#define spu_hw_fnms spu_fnms
+#endif
+"""
+
 # ---------------------------------------------------------------------------
 # Operand helpers
 # ---------------------------------------------------------------------------
@@ -1036,6 +1075,7 @@ class SPULifter:
         self.ib_goto = False
         self.ib_goto_starts = False
         self.precise_regs = False
+        self.spu_ftz_hw = False
 
     def _ib_near(self, addr: int) -> list:
         return sorted((t for t in self.ib_entries if abs(t - addr) <= 0x800),
@@ -1594,7 +1634,9 @@ class SPULifter:
             "clgt": "spu_clgt", "clgth": "spu_clgth", "clgtb": "spu_clgtb",
             "mpy": "spu_mpy", "mpyu": "spu_mpyu",
             "mpyh": "spu_mpyh", "mpyhh": "spu_mpyhh", "mpys": "spu_mpys",
-            "fa": "spu_fa", "fs": "spu_fs", "fm": "spu_fm",
+            "fa": "spu_hw_fa" if self.spu_ftz_hw else "spu_fa",
+            "fs": "spu_hw_fs" if self.spu_ftz_hw else "spu_fs",
+            "fm": "spu_hw_fm" if self.spu_ftz_hw else "spu_fm",
             "fi": "spu_fi",   # floating interpolate (reciprocal refine)
             "fceq": "spu_fceq", "fcgt": "spu_fcgt",
             "fcmeq": "spu_fcmeq", "fcmgt": "spu_fcmgt",
@@ -1702,7 +1744,8 @@ class SPULifter:
             return f"{g(rt())} = spu_shufb({g(ra())}, {g(rb())}, {g(rc)});"
         if mn in ("fma", "fms", "fnms", "mpya"):
             rc = _reg(ops[3])
-            return f"{g(rt())} = spu_{mn}({g(ra())}, {g(rb())}, {g(rc)});"
+            name = (f"spu_hw_{mn}" if (self.spu_ftz_hw and mn in ("fma", "fms", "fnms")) else f"spu_{mn}")
+            return f"{g(rt())} = {name}({g(ra())}, {g(rb())}, {g(rc)});"
         # sfx: extended subtract — RT is also a source (carry-in = low bit of old RT).
         if mn == "sfx":
             return f"{g(rt())} = spu_sfx({g(ra())}, {g(rb())}, {g(rt())});"
@@ -1973,6 +2016,8 @@ class SPULifter:
         lines = [SOURCE_PREAMBLE.format(header_name=header_name)]
         if getattr(self, "inline_direct", False):
             lines.append(INLINE_PREAMBLE)
+        if getattr(self, "spu_ftz_hw", False):
+            lines.append(FTZ_HW_PREAMBLE)
         lines.append("")
         weak = "__attribute__((weak)) " if getattr(self, "weak_emit", False) else ""
         local = getattr(self, "local_regs", False)
@@ -2097,6 +2142,12 @@ def main() -> None:
                    help="With --ib-known-targets: a known target inside the "
                         "current function is reached with a goto (registers stay "
                         "in --local-regs locals) instead of a tail call.")
+    p.add_argument("--spu-ftz-hw", action="store_true",
+                   help="Emit the SPU float helpers for a host thread running "
+                        "with MXCSR FTZ|DAZ (the runtime sets it around a run "
+                        "when a module built with this flag registers itself). "
+                        "Exact for SPU: no denormals, and only the sign of zero "
+                        "needs canonicalising. Default off.")
     p.add_argument("--ib-goto-starts", action="store_true",
                    help="With --ib-goto: also test every function entry within "
                         "reach as a goto target, not only entries the image "
@@ -2257,6 +2308,7 @@ def main() -> None:
     lifter.precise_regs = args.precise_regs
     lifter.ib_goto_starts = args.ib_goto_starts
     lifter.inline_direct = args.inline_direct
+    lifter.spu_ftz_hw = args.spu_ftz_hw
     lifter.bi_r0_jump = compute_bi_r0_jumps(insns, bounds)
     if lifter.bi_r0_jump:
         print(f"  {len(lifter.bi_r0_jump)} `bi $r0` computed-jump site(s) "

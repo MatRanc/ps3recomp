@@ -27,6 +27,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <setjmp.h>
+#if defined(__x86_64__) || defined(__i386__)
+#include <xmmintrin.h>
+#endif
 /* setjmp/longjmp also save and restore the signal mask on POSIX: one
  * sigprocmask system call per halt, stack reset or task resume. These frames
  * never cross a signal handler, so the mask is the same at both ends. */
@@ -282,6 +285,35 @@ static uint64_t spu_float_mode_enter(void)
     return ~0ull;
 #endif
 }
+/* --spu-ftz-hw (lift flag): a generated module built for MXCSR FTZ|DAZ calls
+ * spu_ftz_hw_enable() from a constructor. A lifted run then enters FTZ|DAZ for
+ * its duration and restores the caller's MXCSR on the way out, exactly like
+ * the arm64 SPU_FLOAT_RZ mode above. That keeps a synchronous PPU-thread run
+ * from changing the PPU's denormal/rounding behaviour. */
+int g_spu_ftz_hw = 0;
+void spu_ftz_hw_enable(void) { g_spu_ftz_hw = 1; }
+
+static uint32_t spu_ftz_mode_enter(void)
+{
+#if defined(__x86_64__) || defined(__i386__)
+    if (!__atomic_load_n(&g_spu_ftz_hw, __ATOMIC_RELAXED)) return 0xFFFFFFFFu;
+    uint32_t v = (uint32_t)_mm_getcsr();
+    if ((v & 0x8040u) == 0x8040u) return 0xFFFFFFFFu;   /* nested/already set */
+    _mm_setcsr(v | 0x8040u);                             /* FTZ | DAZ */
+    return v;
+#else
+    return 0xFFFFFFFFu;
+#endif
+}
+static void spu_ftz_mode_leave(uint32_t outer)
+{
+#if defined(__x86_64__) || defined(__i386__)
+    if (outer != 0xFFFFFFFFu) _mm_setcsr(outer);
+#else
+    (void)outer;
+#endif
+}
+
 static void spu_float_mode_leave(uint64_t outer)
 {
 #if defined(__aarch64__) && defined(__ARM_NEON) && !defined(SPU_SCALAR_HELPERS)
@@ -307,6 +339,7 @@ static void spu_honour_stop_request(spu_context* ctx)
 int spu_run_with_halt(void (*entry)(spu_context*), spu_context* ctx)
 {
     const uint64_t fpcr_outer = spu_float_mode_enter();   /* not modified after setjmp */
+    const uint32_t mxcsr_outer = spu_ftz_mode_enter();
     int halted = 0;
     /* Job-args probe: image-1 (the WWS job binary) entries arrive at the crt
      * with r3/r4 zeroed in SOME runs while the jm2 runner sets them -- count
@@ -391,6 +424,7 @@ int spu_run_with_halt(void (*entry)(spu_context*), spu_context* ctx)
     s_spu_halt_armed = outer_armed;
     if (outer_armed) memcpy(s_spu_halt_env, outer_env, sizeof(jmp_buf));
     spu_float_mode_leave(fpcr_outer);
+    spu_ftz_mode_leave(mxcsr_outer);
     return halted;
 }
 

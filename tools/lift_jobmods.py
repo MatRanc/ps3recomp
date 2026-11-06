@@ -390,6 +390,9 @@ def main():
                          "live-out reload filter).")
     ap.add_argument("--ib-goto-starts", action="store_true",
                     help="Pass --ib-goto-starts to spu_lifter.py.")
+    ap.add_argument("--spu-ftz-hw", action="store_true",
+                    help="Pass --spu-ftz-hw to spu_lifter.py: emit the SPU float "
+                         "helpers for a host thread running with MXCSR FTZ|DAZ.")
     ap.add_argument("--inline-direct", action="store_true",
                     help="Pass --inline-direct to spu_lifter.py: fold acyclic "
                          "direct callees into their caller before --local-regs.")
@@ -425,6 +428,8 @@ def main():
         LIFTER_FLAGS.append("--ib-goto-starts")
     if args.inline_direct:
         LIFTER_FLAGS.append("--inline-direct")
+    if args.spu_ftz_hw:
+        LIFTER_FLAGS.append("--spu-ftz-hw")
     OUTDIR  = args.out
     register_c = args.register or os.path.join(OUTDIR, "jobmods_register.c")
 
