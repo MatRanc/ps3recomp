@@ -716,6 +716,29 @@ static int eng_crowd_fix_on(void)
     return s_crowd_fix;
 }
 
+/* PS3RECOMP_WIPE_FIX: recover a Morton texture whose guest bytes are the
+ * linear image our own render-target readback wrote. When a title renders a
+ * 32-bit image into a colour target and then samples that address through a
+ * Morton texture (SET_TEXTURE_FORMAT byte without the LN bit), the hardware
+ * has the target stored in Morton order. Our readback (eng_surface_to_guest)
+ * copies the host image row by row, so the guest bytes are linear; decoding
+ * them as Morton turns the image into the tiled checkerboard of the logo
+ * wipe. Nothing in the binding says which layout the bytes have, so compare
+ * the two decodes on adjacent texels: a natural image is far smoother read
+ * the right way round. Off by default; see docs/notes/tiled-wipe.md. */
+static int s_wipe_fix = -1;
+static int eng_wipe_fix_on(void)
+{
+#if defined(__GNUC__) && !defined(_WIN32)
+    if (ps3_live_ctl_get) return ps3_live_ctl_get(PS3_LIVE_WIPE_FIX);
+#endif
+    if (s_wipe_fix < 0) {
+        const char* e = getenv("PS3RECOMP_WIPE_FIX");
+        s_wipe_fix = e && *e && strcmp(e, "0") != 0 ? 1 : 0;
+    }
+    return s_wipe_fix;
+}
+
 /* ---- guest memory -------------------------------------------------------- */
 
 /* rsx_dsp_* locations are RSX_LOCATION_LOCAL = 0 / _MAIN = 1;
@@ -3070,6 +3093,68 @@ static int eng_staging_reserve(u32 bytes)
  * the census in sink_bind_textures can attribute the dummy fallback. */
 static unsigned s_tex_miss_reason;
 
+/* PS3RECOMP_WIPE_FIX's layout probe: the sum of |R|+|G|+|B| between texels
+ * one stride apart, read with one candidate layout. A natural image is
+ * locally smooth, so the right layout scores much lower. A stride of 8 is
+ * what tells Morton from linear: a Morton permutation keeps neighbours one
+ * texel apart adjacent (so a stride of 1 barely differs) but scatters texels
+ * 8 apart into different rows. Sampled on a fixed grid, 32-bit texels. */
+static u64 eng_tex_adjacency(const u8* src, u32 w, u32 h, u32 row_bytes,
+                             int morton, u32 l2w, u32 l2h)
+{
+    const u32 step = 8u;
+    const u32 xstep = w > 64u ? (w + 63u) / 64u : 1u;
+    const u32 ystep = h > 64u ? (h + 63u) / 64u : 1u;
+    const u32 words_per_row = row_bytes / 4u;
+    u64 sum = 0;
+    for (u32 y = 0; y + step < h; y += ystep) {
+        for (u32 x = 0; x + step < w; x += xstep) {
+            const u32 ah = morton ? rsx_swizzle_offset(x, y, l2w, l2h)
+                                  : y * words_per_row + x;
+            const u32 bh = morton ? rsx_swizzle_offset(x + step, y, l2w, l2h)
+                                  : y * words_per_row + x + step;
+            const u32 av = morton ? rsx_swizzle_offset(x, y + step, l2w, l2h)
+                                  : (y + step) * words_per_row + x;
+            const u8* a = src + (size_t)ah * 4u;
+            const u8* b = src + (size_t)bh * 4u;
+            const u8* c = src + (size_t)av * 4u;
+            sum += (u64)(abs((int)a[0] - (int)b[0]) + abs((int)a[1] - (int)b[1]) +
+                         abs((int)a[2] - (int)b[2]));
+            sum += (u64)(abs((int)a[0] - (int)c[0]) + abs((int)a[1] - (int)c[1]) +
+                         abs((int)a[2] - (int)c[2]));
+        }
+    }
+    return sum;
+}
+
+/* When PS3RECOMP_WIPE_FIX is on, a 32-bit A8R8G8B8/D8R8G8B8 2-D texture the
+ * format declares Morton may actually be the linear image our readback wrote
+ * (see the key's comment). Pick the layout the bytes look like. Returns 1
+ * when the levels were switched to linear. */
+static int eng_tex_layout_probe(const u8* src, u32 fmt, rsx_tex_level* lv, u32 nlv)
+{
+    if (!eng_wipe_fix_on() || !src || !nlv) return 0;
+    const rsx_tex_layout* t0 = &lv[0].tl;
+    if (!t0->swizzled || t0->compressed || t0->bytes_per_texel != 4u) return 0;
+    const u32 base = t0->base_format;
+    if (base != 0x85u && base != 0x9Eu) return 0;
+    if (lv[0].w < 64u || lv[0].h < 64u) return 0;
+    const u32 l2w = rsx_log2_ceil(lv[0].w), l2h = rsx_log2_ceil(lv[0].h);
+    const u64 lin = eng_tex_adjacency(src, lv[0].w, lv[0].h, t0->row_bytes, 0, l2w, l2h);
+    const u64 mor = eng_tex_adjacency(src, lv[0].w, lv[0].h, t0->row_bytes, 1, l2w, l2h);
+    /* Linear has to be clearly the smoother of the two; noise or a genuinely
+     * Morton image stays on the hardware layout. */
+    if (lin * 4u >= mor * 3u) return 0;
+    for (u32 m = 0; m < nlv; m++) lv[m].tl.swizzled = 0;
+    static u32 logs;
+    if (PS3_LOG_FIRST(logs, 16))
+        fprintf(stderr, "[rsx engine] wipe-fix: %ux%u fmt %02X read linear "
+                "(adjacency %llu vs Morton %llu)\n",
+                lv[0].w, lv[0].h, fmt & 0xFFu,
+                (unsigned long long)lin, (unsigned long long)mor);
+    return 1;
+}
+
 /* Decode a guest texture out of guest memory and hand every face and level to
  * the backend. Returns the backend handle, or 0. `into`, when nonzero, is an
  * existing 2D texture of exactly this key to rewrite instead of creating one
@@ -3130,6 +3215,10 @@ static u32 eng_texture_upload_work(u32 location, u32 offset, u32 fmt, u32 w, u32
     const u8* src = eng_guest_ptr(NULL, location, offset, span);
     if (!src) { s_tex_miss_reason = RSX_TEX_MISS_ADDRESS; return 0; }
 
+    /* Faces of a cube and volume slices keep the hardware layout: the probe
+     * only has one image to judge here. */
+    if (!cube && depth <= 1) eng_tex_layout_probe(src, fmt, lv, nlv);
+
     eng_mt_sync();
     const u32 handle = into ? into
         : g.be->texture_create(g.be->user, eng_texfmt(lv[0].tl.fmt), w, h, nlv, faces, remap, fmt);
@@ -3147,6 +3236,35 @@ static u32 eng_texture_upload_work(u32 location, u32 offset, u32 fmt, u32 w, u32
             rsx_texture_decode(g.tex_staging, tl->dst_row_bytes,
                                face + lv[m].offset, lv[m].w, lv[m].h, tl,
                                rsx_texture_argb_is_rgba());
+            /* PS3RECOMP_ENG_TEXDUMP=<existing dir>: write each newly uploaded
+             * texture's level 0 (host RGBA, the pixels the sampler gets) as
+             * <dir>/tex_<location>_<offset>.ppm, once per address. Diagnostic
+             * only, default off. */
+            if (f == 0 && m == 0 && tl->dst_bytes_per_texel == 4u) {
+                static const char* d = (const char*)-1;
+                if (d == (const char*)-1) d = getenv("PS3RECOMP_ENG_TEXDUMP");
+                if (d && *d) {
+                    static u32 seen[256]; static u32 nseen;
+                    u32 k = 0;
+                    while (k < nseen && seen[k] != offset) k++;
+                    if (k == nseen && nseen < 256u) {
+                        seen[nseen++] = offset;
+                        char path[1024];
+                        snprintf(path, sizeof path, "%s/tex_%u_%08X.ppm", d, location, offset);
+                        FILE* tf = fopen(path, "wb");
+                        if (tf) {
+                            fprintf(tf, "P6\n%u %u\n255\n", lv[m].w, lv[m].h);
+                            for (u32 ty = 0; ty < lv[m].h; ty++)
+                                for (u32 tx = 0; tx < lv[m].w; tx++) {
+                                    const u8* p = g.tex_staging + (size_t)ty * tl->dst_row_bytes
+                                                + (size_t)tx * 4u;
+                                    fputc(p[0], tf); fputc(p[1], tf); fputc(p[2], tf);
+                                }
+                            fclose(tf);
+                        }
+                    }
+                }
+            }
             g.be->texture_upload(g.be->user, handle, f, m, lv[m].w, lv[m].h,
                                  g.tex_staging, tl->dst_row_bytes, tl->rows);
         }
@@ -9126,6 +9244,33 @@ void rsx_draw_engine_replay_advance_frame(void)
     g.frames++;
 }
 
+/* PS3RECOMP_REPLAY_SURFACE_INFO=1: one line per registered colour surface at
+ * present time (location, offset, size, AA grid, last write serial), plus the
+ * slot the replay presents. PS3RECOMP_REPLAY_SURFACE_DUMP=<file>: also write
+ * that surface's own bytes (back-end readback, not the present blit) to a PPM,
+ * so a present that disagrees with the surface can be told from a surface that
+ * is itself wrong. Diagnostic only; default off. */
+static void replay_surface_diag(u32 slot)
+{
+    static int info = -1;
+    if (info < 0) { const char* e = getenv("PS3RECOMP_REPLAY_SURFACE_INFO");
+                    info = e && *e && strcmp(e, "0") != 0; }
+    if (info) {
+        for (u32 i = 0; i < g.n_surfaces; i++) {
+            const eng_surface* s = &g.surfaces[i];
+            if (!s->handle) continue;
+            fprintf(stderr, "[surf] %u%s loc=%u off=0x%08X %ux%u pitch=%u aa=%x fmt=%d "
+                    "wseq=%llu cseq=%llu%s\n", i, i == slot ? "*" : "",
+                    s->location, s->offset, s->w, s->h, s->pitch, s->aa_grid, (int)s->fmt,
+                    (unsigned long long)s->last_write_serial,
+                    (unsigned long long)s->color_serial,
+                    eng_is_display_offset(s->location, s->offset) ? " display" : "");
+        }
+    }
+    const char* d = getenv("PS3RECOMP_REPLAY_SURFACE_DUMP");
+    if (d && *d && slot != ENG_INVALID) pd_write_surface(slot, d);
+}
+
 /* Replay image check (PS3RECOMP_VK_DUMP): the capture has no display buffer, so
  * present the colour surface written last. */
 void rsx_draw_engine_replay_present_last(void)
@@ -9137,7 +9282,10 @@ void rsx_draw_engine_replay_present_last(void)
         if (g.surfaces[i].handle &&
             (best == ENG_INVALID || g.surfaces[i].last_write_serial > g.surfaces[best].last_write_serial))
             best = i;
-    if (best != ENG_INVALID) g.be->present(g.be->user, g.surfaces[best].handle);
+    /* The replay has no flip for a capture that ends mid-frame, so the pass
+     * still open when the stream ends would never reach passes.txt. */
+    pd_close_pass();
+    if (best != ENG_INVALID) { replay_surface_diag(best); g.be->present(g.be->user, g.surfaces[best].handle); }
 }
 
 int rsx_draw_engine_replay_present_offset(u32 offset)
@@ -9146,6 +9294,8 @@ int rsx_draw_engine_replay_present_offset(u32 offset)
     if (!g.ready || !g.be->present) return -1;
     for (u32 i = 0; i < g.n_surfaces; i++)
         if (g.surfaces[i].handle && g.surfaces[i].offset == offset) {
+            pd_close_pass();
+            replay_surface_diag(i);
             g.be->present(g.be->user, g.surfaces[i].handle);
             return 0;
         }

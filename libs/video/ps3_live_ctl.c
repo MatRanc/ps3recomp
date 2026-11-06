@@ -105,6 +105,7 @@ static const char* const K_NAME[PS3_LIVE_COUNT] = {
     "PS3RECOMP_VK_VTX_PRE",
     "PS3RECOMP_VK_BATCH_CREATES",
     "PS3RECOMP_CROWD_FIX",
+    "PS3RECOMP_WIPE_FIX",
 };
 
 static _Atomic int s_val[PS3_LIVE_COUNT];

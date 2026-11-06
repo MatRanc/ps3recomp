@@ -106,6 +106,7 @@ enum {
     PS3_LIVE_VK_VTX_PRE,                /* PS3RECOMP_VK_VTX_PRE (needs PASS_KEEP): vertex-unpack dispatches go to a pre command buffer */
     PS3_LIVE_VK_BATCH_CREATES,          /* PS3RECOMP_VK_BATCH_CREATES: target/texture/snapshot creates join the open draw batch instead of a submit+wait */
     PS3_LIVE_CROWD_FIX,                 /* PS3RECOMP_CROWD_FIX: each sub-draw uses the vertex-array state current at it */
+    PS3_LIVE_WIPE_FIX,                  /* PS3RECOMP_WIPE_FIX: recover a Morton texture our linear readback copied out (see tiled-wipe.md) */
     PS3_LIVE_COUNT
 };
 
