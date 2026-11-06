@@ -611,6 +611,8 @@ void rsx_wprof_drain_end(int profiled);
 void rsx_draw_engine_replay_advance_frame(void);
 /* Replay image check: present the colour surface written last. */
 void rsx_draw_engine_replay_present_last(void);
+/* Replay image check: present the colour surface at a guest offset. */
+int rsx_draw_engine_replay_present_offset(u32 offset);
 
 /* Live switches from PS3RECOMP_CTL (cellGcmSys polls the file and calls these
  * on the walker thread). Changing WALKER_FAST flushes the fetch/pipeline

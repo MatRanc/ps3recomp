@@ -315,7 +315,12 @@ int rsx_engine_replay_run_frame(rsx_engine_replay* r, rsx_engine_replay_stats* o
     /* PS3RECOMP_VK_DUMP: complete the present so the frame reaches the dump
      * (the timing arms leave it unset and never wait here). */
     if (r->vk && getenv("PS3RECOMP_VK_DUMP")) {
-        rsx_draw_engine_replay_present_last();
+        const char* off = getenv("PS3RECOMP_REPLAY_DUMP_OFFSET");
+        if (off && *off) {
+            if (rsx_draw_engine_replay_present_offset((u32)strtoul(off, NULL, 0)) != 0)
+                fprintf(stderr, "[replay-engine] no surface at offset %s\n", off);
+        } else
+            rsx_draw_engine_replay_present_last();
         rsx_vulkan_backend_present_finish();
     }
     if (out) {

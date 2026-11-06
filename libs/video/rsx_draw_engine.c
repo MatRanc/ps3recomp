@@ -144,6 +144,14 @@ extern u32 cellGcm_flip_frame_count(void) __attribute__((weak));
 #define M_POLY_OFFSET_FILL    0x0A68
 #define M_POLY_OFFSET_FACTOR  0x0A78
 #define M_POLY_OFFSET_BIAS    0x0A7C
+#define M_VTXBUF_OFFSET       0x1680
+#define M_VERTEX_DATA_BASE    0x1738
+#define M_VB_ELEMENT_BASE     0x173C
+#define M_VTXFMT              0x1740
+#define M_IDXBUF_OFFSET       0x181C
+#define M_IDXBUF_FORMAT       0x1820
+#define M_RESTART_INDEX_ENABLE 0x1DAC
+#define M_RESTART_INDEX       0x1DB0
 
 /* ---- module state -------------------------------------------------------- */
 
@@ -527,6 +535,47 @@ void rsx_draw_engine_set_no_draw(int on)
 static char s_vs_hlsl[256 * 1024];
 static char s_ps_hlsl[256 * 1024];
 
+/* The vertex-fetch registers a draw batch reads. PS3RECOMP_CROWD_FIX keeps
+ * the state of the first batch in a run and replays each run with it. */
+typedef struct {
+    u32 off[RSX_DSP_NUM_VERTEX_ATTR];
+    u32 fmt[RSX_DSP_NUM_VERTEX_ATTR];
+    u32 vbase, ebase, idx_off, idx_fmt, restart_en, restart_idx;
+} eng_vtx_state;
+
+static void eng_vtx_state_capture(const rsx_dispatch* r, eng_vtx_state* s)
+{
+    for (u32 a = 0; a < RSX_DSP_NUM_VERTEX_ATTR; a++) {
+        s->off[a] = rsx_dsp_reg(r, M_VTXBUF_OFFSET + a * 4u);
+        s->fmt[a] = rsx_dsp_reg(r, M_VTXFMT + a * 4u);
+    }
+    s->vbase = rsx_dsp_reg(r, M_VERTEX_DATA_BASE);
+    s->ebase = rsx_dsp_reg(r, M_VB_ELEMENT_BASE);
+    s->idx_off = rsx_dsp_reg(r, M_IDXBUF_OFFSET);
+    s->idx_fmt = rsx_dsp_reg(r, M_IDXBUF_FORMAT);
+    s->restart_en = rsx_dsp_reg(r, M_RESTART_INDEX_ENABLE);
+    s->restart_idx = rsx_dsp_reg(r, M_RESTART_INDEX);
+}
+
+static void eng_vtx_state_apply(rsx_dispatch* r, const eng_vtx_state* s)
+{
+    for (u32 a = 0; a < RSX_DSP_NUM_VERTEX_ATTR; a++) {
+        r->regs[(M_VTXBUF_OFFSET + a * 4u) >> 2] = s->off[a];
+        r->regs[(M_VTXFMT + a * 4u) >> 2] = s->fmt[a];
+    }
+    r->regs[M_VERTEX_DATA_BASE >> 2] = s->vbase;
+    r->regs[M_VB_ELEMENT_BASE >> 2] = s->ebase;
+    r->regs[M_IDXBUF_OFFSET >> 2] = s->idx_off;
+    r->regs[M_IDXBUF_FORMAT >> 2] = s->idx_fmt;
+    r->regs[M_RESTART_INDEX_ENABLE >> 2] = s->restart_en;
+    r->regs[M_RESTART_INDEX >> 2] = s->restart_idx;
+}
+
+static int eng_vtx_state_eq(const eng_vtx_state* a, const eng_vtx_state* b)
+{
+    return memcmp(a, b, sizeof *a) == 0;
+}
+
 /* The draw accumulator: one BEGIN_END group's batches, references and cuts. */
 static struct {
     eng_batch arr[ENG_MAX_BATCHES];
@@ -534,6 +583,9 @@ static struct {
     eng_batch idx[ENG_MAX_BATCHES];
     u32 n_idx;
     u32 n_packets;
+    eng_vtx_state run_state;
+    u32 run_type;
+    u32 group_n;
 
     rsx_vertex_ref* refs;
     u32 n_refs, cap_refs, n_source_refs;
@@ -646,6 +698,22 @@ static void eng_tbloom_rebuild(void)
         if (g.surfaces[i].handle) eng_tbloom_set(g.surfaces[i].location, g.surfaces[i].offset);
     for (u32 i = 0; i < g.n_zdepths; i++)
         if (g.zdepths[i].handle) eng_tbloom_set(g.zdepths[i].location, g.zdepths[i].offset);
+}
+
+/* PS3RECOMP_CROWD_FIX: a BEGIN_END group whose sub-draws change the vertex
+ * array state is split at each change and replayed with the state the batch
+ * saw. Off by default. */
+static int s_crowd_fix = -1;
+static int eng_crowd_fix_on(void)
+{
+#if defined(__GNUC__) && !defined(_WIN32)
+    if (ps3_live_ctl_get) return ps3_live_ctl_get(PS3_LIVE_CROWD_FIX);
+#endif
+    if (s_crowd_fix < 0) {
+        const char* e = getenv("PS3RECOMP_CROWD_FIX");
+        s_crowd_fix = e && *e && strcmp(e, "0") != 0 ? 1 : 0;
+    }
+    return s_crowd_fix;
 }
 
 /* ---- guest memory -------------------------------------------------------- */
@@ -5378,6 +5446,7 @@ static inline u64 eng_refs_hash_ref(u64 h, u32 vertex_id, u32 base_index)
 static void dc_reset(void)
 {
     dc.n_arr = dc.n_idx = dc.n_packets = 0;
+    dc.run_type = 0;
     dc.n_refs = dc.n_source_refs = dc.n_verts = dc.n_cuts = 0;
     dc.refs_hash = 1469598103934665603ull;
     dc.refs_remapped = 0;
@@ -5958,10 +6027,36 @@ static void dc_fetch(const rsx_vertex_layout_plan* layout, int allow_remap, int 
 
 /* ---- sink ---------------------------------------------------------------- */
 
+static void sink_end_work(void* user, const rsx_dispatch* r);
+
+static void dc_flush_run(void* user, const rsx_dispatch* r)
+{
+    if (!dc.run_type || !dc.n_packets) { dc_reset(); return; }
+    eng_vtx_state live;
+    eng_vtx_state_capture(&g.rsx, &live);
+    eng_vtx_state_apply(&g.rsx, &dc.run_state);
+    sink_end_work(user, r);
+    eng_vtx_state_apply(&g.rsx, &live);
+    dc_reset();
+}
+
+static void dc_batch_split(void* user, const rsx_dispatch* r, u32 type, u32 n_current)
+{
+    if (!eng_crowd_fix_on()) return;
+    if (dc.n_immediate || dc.inl_bytes || r->inline_len) return;
+    eng_vtx_state st;
+    eng_vtx_state_capture(r, &st);
+    if (dc.run_type && (dc.run_type != type || n_current >= ENG_MAX_BATCHES ||
+                        !eng_vtx_state_eq(&st, &dc.run_state)))
+        dc_flush_run(user, r);
+    if (!dc.run_type) { dc.run_state = st; dc.run_type = type; }
+}
+
 static void sink_begin(void* user, const rsx_dispatch* r, u32 prim)
 {
     (void)user; (void)prim;
     dc_reset();
+    dc.group_n = 0;
     dc.inline_dropped_at_begin = r->inline_dropped;
 }
 
@@ -5998,7 +6093,8 @@ static void sink_immediate_vertex(void* user, const rsx_dispatch* r)
 
 static void sink_draw_arrays(void* user, const rsx_dispatch* r, u32 first, u32 count)
 {
-    (void)user; (void)r;
+    dc_batch_split(user, r, 1, dc.n_arr);
+    dc.group_n++;
     dc.n_packets++;
     if (dc.n_arr >= ENG_MAX_BATCHES) return;
     dc.arr[dc.n_arr].first = first;
@@ -6028,7 +6124,8 @@ static void sink_inline_array(void* user, const rsx_dispatch* r,
 
 static void sink_draw_index(void* user, const rsx_dispatch* r, u32 first, u32 count)
 {
-    (void)user; (void)r;
+    dc_batch_split(user, r, 2, dc.n_idx);
+    dc.group_n++;
     dc.n_packets++;
     if (dc.n_idx >= ENG_MAX_BATCHES) return;
     dc.idx[dc.n_idx].first = first;
@@ -8282,6 +8379,9 @@ static void sink_end_work(void* user, const rsx_dispatch* r)
         if (s_wprof_pass) s_wp_draws_prof++;
     }
     if (s_wp2 > 0) s_wp2_draw_groups++;
+    { static int iso = -2;
+      if (iso == -2) { const char* e = getenv("PS3RECOMP_CROWD_ISOLATE"); iso = e && *e ? atoi(e) : 0; }
+      if (iso > 0 && dc.group_n < (u32)iso) return; }
     if (s_no_draw) return;
     if (!g.ready || !dc.n_packets || !dc.fetch_ok) return;
     if (dc.n_immediate && (dc.n_arr || dc.n_idx || dc.inl_bytes ||
@@ -8746,7 +8846,7 @@ static int dc_source_is_mesh(void)
     return 0;
 }
 
-static void sink_end(void* user, const rsx_dispatch* r)
+static void sink_end_draw(void* user, const rsx_dispatch* r)
 {
     if (s_wprof <= 0) { sink_end_work(user, r); return; }
     const int timed = s_wprof_pass;
@@ -8761,6 +8861,22 @@ static void sink_end(void* user, const rsx_dispatch* r)
     }
     if (mesh) s_wp_mesh_draws += dc.n_packets;
     else s_wp_main_draws += dc.n_packets;
+}
+
+static void sink_end(void* user, const rsx_dispatch* r)
+{
+    const int restore = eng_crowd_fix_on() && dc.run_type &&
+                        !dc.n_immediate && !dc.inl_bytes;
+    eng_vtx_state live;
+    if (restore) {
+        eng_vtx_state_capture(&g.rsx, &live);
+        eng_vtx_state_apply(&g.rsx, &dc.run_state);
+    }
+    sink_end_draw(user, r);
+    if (restore) {
+        eng_vtx_state_apply(&g.rsx, &live);
+        dc.run_type = 0;
+    }
 }
 
 static void sink_clear(void* user, const rsx_dispatch* r, u32 mask)
@@ -9022,6 +9138,18 @@ void rsx_draw_engine_replay_present_last(void)
             (best == ENG_INVALID || g.surfaces[i].last_write_serial > g.surfaces[best].last_write_serial))
             best = i;
     if (best != ENG_INVALID) g.be->present(g.be->user, g.surfaces[best].handle);
+}
+
+int rsx_draw_engine_replay_present_offset(u32 offset)
+{
+    eng_mt_sync();
+    if (!g.ready || !g.be->present) return -1;
+    for (u32 i = 0; i < g.n_surfaces; i++)
+        if (g.surfaces[i].handle && g.surfaces[i].offset == offset) {
+            g.be->present(g.be->user, g.surfaces[i].handle);
+            return 0;
+        }
+    return -1;
 }
 
 /* ---- public API ---------------------------------------------------------- */
