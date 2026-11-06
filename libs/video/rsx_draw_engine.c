@@ -1805,6 +1805,98 @@ static u64 eng_vp_hash(const u8* uc, u32 bytes, u64 seed)
     return m->hash;
 }
 
+/* PS3RECOMP_ENG_PROG_MEMO=1 (live): every draw used to walk its fragment
+ * program to find the end (rsx_fp_program_size), hash all of it for the
+ * pipeline memo key, and walk the vertex program's inputs again. Keep the last
+ * few programs' bytes. rsx_fp_program_size reads only the bytes up to the size
+ * it returns, and the input analysis only the bytes it is given, so while
+ * those bytes compare equal the size, the hash and the analysis are the same;
+ * a memcmp is far cheaper than the walks and the byte-serial hash it replaces.
+ * Per thread, so a record worker never sees another thread's entry. */
+#define ENG_FP_MEMO        8
+#define ENG_FP_MEMO_BYTES  4096u
+#define ENG_VPA_MEMO       4
+typedef struct {
+    const u8* uc;
+    u32 size;
+    u64 hash;                       /* eng_fnv1a_words(uc, size, FNV basis) */
+    u8 copy[ENG_FP_MEMO_BYTES];
+} eng_fp_memo;
+typedef struct {
+    const u8* uc;
+    u32 bytes;
+    int result;
+    rsx_vp_input_analysis analysis;
+    u8 copy[RSX_DSP_VP_INSTR * 16u];
+} eng_vpa_memo;
+static __thread eng_fp_memo t_fp_memo[ENG_FP_MEMO];
+static __thread u32 t_fp_memo_next;
+static __thread const eng_fp_memo* t_fp_last;   /* entry eng_guest_programs last used */
+static __thread eng_vpa_memo t_vpa_memo[ENG_VPA_MEMO];
+static __thread u32 t_vpa_memo_next;
+
+static int eng_prog_memo_on(void)
+{
+#if defined(__GNUC__) && !defined(_WIN32)
+    if (ps3_live_ctl_get) return ps3_live_ctl_get(PS3_LIVE_ENG_PROG_MEMO);
+#endif
+    static int on = -1;
+    if (on < 0) {
+        const char* e = getenv("PS3RECOMP_ENG_PROG_MEMO");
+        on = e && *e && strcmp(e, "0") != 0 ? 1 : 0;
+    }
+    return on;
+}
+
+/* rsx_fp_program_size(uc, ENG_FP_MAX_BYTES), reused while the bytes match.
+ * Sets t_fp_last to the entry that holds the answer (NULL when none does). */
+static u32 eng_fp_program_size(const u8* uc, u32 loc, u32 off)
+{
+    t_fp_last = NULL;
+    if (!eng_prog_memo_on()) return rsx_fp_program_size(uc, ENG_FP_MAX_BYTES);
+    for (u32 i = 0; i < ENG_FP_MEMO; i++) {
+        const eng_fp_memo* m = &t_fp_memo[i];
+        if (m->uc == uc && m->size &&
+            eng_guest_ptr(NULL, loc, off, m->size) == uc &&
+            !memcmp(m->copy, uc, m->size)) {
+            t_fp_last = m;
+            return m->size;
+        }
+    }
+    const u32 size = rsx_fp_program_size(uc, ENG_FP_MAX_BYTES);
+    if (size && size <= ENG_FP_MEMO_BYTES && eng_guest_ptr(NULL, loc, off, size) == uc) {
+        eng_fp_memo* m = &t_fp_memo[t_fp_memo_next++ % ENG_FP_MEMO];
+        m->uc = uc;
+        m->size = size;
+        memcpy(m->copy, uc, size);
+        m->hash = eng_fnv1a_words(uc, size, 1469598103934665603ull);
+        t_fp_last = m;
+    }
+    return size;
+}
+
+/* rsx_vp_analyze_inputs(uc, bytes, a), reused while the bytes match. */
+static int eng_vp_analyze_inputs(const u8* uc, u32 bytes, rsx_vp_input_analysis* a)
+{
+    if (!eng_prog_memo_on() || bytes > sizeof t_vpa_memo[0].copy)
+        return rsx_vp_analyze_inputs(uc, bytes, a);
+    for (u32 i = 0; i < ENG_VPA_MEMO; i++) {
+        const eng_vpa_memo* m = &t_vpa_memo[i];
+        if (m->uc == uc && m->bytes == bytes && !memcmp(m->copy, uc, bytes)) {
+            *a = m->analysis;
+            return m->result;
+        }
+    }
+    const int r = rsx_vp_analyze_inputs(uc, bytes, a);
+    eng_vpa_memo* m = &t_vpa_memo[t_vpa_memo_next++ % ENG_VPA_MEMO];
+    m->uc = uc;
+    m->bytes = bytes;
+    m->result = r;
+    m->analysis = *a;
+    memcpy(m->copy, uc, bytes);
+    return r;
+}
+
 static u32 eng_pipeline_slot(u64 key)
 {
     return (u32)((key ^ (key >> 29)) * 0x9E3779B97F4A7C15ull >> 40) & (ENG_PIPELINE_INDEX - 1u);
@@ -4924,7 +5016,7 @@ static int eng_guest_programs(const u8** out_vp, u32* out_vp_instrs,
         u32 fp_loc = 0;
         const u32 fp_off = rsx_dsp_fragment_program(&g.rsx, &fp_loc);
         fp_uc = eng_guest_ptr(NULL, fp_loc, fp_off, 16);
-        fp_size = fp_uc ? rsx_fp_program_size(fp_uc, ENG_FP_MAX_BYTES) : 0;
+        fp_size = fp_uc ? eng_fp_program_size(fp_uc, fp_loc, fp_off) : 0;
         if (fp_size) fp_uc = eng_guest_ptr(NULL, fp_loc, fp_off, fp_size);
         if (!fp_uc) fp_size = 0;
     }
@@ -4945,7 +5037,7 @@ static void eng_vertex_layout(rsx_vertex_layout_plan* layout)
     u32 instrs = 0;
     if (eng_guest_programs(&uc, &instrs, NULL, NULL)) {
         rsx_vp_input_analysis analysis = { 0xFFFFu, 0 };
-        if (rsx_vp_analyze_inputs(uc, instrs * 16u, &analysis) == (int)instrs &&
+        if (eng_vp_analyze_inputs(uc, instrs * 16u, &analysis) == (int)instrs &&
             analysis.exact && analysis.input_mask)
             mask = analysis.input_mask;
     }
@@ -5165,7 +5257,16 @@ static u64 eng_pipe_fingerprint(const u8* vp, u32 vp_bytes,
     h = eng_fnv1a(&fx, sizeof fx, h);
     if (!fixed) {
         h = eng_vp_hash(vp, vp_bytes, h);
-        if (fp && fp_size) h = eng_fnv1a_words(fp, fp_size, h);
+        if (fp && fp_size) {
+            const eng_fp_memo* m = eng_prog_memo_on() ? t_fp_last : NULL;
+            /* The memoised hash stands for the bytes; mixing it in keeps the
+             * key a function of the program alone. Memo on or off gives
+             * different keys, which only the in-memory memo ever sees. */
+            if (m && m->uc == fp && m->size == fp_size)
+                h = (h ^ m->hash) * 1099511628211ull;
+            else
+                h = eng_fnv1a_words(fp, fp_size, h);
+        }
     }
     /* Only the registers eng_pipeline_get reads. The whole register file
      * cannot be the identity: the transform-constant upload window and the

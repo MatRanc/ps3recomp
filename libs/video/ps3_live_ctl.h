@@ -109,6 +109,7 @@ enum {
     PS3_LIVE_CROWD_FIX,                 /* PS3RECOMP_CROWD_FIX: each sub-draw uses the vertex-array state current at it */
     PS3_LIVE_WIPE_FIX,                  /* PS3RECOMP_WIPE_FIX: recover a Morton texture our linear readback copied out (see tiled-wipe.md) */
     PS3_LIVE_REMAP_FLAT,                /* PS3RECOMP_REMAP_FLAT: dense constant-base index lists dedup through a flat u32 table, branch-free */
+    PS3_LIVE_ENG_PROG_MEMO,             /* PS3RECOMP_ENG_PROG_MEMO: reuse a fragment program's size/hash and a vertex program's input analysis while their bytes compare equal */
     PS3_LIVE_COUNT
 };
 
