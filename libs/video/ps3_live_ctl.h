@@ -99,6 +99,7 @@ enum {
     PS3_LIVE_FP_AA,                     /* PS3RECOMP_FP_AA: scale derivative LOD by the 2x1 AA sample grid */
     PS3_LIVE_PIPE_ASYNC,                /* PS3RECOMP_PIPE_ASYNC: translate/build pipelines on a worker */
     PS3_LIVE_SPU_FTZ,                   /* PS3RECOMP_SPU_FTZ: run lifted SPU code on the MXCSR FTZ|DAZ variant */
+    PS3_LIVE_SPU_FLOAT_APPROX,          /* PS3RECOMP_SPU_FLOAT_APPROX: approximate float variant (FTZ|DAZ, no sign-of-zero pass, full-precision estimates) */
     PS3_LIVE_ENG_DEPTH_GPU,             /* PS3RECOMP_ENG_DEPTH_GPU: snapshot a clear-only zeta on the GPU instead of a guest store */
     PS3_LIVE_ENG_SHADOW_CONST,          /* PS3RECOMP_ENG_SHADOW_CONST: a clear-only depth texture binds one constant texture */
     PS3_LIVE_VK_PASS_KEEP,              /* PS3RECOMP_VK_PASS_KEEP: consecutive draws to the same targets share a render pass and one barrier */
@@ -107,6 +108,7 @@ enum {
     PS3_LIVE_VK_BATCH_CREATES,          /* PS3RECOMP_VK_BATCH_CREATES: target/texture/snapshot creates join the open draw batch instead of a submit+wait */
     PS3_LIVE_CROWD_FIX,                 /* PS3RECOMP_CROWD_FIX: each sub-draw uses the vertex-array state current at it */
     PS3_LIVE_WIPE_FIX,                  /* PS3RECOMP_WIPE_FIX: recover a Morton texture our linear readback copied out (see tiled-wipe.md) */
+    PS3_LIVE_REMAP_FLAT,                /* PS3RECOMP_REMAP_FLAT: dense constant-base index lists dedup through a flat u32 table, branch-free */
     PS3_LIVE_COUNT
 };
 

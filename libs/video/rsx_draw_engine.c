@@ -3019,6 +3019,13 @@ static void eng_deswizzle_3d_slice(u8* dst, const u8* src, u32 w, u32 h, u32 d, 
                    src + (size_t)rsx_swizzle_offset_3d(x, y, z, lw, lh, ld) * bpp, bpp);
 }
 
+/* PS3RECOMP_ENG_TEXHASH4 (read at engine init): the full hash runs four FNV
+ * lanes over 32-byte blocks and folds them, so the multiplies overlap instead
+ * of forming one dependent chain. Still a mutation detector of the same
+ * strength; only the stored values differ, and they are only ever compared
+ * with values from this same function. Default off. */
+static int s_texhash4;
+
 /* One hash per cached texture per presented frame. Word-at-a-time FNV over
  * the whole span is deliberately cheap: this is a mutation detector, not a
  * content id (rsx_live_draw.c:2002-2026). */
@@ -3029,6 +3036,19 @@ static u64 eng_texture_content_hash(u32 location, u32 offset, u32 span,
     if (!src) { *readable = 0; return 0; }
     u64 hash = 1469598103934665603ull;
     u32 i = 0;
+    if (s_texhash4 && span >= 32) {
+        u64 h0 = hash, h1 = hash ^ 1ull, h2 = hash ^ 2ull, h3 = hash ^ 3ull;
+        for (; i + 32 <= span; i += 32) {
+            u64 w[4];
+            memcpy(w, src + i, sizeof w);
+            h0 = (h0 ^ w[0]) * 1099511628211ull;
+            h1 = (h1 ^ w[1]) * 1099511628211ull;
+            h2 = (h2 ^ w[2]) * 1099511628211ull;
+            h3 = (h3 ^ w[3]) * 1099511628211ull;
+        }
+        hash = (((h0 * 1099511628211ull) ^ h1) * 1099511628211ull ^ h2) *
+               1099511628211ull ^ h3;
+    }
     for (; i + 8 <= span; i += 8) {
         u64 word;
         memcpy(&word, src + i, sizeof(word));
@@ -9351,6 +9371,8 @@ int rsx_draw_engine_init(u32 width, u32 height)
     g.height = height ? height : 720;
     { const char* e = getenv("PS3RECOMP_ENG_TEXHASH_FULL");
       s_texhash_full_always = e && *e && strcmp(e, "0") != 0; }
+    { const char* e = getenv("PS3RECOMP_ENG_TEXHASH4");
+      s_texhash4 = e && *e && strcmp(e, "0") != 0; }
     { const char* e = getenv("PS3RECOMP_ENG_DEPTH_VIA_GUEST");
       s_depth_via_guest = e && *e && strcmp(e, "0") != 0; }
     { const char* e = getenv("PS3RECOMP_ENG_TEXWGEN");

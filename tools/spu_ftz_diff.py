@@ -15,14 +15,20 @@ Examples:
   # captured 0x21 kernel states (ls.bin + gpr.bin per lsa)
   tools/spu_ftz_diff.py --module jobmod_c690c2f7b09a_eF5B8 \
       --capdirs recomp-work/captures/fncap21
+
+  # also time base/ftz and measure the (non-exact) `_approx` twin against ftz
+  tools/spu_ftz_diff.py --module jobmod_c690c2f7b09a_eF5B8 --entry 0xFDA0 \
+      --inputs '...' --approx --reps 200
 """
 import argparse
 import glob
 import os
 import re
+import struct
 import subprocess
 import sys
 import tempfile
+
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)          # ps3recomp-sync
@@ -54,8 +60,10 @@ def build(outdir, module_dir, reg_fn, tag):
     return exe
 
 
-def run(exe, inp, entry, ftz, outfile, want=None):
+def run(exe, inp, entry, ftz, outfile, want=None, reps=0):
     env = dict(os.environ)
+    if reps > 1:
+        env["SPU_DIFF_REPS"] = str(reps)
     if ftz:
         env["SPU_DIFF_FTZ"] = "1"
     env["SPU_DIFF_WRITE"] = outfile
@@ -67,6 +75,50 @@ def run(exe, inp, entry, ftz, outfile, want=None):
         sys.stderr.write("run failed: %s\n%s%s\n" % (" ".join(cmd), r.stdout, r.stderr))
         return None
     return r.stdout.strip()
+
+
+LS_BYTES = 256 * 1024
+
+
+def _f32(u):
+    return struct.unpack("<f", struct.pack("<I", u))[0]
+
+
+def _ord(u):
+    """Float bits as an integer ordered like the value (for ULP distance)."""
+    return 0x80000000 - (u & 0x7FFFFFFF) if u & 0x80000000 else u
+
+
+def report_diff(t, a):
+    """Differences of the approx output `a` against the ftz output `t` (LS then GPRs)."""
+    # the local store holds big-endian words, the GPR file host-order lanes
+    for name, lo, hi, en in (("LS ", 0, LS_BYTES, ">"), ("GPR", LS_BYTES, len(t), "<")):
+        x = struct.unpack("%s%dI" % (en, (hi - lo) // 4), t[lo:hi])
+        y = struct.unpack("%s%dI" % (en, (hi - lo) // 4), a[lo:hi])
+        n = zsign = flips = nonfin = big = 0
+        mabs = mrel = 0.0
+        mulp = 0
+        for u, v in zip(x, y):
+            if u == v:
+                continue
+            n += 1
+            if ((u | v) & 0x7FFFFFFF) == 0:
+                zsign += 1
+            if (u ^ v) >> 31:
+                flips += 1
+            if (u >> 23 & 0xFF) == 0xFF or (v >> 23 & 0xFF) == 0xFF:
+                nonfin += 1
+                continue
+            fu, fv = _f32(u), _f32(v)
+            ab = abs(fu - fv)
+            m = max(abs(fu), abs(fv))
+            rel = ab / m if m else 0.0
+            mabs, mrel = max(mabs, ab), max(mrel, rel)
+            mulp = max(mulp, abs(_ord(u) - _ord(v)))
+            big += rel > 1e-3
+        print("    %s: %d words differ (%d zero-sign-only, %d sign flips, %d with inf/nan); "
+              "max abs %.3g, max rel %.3g, max ulp %d, rel>1e-3: %d" %
+              (name, n, zsign, flips, nonfin, mabs, mrel, mulp, big))
 
 
 def main():
@@ -81,6 +133,9 @@ def main():
                     help="replace this suffix in the input path for the expected output")
     ap.add_argument("--capdirs", action="append", default=[],
                     help="directory whose 0x<lsa>/ subdirs hold ls.bin+gpr.bin")
+    ap.add_argument("--approx", action="store_true",
+                    help="add the _approx twin arm: timing plus a difference report vs ftz")
+    ap.add_argument("--reps", type=int, default=0, help="replays per arm for the median time")
     args = ap.parse_args()
 
     base = os.path.join(args.spu_dir, args.module)
@@ -92,6 +147,11 @@ def main():
     tmp = tempfile.mkdtemp(prefix="spu_ftz_diff.", dir=os.environ.get("TMPDIR", "/tmp"))
     exe_b = build(tmp, base, args.module + "_spu_recomp_register", "base")
     exe_t = build(tmp, twin, args.module + "_ftz_spu_recomp_register", "ftz")
+
+    exe_a = None
+    if args.approx:
+        apx = os.path.join(args.spu_dir, args.module + "_approx")
+        exe_a = build(tmp, apx, args.module + "_approx_spu_recomp_register", "approx")
 
     cases = []   # (label, input, entry, want)
     if args.inputs:
@@ -120,11 +180,12 @@ def main():
 
     bad = 0
     exact_want = 0
+    tot = {"gpr": 0, "ls": 0}
     for label, inp, entry, want in cases:
         ob = os.path.join(tmp, "b.bin")
         ot = os.path.join(tmp, "t.bin")
-        rb = run(exe_b, inp, entry, False, ob, want)
-        rt = run(exe_t, inp, entry, True, ot, want)
+        rb = run(exe_b, inp, entry, False, ob, want, args.reps)
+        rt = run(exe_t, inp, entry, True, ot, want, args.reps)
         if rb is None or rt is None:
             bad += 1
             continue
@@ -138,6 +199,14 @@ def main():
               (label, "SAME" if same else "DIFF", rb, rt, want_ok))
         if not same or "DIFF" in want_ok:
             bad += 1
+        if exe_a:
+            oa = os.path.join(tmp, "a.bin")
+            ra = run(exe_a, inp, entry, True, oa, None, args.reps)
+            if ra is None:
+                bad += 1
+                continue
+            print("    approx[%s]" % ra)
+            report_diff(open(ot, "rb").read(), open(oa, "rb").read())
     print("cases=%d diff=%d want_checked=%d" % (len(cases), bad, exact_want))
     return 1 if bad else 0
 

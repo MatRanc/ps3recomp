@@ -15,6 +15,7 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <immintrin.h>
 #include "spu_context.h"
 #include "spu_helpers.h"
@@ -153,18 +154,40 @@ int main(int argc, char** argv)
     const char* ftz = getenv("SPU_DIFF_FTZ");
     if (ftz && ftz[0] == '1') _mm_setcsr(_mm_getcsr() | 0x8040u);
 
-    ctx.image_id = 6; ctx.int_enable = 0; ctx.event_status = 0; ctx.event_mask = 0;
-    ctx.steps = 1; ctx.pc = entry; ctx.status = 0; ctx.stop_code = 0;
-    g_spu_trampoline_fn = NULL;
-
+    /* SPU_DIFF_REPS=N: replay N times from the entry state and print the median
+     * wall time of one replay (the state left behind is the last replay's). */
+    const char* repse = getenv("SPU_DIFF_REPS");
+    const int reps = repse ? atoi(repse) : 1;
+    static uint8_t in_ls[SPU_LS_SIZE];
+    memcpy(in_ls, ctx.ls_store, SPU_LS_SIZE);
+    double* times = calloc(reps > 0 ? (size_t)reps : 1, sizeof(double));
     unsigned long disp = 0, ent = 0;
-    fn(&ctx); ent++;
-    while (g_spu_trampoline_fn && disp < cap) {
-        spu_fn f = g_spu_trampoline_fn;
+    for (int r = 0; r < (reps > 0 ? reps : 1); r++) {
+        if (r) { memcpy(ctx.ls_store, in_ls, SPU_LS_SIZE); memcpy(ctx.gpr, in_gpr, GPR_BYTES); }
+        ctx.image_id = 6; ctx.int_enable = 0; ctx.event_status = 0; ctx.event_mask = 0;
+        ctx.steps = 1; ctx.pc = entry; ctx.status = 0; ctx.stop_code = 0;
         g_spu_trampoline_fn = NULL;
-        disp++;
-        if (f == spu_indirect_branch) { f = g_lookup(ctx.pc); if (!f) break; }
-        f(&ctx); ent++;
+        disp = 0; ent = 0;
+        struct timespec t0, t1;
+        clock_gettime(CLOCK_MONOTONIC, &t0);
+        fn(&ctx); ent++;
+        while (g_spu_trampoline_fn && disp < cap) {
+            spu_fn f = g_spu_trampoline_fn;
+            g_spu_trampoline_fn = NULL;
+            disp++;
+            if (f == spu_indirect_branch) { f = g_lookup(ctx.pc); if (!f) break; }
+            f(&ctx); ent++;
+        }
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        times[r] = (t1.tv_sec - t0.tv_sec) * 1e6 + (t1.tv_nsec - t0.tv_nsec) / 1e3;
+    }
+    if (reps > 1) {
+        for (int i = 1; i < reps; i++) {
+            double v = times[i]; int j = i - 1;
+            while (j >= 0 && times[j] > v) { times[j + 1] = times[j]; j--; }
+            times[j + 1] = v;
+        }
+        printf("median_us=%.1f ", times[reps / 2]);
     }
 
     size_t ls_diff = 0, gpr_diff = 0;

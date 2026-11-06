@@ -851,8 +851,27 @@ static int rsx_vertex_remap_direct_on(void)
     return s_remap_direct_env;
 }
 
+/* PS3RECOMP_REMAP_FLAT (live key PS3_LIVE_REMAP_FLAT): a one-base list whose
+ * id span is at most 256K dedups through a table indexed by (id - min) with
+ * 8-byte generation-tagged slots. Same first-occurrence order and the same
+ * answer as the hashing path; no probing or key compare, and the new/seen
+ * choice is a select instead of a branch. Default off. */
+static int s_remap_flat_env = -1;
+static int rsx_vertex_remap_flat_on(void)
+{
+#if defined(__GNUC__) && !defined(_WIN32)
+    if (ps3_live_ctl_get) return ps3_live_ctl_get(PS3_LIVE_REMAP_FLAT);
+#endif
+    if (s_remap_flat_env < 0) {
+        const char* e = getenv("PS3RECOMP_REMAP_FLAT");
+        s_remap_flat_env = e && *e && strcmp(e, "0") != 0 ? 1 : 0;
+    }
+    return s_remap_flat_env;
+}
+
 void rsx_vertex_remap_reload_env(void)
 {
+    s_remap_flat_env = -1;
     s_remap_fast_env = -1;
     s_remap_direct_env = -1;
 }
@@ -913,6 +932,54 @@ int rsx_vertex_remap_build(
             return 0;
         remap->occurrence_to_unique = occurrences;
         remap->occurrence_capacity = count;
+    }
+
+    if (rsx_vertex_remap_flat_on() && count >= 8) {
+        const u32 b0 = refs[0].base_index;
+        u32 vmin = refs[0].vertex_id, vmax = vmin;
+        u32 other_base = 0;
+        for (u32 i = 1; i < count; i++) {
+            const u32 v = refs[i].vertex_id;
+            other_base |= refs[i].base_index ^ b0;
+            vmin = v < vmin ? v : vmin;
+            vmax = v > vmax ? v : vmax;
+        }
+        const u64 span = (u64)vmax - (u64)vmin + 1ull;
+        if (!other_base && span <= (1ull << 18)) {
+            if (span > remap->flat_capacity) {
+                rsx_vertex_remap_flat_slot* flat = (rsx_vertex_remap_flat_slot*)
+                    realloc(remap->flat, (size_t)span * sizeof(*flat));
+                if (!flat)
+                    return 0;
+                remap->flat = flat;
+                remap->flat_capacity = (u32)span;
+                memset(flat, 0, (size_t)span * sizeof(*flat));
+                remap->flat_generation = 0u;
+            }
+            if (!++remap->flat_generation) {
+                memset(remap->flat, 0,
+                       (size_t)remap->flat_capacity * sizeof(*remap->flat));
+                remap->flat_generation = 1u;
+            }
+            const u32 gen = remap->flat_generation;
+            rsx_vertex_remap_flat_slot* flat = remap->flat;
+            u32* occ = remap->occurrence_to_unique;
+            u32 unique = 0;
+            for (u32 o = 0; o < count; o++) {
+                const rsx_vertex_ref ref = refs[o];
+                rsx_vertex_remap_flat_slot* slot = &flat[ref.vertex_id - vmin];
+                const u32 is_new = slot->generation != gen;
+                const u32 v = is_new ? unique : slot->value;
+                /* refs[unique] is already consumed (unique <= o). */
+                refs[unique] = ref;
+                slot->generation = gen;
+                slot->value = v;
+                occ[o] = v;
+                unique += is_new;
+            }
+            *unique_count = unique;
+            return 1;
+        }
     }
 
     /* Direct mode is chosen before the table is sized: one base_index and a
@@ -1063,6 +1130,7 @@ void rsx_vertex_remap_destroy(rsx_vertex_remap* remap)
         return;
     free(remap->occurrence_to_unique);
     free(remap->slots);
+    free(remap->flat);
     memset(remap, 0, sizeof(*remap));
 }
 

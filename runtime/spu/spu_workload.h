@@ -57,6 +57,11 @@ void spu_workload_register_img(uint64_t fingerprint, spu_lifted_entry_fn fn,
  * without this symbol ignores it (the generated registration declares it weak). */
 void spu_workload_register_img_ftz(uint64_t fingerprint, spu_lifted_entry_fn fn);
 
+/* Register the PS3RECOMP_SPU_FLOAT_APPROX twin entry for an image already
+ * registered with spu_workload_register_img(). Preferred over the FTZ one when
+ * that key is on; weakly referenced by the generated registration TU. */
+void spu_workload_register_img_approx(uint64_t fingerprint, spu_lifted_entry_fn fn);
+
 /* Look up a lifted entry by fingerprint; NULL if none registered. */
 spu_lifted_entry_fn spu_workload_find(uint64_t fingerprint);
 

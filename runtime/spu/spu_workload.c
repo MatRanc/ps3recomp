@@ -55,6 +55,7 @@ typedef struct {
     uint64_t            fp;
     spu_lifted_entry_fn fn;
     spu_lifted_entry_fn ftz_fn;   /* PS3RECOMP_SPU_FTZ variant, or NULL */
+    spu_lifted_entry_fn approx_fn; /* PS3RECOMP_SPU_FLOAT_APPROX variant, or NULL */
     int                 image_id;
     const char*         name;
     /* Masked registrations only (var_len != 0): the image is `size` bytes and
@@ -78,6 +79,26 @@ static int workload_ftz_on(void)
     if (spu_ftz_key_on) return spu_ftz_key_on();
     const char* e = getenv("PS3RECOMP_SPU_FTZ");
     return e && e[0] != '0' && e[0] != '\0';
+}
+
+/* Same for PS3RECOMP_SPU_FLOAT_APPROX (spu_channels.c; weak for the same reason). */
+#if defined(__GNUC__) && !defined(_WIN32)
+int spu_float_approx_key_on(void) __attribute__((weak));
+#else
+int spu_float_approx_key_on(void);
+#endif
+static int workload_approx_on(void)
+{
+    if (spu_float_approx_key_on) return spu_float_approx_key_on();
+    const char* e = getenv("PS3RECOMP_SPU_FLOAT_APPROX");
+    return e && e[0] != '0' && e[0] != '\0';
+}
+
+/* The entry the active keys select: approx, then ftz, then the base one. */
+static spu_lifted_entry_fn workload_pick(const spu_workload_entry* e)
+{
+    if (e->approx_fn && workload_approx_on()) return e->approx_fn;
+    return (e->ftz_fn && workload_ftz_on()) ? e->ftz_fn : e->fn;
 }
 
 void spu_workload_register_img(uint64_t fingerprint, spu_lifted_entry_fn fn,
@@ -123,13 +144,22 @@ void spu_workload_register_img_ftz(uint64_t fingerprint, spu_lifted_entry_fn fn)
         }
 }
 
+/* Register the PS3RECOMP_SPU_FLOAT_APPROX twin entry (see _ftz above). */
+void spu_workload_register_img_approx(uint64_t fingerprint, spu_lifted_entry_fn fn)
+{
+    if (!fn) return;
+    for (unsigned i = 0; i < s_registry_count; i++)
+        if (s_registry[i].fp == fingerprint) {
+            s_registry[i].approx_fn = fn;
+            return;
+        }
+}
+
 spu_lifted_entry_fn spu_workload_find(uint64_t fingerprint)
 {
-    const int ftz = workload_ftz_on();
     for (unsigned i = 0; i < s_registry_count; i++)
         if (s_registry[i].fp == fingerprint)
-            return (ftz && s_registry[i].ftz_fn) ? s_registry[i].ftz_fn
-                                                 : s_registry[i].fn;
+            return workload_pick(&s_registry[i]);
     return NULL;
 }
 
@@ -137,10 +167,8 @@ spu_lifted_entry_fn spu_workload_find_img(uint64_t fingerprint, int* image_id_ou
 {
     for (unsigned i = 0; i < s_registry_count; i++)
         if (s_registry[i].fp == fingerprint) {
-            const int ftz = workload_ftz_on();
             if (image_id_out) *image_id_out = s_registry[i].image_id;
-            return (ftz && s_registry[i].ftz_fn) ? s_registry[i].ftz_fn
-                                                 : s_registry[i].fn;
+            return workload_pick(&s_registry[i]);
         }
     if (image_id_out) *image_id_out = 0;
     return NULL;
@@ -185,7 +213,7 @@ spu_lifted_entry_fn spu_workload_find_img_masked(const void* data, size_t n,
         if (h != e->fp) continue;
         if (fp_out) *fp_out = h;
         if (image_id_out) *image_id_out = e->image_id;
-        return (workload_ftz_on() && e->ftz_fn) ? e->ftz_fn : e->fn;
+        return workload_pick(e);
     }
     if (image_id_out) *image_id_out = 0;
     return NULL;

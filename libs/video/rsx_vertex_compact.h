@@ -51,6 +51,11 @@ typedef struct rsx_vertex_remap_micro_slot {
     u32 generation;
 } rsx_vertex_remap_micro_slot;
 
+typedef struct rsx_vertex_remap_flat_slot {
+    u32 generation;
+    u32 value;
+} rsx_vertex_remap_flat_slot;
+
 typedef struct rsx_vertex_remap {
     u32* occurrence_to_unique;
     u32 occurrence_capacity;
@@ -59,6 +64,9 @@ typedef struct rsx_vertex_remap {
     u32 generation;
     rsx_vertex_remap_micro_slot micro[RSX_VERTEX_REMAP_MICRO];
     u32 micro_generation;
+    rsx_vertex_remap_flat_slot* flat; /* PS3RECOMP_REMAP_FLAT: id - min -> unique */
+    u32 flat_capacity;
+    u32 flat_generation;
 } rsx_vertex_remap;
 
 typedef struct rsx_vertex_fetch_attr {
