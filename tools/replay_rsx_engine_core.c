@@ -305,13 +305,113 @@ int rsx_engine_replay_run_frame(rsx_engine_replay* r, rsx_engine_replay_stats* o
     s_ref_qtail = 0;
     s_fifo_back_jumps = 0;
 
-    for (int pass = 0; s_fifo_getoff != r->stream_end && pass < 256; pass++)
-        cellGcm_rsx_process_fifo();
+    /* A capture is normally one frame, but a synthetic stream may carry a
+     * whole scene sequence (the wipe mission splices raw dump frames after
+     * the captured frame). 256 passes is not enough for that: the engine
+     * stops early and presents an old frame. PS3RECOMP_REPLAY_MAX_PASSES
+     * raises the bound without changing the one-frame default. */
+    int max_passes = 256;
+    { const char* mp = getenv("PS3RECOMP_REPLAY_MAX_PASSES");
+      if (mp && atoi(mp) > 0) max_passes = atoi(mp); }
+    /* PS3RECOMP_REPLAY_SPLIT=1 processes the stream one flip-delimited frame
+     * at a time. A multi-frame stream otherwise parks at the first sync the
+     * live guest would have serviced between frames and the loop never reaches
+     * stream_end. PS3RECOMP_REPLAY_STOP_FRAME=<n> stops after that many flip
+     * markers so the presented image is frame n. */
+    int split = 0;
+    { const char* se = getenv("PS3RECOMP_REPLAY_SPLIT");
+      split = se && *se && strcmp(se, "0") != 0; }
+    long stop_frame = -1;
+    { const char* sf = getenv("PS3RECOMP_REPLAY_STOP_FRAME");
+      if (sf && *sf) stop_frame = strtol(sf, NULL, 0); }
+    if (split) {
+        long frame = 0;
+        u32 seg_start = r->stream_start;
+        for (size_t i = 0; i + 4 <= r->fifo_len; i += 4) {
+            const u32 w = ((u32)r->fifo[i] << 24) | ((u32)r->fifo[i+1] << 16) |
+                          ((u32)r->fifo[i+2] << 8) | (u32)r->fifo[i+3];
+            if ((w & 0xFFFF0000u) != 0xFEAD0000u) continue;
+            const u32 seg_end = r->stream_start + (u32)i + 4u;
+            s_fifo_getoff = seg_start;
+            vm_write32(GCM_CONTROL_GUEST_ADDR + 0, seg_end);
+            for (int pass = 0; s_fifo_getoff != seg_end && pass < max_passes; pass++)
+                cellGcm_rsx_process_fifo();
+            while (s_ref_qhead != s_ref_qtail) s_ref_qhead++;
+            rsx_draw_engine_mt_sync();
+            rsx_draw_engine_replay_advance_frame();
+            { const char* sd = getenv("PS3RECOMP_REPLAY_SAVE_STATE_DIR");
+              const char* sf = getenv("PS3RECOMP_REPLAY_SAVE_STATE_FROM");
+              const char* st = getenv("PS3RECOMP_REPLAY_SAVE_STATE_TO");
+              long from = (sf && *sf) ? strtol(sf, NULL, 0) : -1;
+              long to = (st && *st) ? strtol(st, NULL, 0) : -1;
+              if (sd && *sd && frame >= from && (to < 0 || frame <= to)) {
+                  rsx_wcap_state sst;
+                  if (rsx_draw_engine_state_snapshot(&sst) == 0) {
+                      char sp[1024];
+                      snprintf(sp, sizeof sp, "%s/state_%ld.bin", sd, frame);
+                      FILE* fp = fopen(sp, "wb");
+                      if (fp) { fwrite(&sst, sizeof sst, 1, fp); fclose(fp); }
+                  }
+              } }
+            if (frame < 5 || (frame % 100) == 0)
+                fprintf(stderr, "[split] f=%ld seg=%x..%x got=%x draws=%u\n",
+                        frame, seg_start - r->stream_start, seg_end - r->stream_start,
+                        s_fifo_getoff - r->stream_start,
+                        r->vk ? rsx_vulkan_backend_guest_draws() : replay_null_draws());
+            if (stop_frame >= 0 && frame >= stop_frame) break;
+            frame++;
+            seg_start = seg_end;
+        }
+    } else {
+        for (int pass = 0; s_fifo_getoff != r->stream_end && pass < max_passes; pass++)
+            cellGcm_rsx_process_fifo();
 
-    while (s_ref_qhead != s_ref_qtail) s_ref_qhead++;
+        while (s_ref_qhead != s_ref_qtail) s_ref_qhead++;
 
-    rsx_draw_engine_mt_sync();
-    rsx_draw_engine_replay_advance_frame();
+        rsx_draw_engine_mt_sync();
+        rsx_draw_engine_replay_advance_frame();
+    }
+    /* PS3RECOMP_REPLAY_SAVE_STATE=<file>: after a split replay reached
+     * PS3RECOMP_REPLAY_STOP_FRAME, write the engine state snapshot so a later
+     * single-frame capture can be replayed with the right state. */
+    { const char* ss = getenv("PS3RECOMP_REPLAY_SAVE_STATE");
+      if (ss && *ss) {
+        rsx_wcap_state st;
+        if (rsx_draw_engine_state_snapshot(&st) == 0) {
+            FILE* f = fopen(ss, "wb");
+            if (f) { fwrite(&st, sizeof st, 1, f); fclose(f);
+                     fprintf(stderr, "[replay-engine] state saved -> %s\n", ss); }
+        }
+      } }
+
+    /* PS3RECOMP_REPLAY_GUEST_DUMP=<file>: save a guest-memory display buffer
+     * (the live present blits it; the replay engine has no surface for it).
+     * A8R8G8B8 with the given pitch; PPM drops alpha. */
+    { const char* gd = getenv("PS3RECOMP_REPLAY_GUEST_DUMP");
+      if (gd && *gd) {
+        const char* so = getenv("PS3RECOMP_REPLAY_GUEST_OFFSET");
+        const char* sw = getenv("PS3RECOMP_REPLAY_GUEST_W");
+        const char* sh = getenv("PS3RECOMP_REPLAY_GUEST_H");
+        const char* sp = getenv("PS3RECOMP_REPLAY_GUEST_PITCH");
+        const u32 off = (so && *so) ? (u32)strtoul(so, NULL, 0) : 0x10000u;
+        const u32 gw = (sw && *sw) ? (u32)strtoul(sw, NULL, 0) : 1280u;
+        const u32 gh = (sh && *sh) ? (u32)strtoul(sh, NULL, 0) : 720u;
+        const u32 gp = (sp && *sp) ? (u32)strtoul(sp, NULL, 0) : gw * 4u;
+        const u32 ea = gcm_io2ea(off);
+        if (ea) {
+            FILE* f = fopen(gd, "wb");
+            if (f) {
+                fprintf(f, "P6\n%u %u\n255\n", gw, gh);
+                for (u32 y = 0; y < gh; y++)
+                    for (u32 x = 0; x < gw; x++) {
+                        const u8* p = vm_base + ea + y * gp + x * 4u;
+                        fputc(p[1], f); fputc(p[2], f); fputc(p[3], f);
+                    }
+                fclose(f);
+            }
+        } else fprintf(stderr, "[replay-engine] no guest mapping for 0x%x\n", off);
+      } }
+
     /* PS3RECOMP_VK_DUMP: complete the present so the frame reaches the dump
      * (the timing arms leave it unset and never wait here). */
     if (r->vk && getenv("PS3RECOMP_VK_DUMP")) {
