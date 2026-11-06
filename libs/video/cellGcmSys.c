@@ -4174,13 +4174,18 @@ static s32 gcm_flip_request(u32 bufferId, int in_fifo)
       if (dbg < 0) dbg = getenv("GCM_FLIPCOUNT") ? 1 : 0;
       if (dbg) {
           extern unsigned long long ps3_ms_now(void);
-          static unsigned long long n = 0, t0 = 0;
+          static unsigned long long n = 0, t0 = 0, real = 0;
+          static u32 last_buf = ~0u;
           unsigned long long now = ps3_ms_now();
           if (!t0) t0 = now;
           ++n;
+          /* A re-flip of the buffer already shown (the title's flip-wait
+           * timeout) is not a new frame; `real` counts buffer changes. */
+          if (bufferId != last_buf) real++;
+          last_buf = bufferId;
           if (n <= 400ull || (n % 10ull) == 0)
-              fprintf(stderr, "[flip] %llu at %llu ms vc=%u%c", n, now - t0,
-                      s_vblank_count, 10);
+              fprintf(stderr, "[flip] %llu at %llu ms vc=%u buf=%u real=%llu%c", n, now - t0,
+                      s_vblank_count, bufferId, real, 10);
       } }
 
     /* GCM_FLIP_BT=<n>: dump the flipping thread's guest stack for the flips
