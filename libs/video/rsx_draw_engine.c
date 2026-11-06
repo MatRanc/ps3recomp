@@ -385,6 +385,11 @@ static int s_pipe_memo;
 /* PS3RECOMP_REMAP_CACHE: memoize rsx_vertex_remap_build by the reference
  * list, independent of the fetch plan (plan item 1/4). */
 static int s_remap_cache;
+/* PS3RECOMP_REMAP_SHIFT: key the remap memo by the reference pattern relative
+ * to its first reference, so a draw whose vertex ids (or base index) moved by
+ * a constant reuses the collapse; the unique list is stored relative and
+ * shifted back on a hit. Needs REMAP_CACHE. */
+static int s_remap_shift;
 /* PS3RECOMP_MEMO_INDEX: probe the memo through a direct-mapped index before
  * the exact linear scan. PS3RECOMP_REFS_HASH_FAST: fold the reference hash
  * into the reference-building loop instead of hashing the whole list again. */
@@ -504,6 +509,15 @@ void rsx_draw_engine_set_remap_cache(int on)
         s_remap_cache = on;
         eng_fast_reset_caches();
         fprintf(stderr, "[live] PS3RECOMP_REMAP_CACHE=%d: remap memo flushed\n", on);
+    }
+}
+
+void rsx_draw_engine_set_remap_shift(int on)
+{
+    if (on != s_remap_shift) {
+        s_remap_shift = on;
+        eng_fast_reset_caches();
+        fprintf(stderr, "[live] PS3RECOMP_REMAP_SHIFT=%d: remap memo flushed\n", on);
     }
 }
 
@@ -5762,6 +5776,53 @@ static u64 eng_refs_key(const rsx_vertex_ref* refs, u32 n)
     return rsx_vertex_refs_hash(refs, n);
 }
 
+/* PS3RECOMP_REMAP_DIAG: classify remap-memo misses by whether the same
+ * reference pattern, shifted by a constant vertex/base offset, was seen
+ * before (a shift-invariant key would hit). Diagnostic only. */
+static int s_remap_diag = -1;
+static u64 s_rdiag_seen[1u << 14];
+static unsigned long long s_rdiag_n[3], s_rdiag_refs[3]; /* hit, miss, shift */
+
+static void eng_remap_diag(int hit, const rsx_vertex_ref* refs, u32 n)
+{
+    if (s_remap_diag < 0) {
+        const char* e = getenv("PS3RECOMP_REMAP_DIAG");
+        s_remap_diag = e && *e && strcmp(e, "0") != 0;
+    }
+    if (!s_remap_diag) return;
+    s_rdiag_n[!hit]++;
+    s_rdiag_refs[!hit] += n;
+    u64 h = 1469598103934665603ull;
+    /* A hit's refs are already the unique list; only misses are classified. */
+    for (u32 i = 0; !hit && i < n; i++)
+        h = rsx_vertex_refs_hash_fold(h, refs[i].vertex_id - refs[0].vertex_id,
+                                      refs[i].base_index - refs[0].base_index);
+    h = (h ^ n) * 1099511628211ull;
+    u64* slot = &s_rdiag_seen[(h ^ (h >> 32)) & ((1u << 14) - 1u)];
+    if (!hit) {
+        if (*slot == h) { s_rdiag_n[2]++; s_rdiag_refs[2] += n; }
+        *slot = h;
+    }
+    if ((s_rdiag_n[0] + s_rdiag_n[1]) % 20000u == 0) {
+        fprintf(stderr, "[remap-diag] hit %llu (%llu refs) miss %llu (%llu refs)"
+                " shift-hit %llu (%llu refs)\n",
+                s_rdiag_n[0], s_rdiag_refs[0], s_rdiag_n[1], s_rdiag_refs[1],
+                s_rdiag_n[2], s_rdiag_refs[2]);
+        memset(s_rdiag_n, 0, sizeof s_rdiag_n);
+        memset(s_rdiag_refs, 0, sizeof s_rdiag_refs);
+    }
+}
+
+/* The remap memo's key under REMAP_SHIFT: the list relative to refs[0]. */
+static u64 eng_refs_shift_key(const rsx_vertex_ref* refs, u32 n)
+{
+    u64 h = 1469598103934665603ull;
+    for (u32 i = 0; i < n; i++)
+        h = rsx_vertex_refs_hash_fold(h, refs[i].vertex_id - refs[0].vertex_id,
+                                      refs[i].base_index - refs[0].base_index);
+    return eng_fnv1a(&n, sizeof n, h);
+}
+
 static eng_remap_memo* eng_remap_memo_find(u64 key)
 {
     if (s_memo_index) {
@@ -5818,6 +5879,11 @@ static void eng_remap_memo_save(u64 key, const rsx_vertex_ref* refs,
         }
         if (n_unique) memcpy(m->refs, refs, (size_t)n_unique * sizeof(*refs));
         if (n_source) memcpy(m->occ, occ, (size_t)n_source * sizeof(*occ));
+        if (s_remap_shift)
+            for (u32 i = n_unique; i-- > 0;) {
+                m->refs[i].vertex_id -= refs[0].vertex_id;
+                m->refs[i].base_index -= refs[0].base_index;
+            }
     }
 }
 
@@ -5915,8 +5981,15 @@ static int dc_remap_memo_restore(const eng_remap_memo* m)
     }
     if (!dc_ensure_refs(m->n_unique) || !dc_ensure_occ(m->n_source))
         return 0;
+    /* The first reference is always unique #0, so it is the shift base. */
+    const rsx_vertex_ref r0 = dc.refs[0];
     if (m->n_unique)
         memcpy(dc.refs, m->refs, (size_t)m->n_unique * sizeof(*dc.refs));
+    if (s_remap_shift)
+        for (u32 i = 0; i < m->n_unique; i++) {
+            dc.refs[i].vertex_id += r0.vertex_id;
+            dc.refs[i].base_index += r0.base_index;
+        }
     if (m->n_source)
         memcpy(dc.ref_remap.occurrence_to_unique, m->occ,
                (size_t)m->n_source * sizeof(*m->occ));
@@ -6017,7 +6090,9 @@ static void dc_fetch(const rsx_vertex_layout_plan* layout, int allow_remap, int 
     /* One pass over the source references feeds both memos; the fetch key
      * used to hash the same words a second time. */
     u64 refs_key = 0;
-    if (fast_cacheable || remap_cacheable) {
+    /* Under REMAP_SHIFT the remap memo has its own key; the content key is
+     * then only for the fetch memo. */
+    if (fast_cacheable || (remap_cacheable && !s_remap_shift)) {
 #ifdef ENG_HAVE_FAST_REFS_HASH
         if (s_refs_hash_fast) {
             /* Folded while the list was built; only eng_refs_key()'s tail
@@ -6072,9 +6147,12 @@ static void dc_fetch(const rsx_vertex_layout_plan* layout, int allow_remap, int 
          * the order it arrived, so collapsing duplicates would reorder it. */
         if (s_vtx_remap && allow_remap && dc.n_refs > 1) {
             int restored = 0;
+            const u64 remap_key = remap_cacheable && s_remap_shift
+                ? eng_refs_shift_key(dc.refs, dc.n_refs) : refs_key;
             if (remap_cacheable) {
-                eng_remap_memo* rm = eng_remap_memo_find(refs_key);
+                eng_remap_memo* rm = eng_remap_memo_find(remap_key);
                 if (rm && dc_remap_memo_restore(rm)) {
+                    eng_remap_diag(1, dc.refs, rm->n_source);
                     s_remap_hits++;
                     s_wp2_remap_hit++;
                     restored = 1;
@@ -6084,6 +6162,7 @@ static void dc_fetch(const rsx_vertex_layout_plan* layout, int allow_remap, int 
                 const u32 n_source = dc.n_refs;
                 u32 unique = dc.n_refs;
                 if (remap_cacheable) {
+                    eng_remap_diag(0, dc.refs, dc.n_refs);
                     s_remap_misses++;
                     s_wp2_remap_miss++;
                 }
@@ -6092,7 +6171,7 @@ static void dc_fetch(const rsx_vertex_layout_plan* layout, int allow_remap, int 
                     dc.refs_remapped = unique < dc.n_refs;
                     dc.n_refs = unique;
                     if (remap_cacheable)
-                        eng_remap_memo_save(refs_key, dc.refs, unique,
+                        eng_remap_memo_save(remap_key, dc.refs, unique,
                                             dc.ref_remap.occurrence_to_unique,
                                             n_source, dc.refs_remapped);
                 }
@@ -9376,6 +9455,8 @@ int rsx_draw_engine_init(u32 width, u32 height)
       if (e && *e) s_pipe_memo = strcmp(e, "0") != 0; }
     { const char* e = getenv("PS3RECOMP_REMAP_CACHE");
       s_remap_cache = e && *e && strcmp(e, "0") != 0; }
+    { const char* e = getenv("PS3RECOMP_REMAP_SHIFT");
+      s_remap_shift = e && *e && strcmp(e, "0") != 0; }
     { const char* e = getenv("PS3RECOMP_MEMO_INDEX");
       s_memo_index = e && *e && strcmp(e, "0") != 0; }
     { const char* e = getenv("PS3RECOMP_REFS_HASH_FAST");

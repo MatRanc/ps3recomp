@@ -3000,6 +3000,8 @@ static void gcm_rsx_process_fifo_unlocked(void)
                  : walker_fast);
     rsx_draw_engine_set_remap_cache(gcm_live_get(PS3_LIVE_REMAP_CACHE,
                                                  "PS3RECOMP_REMAP_CACHE"));
+    rsx_draw_engine_set_remap_shift(gcm_live_get(PS3_LIVE_REMAP_SHIFT,
+                                                 "PS3RECOMP_REMAP_SHIFT"));
     rsx_draw_engine_set_memo_index(gcm_live_get(PS3_LIVE_MEMO_INDEX,
                                                 "PS3RECOMP_MEMO_INDEX"));
     rsx_draw_engine_set_refs_hash_fast(gcm_live_get(PS3_LIVE_REFS_HASH_FAST,
