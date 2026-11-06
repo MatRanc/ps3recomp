@@ -1000,6 +1000,13 @@ static void gcm_intr_main(void* unused)
 
 void ppu_gcm_pump(void)
 {
+    /* Every HLE call and timer sleep pumps, tens of thousands of times a
+     * second, and almost always nothing is pending. Look before taking the
+     * pump and swapping the pending words out: three atomic operations on
+     * lines the ticker thread writes. A notification posted just after this
+     * read is delivered by the next pump, as one posted while another thread
+     * holds the pump is. */
+    if (!s_gcm_pending && !s_user_pending) return;
     if (gcm_handler_thread_on() && (unsigned long)GetCurrentThreadId() != s_gcm_intr_tid) {
         static volatile long started = 0;
         if (!started && InterlockedCompareExchange(&started, 1, 0) == 0)
