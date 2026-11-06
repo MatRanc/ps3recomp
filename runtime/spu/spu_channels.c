@@ -285,33 +285,61 @@ static uint64_t spu_float_mode_enter(void)
     return ~0ull;
 #endif
 }
-/* --spu-ftz-hw (lift flag): a generated module built for MXCSR FTZ|DAZ calls
- * spu_ftz_hw_enable() from a constructor. A lifted run then enters FTZ|DAZ for
- * its duration and restores the caller's MXCSR on the way out, exactly like
- * the arm64 SPU_FLOAT_RZ mode above. That keeps a synchronous PPU-thread run
- * from changing the PPU's denormal/rounding behaviour. */
-int g_spu_ftz_hw = 0;
-void spu_ftz_hw_enable(void) { g_spu_ftz_hw = 1; }
+/* PS3RECOMP_SPU_FTZ (live key, default 0): the lifted SPU modules carry two
+ * function variants. Variant 0 is the exact/FAST_FLOAT helper path; variant 1
+ * (the twin symbols registered by tools/spu_ftz_twin.py) takes the hardware
+ * MXCSR FTZ|DAZ form. The key is sampled once at the start of a lifted run, so
+ * it is switchable between jobs (the control file) without a relaunch. The
+ * sampled value is kept per host thread and used by dispatch; MXCSR is
+ * restored on the way out so a synchronous PPU-thread run does not change the
+ * PPU's floating point. A nested run restores the outer variant too. */
+SPU_THREAD_LOCAL int g_spu_ftz_variant = 0;
+int spu_ftz_variant_active(void) { return g_spu_ftz_variant; }
 
-static uint32_t spu_ftz_mode_enter(void)
+int spu_ftz_key_on(void)
 {
+    static int s_env = -1;
+    if (s_env < 0) {
+        const char* e = getenv("PS3RECOMP_SPU_FTZ");
+        s_env = e && e[0] != '0' && e[0] != '\0';
+    }
+#ifdef SPU_HAVE_LIVE_CTL
+    /* The control file is the live switch; ps3_live_ctl_get() is seeded from
+     * the same environment variable, so this also covers the no-file case. */
+    if (ps3_live_ctl_get) return ps3_live_ctl_get(PS3_LIVE_SPU_FTZ) != 0;
+#endif
+    return s_env;
+}
+
+typedef struct { uint32_t mxcsr; int prev_variant; } spu_ftz_state;
+#define SPU_FTZ_STATE_NONE ((spu_ftz_state){ 0xFFFFFFFFu, 0 })
+
+static spu_ftz_state spu_ftz_mode_enter(void)
+{
+    spu_ftz_state st = SPU_FTZ_STATE_NONE;
+    st.prev_variant = g_spu_ftz_variant;
 #if defined(__x86_64__) || defined(__i386__)
-    if (!__atomic_load_n(&g_spu_ftz_hw, __ATOMIC_RELAXED)) return 0xFFFFFFFFu;
-    uint32_t v = (uint32_t)_mm_getcsr();
-    if ((v & 0x8040u) == 0x8040u) return 0xFFFFFFFFu;   /* nested/already set */
-    _mm_setcsr(v | 0x8040u);                             /* FTZ | DAZ */
-    return v;
+    const int on = spu_ftz_key_on();
+    if (!on) { g_spu_ftz_variant = 0; return st; }
+    const uint32_t v = (uint32_t)_mm_getcsr();
+    g_spu_ftz_variant = 1;
+    if ((v & 0x8040u) == 0x8040u) return st;   /* nested/already set */
+    _mm_setcsr(v | 0x8040u);                    /* FTZ | DAZ */
+    st.mxcsr = v;
+    return st;
 #else
-    return 0xFFFFFFFFu;
+    g_spu_ftz_variant = 0;
+    return st;
 #endif
 }
-static void spu_ftz_mode_leave(uint32_t outer)
+static void spu_ftz_mode_leave(spu_ftz_state st)
 {
 #if defined(__x86_64__) || defined(__i386__)
-    if (outer != 0xFFFFFFFFu) _mm_setcsr(outer);
+    if (st.mxcsr != 0xFFFFFFFFu) _mm_setcsr(st.mxcsr);
 #else
-    (void)outer;
+    (void)st;
 #endif
+    g_spu_ftz_variant = st.prev_variant;
 }
 
 static void spu_float_mode_leave(uint64_t outer)
@@ -339,7 +367,7 @@ static void spu_honour_stop_request(spu_context* ctx)
 int spu_run_with_halt(void (*entry)(spu_context*), spu_context* ctx)
 {
     const uint64_t fpcr_outer = spu_float_mode_enter();   /* not modified after setjmp */
-    const uint32_t mxcsr_outer = spu_ftz_mode_enter();
+    const spu_ftz_state ftz_outer = spu_ftz_mode_enter();
     int halted = 0;
     /* Job-args probe: image-1 (the WWS job binary) entries arrive at the crt
      * with r3/r4 zeroed in SOME runs while the jm2 runner sets them -- count
@@ -424,7 +452,7 @@ int spu_run_with_halt(void (*entry)(spu_context*), spu_context* ctx)
     s_spu_halt_armed = outer_armed;
     if (outer_armed) memcpy(s_spu_halt_env, outer_env, sizeof(jmp_buf));
     spu_float_mode_leave(fpcr_outer);
-    spu_ftz_mode_leave(mxcsr_outer);
+    spu_ftz_mode_leave(ftz_outer);
     return halted;
 }
 
@@ -1798,6 +1826,7 @@ typedef struct {
     uint32_t addr;
     spu_fn   fn;
     int      image_id;   /* which recompiled image this function belongs to */
+    int      variant;    /* 0 = exact/default helpers, 1 = MXCSR FTZ|DAZ twin */
 } spu_reg_entry;
 
 /* One entry per lifted SPU function across EVERY registered image, and a game
@@ -1854,7 +1883,7 @@ static inline uint32_t spu_fn_hash(uint32_t addr)
 static int s_reg_image = 0;
 void spu_begin_image(int image_id) { s_reg_image = image_id; }
 
-void spu_register_function(uint32_t addr, spu_fn fn)
+void spu_register_function_var(uint32_t addr, spu_fn fn, int variant)
 {
     if (s_registry_count >= SPU_FN_REGISTRY_MAX) {
         /* Silent truncation here dropped whole late-registered SPU images and
@@ -1878,6 +1907,7 @@ void spu_register_function(uint32_t addr, spu_fn fn)
     s_registry[i].addr = addr;
     s_registry[i].fn = fn;
     s_registry[i].image_id = s_reg_image;
+    s_registry[i].variant = variant;
     uint32_t h = spu_fn_hash(addr);
     s_hash_next[i] = 0;
     if (s_hash_head[h] == 0)
@@ -1888,6 +1918,11 @@ void spu_register_function(uint32_t addr, spu_fn fn)
     /* Published after the entry is linked: the dispatch cache keys its entries
      * by this count, so a lookup that sees the new count also finds the entry. */
     __atomic_store_n(&s_registry_count, i + 1, __ATOMIC_RELEASE);
+}
+
+void spu_register_function(uint32_t addr, spu_fn fn)
+{
+    spu_register_function_var(addr, fn, 0);
 }
 
 /* Report a CROSS-IMAGE match: the registry served a function some other image
@@ -1932,18 +1967,29 @@ static void spu_report_cross_image(uint32_t addr, int want, int got)
 spu_fn spu_lookup(uint32_t addr, int image_id)   /* exported: clang-built fast-path dispatch (spu_dispatch_mt.c) needs it */
 {
     /* Match the context's active image; image_id 0 (context or entry) matches
-     * any, for back-compat with single-image contexts. */
+     * any, for back-compat with single-image contexts. With PS3RECOMP_SPU_FTZ
+     * on for this run, prefer the variant-1 (MXCSR FTZ|DAZ) function and fall
+     * back to the default one if this image has no twin. With the key off the
+     * first registered match is returned exactly as before. */
+    spu_fn fallback = NULL;
+    int fallback_image = 0;
+    const int want_variant = g_spu_ftz_variant;
     for (uint32_t n = s_hash_head[spu_fn_hash(addr)]; n; n = s_hash_next[n - 1]) {
         const spu_reg_entry* e = &s_registry[n - 1];
-        if (e->addr == addr &&
-            (image_id == 0 || e->image_id == 0 || e->image_id == image_id)) {
+        if (e->addr != addr ||
+            !(image_id == 0 || e->image_id == 0 || e->image_id == image_id))
+            continue;
+        if (want_variant && e->variant) {
             /* One compare on the return path; the report itself is rare. */
             if (e->image_id != image_id)
                 spu_report_cross_image(addr, image_id, e->image_id);
             return e->fn;
         }
+        if (!fallback) { fallback = e->fn; fallback_image = e->image_id; }
     }
-    return NULL;
+    if (fallback && fallback_image != image_id)
+        spu_report_cross_image(addr, image_id, fallback_image);
+    return fallback;
 }
 
 /* Indirect dispatch resolves the same (address, image) pairs on every guest
@@ -1954,7 +2000,7 @@ spu_fn spu_lookup(uint32_t addr, int image_id)   /* exported: clang-built fast-p
  * invalidates every cached entry, including cached misses. The generation is
  * read before the walk, so a registration that races the walk leaves the entry
  * stale and the next lookup redoes it. */
-typedef struct { uint32_t addr, gen; int image; spu_fn fn; } spu_lookup_memo;
+typedef struct { uint32_t addr, gen; int image, variant; spu_fn fn; } spu_lookup_memo;
 #define SPU_LOOKUP_MEMO_SIZE 512   /* power of two */
 static SPU_TLS spu_lookup_memo t_lookup_memo[SPU_LOOKUP_MEMO_SIZE];
 static spu_fn spu_lookup_memoized(uint32_t addr, int image_id)
@@ -1962,9 +2008,11 @@ static spu_fn spu_lookup_memoized(uint32_t addr, int image_id)
     spu_lookup_memo* m = &t_lookup_memo[((addr >> 2) ^ ((uint32_t)image_id * 0x9E3779B1u)) &
                                         (SPU_LOOKUP_MEMO_SIZE - 1)];
     const uint32_t gen = s_registry_count + 1;   /* +1: zero-init never matches */
-    if (m->gen != gen || m->addr != addr || m->image != image_id) {
+    const int variant = g_spu_ftz_variant;
+    if (m->gen != gen || m->addr != addr || m->image != image_id ||
+        m->variant != variant) {
         m->fn = spu_lookup(addr, image_id);
-        m->addr = addr; m->image = image_id; m->gen = gen;
+        m->addr = addr; m->image = image_id; m->gen = gen; m->variant = variant;
     }
     return m->fn;
 }
@@ -2049,7 +2097,7 @@ static spu_lifted_fn spu_lifted_lookup_full(const spu_context* ctx, uint32_t lsa
 typedef struct {
     spu_lifted_fn fn;
     uint32_t id, lsa, rgen, residency;
-    int image, ovl, task;
+    int image, ovl, task, variant;
 } spu_dcache_ent;
 #define SPU_DCACHE_ENTRIES 512u
 static SPU_TLS spu_dcache_ent t_dcache[SPU_DCACHE_ENTRIES];
@@ -2217,7 +2265,8 @@ spu_lifted_fn spu_lifted_lookup(const spu_context* ctx, uint32_t lsa)
     spu_dcache_ent* e = &t_dcache[((lsa >> 2) ^ (id * 0x9E3779B1u)) & (SPU_DCACHE_ENTRIES - 1)];
     if (e->fn && e->id == id && e->lsa == lsa && e->rgen == rgen &&
         e->residency == c->dcache_residency && e->image == c->image_id &&
-        e->ovl == c->resident_ovl && e->task == c->resident_task) {
+        e->ovl == c->resident_ovl && e->task == c->resident_task &&
+        e->variant == g_spu_ftz_variant) {
         if (mode == 2) {
             __atomic_fetch_add(&s_dcache_hits, 1, __ATOMIC_RELAXED);
             const spu_lifted_fn full = spu_lifted_lookup_full(ctx, lsa);
@@ -2244,6 +2293,7 @@ spu_lifted_fn spu_lifted_lookup(const spu_context* ctx, uint32_t lsa)
         e->fn = fn; e->id = id; e->lsa = lsa; e->rgen = rgen;
         e->residency = c->dcache_residency; e->image = c->image_id;
         e->ovl = c->resident_ovl; e->task = c->resident_task;
+        e->variant = g_spu_ftz_variant;
     }
     return fn;
 }

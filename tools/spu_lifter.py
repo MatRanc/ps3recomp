@@ -187,10 +187,12 @@ static inline u128 spu_hw_fm(u128 a, u128 b) { return spu_hw_st(_mm_mul_ps(spu_h
 static inline u128 spu_hw_fma(u128 a, u128 b, u128 c)  { return spu_hw_st(_mm_fmadd_ps(spu_hw_ld(a), spu_hw_ld(b), spu_hw_ld(c))); }
 static inline u128 spu_hw_fms(u128 a, u128 b, u128 c)  { return spu_hw_st(_mm_fmsub_ps(spu_hw_ld(a), spu_hw_ld(b), spu_hw_ld(c))); }
 static inline u128 spu_hw_fnms(u128 a, u128 b, u128 c) { return spu_hw_st(_mm_fnmadd_ps(spu_hw_ld(a), spu_hw_ld(b), spu_hw_ld(c))); }
-extern void spu_ftz_hw_enable(void) __attribute__((weak));
-__attribute__((constructor)) static void spu_hw_ftz_ctor(void) {
-    if (spu_ftz_hw_enable) spu_ftz_hw_enable();
-}
+/* Registered as variant 1 (spu_register_function_var) at the module
+ * registration call; the runtime selects it when PS3RECOMP_SPU_FTZ is on and
+ * sets MXCSR FTZ|DAZ for the run. The weak symbol keeps a runtime without the
+ * variant registry (the play tree) linking: it simply registers nothing. */
+extern void spu_register_function_var(uint32_t, void (*)(spu_context*), int)
+    __attribute__((weak));
 #else
 /* No FMA: keep the exact per-operand helpers, and do not ask the runtime for
  * FTZ|DAZ mode (it would only add a second flush). */
@@ -2061,8 +2063,13 @@ class SPULifter:
         lines.append("};")
         lines.append("")
         lines.append(f"void {self.prefix}spu_recomp_register(void) {{")
-        lines.append("    for (const spu_func_entry* e = spu_function_table; e->func; ++e)")
-        lines.append("        spu_register_function(e->addr, e->func);")
+        if getattr(self, "spu_ftz_hw", False):
+            lines.append("    if (!spu_register_function_var) return;   /* play tree: no variants */")
+            lines.append("    for (const spu_func_entry* e = spu_function_table; e->func; ++e)")
+            lines.append("        spu_register_function_var(e->addr, e->func, 1);")
+        else:
+            lines.append("    for (const spu_func_entry* e = spu_function_table; e->func; ++e)")
+            lines.append("        spu_register_function(e->addr, e->func);")
         lines.append("}")
         lines.append("")
         return "\n".join(lines)

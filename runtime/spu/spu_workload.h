@@ -52,6 +52,11 @@ void spu_workload_register(uint64_t fingerprint, spu_lifted_entry_fn fn,
 void spu_workload_register_img(uint64_t fingerprint, spu_lifted_entry_fn fn,
                                int image_id, const char* name);
 
+/* Register the MXCSR FTZ|DAZ twin entry for an image already registered with
+ * spu_workload_register_img(). PS3RECOMP_SPU_FTZ selects it per run; a runtime
+ * without this symbol ignores it (the generated registration declares it weak). */
+void spu_workload_register_img_ftz(uint64_t fingerprint, spu_lifted_entry_fn fn);
+
 /* Look up a lifted entry by fingerprint; NULL if none registered. */
 spu_lifted_entry_fn spu_workload_find(uint64_t fingerprint);
 
