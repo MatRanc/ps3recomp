@@ -101,6 +101,30 @@ uint64_t ppu_thread_register_main(void);
  * With PS3_PRIO_START=1, sys_ppu_thread_create waits for it on a thread it has just made at a higher priority than
  * the creator's, as lv2's scheduler would run that thread first. */
 void ppu_thread_note_block(uint64_t tid);
+
+/* ---------------------------------------------------------------------------
+ * PS3RECOMP_SPU_CRIT (off by default): what the PPU main thread does with a
+ * guest frame. The waits it takes are attributed by what wakes them: the GCM
+ * ref condition is the RSX/walker side, the flip conditions the display side,
+ * SPURS event flags and workload-info polls the SPU side, everything else
+ * (mutexes, semaphores, generic event counts, usleep) is "other". Running time
+ * is the frame interval minus those waits. A per-frame line is printed every
+ * ~2 s anchored on the main thread waking from the GCM ref condition.
+ * -----------------------------------------------------------------------*/
+enum {
+    PPU_CRIT_RSX = 0,   /* GCM ref lwcond 0x1245090 (RSX walker consumed) */
+    PPU_CRIT_FLIP,      /* flip queue / flip-done lwconds */
+    PPU_CRIT_SPU,       /* SPURS event flag, workload-info progress poll */
+    PPU_CRIT_OTHER,     /* every other blocking point */
+    PPU_CRIT_NCAT
+};
+int      ppu_crit_on(void);
+uint64_t ppu_thread_current_id(void);
+uint64_t ppu_crit_begin(uint64_t tid);
+void     ppu_crit_end(uint64_t t0, int cat, uint64_t tid);
+void     ppu_crit_ref_wake(uint64_t tid);
+void     ppu_crit_spu_poll(uint64_t tid);
+
 int64_t sys_ppu_thread_exit(ppu_context* ctx);
 int64_t sys_ppu_thread_join(ppu_context* ctx);
 int64_t sys_ppu_thread_detach(ppu_context* ctx);

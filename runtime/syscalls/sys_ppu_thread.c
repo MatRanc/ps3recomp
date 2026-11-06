@@ -31,6 +31,7 @@ static PPU_TLS int     s_exit_armed = 0;
 #include "ps3emu/thread_name.h"
 #ifndef _WIN32
 #include <errno.h>
+#include <time.h>
 #endif
 
 /* Host stack reserved per guest thread, on both branches below, so a
@@ -146,6 +147,110 @@ void ppu_thread_note_block(uint64_t tid)
         __atomic_store_n(blocked, 1, __ATOMIC_RELEASE);
 }
 
+/* ---------------------------------------------------------------------------
+ * PS3RECOMP_SPU_CRIT: the PPU main thread's per-frame time split.
+ *
+ * Opt-in (environment, default 0). The wait wrappers in syscalls/ppu_sysprx
+ * bracket their blocking call with ppu_crit_begin/end and name the category;
+ * a nested wait (e.g. the lv2 event queue inside cellSpursEventFlagWait) is
+ * folded into the outer one. Only thread id 1 (the main guest thread) is
+ * accounted, and only it writes the counters, so no locking is needed.
+ * ppu_crit_ref_wake runs when main resumes from the GCM ref condition, which
+ * is the frame's PPU start; that closes a frame and prints a ~2 s window.
+ * -----------------------------------------------------------------------*/
+static int s_pc_enabled = -1;
+int ppu_crit_on(void)
+{
+    if (s_pc_enabled < 0) {
+        const char* e = getenv("PS3RECOMP_SPU_CRIT");
+        s_pc_enabled = (e && *e && *e != '0') ? 1 : 0;
+    }
+    return s_pc_enabled;
+}
+
+static PPU_TLS uint64_t s_cur_tid;
+uint64_t ppu_thread_current_id(void) { return s_cur_tid; }
+
+static uint64_t pc_now_ns(void)
+{
+#ifdef _WIN32
+    LARGE_INTEGER c, f;
+    QueryPerformanceCounter(&c);
+    QueryPerformanceFrequency(&f);
+    return (uint64_t)((double)c.QuadPart * 1e9 / (double)f.QuadPart);
+#else
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+#endif
+}
+
+static PPU_TLS int      s_pc_depth;
+static PPU_TLS uint64_t s_pc_acc[PPU_CRIT_NCAT];
+static PPU_TLS uint64_t s_pc_last_report;
+static PPU_TLS uint64_t s_pc_last_gw;
+static PPU_TLS long     s_pc_frames;
+
+uint64_t ppu_crit_begin(uint64_t tid)
+{
+    if (tid != 1 || !ppu_crit_on()) return 0;
+    if (s_pc_depth++ != 0) return 0;       /* nested: folded into the outer wait */
+    return pc_now_ns();
+}
+
+void ppu_crit_end(uint64_t t0, int cat, uint64_t tid)
+{
+    if (tid != 1 || !ppu_crit_on()) return;
+    if (s_pc_depth > 0) s_pc_depth--;
+    if (!t0) return;
+    if (cat < 0 || cat >= PPU_CRIT_NCAT) cat = PPU_CRIT_OTHER;
+    s_pc_acc[cat] += pc_now_ns() - t0;
+}
+
+/* cellSpursGetWorkloadInfo is the runtime call a guest job-list wait polls
+ * between reads of the SPU-written counters. A short gap between two calls on
+ * main is that spin; attribute it to the SPU side. */
+void ppu_crit_spu_poll(uint64_t tid)
+{
+    if (tid != 1 || !ppu_crit_on()) return;
+    const uint64_t now = pc_now_ns();
+    if (s_pc_last_gw && now > s_pc_last_gw && now - s_pc_last_gw < 2000000ull)
+        s_pc_acc[PPU_CRIT_SPU] += now - s_pc_last_gw;
+    s_pc_last_gw = now;
+}
+
+void ppu_crit_ref_wake(uint64_t tid)
+{
+    if (tid != 1 || !ppu_crit_on()) return;
+    const uint64_t now = pc_now_ns();
+    if (!s_pc_last_report) {                 /* first ref wake: start the clock */
+        memset(s_pc_acc, 0, sizeof s_pc_acc);
+        s_pc_last_report = now;
+        s_pc_last_gw = 0;
+        s_pc_frames = 0;
+        return;
+    }
+    s_pc_frames++;
+    if (now - s_pc_last_report < 2000000000ull) return;
+    const double frames = (double)s_pc_frames;
+    const double frame_ms = (now - s_pc_last_report) / 1e6 / frames;
+    double cat_ms[PPU_CRIT_NCAT];
+    double waited = 0;
+    for (int i = 0; i < PPU_CRIT_NCAT; i++) {
+        cat_ms[i] = (double)s_pc_acc[i] / 1e6 / frames;
+        waited += cat_ms[i];
+    }
+    fprintf(stderr, "[spu-crit] frames=%ld frame=%.2fms run=%.2f rsx=%.2f flip=%.2f "
+                    "spu=%.2f other=%.2f%c",
+            s_pc_frames, frame_ms, frame_ms - waited, cat_ms[PPU_CRIT_RSX],
+            cat_ms[PPU_CRIT_FLIP], cat_ms[PPU_CRIT_SPU], cat_ms[PPU_CRIT_OTHER], 10);
+    fflush(stderr);
+    memset(s_pc_acc, 0, sizeof s_pc_acc);
+    s_pc_last_report = now;
+    s_pc_last_gw = 0;
+    s_pc_frames = 0;
+}
+
 /* Priority the creator runs at. Must be called under the table lock. Main registers with priority 0, which means
  * "never set" until it calls sys_ppu_thread_set_priority; it is treated as the default. */
 static int32_t creator_priority(uint64_t tid)
@@ -185,6 +290,7 @@ static void* ppu_host_thread_proc(void* param)
 {
     ppu_thread_info* info = (ppu_thread_info*)param;
     ps3_thread_name("ppu %s", info->name);
+    s_cur_tid = info->ctx.thread_id;
 
 #ifdef _WIN32
     /* Reserve stack for the STACK_OVERFLOW handler, same as main() does for the
@@ -334,6 +440,7 @@ uint64_t ppu_thread_register_main(void)
         ps3_ft_name(1, "main");
         ps3_tprof_thread('P', 1);
         ps3_thread_name("ppu main");      /* registered from the boot thread itself */
+        s_cur_tid = 1;
 #ifdef _WIN32
         t->finish_event = CreateEventA(NULL, TRUE, FALSE, NULL);
 #else

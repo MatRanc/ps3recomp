@@ -134,7 +134,17 @@ static void write_be64(uint32_t addr, uint64_t val)
  *
  * r3 = microseconds
  * -----------------------------------------------------------------------*/
+static int64_t sys_timer_usleep_impl(ppu_context* ctx);
+
 int64_t sys_timer_usleep(ppu_context* ctx)
+{
+    uint64_t _pc0 = ppu_crit_begin(ctx->thread_id);
+    int64_t _r = sys_timer_usleep_impl(ctx);
+    ppu_crit_end(_pc0, PPU_CRIT_OTHER, ctx->thread_id);
+    return _r;
+}
+
+static int64_t sys_timer_usleep_impl(ppu_context* ctx)
 {
     uint64_t usec = LV2_ARG_U64(ctx, 0);
     ppu_thread_note_block(ctx->thread_id);   /* PS3_PRIO_START */

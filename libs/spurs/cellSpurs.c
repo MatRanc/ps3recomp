@@ -20,6 +20,7 @@
 #include "../../runtime/ps3_log.h"
 #include "spu_workload.h"   /* SPU image -> lifted-entry dispatch (runtime/spu) */
 #include "spurs_taskset.h"  /* REAL BE CellSpursTaskset layout builders (fork Option-B) */
+#include "../../runtime/syscalls/sys_ppu_thread.h"  /* PS3RECOMP_SPU_CRIT */
 #include "../../runtime/ppu/ppu_memory.h"   /* vm_base (guest mem) */
 #include "ps3emu/ps3_tprof.h"    /* PS3_TPROF: in-process samples of the SPU workers */
 #include "ps3emu/ps3_ftrace.h"   /* PS3_FTRACE: SPURS SPU busy spans */
@@ -2724,6 +2725,8 @@ s32 cellSpursEventFlagWait(CellSpursEventFlag* eventFlag, u16* bits,
         return CELL_SPURS_TASK_ERROR_STAT;
 
     u16 pattern = vm_read16(bits_ea);
+    const uint64_t _pc_tid = ppu_thread_current_id();
+    const uint64_t _pc0 = ppu_crit_begin(_pc_tid);
 
     ef_lock(sync);
 
@@ -2795,6 +2798,7 @@ s32 cellSpursEventFlagWait(CellSpursEventFlag* eventFlag, u16* bits,
     }
 
     ef_unlock(sync);
+    ppu_crit_end(_pc0, PPU_CRIT_SPU, _pc_tid);
 
     return CELL_OK;
 }
@@ -3811,6 +3815,7 @@ s32 cellSpursSetExceptionEventHandler(u64 spurs_ea, u64 handler_ea, u64 arg_ea)
 
 s32 cellSpursGetWorkloadInfo(u64 spurs_ea, u32 wid, u64 info_ea)
 {
+    ppu_crit_spu_poll(ppu_thread_current_id());
     static int _n = 0;
     if (PS3_LOG_FIRST(_n, 8)) printf("[cellSpurs] GetWorkloadInfo(wid=%u info=0x%08X)\n", wid, (u32)info_ea);
 

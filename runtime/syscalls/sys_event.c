@@ -293,7 +293,17 @@ void sys_event_queue_cancel_by_id(uint32_t queue_id)
 /* Diagnostic gates polled on every receive (~140k/s in GH3): read once. */
 static int s_ps3_waitbt = -1, s_ydkj_sputask = -1, s_ydkj_spurs_ready = -1, s_ydkj_fakecomplete = -1, s_ydkj_hle_draw = -1;
 
+static int64_t sys_event_queue_receive_impl(ppu_context* ctx);
+
 int64_t sys_event_queue_receive(ppu_context* ctx)
+{
+    uint64_t _pc0 = ppu_crit_begin(ctx->thread_id);
+    int64_t _r = sys_event_queue_receive_impl(ctx);
+    ppu_crit_end(_pc0, PPU_CRIT_OTHER, ctx->thread_id);
+    return _r;
+}
+
+static int64_t sys_event_queue_receive_impl(ppu_context* ctx)
 {
     uint32_t queue_id    = LV2_ARG_U32(ctx, 0);
     uint32_t event_addr  = LV2_ARG_PTR(ctx, 1);
@@ -1164,7 +1174,17 @@ static int flag_check(uint64_t pattern, uint64_t bitpat, uint32_t mode)
  * r6 = pointer to receive result pattern (u64*)
  * r7 = timeout_usec (0 = infinite)
  * -----------------------------------------------------------------------*/
+static int64_t sys_event_flag_wait_impl(ppu_context* ctx);
+
 int64_t sys_event_flag_wait(ppu_context* ctx)
+{
+    uint64_t _pc0 = ppu_crit_begin(ctx->thread_id);
+    int64_t _r = sys_event_flag_wait_impl(ctx);
+    ppu_crit_end(_pc0, PPU_CRIT_OTHER, ctx->thread_id);
+    return _r;
+}
+
+static int64_t sys_event_flag_wait_impl(ppu_context* ctx)
 {
     ppu_thread_note_block(ctx->thread_id);   /* PS3_PRIO_START */
     uint32_t flag_id    = LV2_ARG_U32(ctx, 0);

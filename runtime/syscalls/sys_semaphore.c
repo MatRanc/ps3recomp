@@ -339,12 +339,14 @@ void* ppu_gcm_wait_pump_absent(void (**pump)(void)) { *pump = NULL; return NULL;
 #endif
 int64_t sys_semaphore_wait(ppu_context* ctx)
 {
+    uint64_t _pc0 = ppu_crit_begin(ctx->thread_id);
     ppu_thread_note_block(ctx->thread_id);   /* PS3_PRIO_START */
     int64_t r = sys_semaphore_wait_impl(ctx);
     static int d = -1; if (d < 0) d = getenv("SEM_ERRDBG") ? 1 : 0;
     if (d && r) { static int n = 0; if (PS3_LOG_FIRST(n, 12))
         fprintf(stderr, "[sem] wait(sem=%u) -> %lld%c",
                 (unsigned)ctx->gpr[3], (long long)r, 10); }
+    ppu_crit_end(_pc0, PPU_CRIT_OTHER, ctx->thread_id);
     return r;
 }
 static int64_t sys_semaphore_wait_impl(ppu_context* ctx)

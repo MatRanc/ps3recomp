@@ -292,6 +292,12 @@ static void lwm_release(struct LwmSlot* sl)
 volatile int g_nd_inpump = 0;
 /* syscalls/sys_ppu_thread.c: this thread is about to wait (PS3_PRIO_START). */
 extern "C" void ppu_thread_note_block(uint64_t tid);
+/* PS3RECOMP_SPU_CRIT (off by default): per-frame main-thread wait split. */
+extern "C" int      ppu_crit_on(void);
+extern "C" uint64_t ppu_crit_begin(uint64_t tid);
+extern "C" void     ppu_crit_end(uint64_t t0, int cat, uint64_t tid);
+extern "C" void     ppu_crit_ref_wake(uint64_t tid);
+enum { PPU_CRIT_RSX = 0, PPU_CRIT_FLIP = 1, PPU_CRIT_SPU = 2, PPU_CRIT_OTHER = 3 };
 static void sys_lwmutex_lock(ppu_context* ctx)
 {
     uint32_t lwm = (uint32_t)ctx->gpr[3];
@@ -325,13 +331,16 @@ static void sys_lwmutex_lock(ppu_context* ctx)
                     (unsigned long long)ctx->thread_id, lwm, h, held, vm_read32(lwm + LWM_OWNER)); fflush(stderr); }
             ppu_thread_note_block(ctx->thread_id);
             PS3_TRACE_SCOPE(PS3_TR_PPU_LWMUTEX, lwm, ps3_trace_clamp32(timeout_us));
+            const uint64_t _pc0 = ppu_crit_begin(ctx->thread_id);
             long long _blk_start = lwm_trace() ? lwm_now_us() : 0;
-            if (!lwm_acquire(sl0, timeout_us)) {   /* honor the timeout: ETIMEDOUT, no acquire */
+            if (!lwm_acquire(sl0, timeout_us)) {
+                ppu_crit_end(_pc0, PPU_CRIT_OTHER, ctx->thread_id);   /* honor the timeout: ETIMEDOUT, no acquire */
                 if (lwm_trace()) fprintf(stderr, "[LWM-CONVOY] tid=%llu TIMED-OUT on lwm=0x%08X after %lldus (ETIMEDOUT, retry)\n",
                     (unsigned long long)ctx->thread_id, lwm, lwm_now_us() - _blk_start);
                 ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)0x8001000Bu;
                 return;
             }
+            ppu_crit_end(_pc0, PPU_CRIT_OTHER, ctx->thread_id);
             if (lwm_trace()) fprintf(stderr, "[LWM-CONVOY] tid=%llu ACQUIRED lwm=0x%08X after waiting %lldus\n",
                 (unsigned long long)ctx->thread_id, lwm, lwm_now_us() - _blk_start);
             if (g_nd_inpump || _b <= 40) fprintf(stderr, "[LWM-GOT] tid=%llu lwm=0x%08X\n", (unsigned long long)ctx->thread_id, lwm);
@@ -664,7 +673,13 @@ static void sys_lwcond_wait_traced(ppu_context* ctx)
     uint32_t tl_ref = 0;
     if (tl_t0 && cellGcm_debug_ref_value) tl_ref = cellGcm_debug_ref_value();
     PS3_TRACE_SCOPE(PS3_TR_PPU_LWCOND, lwcond, 0);
+    const uint64_t _pc0 = ppu_crit_begin(ctx->thread_id);
     sys_lwcond_wait(ctx);
+    const int _pc_cat = lwcond == 0x1245090u ? PPU_CRIT_RSX
+                      : (lwcond == 0x12450c8u || lwcond == 0x1245100u) ? PPU_CRIT_FLIP
+                      : PPU_CRIT_OTHER;
+    ppu_crit_end(_pc0, _pc_cat, ctx->thread_id);
+    if (lwcond == 0x1245090u) ppu_crit_ref_wake(ctx->thread_id);
     if (tl_t0) {
         /* 0x1245090 is FUN_000655cc's ref cond; 0x12450c8 the flip queue and
          * 0x1245100 the flip-done cond (docs/ppu-critical-path.md). */
