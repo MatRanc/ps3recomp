@@ -38,8 +38,11 @@
 #include "ps3emu/log_first.h"
 #include "../../runtime/memory/vm.h"   /* vm_commit: the capture images pages */
 
-/* Draw-record worker barriers (defined with the packet code below). */
-static void eng_mt_sync(void);
+/* Draw-record worker barriers (defined with the packet code below). Every
+ * call site passes its line so PS3RECOMP_WALKER_MT_SYNC_PROF can say which
+ * barrier the state thread waits in. */
+static void eng_mt_sync_at(int line);
+#define eng_mt_sync() eng_mt_sync_at(__LINE__)
 static int eng_mt_has_workers(void);
 static int eng_mt_recording(void);
 static int eng_mt_defers_release(void);
@@ -7580,7 +7583,6 @@ static void eng_mt_retire(u32 handle)
 }
 
 static void eng_mt_worker_exec(void* ctx, const void* rec, u32 size);
-static void eng_mt_sync(void);
 static int  eng_mt_prepare_one(const eng_draw_pkt* p, eng_worker* w, eng_prep* out);
 static void eng_mt_commit_packet(const eng_draw_pkt* p, const eng_prep* r, void* u);
 static void eng_mt_run_packet_inline(const eng_draw_pkt* p);
@@ -7858,14 +7860,69 @@ static void eng_mt_chunk_close(void)
 /* Drain every published chunk. Called before any backend call the state
  * thread makes itself, and at every guest-visible sync point. Closes the open
  * chunk first so a sync point is also a chunk boundary. */
-static void eng_mt_sync(void)
+/* PS3RECOMP_WALKER_MT_SYNC_PROF=1: per call-site count and wait time of the
+ * state thread's worker barriers, printed every ~2 s (diagnostic, default off). */
+#define ENG_MT_SYNC_LINES 16384
+static unsigned long long s_mt_sync_n[ENG_MT_SYNC_LINES];
+static unsigned long long s_mt_sync_ns[ENG_MT_SYNC_LINES];
+static unsigned long long s_mt_sync_last_print;
+
+static void eng_mt_sync_prof_print(unsigned long long now)
+{
+    unsigned long long tot = 0;
+    for (int i = 0; i < ENG_MT_SYNC_LINES; i++) tot += s_mt_sync_ns[i];
+    fprintf(stderr, "[mt-sync] window_ms=%.0f wait_ms=%.3f top:",
+            (double)(now - s_mt_sync_last_print) / 1e6, (double)tot / 1e6);
+    for (int k = 0; k < 10; k++) {
+        int best = -1;
+        for (int i = 0; i < ENG_MT_SYNC_LINES; i++)
+            if (s_mt_sync_n[i] && (best < 0 || s_mt_sync_ns[i] > s_mt_sync_ns[best])) best = i;
+        if (best < 0) break;
+        fprintf(stderr, " L%d n=%llu ms=%.3f", best, s_mt_sync_n[best],
+                (double)s_mt_sync_ns[best] / 1e6);
+        s_mt_sync_n[best] = 0;
+        s_mt_sync_ns[best] = 0;
+    }
+    fputc('\n', stderr);
+    memset(s_mt_sync_n, 0, sizeof s_mt_sync_n);
+    memset(s_mt_sync_ns, 0, sizeof s_mt_sync_ns);
+    s_mt_sync_last_print = now;
+}
+
+static void eng_mt_sync_at(int line)
 {
     if (!s_mt.on) return;
     if (t_mt_no_sync) return;      /* the resolver already holds its turn */
     eng_tex_group_close();
     eng_mt_chunk_close();
     if (!s_mt.workers) return;
+    static int prof = -1;
+    if (prof < 0) { const char* e = getenv("PS3RECOMP_WALKER_MT_SYNC_PROF"); prof = e && *e && *e != '0'; }
+    /* PS3RECOMP_WALKER_MT_SYNC_SKIP=<line>[,<line>...]: diagnostic ceiling only,
+     * NOT exact -- skip the wait at those call sites to bound what removing
+     * them is worth. Default off. */
+    static int skip_n = -1;
+    static int skip_lines[8];
+    if (skip_n < 0) {
+        skip_n = 0;
+        const char* e = getenv("PS3RECOMP_WALKER_MT_SYNC_SKIP");
+        while (e && *e && skip_n < 8) {
+            skip_lines[skip_n++] = (int)strtol(e, (char**)&e, 10);
+            while (*e == ',' || *e == ' ') e++;
+        }
+    }
+    for (int k = 0; k < skip_n; k++)
+        if (skip_lines[k] == line) return;
+    const unsigned long long t0 = prof ? rsx_wprof_now() : 0;
     eng_mt_wait_upto(s_mt.seq);
+    if (prof) {
+        const unsigned long long t1 = rsx_wprof_now();
+        const int i = line >= 0 && line < ENG_MT_SYNC_LINES ? line : 0;
+        s_mt_sync_n[i]++;
+        s_mt_sync_ns[i] += t1 - t0;
+        if (!s_mt_sync_last_print) s_mt_sync_last_print = t1;
+        else if (t1 - s_mt_sync_last_print >= 2000000000ull) eng_mt_sync_prof_print(t1);
+    }
     eng_mt_release_retired();
     s_mt.syncs++;
 }
