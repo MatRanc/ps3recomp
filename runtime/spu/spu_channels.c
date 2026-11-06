@@ -1969,8 +1969,9 @@ spu_fn spu_lookup(uint32_t addr, int image_id)   /* exported: clang-built fast-p
     /* Match the context's active image; image_id 0 (context or entry) matches
      * any, for back-compat with single-image contexts. With PS3RECOMP_SPU_FTZ
      * on for this run, prefer the variant-1 (MXCSR FTZ|DAZ) function and fall
-     * back to the default one if this image has no twin. With the key off the
-     * first registered match is returned exactly as before. */
+     * back to the default one if this image has no twin. With the key off only
+     * variant 0 is ever returned, on its first match, regardless of the order
+     * the twin and base were registered in. */
     spu_fn fallback = NULL;
     int fallback_image = 0;
     const int want_variant = g_spu_ftz_variant;
@@ -1979,13 +1980,13 @@ spu_fn spu_lookup(uint32_t addr, int image_id)   /* exported: clang-built fast-p
         if (e->addr != addr ||
             !(image_id == 0 || e->image_id == 0 || e->image_id == image_id))
             continue;
-        if (want_variant && e->variant) {
+        if (e->variant == want_variant) {
             /* One compare on the return path; the report itself is rare. */
             if (e->image_id != image_id)
                 spu_report_cross_image(addr, image_id, e->image_id);
             return e->fn;
         }
-        if (!fallback) { fallback = e->fn; fallback_image = e->image_id; }
+        if (!fallback && !e->variant) { fallback = e->fn; fallback_image = e->image_id; }
     }
     if (fallback && fallback_image != image_id)
         spu_report_cross_image(addr, image_id, fallback_image);
