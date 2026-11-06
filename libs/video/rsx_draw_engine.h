@@ -224,6 +224,9 @@ typedef struct rsx_draw_backend {
     /* Resolve a depth target into a sampleable texture and return it; 0 when
      * the backend cannot. The engine only asks after a depth-writing draw. */
     u32  (*depth_snapshot)(void* user, u32 depth, u32 w, u32 h);
+    /* Optional: a shared 1x1 float texture holding `value`, for a depth map
+     * that was cleared and never drawn into; 0 when the backend cannot. */
+    u32  (*depth_constant)(void* user, float value);
 
     /* Pipelines, from the decompilers' HLSL plus the state that selects a
      * variant. This is the one call that hides D3DCompile against glslang
@@ -553,6 +556,46 @@ void rsx_wprof_note_drain(unsigned long long ns);
 void rsx_wprof_note_dispatch(unsigned long long ns);
 /* A FIFO flip word: the pass that contains it completes a frame. */
 void rsx_wprof_note_flip(void);
+/* PS3RECOMP_WALKER_WAITS=1 (default 0): wall time the walker thread spends in
+ * each blocking site, one [walker-waits] line per [walker-prof] report. Off, a
+ * site costs one thread-local load. Only the thread between rsx_ww_enter and
+ * rsx_ww_leave (the FIFO walker pass) is counted. docs/walker-waits.md. */
+enum {
+    RSX_WW_FIFO_LOCK,    /* s_gcm_fifo_lock acquire, before the drain timer starts */
+    RSX_WW_WCB_LOCK,     /* wcb_lock contention with a faulting guest thread */
+    RSX_WW_QSUBMIT,      /* queue_mu + vkQueueSubmit */
+    RSX_WW_ONESHOT,     /* vk_submit_and_wait: submit + fence (readback, create, snapshot) */
+    RSX_WW_EBS_SWAP,    /* pipelined batch: fence of the set about to be reused */
+    RSX_WW_EBS_OTHER,   /* pipelined batch: fences of every other set */
+    RSX_WW_PRES_DONE,   /* previous present's fence (vk_present_complete_locked) */
+    RSX_WW_PRES_GPU,    /* vk_present_wait_gpu */
+    RSX_WW_PRES_MU,     /* present_mu acquire */
+    RSX_WW_ACQUIRE,     /* vkAcquireNextImageKHR */
+    RSX_WW_PIPE_ASYNC,  /* vk_pa_wait: async shader translation */
+    RSX_WW_PIPE_CREATE, /* s_pipe_create_mu + vkCreateGraphicsPipelines */
+    RSX_WW_TEX_TOKEN,   /* eng_tex_token_wait spin (WALKER_MT texture resolver) */
+    RSX_WW_MT_TURN,     /* eng_mt_wait_turn / wait_upto spin (WALKER_MT) */
+    RSX_WW_COUNT
+};
+extern __thread int g_rsx_ww_walker;
+/* Names the engine call site of the next backend submit_and_wait ([oneshot-by] flush:engine split). */
+extern const char* g_rsx_ww_ctx;
+void rsx_ww_enter(void);
+void rsx_ww_leave(void);
+void rsx_ww_add(int site, unsigned long long ns);
+static inline unsigned long long rsx_ww_begin(void)
+{
+    return g_rsx_ww_walker ? rsx_wprof_now() : 0;
+}
+static inline void rsx_ww_end(int site, unsigned long long t0)
+{
+    if (t0) rsx_ww_add(site, rsx_wprof_now() - t0);
+}
+void rsx_ww_add_tag(int site, unsigned long long ns, const char* who);
+static inline void rsx_ww_end_tag(int site, unsigned long long t0, const char* who)
+{
+    if (t0) rsx_ww_add_tag(site, rsx_wprof_now() - t0, who);
+}
 /* vkCreate*Pipelines time, reported as `pipecrt`/`pipems` in the next report. */
 void rsx_wprof_note_pipeline_create(unsigned long long ns);
 /* Log and reset the frame counters if a flip was seen in this pass.
@@ -566,6 +609,8 @@ void rsx_wprof_drain_end(int profiled);
  * frame so the per-frame texture revalidation / hash cadence and the
  * last_use ageing follow the live path instead of staying on frame 0. */
 void rsx_draw_engine_replay_advance_frame(void);
+/* Replay image check: present the colour surface written last. */
+void rsx_draw_engine_replay_present_last(void);
 
 /* Live switches from PS3RECOMP_CTL (cellGcmSys polls the file and calls these
  * on the walker thread). Changing WALKER_FAST flushes the fetch/pipeline
@@ -577,6 +622,10 @@ void rsx_draw_engine_set_remap_cache(int on);
 void rsx_draw_engine_set_memo_index(int on);
 void rsx_draw_engine_set_refs_hash_fast(int on);
 void rsx_draw_engine_set_no_draw(int on);
+/* Unit tests: force PS3RECOMP_ENG_DEPTH_GPU on/off (-1 follows the key again). */
+void rsx_draw_engine_set_depth_gpu(int on);
+/* Unit tests: force PS3RECOMP_ENG_SHADOW_CONST on/off (-1 follows the key again). */
+void rsx_draw_engine_set_shadow_const(int on);
 
 /* Captured dispatcher state: enough to start a replay at the frame boundary
  * the capture began on. The sink and the coverage counters are not part of
