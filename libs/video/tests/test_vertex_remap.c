@@ -109,6 +109,46 @@ int main(void)
     setenv("PS3RECOMP_REMAP_DIRECT", "0", 1);
     rsx_vertex_remap_reload_env();
 
+    /* PS3RECOMP_REMAP_FLAT: same collapse as the hashing path, including a
+     * second build on the same object (generation tags), a different base
+     * (falls back) and a span past the flat limit (falls back). */
+    {
+        enum { FN = 600 };
+        rsx_vertex_ref src[FN], a[FN], b[FN];
+        rsx_vertex_remap ra, rb;
+        memset(&rb, 0, sizeof rb);
+        for (int pass = 0; pass < 4; pass++) {
+            for (u32 i = 0; i < FN; i++) {
+                src[i].vertex_id = pass == 2
+                    ? ((i * 2654435761u) & 0xFFFFFFu)
+                    : ((i * 17u + (i / 7u) * 3u) % (pass ? 4001u : 211u)) + 90000u;
+                src[i].base_index = pass == 1 && i == 300 ? 6 : 5;
+            }
+            memcpy(a, src, sizeof a);
+            memcpy(b, src, sizeof b);
+            u32 ua = 0, ub = 0;
+            memset(&ra, 0, sizeof ra);
+            setenv("PS3RECOMP_REMAP_FLAT", "0", 1);
+            rsx_vertex_remap_reload_env();
+            assert(rsx_vertex_remap_build(&ra, a, FN, &ua));
+            setenv("PS3RECOMP_REMAP_FLAT", "1", 1);
+            rsx_vertex_remap_reload_env();
+            assert(rsx_vertex_remap_build(&rb, b, FN, &ub));   /* rb is reused */
+            assert(ua == ub);
+            for (u32 i = 0; i < ua; i++) {
+                assert(a[i].vertex_id == b[i].vertex_id);
+                assert(a[i].base_index == b[i].base_index);
+            }
+            for (u32 i = 0; i < FN; i++)
+                assert(rsx_vertex_remap_index(&ra, i) ==
+                       rsx_vertex_remap_index(&rb, i));
+            rsx_vertex_remap_destroy(&ra);
+        }
+        rsx_vertex_remap_destroy(&rb);
+    }
+    setenv("PS3RECOMP_REMAP_FLAT", "0", 1);
+    rsx_vertex_remap_reload_env();
+
     /* Incremental reference hash: folding each reference as it is appended
      * must give exactly rsx_vertex_refs_hash() of the finished list (the draw
      * engine uses the fold to skip a second pass over the list). Includes the
