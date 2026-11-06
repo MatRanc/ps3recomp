@@ -3269,6 +3269,16 @@ static void gcm_rsx_process_fifo_unlocked(void)
             continue;
         }
         u32 type = w >> 29;
+        /* GCM_JUMP_NEW_LOG=1: count header words in the new JUMP form (offset | 1, top three bits 0). A valid method
+         * header never has the low bits 01, so each hit is a new-style JUMP this walker reads as a count-0 header
+         * (diagnostic for upstream #675, default off). */
+        { static int jl = -1; static unsigned long long jn;
+          if (jl < 0) { const char* e = getenv("GCM_JUMP_NEW_LOG"); jl = e && *e && *e != '0'; }
+          if (jl && (w & 0xE0000003u) == 1u) {
+              ++jn;
+              if (jn <= 20 || !(jn & (jn - 1)))
+                  fprintf(stderr, "[jump-new] n=%llu at io=%08X w=%08X put=%08X\n", jn, s_fifo_getoff, w, put);
+          } }
         /* The walker is reading something other than the park it waited on:
          * it has left it, by the patched word (a JUMP elsewhere, or commands
          * written over the park) or by a resync. Forget the park here. Kept,
