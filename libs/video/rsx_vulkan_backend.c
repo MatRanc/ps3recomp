@@ -143,7 +143,7 @@ static void vk_pipe_create_done(const char* what, unsigned long long t0)
     X(vkCmdBeginRenderPass) X(vkCmdEndRenderPass) X(vkCmdBindPipeline) \
     X(vkCmdBindVertexBuffers) X(vkCmdBindDescriptorSets) X(vkCmdPushConstants) \
     X(vkCmdSetViewport) X(vkCmdSetScissor) X(vkCmdDraw) X(vkCmdDispatch) \
-    X(vkCmdSetStencilReference) X(vkCmdSetDepthBounds) \
+    X(vkCmdSetStencilReference) X(vkCmdSetDepthBounds) X(vkCmdSetDepthBias) \
     X(vkCmdBindIndexBuffer) X(vkCmdDrawIndexed) \
     X(vkCreateSemaphore) X(vkDestroySemaphore) X(vkCmdBlitImage)
 /* Window-system entry points, loaded only when a window was requested, so a
@@ -859,7 +859,18 @@ static int s_pass_open;
 static VkRenderPass s_pass_rp;
 static VkFramebuffer s_pass_fb;
 /* PS3RECOMP_VK_DRAW_STATE: dynamic state last set inside the open pass. */
-static struct { int valid; VkPipeline pipe; VkViewport vp; VkRect2D sc; u32 sref; float db[2]; } s_pass_st;
+static struct { int valid; VkPipeline pipe; VkViewport vp; VkRect2D sc; u32 sref; float db[2]; float dbias[2]; } s_pass_st;
+
+/* PS3RECOMP_VK_DEPTH_BIAS=1 (read once: pipelines bake it): engine pipelines
+ * take the guest's polygon offset as dynamic depth bias. Without it shadow
+ * casters are drawn unbiased and the receivers self-shadow (cloth stipple,
+ * docs/notes/uniform-moire.md). */
+static int vk_depth_bias_on(void)
+{
+    static int on = -1;
+    if (on < 0) { const char* e = getenv("PS3RECOMP_VK_DEPTH_BIAS"); on = e && *e && strcmp(e, "0") != 0; }
+    return on;
+}
 
 static void vk_pass_close(void)
 {
@@ -4175,6 +4186,7 @@ typedef struct vk_e2_state {
     int          have_vp, have_sc;
     u32          stencil_ref;
     float        depth_bounds[2];     /* min, max for the next draw */
+    float        depth_bias[2];       /* constant, slope for the next draw (PS3RECOMP_VK_DEPTH_BIAS) */
     vk_buffer    indices;
     u32          warned;
     /* The split set layout (vk_eng_split_layout) and its one set, made the
@@ -4847,6 +4859,7 @@ static VkPipeline vk_eng_variant_create(vk_eng_pipe* P, u32 topo_idx)
                                                                            : VK_CULL_MODE_BACK_BIT,
         .frontFace = (rs->front_face == 0x0901u) ? VK_FRONT_FACE_COUNTER_CLOCKWISE
                                                  : VK_FRONT_FACE_CLOCKWISE,
+        .depthBiasEnable = vk_depth_bias_on() ? VK_TRUE : VK_FALSE,
         .lineWidth = 1.0f };
     VkPipelineMultisampleStateCreateInfo ms = {
         .sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
@@ -4917,11 +4930,14 @@ static VkPipeline vk_eng_variant_create(vk_eng_pipe* P, u32 topo_idx)
     VkPipelineColorBlendStateCreateInfo cb = {
         .sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,
         .attachmentCount = P->rt_count, .pAttachments = cba };
-    VkDynamicState dyn[4] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR,
-                              VK_DYNAMIC_STATE_STENCIL_REFERENCE, VK_DYNAMIC_STATE_DEPTH_BOUNDS };
+    VkDynamicState dyn[5] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR,
+                              VK_DYNAMIC_STATE_STENCIL_REFERENCE };
+    u32 ndyn = 3;
+    if (s_vk.depth_bounds_ok) dyn[ndyn++] = VK_DYNAMIC_STATE_DEPTH_BOUNDS;
+    if (vk_depth_bias_on()) dyn[ndyn++] = VK_DYNAMIC_STATE_DEPTH_BIAS;
     VkPipelineDynamicStateCreateInfo dy = {
         .sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO,
-        .dynamicStateCount = s_vk.depth_bounds_ok ? 4u : 3u, .pDynamicStates = dyn };
+        .dynamicStateCount = ndyn, .pDynamicStates = dyn };
     VkGraphicsPipelineCreateInfo gci = {
         .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
         .stageCount = 2, .pStages = st, .pVertexInputState = &vi, .pInputAssemblyState = &ia,
@@ -5101,6 +5117,18 @@ static void vk_eng_set_depth_bounds(void* user, float min, float max)
     s_e2.depth_bounds[1] = vk_depth_bound(max, 1.0f);
 }
 
+/* The guest's SET_POLY_OFFSET: `units` are steps of the guest zeta format
+ * (2^-24 for Z24S8, 2^-16 for Z16). The host D32F target's unit is 2^-24 for
+ * depths in [0.5, 1) and smaller below, so a near caster gets less bias than
+ * on RSX. shortcut: exact only for depth >= 0.5; convert in the vertex shader
+ * if near-depth acne remains. */
+static void vk_eng_set_depth_bias(void* user, float slope, float units, u32 depth_bits)
+{
+    vk_bind_user(user);
+    s_e2.depth_bias[0] = depth_bits == 16u ? units * 256.0f : units;
+    s_e2.depth_bias[1] = slope;
+}
+
 static VkFramebuffer vk_eng_framebuffer(VkRenderPass rp, const u32* rt, u32 n, VkImageView dview,
                                         u32 dkey, u32 w, u32 h)
 {
@@ -5185,6 +5213,10 @@ static VkSampler vk_eng_sampler(const rsx_be_sampler_desc* d)
     u32 lo, hi;
     memcpy(&lo, &d->min_lod, 4); memcpy(&hi, &d->max_lod, 4);
     const u32 aniso = vk_eng_aniso(d);
+    /* PS3RECOMP_ENG_LOD_BIAS=<float> (diagnostic, read once): a mip LOD bias
+     * on every engine sampler, to test whether a shimmer is a mip choice. */
+    static float bias = -1000.0f;
+    if (bias == -1000.0f) { const char* e = getenv("PS3RECOMP_ENG_LOD_BIAS"); bias = e ? (float)atof(e) : 0.0f; }
     const u64 key = (u64)d->min_linear | ((u64)d->mag_linear << 1) | ((u64)d->mip_linear << 2)
                   | ((u64)d->mip_present << 3) | ((u64)(d->wrap_s & 0xF) << 4)
                   | ((u64)(d->wrap_t & 0xF) << 8) | ((u64)(d->wrap_r & 0xF) << 12)
@@ -5200,6 +5232,7 @@ static VkSampler vk_eng_sampler(const rsx_be_sampler_desc* d)
         .mipmapMode = d->mip_linear ? VK_SAMPLER_MIPMAP_MODE_LINEAR : VK_SAMPLER_MIPMAP_MODE_NEAREST,
         .addressModeU = vk_gcm_wrap(d->wrap_s), .addressModeV = vk_gcm_wrap(d->wrap_t),
         .addressModeW = vk_gcm_wrap(d->wrap_r),
+        .mipLodBias = bias,
         .anisotropyEnable = aniso ? VK_TRUE : VK_FALSE, .maxAnisotropy = aniso ? (float)aniso : 1.0f,
         .minLod = min_lod, .maxLod = max_lod,
         .borderColor = VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK };
@@ -5723,6 +5756,12 @@ static VkDescriptorSet vk_eng_write_descriptors_to(const vk_eng_pipe* P, VkDescr
         const int cube = (P->cube_mask >> u) & 1u;
         VkImageView v = ((s_e2.tex_mask >> u) & 1u) ? vk_eng_sample_view(s_e2.tex[u], cube)
                                                      : VK_NULL_HANDLE;
+        /* PS3RECOMP_DBG_DUMMY_VKFMT=<VkFormat> (diagnostic, read once): units
+         * bound to an object of that format sample the dummy instead. */
+        static int dbg_fmt = -2;
+        if (dbg_fmt == -2) { const char* e = getenv("PS3RECOMP_DBG_DUMMY_VKFMT"); dbg_fmt = e ? atoi(e) : -1; }
+        if (v && dbg_fmt >= 0 && s_e2.tex[u] < VK_ENG_MAX_OBJ &&
+            (int)s_eobj[s_e2.tex[u]].fmt == dbg_fmt) v = VK_NULL_HANDLE;
         VkSampler smp = v ? vk_eng_sampler(&s_e2.samp[u]) : s_vk.sampler;
         /* A bound handle whose kind/cube does not match the unit samples the
          * dummy. Handles that failed to resolve were counted by the engine. */
@@ -6043,9 +6082,12 @@ static int vk_eng_draw_from(rsx_topology topology, const void* vertices,
         pvkCmdSetStencilReference(s_vk.cmd, VK_STENCIL_FACE_FRONT_AND_BACK, sref);
     if (s_vk.depth_bounds_ok && !(ds_on && !memcmp(s_pass_st.db, s_e2.depth_bounds, sizeof s_pass_st.db)))
         pvkCmdSetDepthBounds(s_vk.cmd, s_e2.depth_bounds[0], s_e2.depth_bounds[1]);
+    if (vk_depth_bias_on() && !(ds_on && !memcmp(s_pass_st.dbias, s_e2.depth_bias, sizeof s_pass_st.dbias)))
+        pvkCmdSetDepthBias(s_vk.cmd, s_e2.depth_bias[0], 0.0f, s_e2.depth_bias[1]);
     if (keep) {
         s_pass_st.pipe = pipe; s_pass_st.vp = vp; s_pass_st.sc = sc; s_pass_st.sref = sref;
         memcpy(s_pass_st.db, s_e2.depth_bounds, sizeof s_pass_st.db);
+        memcpy(s_pass_st.dbias, s_e2.depth_bias, sizeof s_pass_st.dbias);
         s_pass_st.valid = 1;
     }
     DP_T1(5);
@@ -6451,6 +6493,8 @@ static int vk_mt_draw(vk_mt_ctx* c, rsx_topology topology, const void* vertices,
     pvkCmdSetStencilReference(c->cmd, VK_STENCIL_FACE_FRONT_AND_BACK, s_e2.stencil_ref & 0xFFu);
     if (s_vk.depth_bounds_ok)
         pvkCmdSetDepthBounds(c->cmd, s_e2.depth_bounds[0], s_e2.depth_bounds[1]);
+    if (vk_depth_bias_on())
+        pvkCmdSetDepthBias(c->cmd, s_e2.depth_bias[0], 0.0f, s_e2.depth_bias[1]);
     pvkCmdBindDescriptorSets(c->cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
                              P->cube_mask ? c->e2.split_pipe_layout : s_g.pipe_layout,
                              0, 1, &set, 0, NULL);
@@ -6522,6 +6566,7 @@ static const rsx_draw_backend s_vk_engine_backend = {
     .set_scissor          = vk_eng_set_scissor,
     .set_stencil_ref      = vk_eng_set_stencil_ref,
     .set_depth_bounds     = vk_eng_set_depth_bounds,
+    .set_depth_bias       = vk_eng_set_depth_bias,
     .draw                 = vk_eng_draw,
     .draw_fill            = vk_eng_draw_fill,
     .clear_color          = vk_eng_clear_color,

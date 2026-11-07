@@ -5674,7 +5674,10 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
             snprintf(path, sizeof path, "%s/%s.vs.hlsl", dir, stem);
             if ((f = fopen(path, "w"))) { fputs(s_vs_hlsl, f); fclose(f); }
             snprintf(path, sizeof path, "%s/%s.ps.hlsl", dir, stem);
-            if ((f = fopen(path, "w"))) { fputs(s_ps_hlsl, f); fclose(f); }
+            if ((f = fopen(path, "w"))) {
+                fprintf(f, "// fp 0x%016llX\n", (unsigned long long)fp_hash);
+                fputs(s_ps_hlsl, f); fclose(f);
+            }
             if (!fixed && fp_uc && fp_size) {
                 u32 fp_loc = 0;
                 const u32 fp_off = rsx_dsp_fragment_program(&g.rsx, &fp_loc);
