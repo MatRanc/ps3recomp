@@ -308,6 +308,7 @@ typedef struct vk_state {
     int              bc_ok;           /* textureCompressionBC enabled       */
     int              depth_bounds_ok; /* depthBounds enabled                */
     int              indep_blend_ok;  /* independentBlend: per-target MRT state */
+    float            max_aniso;       /* samplerAnisotropy limit, 0 without the feature */
     u32              max_dim;         /* maxImageDimension2D of the device  */
     int              windowed;
     SDL_Window*      window;
@@ -4147,7 +4148,7 @@ static VkPipeline vk_eng_variant_create(vk_eng_pipe* P, u32 topo_idx);
 static int vk_eng_pipe_modules(vk_eng_pipe* P, const char* vs_hlsl, const char* ps_hlsl,
                                u64 key, u32* spv, u32 spv_max, char* log, u32 log_size);
 
-#define VK_ENG_SAMP_CACHE 64
+#define VK_ENG_SAMP_CACHE 256
 
 /* Every field of the E2 per-draw state is per recording context: the state
  * thread uses s_e2_global, each MT record worker its own copy. The object
@@ -5167,14 +5168,27 @@ static int vk_eng_ensure_indices(VkDeviceSize bytes)
 
 /* rsx_be_sampler_desc is the registers decoded the D3D12 way; the wrap codes
  * stay the guest's 1..8, which vk_gcm_wrap already translates. */
+/* PS3RECOMP_ENG_ANISO (default 0, live): apply the guest's max anisotropy.
+ * The cloth units ask for 2x-8x; without it they alias at a slant
+ * (docs/notes/uniform-moire.md). As the D3D12 backend: linear min and mag only. */
+static u32 vk_eng_aniso(const rsx_be_sampler_desc* d)
+{
+    int on;
+    if (ps3_live_ctl_get) on = ps3_live_ctl_get(PS3_LIVE_ENG_ANISO);
+    else { const char* e = getenv("PS3RECOMP_ENG_ANISO"); on = e && *e && strcmp(e, "0") != 0; }
+    if (!on || s_vk.max_aniso < 2.0f || d->aniso < 2 || !d->min_linear || !d->mag_linear) return 0;
+    return (float)d->aniso < s_vk.max_aniso ? d->aniso : (u32)s_vk.max_aniso;
+}
+
 static VkSampler vk_eng_sampler(const rsx_be_sampler_desc* d)
 {
     u32 lo, hi;
     memcpy(&lo, &d->min_lod, 4); memcpy(&hi, &d->max_lod, 4);
+    const u32 aniso = vk_eng_aniso(d);
     const u64 key = (u64)d->min_linear | ((u64)d->mag_linear << 1) | ((u64)d->mip_linear << 2)
                   | ((u64)d->mip_present << 3) | ((u64)(d->wrap_s & 0xF) << 4)
                   | ((u64)(d->wrap_t & 0xF) << 8) | ((u64)(d->wrap_r & 0xF) << 12)
-                  | ((u64)(lo >> 16) << 16) | ((u64)(hi >> 16) << 32);
+                  | ((u64)(lo >> 16) << 16) | ((u64)(hi >> 16) << 32) | ((u64)aniso << 48);
     for (u32 i = 0; i < s_esamp_count; i++) if (s_esamp[i].key == key) return s_esamp[i].s;
     if (s_esamp_count >= VK_ENG_SAMP_CACHE) return s_vk.sampler;
     float min_lod = d->min_lod, max_lod = d->mip_present ? d->max_lod : d->min_lod;
@@ -5186,6 +5200,7 @@ static VkSampler vk_eng_sampler(const rsx_be_sampler_desc* d)
         .mipmapMode = d->mip_linear ? VK_SAMPLER_MIPMAP_MODE_LINEAR : VK_SAMPLER_MIPMAP_MODE_NEAREST,
         .addressModeU = vk_gcm_wrap(d->wrap_s), .addressModeV = vk_gcm_wrap(d->wrap_t),
         .addressModeW = vk_gcm_wrap(d->wrap_r),
+        .anisotropyEnable = aniso ? VK_TRUE : VK_FALSE, .maxAnisotropy = aniso ? (float)aniso : 1.0f,
         .minLod = min_lod, .maxLod = max_lod,
         .borderColor = VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK };
     VkSampler smp;
@@ -6632,6 +6647,13 @@ static int vk_init_all(u32 width, u32 height, const char* title)
      * have their own); without it every target takes target A's. */
     want.independentBlend = have.independentBlend;
     s_vk.indep_blend_ok = have.independentBlend ? 1 : 0;
+    /* The guest's per-unit max anisotropy (PS3RECOMP_ENG_ANISO). */
+    want.samplerAnisotropy = have.samplerAnisotropy;
+    if (have.samplerAnisotropy) {
+        VkPhysicalDeviceProperties p;
+        pvkGetPhysicalDeviceProperties(s_vk.phys, &p);
+        s_vk.max_aniso = p.limits.maxSamplerAnisotropy;
+    }
     VkDeviceCreateInfo dci = { .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
                                .queueCreateInfoCount = 1, .pQueueCreateInfos = &qci,
                                .enabledExtensionCount = s_vk.windowed ? 1u : 0u,

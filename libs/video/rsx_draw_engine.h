@@ -73,6 +73,8 @@ typedef struct rsx_be_sampler_desc {
      * edge texel instead -- nearer than black for the colours seen (a video
      * title's chroma planes border at 0x80, neutral). */
     u8  border;
+    /* SET_TEXTURE_CONTROL0 max anisotropy [6:4] as a sample count, 1..16. */
+    u8  aniso;
     float min_lod, max_lod;
 } rsx_be_sampler_desc;
 

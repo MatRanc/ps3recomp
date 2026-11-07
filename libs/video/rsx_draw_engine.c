@@ -182,6 +182,9 @@ typedef struct {
      * bytes are not known to be valid. */
     u64 guest_valid_serial;
     u32 guest_valid_x, guest_valid_y, guest_valid_w, guest_valid_h;
+    /* SET_SURFACE_FORMAT raster type 2: RSX stores this target in Morton
+     * order (a render-to-texture whose texture declares a swizzled layout). */
+    int swizzled;
 } eng_surface;
 
 typedef struct {
@@ -2334,6 +2337,7 @@ static u32 eng_current_target_set(u32 slots[RSX_BE_MAX_COLOR_TARGETS])
                                       sf.clip_w, sf.clip_h, fmt, sf.color_pitch[sel], aa_grid);
     if (first == ENG_INVALID) return 0;
     g.surfaces[first].pitch = sf.color_pitch[sel];
+    g.surfaces[first].swizzled = sf.raster_type == 2u;
     slots[0] = first;
     u32 n = 1;
 
@@ -2351,6 +2355,7 @@ static u32 eng_current_target_set(u32 slots[RSX_BE_MAX_COLOR_TARGETS])
                                          sf.color_pitch[i + 1], aa_grid);
         if (slot == ENG_INVALID) break;
         g.surfaces[slot].pitch = sf.color_pitch[i + 1];
+        g.surfaces[slot].swizzled = sf.raster_type == 2u;
         /* A set naming one buffer twice would attach the same target twice,
          * which no host API allows. */
         int seen = 0;
@@ -2606,8 +2611,7 @@ static void eng_row_convert(u8* dst, const u8* src, u32 w, int rgba, int to_gues
  * bytes into each. `forced`: the destination may still be protected for
  * on-demand readback, so write through rsx_wcb_store, as one write when the
  * rows are already laid out exactly as guest memory is. */
-static void eng_color_rows_store(u32 bpp, u32 location, u32 offset, u32 pitch, u8* rows,
-                                 u32 n, u32 h, u32 skip, u32 bytes, int forced)
+static void eng_color_rows_convert(u32 bpp, u8* rows, u32 n, u32 h)
 {
     const int rgba = rsx_texture_argb_is_rgba();
     const size_t stride = (size_t)n * bpp;
@@ -2623,6 +2627,13 @@ static void eng_color_rows_store(u32 bpp, u32 location, u32 offset, u32 pitch, u
             eng_row_convert(src, src, n, 0, 1);   /* in place: one pixel per load/store */
         }
     }
+}
+
+static void eng_color_rows_store(u32 bpp, u32 location, u32 offset, u32 pitch, u8* rows,
+                                 u32 n, u32 h, u32 skip, u32 bytes, int forced)
+{
+    const size_t stride = (size_t)n * bpp;
+    eng_color_rows_convert(bpp, rows, n, h);
     if (forced && !skip && bytes == stride && bytes == pitch && h) {
         u8* dst = (u8*)eng_guest_ptr_raw(location, offset, pitch * h);
         if (dst) { rsx_wcb_store(dst, rows, (size_t)pitch * h); return; }
@@ -2640,6 +2651,51 @@ static void eng_color_rows_store(u32 bpp, u32 location, u32 offset, u32 pitch, u
             memcpy(dst, src, bytes);
         }
     }
+}
+
+/* PS3RECOMP_ENG_SWZ_RT (default 0, live): store a whole raster-type-2
+ * (swizzled) colour target back to guest memory in Morton order, as RSX
+ * does, instead of as pitch rows. The texture that samples it declares a
+ * swizzled layout; the linear copy is what made the tiled wipes
+ * (docs/notes/tiled-wipe.md). Returns 1 when it stored the surface. */
+static int eng_swz_rt_on(void)
+{
+    if (ps3_live_ctl_get) return ps3_live_ctl_get(PS3_LIVE_ENG_SWZ_RT);
+    static int on = -1;
+    if (on < 0) { const char* e = getenv("PS3RECOMP_ENG_SWZ_RT"); on = e && *e && strcmp(e, "0") != 0; }
+    return on;
+}
+
+static int eng_color_store_swizzled(const eng_surface* s, u32 bpp, u8* rows, int forced)
+{
+    if (!s->swizzled || !eng_swz_rt_on() || !s->w || !s->h ||
+        (s->w & (s->w - 1u)) || (s->h & (s->h - 1u))) return 0;
+    const size_t bytes = (size_t)s->w * s->h * bpp;
+    u8* swz = (u8*)malloc(bytes);
+    if (!swz) return 0;
+    /* Converts `rows` in place to guest byte order; the pitch-row store that
+     * follows is then rewritten pixel by pixel into the Morton buffer. */
+    u8* dst = (u8*)(forced ? eng_guest_ptr_raw(s->location, s->offset, (u32)bytes)
+                           : eng_guest_ptr(NULL, s->location, s->offset, (u32)bytes));
+    if (!dst) { free(swz); return 0; }
+    eng_color_rows_convert(bpp, rows, s->w, s->h);
+    const u32 l2w = rsx_log2_ceil(s->w), l2h = rsx_log2_ceil(s->h);
+    for (u32 y = 0; y < s->h; y++)
+        for (u32 x = 0; x < s->w; x++)
+            memcpy(swz + (size_t)rsx_swizzle_offset(x, y, l2w, l2h) * bpp,
+                   rows + ((size_t)y * s->w + x) * bpp, bpp);
+    if (forced) {
+        rsx_wcb_store(dst, swz, bytes);
+    } else {
+        rsx_texdirty_note_write_host(dst, bytes);
+        memcpy(dst, swz, bytes);
+    }
+    free(swz);
+    static u32 logs;
+    if (PS3_LOG_FIRST(logs, 16))
+        fprintf(stderr, "[rsx engine] swz-rt: stored %ux%u target %u:0x%08X in Morton order\n",
+                s->w, s->h, s->location, s->offset);
+    return 1;
 }
 
 void rsx_draw_engine_guest_read(u32 location, u32 offset, u32 pitch, u32 w, u32 h)
@@ -2727,7 +2783,9 @@ void rsx_draw_engine_guest_read(u32 location, u32 offset, u32 pitch, u32 w, u32 
         fprintf(stderr, "[rsx engine] guest_read %u:0x%08X %ux%u <- surface 0x%08X (%u bpp) at %u,%u:"
                         " %u non-zero pixels\n", location, offset, w, h, s->offset, bpp, x, y,
                 eng_nonzero_pixels(rows, n * h, bpp));
-    eng_color_rows_store(bpp, location, offset, pitch, rows, n, h, skip, bytes, 0);
+    if (!(x == 0 && y == 0 && !skip && n == s->w && h == s->h &&
+          eng_color_store_swizzled(s, bpp, rows, 0)))
+        eng_color_rows_store(bpp, location, offset, pitch, rows, n, h, skip, bytes, 0);
     eng_guest_valid_set(s, x, y, n, h);
     eng_light_probe_log(slot, s, x, y, n, h, streamed ? "stream" : "direct", rows, n,
                         probe_stored, probe_covers, 0);
@@ -4395,8 +4453,9 @@ static int eng_wcb_copy_surface(u32 slot, int use_ticket)
         (g_rsx_ww_ctx = "eng:wcb_copy_surface", g.be->submit_and_wait)(g.be->user, RSX_BE_FLUSH_GUEST_REFERENCE);
         g.be->readback(g.be->user, s->handle, rx, ry, rw, rh, rows, rw * bpp);
     }
-    eng_color_rows_store(bpp, s->location, s->offset + ry * s->pitch + rx * bpp,
-                         s->pitch, rows, rw, rh, 0, rw * bpp, 1);
+    if (!(full && eng_color_store_swizzled(s, bpp, rows, 1)))
+        eng_color_rows_store(bpp, s->location, s->offset + ry * s->pitch + rx * bpp,
+                             s->pitch, rows, rw, rh, 0, rw * bpp, 1);
     /* Drawn again since the queued copy: guest memory holds the sync point's
      * bytes, and the next sync point arms it again for the newer ones. A
      * rectangle-only copy leaves the rest stale and stays dirty either way. */
@@ -4876,6 +4935,8 @@ static void eng_decode_sampler(u32 filter, u32 wrap, u32 control0,
     out->wrap_s = (u8)(wrap & 0xFu);
     out->wrap_t = (u8)((wrap >> 8) & 0xFu);
     out->wrap_r = (u8)((wrap >> 16) & 0xFu);
+    static const u8 aniso[8] = { 1, 2, 4, 6, 8, 10, 12, 16 };
+    out->aniso = aniso[(control0 >> 4) & 7u];
     out->min_lod = (float)((control0 >> 19) & 0xFFFu) / 256.0f;
     out->max_lod = out->mip_present ? (float)((control0 >> 7) & 0xFFFu) / 256.0f
                                     : 0.0f;

@@ -110,6 +110,8 @@ enum {
     PS3_LIVE_WIPE_FIX,                  /* PS3RECOMP_WIPE_FIX: recover a Morton texture our linear readback copied out (see tiled-wipe.md) */
     PS3_LIVE_REMAP_FLAT,                /* PS3RECOMP_REMAP_FLAT: dense constant-base index lists dedup through a flat u32 table, branch-free */
     PS3_LIVE_ENG_PROG_MEMO,             /* PS3RECOMP_ENG_PROG_MEMO: reuse a fragment program's size/hash and a vertex program's input analysis while their bytes compare equal */
+    PS3_LIVE_ENG_ANISO,                 /* PS3RECOMP_ENG_ANISO: the Vulkan engine sampler applies the guest's max anisotropy (TEXTURE_CONTROL0 [6:4]) on linear units */
+    PS3_LIVE_ENG_SWZ_RT,                /* PS3RECOMP_ENG_SWZ_RT: store a whole raster-type-2 (swizzled) colour target back in Morton order */
     PS3_LIVE_COUNT
 };
 
