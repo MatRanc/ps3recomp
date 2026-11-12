@@ -186,6 +186,17 @@ if(PS3RECOMP_RSX_VULKAN)
     # PUBLIC: ps3recomp_host selects its backend on this definition.
     target_compile_definitions(ps3recomp_runtime PUBLIC PS3RECOMP_RSX_VULKAN)
     target_link_libraries(ps3recomp_runtime PUBLIC ${CMAKE_DL_LIBS})
+    if(WIN32)
+        # The optional window is SDL2, and Windows does not link SDL2 above.
+        # The LunarG SDK ships it: Include/SDL2 and Lib/SDL2.lib.
+        find_library(PS3RECOMP_SDL2_LIB NAMES SDL2
+            HINTS "${PS3RECOMP_VULKAN_INCLUDE_DIR}/../Lib" NO_DEFAULT_PATH)
+        if(NOT PS3RECOMP_SDL2_LIB)
+            message(FATAL_ERROR "SDL2.lib not found next to the Vulkan SDK. "
+                "Pass -DPS3RECOMP_SDL2_LIB=<path to SDL2.lib>")
+        endif()
+        target_link_libraries(ps3recomp_runtime PRIVATE "${PS3RECOMP_SDL2_LIB}")
+    endif()
     message(STATUS "  Vulkan:       RSX backend enabled (rsx_vulkan_backend.c, headers in ${PS3RECOMP_VULKAN_INCLUDE_DIR})")
 endif()
 
@@ -296,6 +307,11 @@ endif()
 # libs/video/rsx_shader_spirv.cpp is a stub and the Vulkan backend stays on
 # its fixed-function path.
 if(PS3RECOMP_RSX_VULKAN)
+    if(NOT UNIX)
+        # The lookup above runs on UNIX only. The LunarG SDK's glslang config is
+        # one folder down, so set glslang_DIR to Lib/cmake/glslang/glslang.
+        find_package(glslang CONFIG QUIET)
+    endif()
     if(glslang_FOUND AND TARGET glslang::glslang AND TARGET glslang::SPIRV)
         set_source_files_properties(
             "${CMAKE_CURRENT_SOURCE_DIR}/libs/video/rsx_shader_spirv.cpp"
