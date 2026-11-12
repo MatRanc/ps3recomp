@@ -3,7 +3,7 @@
 #endif
 #include "vk_pipe_queue.h"
 
-#include <pthread.h>
+#include "vk_win32_compat.h"
 #include <stdlib.h>
 #include <string.h>
 

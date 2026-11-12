@@ -136,7 +136,17 @@ void     cellGcmFlipOnPresent(void);          /* completes the flip on present *
  * path anywhere else -- the same selection runtime/host/host_posix.c and the
  * toolkit's boot harness make. All three expose the same three entry points,
  * so the frame clock below is backend-agnostic. */
-#if defined(_WIN32)
+/* An explicit Vulkan build wins on every host (Windows included); without it
+ * Windows gets D3D12 as before. */
+#if defined(PS3RECOMP_RSX_VULKAN)
+extern "C" int  rsx_vulkan_backend_init(uint32_t w, uint32_t h, const char* title);
+extern "C" void rsx_vulkan_backend_present(void);
+extern "C" int  rsx_vulkan_backend_pump_messages(void);
+#  define rsx_backend_init    rsx_vulkan_backend_init
+#  define rsx_backend_present rsx_vulkan_backend_present
+#  define rsx_backend_pump    rsx_vulkan_backend_pump_messages
+#  define RSX_BACKEND_NAME    "Vulkan"
+#elif defined(_WIN32)
 extern "C" int  rsx_d3d12_backend_init(uint32_t w, uint32_t h, const char* title);
 extern "C" void rsx_d3d12_backend_present(void);
 extern "C" int  rsx_d3d12_backend_pump_messages(void);
@@ -152,14 +162,6 @@ extern "C" int  rsx_metal_backend_pump_messages(void);
 #  define rsx_backend_present rsx_metal_backend_present
 #  define rsx_backend_pump    rsx_metal_backend_pump_messages
 #  define RSX_BACKEND_NAME    "Metal"
-#elif defined(PS3RECOMP_RSX_VULKAN)
-extern "C" int  rsx_vulkan_backend_init(uint32_t w, uint32_t h, const char* title);
-extern "C" void rsx_vulkan_backend_present(void);
-extern "C" int  rsx_vulkan_backend_pump_messages(void);
-#  define rsx_backend_init    rsx_vulkan_backend_init
-#  define rsx_backend_present rsx_vulkan_backend_present
-#  define rsx_backend_pump    rsx_vulkan_backend_pump_messages
-#  define RSX_BACKEND_NAME    "Vulkan"
 #else
 extern "C" int  rsx_null_backend_init(uint32_t w, uint32_t h, const char* title);
 extern "C" void rsx_null_backend_present(void);

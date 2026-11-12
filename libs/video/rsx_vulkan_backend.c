@@ -38,8 +38,6 @@
  * with spaces.
  */
 
-#ifndef _WIN32
-
 #define VK_NO_PROTOTYPES
 #include <vulkan/vulkan.h>
 
@@ -63,11 +61,19 @@
 
 /* SDL2 is already required off Windows (cellPad, cellAudio); here it only
  * opens the optional window. Same include style as those two. */
-#include <SDL2/SDL.h>
-#include <SDL2/SDL_vulkan.h>
+#if defined(__has_include)
+#  if __has_include(<SDL2/SDL.h>)
+#    include <SDL2/SDL.h>
+#    include <SDL2/SDL_vulkan.h>
+#  else
+#    include <SDL.h>
+#    include <SDL_vulkan.h>
+#  endif
+#else
+#  include <SDL2/SDL.h>
+#  include <SDL2/SDL_vulkan.h>
+#endif
 
-#include <dlfcn.h>
-#include <pthread.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -108,6 +114,8 @@ static void vk_pipe_create_done(const char* what, unsigned long long t0)
                 what, (double)ns / 1000.0, ps3_ms_now());
     vk_pipe_cache_tick();
 }
+
+#include "vk_win32_compat.h"
 
 /* ---------------------------------------------------------------------------
  * Run-time loaded entry points (Vulkan 1.0 core only)
@@ -353,17 +361,42 @@ static unsigned long long s_pipe_cache_saved;
 /* ---------------------------------------------------------------------------
  * Loading
  * -------------------------------------------------------------------------*/
+#ifdef _WIN32
+/* The NVIDIA/AMD/Intel driver installs vulkan-1.dll into System32. */
+static void* vk_dlopen_win(const char* name) { return (void*)LoadLibraryA(name); }
+static void* vk_dlsym_win(void* lib, const char* sym) { return (void*)GetProcAddress((HMODULE)lib, sym); }
+static const char* vk_dlerror_win(void)
+{
+    static char buf[64];
+    snprintf(buf, sizeof buf, "error %lu", (unsigned long)GetLastError());
+    return buf;
+}
+#  define VK_DLOPEN(n)  vk_dlopen_win(n)
+#  define VK_DLSYM(l,s) vk_dlsym_win((l), (s))
+#  define VK_DLERROR()  vk_dlerror_win()
+#  define VK_DLCLOSE(l) FreeLibrary((HMODULE)(l))
+#else
+#  define VK_DLOPEN(n)  dlopen((n), RTLD_NOW | RTLD_LOCAL)
+#  define VK_DLSYM(l,s) dlsym((l), (s))
+#  define VK_DLERROR()  dlerror()
+#  define VK_DLCLOSE(l) dlclose((l))
+#endif
+
 static int vk_load_library(void)
 {
+#ifdef _WIN32
+    static const char* names[] = { "vulkan-1.dll" };
+#else
     static const char* names[] = { "libvulkan.so.1", "libvulkan.so" };
+#endif
     for (size_t i = 0; i < sizeof names / sizeof names[0] && !s_vk.lib; i++)
-        s_vk.lib = dlopen(names[i], RTLD_NOW | RTLD_LOCAL);
+        s_vk.lib = VK_DLOPEN(names[i]);
     if (!s_vk.lib) {
-        VK_LOG("no Vulkan loader found (dlopen libvulkan.so.1: %s)\n", dlerror());
+        VK_LOG("no Vulkan loader found (dlopen %s: %s)\n", names[0], VK_DLERROR());
         return -1;
     }
     pvkGetInstanceProcAddr =
-        (PFN_vkGetInstanceProcAddr)dlsym(s_vk.lib, "vkGetInstanceProcAddr");
+        (PFN_vkGetInstanceProcAddr)VK_DLSYM(s_vk.lib, "vkGetInstanceProcAddr");
     if (!pvkGetInstanceProcAddr) { VK_LOG("libvulkan has no vkGetInstanceProcAddr\n"); return -1; }
 #define LOAD_G(name) \
     if (!(p##name = (PFN_##name)pvkGetInstanceProcAddr(VK_NULL_HANDLE, #name))) \
@@ -5819,8 +5852,7 @@ static unsigned long long s_dp_ns[8], s_dp_n[9];
 static unsigned long long s_dp_t0;
 static inline unsigned long long vk_dp_ns(void)
 {
-    struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t);
-    return (unsigned long long)t.tv_sec * 1000000000ull + (unsigned long long)t.tv_nsec;
+    return vk_mono_ns();
 }
 static void vk_dp_log(void)
 {
@@ -6871,7 +6903,7 @@ void rsx_vulkan_backend_shutdown(void)
         pvkDestroyDevice(s_vk.device, NULL);
     }
     if (s_vk.instance && pvkDestroyInstance) pvkDestroyInstance(s_vk.instance, NULL);
-    if (s_vk.lib) dlclose(s_vk.lib);
+    if (s_vk.lib) VK_DLCLOSE(s_vk.lib);
     vk_pipe_async_shutdown();               /* report and free the worker state */
     free(s_vk.cpu_verts);
     pthread_mutex_destroy(&s_vk.queue_mu);
@@ -6946,5 +6978,3 @@ int rsx_vulkan_backend_depth_bounds(void)
 {
     return s_vk.eng_active && s_vk.depth_bounds_ok;
 }
-
-#endif /* !_WIN32 */

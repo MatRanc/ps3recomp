@@ -51,11 +51,11 @@ list(FILTER HLE_SOURCES EXCLUDE REGEX "rsx_tex_miss\\.c$")
 # The Vulkan RSX backend is opt-in while it grows (stage V0: clear + present).
 # It loads libvulkan at run time, so building needs only the Vulkan headers --
 # no target-architecture libvulkan, which keeps cross-compiling simple.
-option(PS3RECOMP_RSX_VULKAN "Build the Vulkan RSX backend (Linux)" OFF)
+option(PS3RECOMP_RSX_VULKAN "Build the Vulkan RSX backend (Linux, Windows)" OFF)
 list(FILTER HLE_SOURCES EXCLUDE REGEX "rsx_vulkan_backend\\.c$")
 if(PS3RECOMP_RSX_VULKAN)
-    if(WIN32 OR APPLE)
-        message(FATAL_ERROR "PS3RECOMP_RSX_VULKAN is Linux-only for now")
+    if(APPLE)
+        message(FATAL_ERROR "PS3RECOMP_RSX_VULKAN is not supported on macOS (use Metal)")
     endif()
     find_path(PS3RECOMP_VULKAN_INCLUDE_DIR vulkan/vulkan.h)
     if(NOT PS3RECOMP_VULKAN_INCLUDE_DIR)
