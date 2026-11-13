@@ -2400,10 +2400,15 @@ static void vk_swapchain_lost(void)
  * the frame-clock and present threads; one line a second from the pump.
  * -------------------------------------------------------------------------*/
 #ifdef _WIN32
+#define HUD_GRAPH_SAMPLES 90
 static HWND s_hud_hwnd = NULL;
 static HWND s_game_hwnd = NULL;
 static char s_hud_title[64] = "MLB The Show 16";
 static char s_hud_gpu[64] = "Vulkan";
+static float s_hud_history[HUD_GRAPH_SAMPLES];
+static int s_hud_history_head = 0;
+static unsigned int s_hud_fps = 60;
+static float s_hud_last_ms = 16.6f;
 
 static int vk_hud_on(void)
 {
@@ -2422,6 +2427,23 @@ static LRESULT CALLBACK vk_hud_wndproc(HWND hwnd, UINT msg, WPARAM wParam, LPARA
     return DefWindowProcA(hwnd, msg, wParam, lParam);
 }
 
+void vk_hud_record_present(void)
+{
+    if (!s_hud_hwnd) return;
+    static unsigned long long s_last_present_us = 0;
+    unsigned long long now = vk_now_us();
+    if (s_last_present_us > 0) {
+        unsigned long long diff = now - s_last_present_us;
+        float ms = (float)diff / 1000.0f;
+        if (ms < 0.1f) ms = 0.1f;
+        if (ms > 50.0f) ms = 50.0f;
+        s_hud_history[s_hud_history_head] = ms;
+        s_hud_history_head = (s_hud_history_head + 1) % HUD_GRAPH_SAMPLES;
+        s_hud_last_ms = ms;
+    }
+    s_last_present_us = now;
+}
+
 void vk_hud_draw(unsigned int fps)
 {
     if (!s_hud_hwnd || !s_game_hwnd) return;
@@ -2430,17 +2452,21 @@ void vk_hud_draw(unsigned int fps)
         return;
     }
 
+    const int hud_w = 210;
+    const int hud_h = 125;
+
     POINT pt = {16, 16};
     ClientToScreen(s_game_hwnd, &pt);
-    SetWindowPos(s_hud_hwnd, HWND_TOPMOST, pt.x, pt.y, 205, 78, SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    SetWindowPos(s_hud_hwnd, HWND_TOPMOST, pt.x, pt.y, hud_w, hud_h, SWP_NOACTIVATE | SWP_SHOWWINDOW);
 
     HDC hdc = GetDC(s_hud_hwnd);
     if (!hdc) return;
     HDC memDC = CreateCompatibleDC(hdc);
-    HBITMAP memBm = CreateCompatibleBitmap(hdc, 205, 78);
+    HBITMAP memBm = CreateCompatibleBitmap(hdc, hud_w, hud_h);
     HBITMAP oldBm = (HBITMAP)SelectObject(memDC, memBm);
 
-    RECT r = {0, 0, 205, 78};
+    /* 1. Main HUD container */
+    RECT r = {0, 0, hud_w, hud_h};
     HBRUSH bg = CreateSolidBrush(RGB(18, 20, 24));
     FillRect(memDC, &r, bg);
     DeleteObject(bg);
@@ -2448,7 +2474,7 @@ void vk_hud_draw(unsigned int fps)
     HPEN borderPen = CreatePen(PS_SOLID, 1, RGB(55, 62, 72));
     HPEN oldPen = (HPEN)SelectObject(memDC, borderPen);
     HBRUSH oldBrush = (HBRUSH)SelectObject(memDC, GetStockObject(NULL_BRUSH));
-    Rectangle(memDC, 0, 0, 205, 78);
+    Rectangle(memDC, 0, 0, hud_w, hud_h);
 
     HFONT fontBold = CreateFontA(14, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE,
         ANSI_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
@@ -2456,38 +2482,94 @@ void vk_hud_draw(unsigned int fps)
     HFONT fontSmall = CreateFontA(12, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
         ANSI_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
         CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, "Segoe UI");
+    HFONT fontTiny = CreateFontA(10, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+        ANSI_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+        CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, "Consolas");
 
     SetBkMode(memDC, TRANSPARENT);
 
+    /* Title */
     HFONT oldFont = (HFONT)SelectObject(memDC, fontSmall);
     SetTextColor(memDC, RGB(160, 170, 185));
     TextOutA(memDC, 10, 5, s_hud_title, (int)strlen(s_hud_title));
 
+    /* FPS & Frametime */
     SelectObject(memDC, fontBold);
     SetTextColor(memDC, RGB(220, 225, 235));
-    TextOutA(memDC, 10, 25, "FPS", 3);
+    TextOutA(memDC, 10, 24, "FPS", 3);
     SetTextColor(memDC, RGB(60, 255, 120)); /* Signature MangoHud green */
     char fps_str[32];
-    snprintf(fps_str, sizeof(fps_str), "%u.0", fps);
-    TextOutA(memDC, 48, 25, fps_str, (int)strlen(fps_str));
+    snprintf(fps_str, sizeof(fps_str), "%u.0", fps ? fps : s_hud_fps);
+    TextOutA(memDC, 48, 24, fps_str, (int)strlen(fps_str));
 
     SetTextColor(memDC, RGB(220, 225, 235));
-    TextOutA(memDC, 100, 25, "TIME", 4);
+    TextOutA(memDC, 100, 24, "TIME", 4);
     SetTextColor(memDC, RGB(0, 215, 255)); /* Signature MangoHud cyan */
     char ms_str[32];
-    float ms = fps > 0 ? 1000.0f / (float)fps : 0.0f;
-    snprintf(ms_str, sizeof(ms_str), "%.1f ms", ms);
-    TextOutA(memDC, 142, 25, ms_str, (int)strlen(ms_str));
+    snprintf(ms_str, sizeof(ms_str), "%.1f ms", s_hud_last_ms);
+    TextOutA(memDC, 142, 24, ms_str, (int)strlen(ms_str));
 
+    /* GPU & API */
     SelectObject(memDC, fontSmall);
     SetTextColor(memDC, RGB(140, 150, 165));
-    TextOutA(memDC, 10, 51, s_hud_gpu, (int)strlen(s_hud_gpu));
+    TextOutA(memDC, 10, 48, s_hud_gpu, (int)strlen(s_hud_gpu));
 
-    BitBlt(hdc, 0, 0, 205, 78, memDC, 0, 0, SRCCOPY);
+    /* 2. Frametime Graph Box */
+    const int gx = 10;
+    const int gy = 69;
+    const int gw = 188;
+    const int gh = 46;
+
+    RECT gr = {gx, gy, gx + gw, gy + gh};
+    HBRUSH gbg = CreateSolidBrush(RGB(10, 12, 15));
+    FillRect(memDC, &gr, gbg);
+    DeleteObject(gbg);
+
+    HPEN gborder = CreatePen(PS_SOLID, 1, RGB(42, 48, 58));
+    SelectObject(memDC, gborder);
+    Rectangle(memDC, gx, gy, gx + gw, gy + gh);
+    DeleteObject(gborder);
+
+    /* 16.6ms reference target line (60 FPS baseline) */
+    int target_y = gy + gh - (int)((float)(gh - 2) * (16.6f / 33.3f)) - 1;
+    HPEN targetPen = CreatePen(PS_DOT, 1, RGB(50, 65, 80));
+    SelectObject(memDC, targetPen);
+    MoveToEx(memDC, gx + 1, target_y, NULL);
+    LineTo(memDC, gx + gw - 1, target_y);
+    DeleteObject(targetPen);
+
+    SelectObject(memDC, fontTiny);
+    SetTextColor(memDC, RGB(75, 95, 115));
+    TextOutA(memDC, gx + gw - 42, target_y - 10, "16.6ms", 6);
+
+    /* Frametime bars (ordered from oldest to newest) */
+    const int bar_w = 2;
+    for (int i = 0; i < HUD_GRAPH_SAMPLES && (i * bar_w) < (gw - 2); i++) {
+        int idx = (s_hud_history_head + i) % HUD_GRAPH_SAMPLES;
+        float ms = s_hud_history[idx];
+        if (ms <= 0.0f) continue;
+        int bar_h = (int)((ms / 33.3f) * (float)(gh - 3));
+        if (bar_h > gh - 3) bar_h = gh - 3;
+        if (bar_h < 1) bar_h = 1;
+
+        COLORREF color;
+        if (ms <= 18.0f) color = RGB(60, 255, 120);       /* Solid 60 FPS green */
+        else if (ms <= 24.0f) color = RGB(180, 255, 60);  /* Minor hitch lime */
+        else if (ms <= 35.0f) color = RGB(255, 180, 40);  /* Framedrop orange */
+        else color = RGB(255, 60, 60);                     /* Major stutter red */
+
+        HBRUSH barBrush = CreateSolidBrush(color);
+        RECT br = {gx + 1 + i * bar_w, gy + gh - 1 - bar_h, gx + 1 + (i + 1) * bar_w, gy + gh - 1};
+        FillRect(memDC, &br, barBrush);
+        DeleteObject(barBrush);
+    }
+
+    BitBlt(hdc, 0, 0, hud_w, hud_h, memDC, 0, 0, SRCCOPY);
 
     SelectObject(memDC, oldFont);
     DeleteObject(fontBold);
     DeleteObject(fontSmall);
+    DeleteObject(fontTiny);
 
     SelectObject(memDC, oldBrush);
     SelectObject(memDC, oldPen);
@@ -2506,6 +2588,10 @@ void vk_hud_init(HWND game_hwnd, const char* title, const char* gpu_name)
     if (title && *title) snprintf(s_hud_title, sizeof(s_hud_title), "%s", title);
     if (gpu_name && *gpu_name) snprintf(s_hud_gpu, sizeof(s_hud_gpu), "Vulkan | %s", gpu_name);
 
+    for (int i = 0; i < HUD_GRAPH_SAMPLES; i++) {
+        s_hud_history[i] = 16.6f;
+    }
+
     WNDCLASSA wc = {0};
     wc.lpfnWndProc = vk_hud_wndproc;
     wc.hInstance = GetModuleHandle(NULL);
@@ -2516,12 +2602,12 @@ void vk_hud_init(HWND game_hwnd, const char* title, const char* gpu_name)
         WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
         "Ps3recomp_MangoHud", "MangoHud",
         WS_POPUP,
-        0, 0, 205, 78,
+        0, 0, 210, 125,
         game_hwnd, NULL, GetModuleHandle(NULL), NULL
     );
 
     if (s_hud_hwnd) {
-        SetLayeredWindowAttributes(s_hud_hwnd, 0, 215, LWA_ALPHA);
+        SetLayeredWindowAttributes(s_hud_hwnd, 0, 220, LWA_ALPHA);
         ShowWindow(s_hud_hwnd, SW_SHOWNOACTIVATE);
         vk_hud_draw(60);
     }
@@ -2540,6 +2626,14 @@ void vk_hud_sync_pos(void)
     GetWindowRect(s_hud_hwnd, &cur);
     if (cur.left != pt.x || cur.top != pt.y || !IsWindowVisible(s_hud_hwnd)) {
         SetWindowPos(s_hud_hwnd, HWND_TOPMOST, pt.x, pt.y, 0, 0, SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    }
+
+    /* Redraw HUD at ~30 FPS cadence for smooth real-time frametime graph animation */
+    static unsigned long long s_last_draw_us = 0;
+    unsigned long long now = vk_now_us();
+    if (now - s_last_draw_us >= 33333ull) {
+        s_last_draw_us = now;
+        vk_hud_draw(s_hud_fps);
     }
 }
 
@@ -2603,6 +2697,7 @@ static void vk_window_stats_pump(void)
         SDL_SetWindowTitle(s_vk.window, title_buf);
     }
 #ifdef _WIN32
+    s_hud_fps = shown;
     vk_hud_draw(shown);
 #endif
     s_vkw.pumps = 0;
@@ -2759,6 +2854,10 @@ static void* vk_present_thread_main(void* arg)
         VkResult r = vk_queue_present(&pi);
         ps3_trace_end(tp0, PS3_TR_VK_PRESENT, frame, 0);
         if (q0) { vk_window_stats_max(&s_vkw.q_max_us, vk_now_us() - q0); VKW_ADD(shown); }
+#ifdef _WIN32
+        void vk_hud_record_present(void);
+        vk_hud_record_present();
+#endif
         cellGcm_flip_log_shown(frame);
         ps3_trace_instant(PS3_TR_IMAGE_SHOWN, frame, 0);
         if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR)
@@ -3039,6 +3138,10 @@ static void vk_present_window(void)
     const unsigned long long q0 = vk_window_stats_on() ? vk_now_us() : 0;
     r = vk_queue_present(&pi);
     if (q0) { vk_window_stats_max(&s_vkw.q_max_us, vk_now_us() - q0); VKW_ADD(shown); }
+#ifdef _WIN32
+    void vk_hud_record_present(void);
+    vk_hud_record_present();
+#endif
     cellGcm_flip_log_shown(present_frame);
     if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR) vk_swapchain_lost();
     else if (r != VK_SUCCESS) VK_LOG("vkQueuePresentKHR failed (VkResult %d)\n", (int)r);
