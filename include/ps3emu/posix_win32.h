@@ -69,9 +69,20 @@ static inline int clock_gettime(int clock_id, struct timespec* ts)
 
 static inline int nanosleep(const struct timespec* ts, struct timespec* rem)
 {
-    /* Win32 Sleep() is milliseconds: sub-millisecond requests round up to 1 ms. */
-    const DWORD ms = (DWORD)((uint64_t)ts->tv_sec * 1000ull + (uint64_t)ts->tv_nsec / 1000000ull);
+    DWORD ms;
     (void)rem;
+    if (ts->tv_sec == 0) {
+        if (ts->tv_nsec == 0) {
+            SwitchToThread();
+            return 0;
+        }
+        if (ts->tv_nsec < 1000000L) {
+            /* Sub-millisecond sleep: avoid 1-15ms scheduler penalty on Windows */
+            YieldProcessor();
+            return 0;
+        }
+    }
+    ms = (DWORD)((uint64_t)ts->tv_sec * 1000ull + (uint64_t)ts->tv_nsec / 1000000ull);
     Sleep(ms ? ms : 1);
     return 0;
 }
@@ -80,6 +91,17 @@ static inline int sched_yield(void)
 {
     SwitchToThread();
     return 0;
+}
+
+static inline pthread_t pthread_self(void)
+{
+    return GetCurrentThread();
+}
+
+static inline int pthread_equal(pthread_t t1, pthread_t t2)
+{
+    if (t1 == t2) return 1;
+    return GetThreadId(t1) == GetThreadId(t2);
 }
 
 static inline int pthread_mutex_init(pthread_mutex_t* m, const void* attr)

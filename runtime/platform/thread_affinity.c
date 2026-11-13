@@ -39,15 +39,6 @@
 #include "win32_compat.h"
 #include "ps3emu/posix_win32.h"
 
-#ifdef _WIN32
-/* Pinning reads sysfs and calls pthread_setaffinity_np, both Linux-only. On
- * Windows the switch does nothing. */
-void ps3_thread_pin_link_anchor(void) {}
-void ps3_thread_pin_by_name(const char* name) { (void)name; }
-void ps3_thread_pin_spurs_lane(int lane) { (void)lane; }
-void ps3_thread_pin_poll(void) {}
-#else
-
 /* Live layout switch (libs/video's control file). Optional so a fixture that
  * compiles this file alone still links: the string getter is weak. */
 #if defined(__has_include)
@@ -97,8 +88,14 @@ enum {
     PIN_ROLE_SPURS_KERNEL
 };
 
+static unsigned s_ncore = 0;
+static uint64_t s_cores[MAX_CPU];
+
 typedef struct {
     pthread_t pt;
+#ifdef _WIN32
+    HANDLE    hThread;
+#endif
     int       role;
     int       lane;
     int       used;
@@ -169,12 +166,19 @@ static void fmt_mask(uint64_t m, char* out, size_t cap)
 
 static uint64_t siblings_of(unsigned cpu)
 {
+    for (unsigned k = 0; k < s_ncore; k++) {
+        if (s_cores[k] & ((uint64_t)1 << cpu)) return s_cores[k];
+    }
+#ifndef _WIN32
     char path[160], buf[128];
     snprintf(path, sizeof path,
              "/sys/devices/system/cpu/cpu%u/topology/thread_siblings_list", cpu);
     if (!read_line(path, buf, sizeof buf)) return (uint64_t)1 << cpu;
     uint64_t sib = parse_cpu_list(buf);
     return sib ? sib : (uint64_t)1 << cpu;
+#else
+    return (uint64_t)1 << cpu;
+#endif
 }
 
 static int layout_from_name(const char* name)
@@ -284,17 +288,61 @@ static void init_mapping(void)
     s_pin = e && *e && strcmp(e, "0") != 0;
     if (!s_pin) return;
 
+    s_ncore = 0;
+    uint64_t core_l3[MAX_CPU];
+    unsigned core_cpu[MAX_CPU];
+
+#ifdef _WIN32
+    DWORD_PTR procMask = 0, sysMask = 0;
+    if (GetProcessAffinityMask(GetCurrentProcess(), &procMask, &sysMask) && procMask) {
+        s_online = (uint64_t)procMask;
+    } else {
+        s_online = (uint64_t)1 << 0 | (uint64_t)1 << 1;
+    }
+
+    DWORD len = 0;
+    GetLogicalProcessorInformationEx(RelationAll, NULL, &len);
+    PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX buf = (PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX)malloc(len);
+    if (buf && GetLogicalProcessorInformationEx(RelationAll, buf, &len)) {
+        DWORD offset = 0;
+        while (offset < len && s_ncore < MAX_CPU) {
+            PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX info = (PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX)((char*)buf + offset);
+            if (info->Relationship == RelationProcessorCore) {
+                uint64_t sib = (uint64_t)info->Processor.GroupMask[0].Mask & s_online;
+                if (!sib) sib = (uint64_t)info->Processor.GroupMask[0].Mask;
+                int dup = 0;
+                for (unsigned k = 0; k < s_ncore; k++) if (s_cores[k] == sib) { dup = 1; break; }
+                if (!dup) {
+                    s_cores[s_ncore] = sib;
+                    core_cpu[s_ncore] = lowest_cpu(sib);
+                    core_l3[s_ncore] = s_online;
+                    s_ncore++;
+                }
+            }
+            offset += info->Size;
+        }
+        offset = 0;
+        while (offset < len) {
+            PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX info = (PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX)((char*)buf + offset);
+            if (info->Relationship == RelationCache && info->Cache.Level == 3) {
+                uint64_t l3_mask = (uint64_t)info->Cache.GroupMask.Mask;
+                for (unsigned k = 0; k < s_ncore; k++) {
+                    if (s_cores[k] & l3_mask) {
+                        core_l3[k] = l3_mask;
+                    }
+                }
+            }
+            offset += info->Size;
+        }
+        free(buf);
+    }
+#else
     char buf[256];
     if (!read_line("/sys/devices/system/cpu/online", buf, sizeof buf) ||
         !(s_online = parse_cpu_list(buf)))
         s_online = (uint64_t)1 << 0 | (uint64_t)1 << 1;
 
-    /* Distinct physical cores, in CPU order. */
-    uint64_t cores[MAX_CPU];
-    unsigned ncore = 0;
-    uint64_t core_l3[MAX_CPU];
-    unsigned core_cpu[MAX_CPU];
-    for (unsigned cpu = 0; cpu < MAX_CPU && ncore < MAX_CPU; cpu++) {
+    for (unsigned cpu = 0; cpu < MAX_CPU && s_ncore < MAX_CPU; cpu++) {
         if (!(s_online & ((uint64_t)1 << cpu))) continue;
         char path[160];
         snprintf(path, sizeof path,
@@ -303,10 +351,10 @@ static void init_mapping(void)
         uint64_t sib = parse_cpu_list(buf);
         if (!sib) sib = (uint64_t)1 << cpu;
         int dup = 0;
-        for (unsigned k = 0; k < ncore; k++) if (cores[k] == sib) { dup = 1; break; }
+        for (unsigned k = 0; k < s_ncore; k++) if (s_cores[k] == sib) { dup = 1; break; }
         if (dup) continue;
-        cores[ncore] = sib;
-        core_cpu[ncore] = lowest_cpu(sib);
+        s_cores[s_ncore] = sib;
+        core_cpu[s_ncore] = lowest_cpu(sib);
         /* L3 group: scan the cpu's cache dirs for level 3. */
         uint64_t l3 = s_online;
         for (unsigned idx = 0; idx < 8; idx++) {
@@ -323,12 +371,13 @@ static void init_mapping(void)
             }
             break;
         }
-        core_l3[ncore] = l3;
-        ncore++;
-        if (ncore >= 2) break;   /* the first two cores are all this needs */
+        core_l3[s_ncore] = l3;
+        s_ncore++;
+        if (s_ncore >= 2) break;   /* the first two cores are all this needs */
     }
+#endif
 
-    if (!ncore) {
+    if (!s_ncore) {
         s_walker_mask = (uint64_t)1 << 0;
         s_ppu_mask    = (uint64_t)1 << 1;
         s_other_mask  = s_online & ~(s_walker_mask | s_ppu_mask);
@@ -338,14 +387,14 @@ static void init_mapping(void)
         s_walker_l3 = (unsigned)lowest_cpu(core_l3[0]);
         s_walker_mask = (uint64_t)1 << s_walker_core;
         unsigned pick = 0;
-        for (unsigned k = 1; k < ncore; k++) {
+        for (unsigned k = 1; k < s_ncore; k++) {
             if (core_l3[k] == core_l3[0]) { pick = k; break; }
         }
-        if (!pick) pick = ncore > 1 ? 1 : 0;
+        if (!pick) pick = s_ncore > 1 ? 1 : 0;
         s_ppu_core = core_cpu[pick];
         s_ppu_l3 = (unsigned)lowest_cpu(core_l3[pick]);
         s_ppu_mask = (uint64_t)1 << s_ppu_core;
-        s_other_mask = s_online & ~(cores[0] | cores[pick]);
+        s_other_mask = s_online & ~(s_cores[0] | s_cores[pick]);
         if (!s_other_mask) s_other_mask = s_online & ~(s_walker_mask | s_ppu_mask);
         s_ready = 1;
     }
@@ -394,12 +443,22 @@ static uint64_t mask_for(int role, int lane)
     }
 }
 
-static void apply_to_thread(pthread_t pt, uint64_t mask)
+static void apply_to_thread(pin_thread* slot, pthread_t pt, uint64_t mask)
 {
     if (!mask) return;
 #if defined(_WIN32)
-    (void)pt; (void)mask;   /* role pinning of running threads is POSIX-only */
+    HANDLE h = (slot && slot->hThread) ? slot->hThread : (HANDLE)pt;
+    if (!h || h == (HANDLE)(intptr_t)-2) h = GetCurrentThread();
+    SetThreadAffinityMask(h, (DWORD_PTR)mask);
+    if (slot) {
+        if (slot->role == PIN_ROLE_WALKER || slot->role == PIN_ROLE_MAIN) {
+            SetThreadPriority(h, THREAD_PRIORITY_HIGHEST);
+        } else if (slot->role == PIN_ROLE_PRESENT) {
+            SetThreadPriority(h, THREAD_PRIORITY_ABOVE_NORMAL);
+        }
+    }
 #else
+    (void)slot;
     cpu_set_t set;
     CPU_ZERO(&set);
     for (unsigned i = 0; i < MAX_CPU; i++)
@@ -421,7 +480,7 @@ static void register_and_apply(int role, int lane)
     if (!s_pin || !s_ready) return;
     pthread_t self = pthread_self();
     if (role == PIN_ROLE_OTHER) {
-        apply_to_thread(self, mask_for(role, lane));
+        apply_to_thread(NULL, self, mask_for(role, lane));
         return;
     }
     pthread_mutex_lock(&s_threads_lock);
@@ -437,11 +496,17 @@ static void register_and_apply(int role, int lane)
     if (slot) {
         slot->used = 1;
         slot->pt = self;
+#ifdef _WIN32
+        if (slot->hThread) CloseHandle(slot->hThread);
+        DuplicateHandle(GetCurrentProcess(), GetCurrentThread(),
+                        GetCurrentProcess(), &slot->hThread,
+                        0, FALSE, DUPLICATE_SAME_ACCESS);
+#endif
         slot->role = role;
         slot->lane = lane;
     }
     pthread_mutex_unlock(&s_threads_lock);
-    apply_to_thread(self, mask_for(role, lane));
+    apply_to_thread(slot, self, mask_for(role, lane));
 }
 
 /* Non-weak link anchor. thread_name.h reaches ps3_thread_pin_by_name through a
@@ -504,9 +569,8 @@ void ps3_thread_pin_poll(void)
     for (int i = 0; i < PIN_MAX_THREADS; i++) {
         if (!s_threads[i].used) continue;
         if (s_threads[i].role == PIN_ROLE_OTHER) continue;
-        apply_to_thread(s_threads[i].pt,
+        apply_to_thread(&s_threads[i], s_threads[i].pt,
                         mask_for(s_threads[i].role, s_threads[i].lane));
     }
     pthread_mutex_unlock(&s_threads_lock);
 }
-#endif /* _WIN32 */

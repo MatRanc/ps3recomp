@@ -22,6 +22,13 @@
 
 #ifdef _WIN32
 #include <windows.h>
+#ifdef __cplusplus
+extern "C" {
+#endif
+void ps3_thread_pin_by_name(const char* name);
+#ifdef __cplusplus
+}
+#endif
 
 static inline void ps3_thread_name(const char* fmt, ...)
 {
@@ -33,19 +40,20 @@ static inline void ps3_thread_name(const char* fmt, ...)
                                                       "SetThreadDescription");
         looked_up = 1;
     }
-    if (!set_desc && !ps3_trace_on()) return;
     char s[64];
     va_list ap;
     va_start(ap, fmt);
     vsnprintf(s, sizeof s, fmt, ap);
     va_end(ap);
-    ps3_trace_thread_name(s);
-    if (!set_desc) return;
-    WCHAR w[64];
-    int i = 0;
-    for (; s[i] && i < 63; i++) w[i] = (WCHAR)(unsigned char)s[i];
-    w[i] = 0;
-    set_desc(GetCurrentThread(), w);
+    if (ps3_trace_on()) ps3_trace_thread_name(s);
+    if (set_desc) {
+        WCHAR w[64];
+        int i = 0;
+        for (; s[i] && i < 63; i++) w[i] = (WCHAR)(unsigned char)s[i];
+        w[i] = 0;
+        set_desc(GetCurrentThread(), w);
+    }
+    ps3_thread_pin_by_name(s);
 }
 #else
 #include <pthread.h>

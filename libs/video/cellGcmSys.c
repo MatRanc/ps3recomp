@@ -14,8 +14,16 @@
 #include "cellGcmSys.h"
 /* Live pin-layout switch (runtime/platform/thread_affinity.c), weak so the
  * FIFO-walker fixtures still link without the platform layer. */
+#ifdef __cplusplus
+extern "C" {
+#endif
 #if defined(__GNUC__) && !defined(_WIN32)
 extern void ps3_thread_pin_poll(void) __attribute__((weak));
+#else
+extern void ps3_thread_pin_poll(void);
+#endif
+#ifdef __cplusplus
+}
 #endif
 #include "../../runtime/platform/win32_compat.h"
 #include "../../runtime/ppu/ppu_memory.h"   /* vm_write32 (translate + byte-swap, OOB-safe) */
@@ -2983,6 +2991,8 @@ static void gcm_rsx_process_fifo_unlocked(void)
     gcm_fifo_dump_poll();
 #if defined(__GNUC__) && !defined(_WIN32)
     if (ps3_thread_pin_poll) ps3_thread_pin_poll();
+#else
+    ps3_thread_pin_poll();
 #endif
     const int walker_fast = gcm_live_get(PS3_LIVE_WALKER_FAST,
                                          "PS3RECOMP_WALKER_FAST");
