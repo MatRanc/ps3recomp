@@ -2400,7 +2400,7 @@ static void vk_swapchain_lost(void)
  * the frame-clock and present threads; one line a second from the pump.
  * -------------------------------------------------------------------------*/
 #ifdef _WIN32
-#define HUD_GRAPH_SAMPLES 90
+#define HUD_GRAPH_SAMPLES 120
 static HWND s_hud_hwnd = NULL;
 static HWND s_game_hwnd = NULL;
 static char s_hud_title[64] = "MLB The Show 16";
@@ -2452,8 +2452,8 @@ void vk_hud_draw(unsigned int fps)
         return;
     }
 
-    const int hud_w = 210;
-    const int hud_h = 125;
+    const int hud_w = 265;
+    const int hud_h = 130;
 
     POINT pt = {16, 16};
     ClientToScreen(s_game_hwnd, &pt);
@@ -2493,32 +2493,68 @@ void vk_hud_draw(unsigned int fps)
     SetTextColor(memDC, RGB(160, 170, 185));
     TextOutA(memDC, 10, 5, s_hud_title, (int)strlen(s_hud_title));
 
-    /* FPS & Frametime */
+    /* FPS */
     SelectObject(memDC, fontBold);
     SetTextColor(memDC, RGB(220, 225, 235));
     TextOutA(memDC, 10, 24, "FPS", 3);
     SetTextColor(memDC, RGB(60, 255, 120)); /* Signature MangoHud green */
     char fps_str[32];
     snprintf(fps_str, sizeof(fps_str), "%u.0", fps ? fps : s_hud_fps);
-    TextOutA(memDC, 48, 24, fps_str, (int)strlen(fps_str));
+    TextOutA(memDC, 44, 24, fps_str, (int)strlen(fps_str));
 
+    /* TIME */
     SetTextColor(memDC, RGB(220, 225, 235));
-    TextOutA(memDC, 100, 24, "TIME", 4);
+    TextOutA(memDC, 86, 24, "TIME", 4);
     SetTextColor(memDC, RGB(0, 215, 255)); /* Signature MangoHud cyan */
     char ms_str[32];
-    snprintf(ms_str, sizeof(ms_str), "%.1f ms", s_hud_last_ms);
-    TextOutA(memDC, 142, 24, ms_str, (int)strlen(ms_str));
+    snprintf(ms_str, sizeof(ms_str), "%.1fms", s_hud_last_ms);
+    TextOutA(memDC, 124, 24, ms_str, (int)strlen(ms_str));
+
+    /* Calculate min and max frametimes within the graph period */
+    float min_ms = 999.0f;
+    float max_ms = 0.0f;
+    int valid = 0;
+    for (int i = 0; i < HUD_GRAPH_SAMPLES; i++) {
+        float ms = s_hud_history[i];
+        if (ms <= 0.0f) continue;
+        if (ms < min_ms) min_ms = ms;
+        if (ms > max_ms) max_ms = ms;
+        valid++;
+    }
+    if (!valid) {
+        min_ms = s_hud_last_ms;
+        max_ms = s_hud_last_ms;
+    }
+
+    /* Alongside TIME: min & max labels and values */
+    SelectObject(memDC, fontTiny);
+    SetTextColor(memDC, RGB(140, 155, 175));
+    TextOutA(memDC, 178, 21, "min", 3);
+    TextOutA(memDC, 178, 33, "max", 3);
+
+    SetTextColor(memDC, RGB(60, 255, 120)); /* Min is green */
+    char min_val[16];
+    snprintf(min_val, sizeof(min_val), "%.1fms", min_ms);
+    TextOutA(memDC, 202, 21, min_val, (int)strlen(min_val));
+
+    COLORREF max_col = (max_ms <= 18.0f) ? RGB(60, 255, 120) :
+                       (max_ms <= 24.0f) ? RGB(180, 255, 60) :
+                       (max_ms <= 35.0f) ? RGB(255, 180, 40) : RGB(255, 60, 60);
+    SetTextColor(memDC, max_col);
+    char max_val[16];
+    snprintf(max_val, sizeof(max_val), "%.1fms", max_ms);
+    TextOutA(memDC, 202, 33, max_val, (int)strlen(max_val));
 
     /* GPU & API */
     SelectObject(memDC, fontSmall);
     SetTextColor(memDC, RGB(140, 150, 165));
-    TextOutA(memDC, 10, 48, s_hud_gpu, (int)strlen(s_hud_gpu));
+    TextOutA(memDC, 10, 49, s_hud_gpu, (int)strlen(s_hud_gpu));
 
     /* 2. Frametime Graph Box */
     const int gx = 10;
-    const int gy = 69;
-    const int gw = 188;
-    const int gh = 46;
+    const int gy = 70;
+    const int gw = hud_w - 20;
+    const int gh = 48;
 
     RECT gr = {gx, gy, gx + gw, gy + gh};
     HBRUSH gbg = CreateSolidBrush(RGB(10, 12, 15));
@@ -2602,7 +2638,7 @@ void vk_hud_init(HWND game_hwnd, const char* title, const char* gpu_name)
         WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
         "Ps3recomp_MangoHud", "MangoHud",
         WS_POPUP,
-        0, 0, 210, 125,
+        0, 0, 265, 130,
         game_hwnd, NULL, GetModuleHandle(NULL), NULL
     );
 
