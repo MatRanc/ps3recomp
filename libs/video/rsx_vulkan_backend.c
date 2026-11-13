@@ -2566,17 +2566,23 @@ void vk_hud_draw(unsigned int fps)
     Rectangle(memDC, gx, gy, gx + gw, gy + gh);
     DeleteObject(gborder);
 
-    /* 16.6ms reference target line (60 FPS baseline) */
-    int target_y = gy + gh - (int)((float)(gh - 2) * (16.6f / 33.3f)) - 1;
-    HPEN targetPen = CreatePen(PS_DOT, 1, RGB(50, 65, 80));
-    SelectObject(memDC, targetPen);
-    MoveToEx(memDC, gx + 1, target_y, NULL);
-    LineTo(memDC, gx + gw - 1, target_y);
-    DeleteObject(targetPen);
+    /* Dynamic graph auto-scaling (MangoHud behavior: highest pillar reaches the top) */
+    float scale_max = max_ms;
+    if (scale_max < 18.0f) scale_max = 18.0f;
 
-    SelectObject(memDC, fontTiny);
-    SetTextColor(memDC, RGB(75, 95, 115));
-    TextOutA(memDC, gx + gw - 42, target_y - 10, "16.6ms", 6);
+    /* 16.6ms reference target line (60 FPS baseline) */
+    int target_y = gy + gh - (int)((float)(gh - 2) * (16.6f / scale_max)) - 1;
+    if (target_y >= gy && target_y < gy + gh) {
+        HPEN targetPen = CreatePen(PS_DOT, 1, RGB(50, 65, 80));
+        SelectObject(memDC, targetPen);
+        MoveToEx(memDC, gx + 1, target_y, NULL);
+        LineTo(memDC, gx + gw - 1, target_y);
+        DeleteObject(targetPen);
+
+        SelectObject(memDC, fontTiny);
+        SetTextColor(memDC, RGB(75, 95, 115));
+        TextOutA(memDC, gx + gw - 42, target_y - 10, "16.6ms", 6);
+    }
 
     /* Frametime bars (ordered from oldest to newest) */
     const int bar_w = 2;
@@ -2584,7 +2590,7 @@ void vk_hud_draw(unsigned int fps)
         int idx = (s_hud_history_head + i) % HUD_GRAPH_SAMPLES;
         float ms = s_hud_history[idx];
         if (ms <= 0.0f) continue;
-        int bar_h = (int)((ms / 33.3f) * (float)(gh - 3));
+        int bar_h = (int)((ms / scale_max) * (float)(gh - 3));
         if (bar_h > gh - 3) bar_h = gh - 3;
         if (bar_h < 1) bar_h = 1;
 
