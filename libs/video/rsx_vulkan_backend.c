@@ -65,13 +65,16 @@
 #  if __has_include(<SDL2/SDL.h>)
 #    include <SDL2/SDL.h>
 #    include <SDL2/SDL_vulkan.h>
+#    include <SDL2/SDL_syswm.h>
 #  else
 #    include <SDL.h>
 #    include <SDL_vulkan.h>
+#    include <SDL_syswm.h>
 #  endif
 #else
 #  include <SDL2/SDL.h>
 #  include <SDL2/SDL_vulkan.h>
+#  include <SDL2/SDL_syswm.h>
 #endif
 
 #include <stddef.h>
@@ -2218,6 +2221,19 @@ static void vk_window_open(const char* title)
         vk_window_drop(why);
         return;
     }
+    SDL_ShowWindow(s_vk.window);
+    SDL_RaiseWindow(s_vk.window);
+#ifdef _WIN32
+    SDL_SysWMinfo wmInfo;
+    SDL_VERSION(&wmInfo.version);
+    if (SDL_GetWindowWMInfo(s_vk.window, &wmInfo) && wmInfo.subsystem == SDL_SYSWM_WINDOWS) {
+        HWND hwnd = wmInfo.info.win.window;
+        VK_LOG("window: Win32 HWND = %p\n", (void*)hwnd);
+        ShowWindow(hwnd, SW_SHOWNORMAL);
+        UpdateWindow(hwnd);
+        SetForegroundWindow(hwnd);
+    }
+#endif
     unsigned n = 0;
     if (!SDL_Vulkan_GetInstanceExtensions(s_vk.window, &n, NULL) || n == 0 || n > 16 ||
         !SDL_Vulkan_GetInstanceExtensions(s_vk.window, &n, s_vk.inst_exts)) {

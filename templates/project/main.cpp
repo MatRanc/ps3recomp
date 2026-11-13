@@ -224,6 +224,12 @@ extern "C" void cellGcm_fifo_kick_wait(unsigned ms);
 
 static DWORD WINAPI frame_clock(LPVOID)
 {
+#ifdef _WIN32
+    HDESK hDefDesk = OpenDesktopA("Default", 0, FALSE, GENERIC_ALL);
+    if (hDefDesk) {
+        SetThreadDesktop(hDefDesk);
+    }
+#endif
     /* The RSX walker is this thread (the docs call it that); naming it also
      * lets PS3RECOMP_PIN give it a physical core of its own. */
     ps3_thread_name("rsx walker");
@@ -544,9 +550,13 @@ int main(int argc, char** argv)
 
 #ifdef _WIN32
 #pragma comment(lib, "winmm.lib")
-    /* 1 ms timer resolution. The default granularity is about 15.6 ms, which
-     * inflates every shorter wait the title makes and throttles the whole
-     * thing. POSIX timers are already fine-grained. */
+#pragma comment(lib, "user32.lib")
+    /* Ensure the process is attached to the interactive user desktop ("Default")
+     * so that the SDL Vulkan window is visible on the user's screen. */
+    HDESK hDefDesk = OpenDesktopA("Default", 0, FALSE, GENERIC_ALL);
+    if (hDefDesk) {
+        SetThreadDesktop(hDefDesk);
+    }
     timeBeginPeriod(1);
     setvbuf(stdout, NULL, _IONBF, 0);   /* unbuffered: do not lose prints on a kill */
 #endif
