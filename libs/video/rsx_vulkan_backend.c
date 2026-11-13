@@ -2421,14 +2421,20 @@ static void vk_window_stats_pump(void)
     s_vkw.pumps++;
     if (!s_vkw.last_print_us) { s_vkw.last_print_us = now; return; }
     if (now - s_vkw.last_print_us < 1000000ull) return;
+    const unsigned int shown = __atomic_exchange_n(&s_vkw.shown, 0u, __ATOMIC_RELAXED);
     VK_LOG("window: %u pumps, max pump gap %llu ms | blits %u, shown %u, "
            "dropped %u no-slot + %u not-ready, longest vkQueuePresentKHR %llu ms\n",
            s_vkw.pumps, s_vkw.max_gap_us / 1000ull,
            __atomic_exchange_n(&s_vkw.enq, 0u, __ATOMIC_RELAXED),
-           __atomic_exchange_n(&s_vkw.shown, 0u, __ATOMIC_RELAXED),
+           shown,
            __atomic_exchange_n(&s_vkw.noslot, 0u, __ATOMIC_RELAXED),
            __atomic_exchange_n(&s_vkw.notready, 0u, __ATOMIC_RELAXED),
            __atomic_exchange_n(&s_vkw.q_max_us, 0ull, __ATOMIC_RELAXED) / 1000ull);
+    if (s_vk.window) {
+        char title_buf[128];
+        snprintf(title_buf, sizeof(title_buf), "ps3recomp - MLB The Show 16 | %u FPS", shown);
+        SDL_SetWindowTitle(s_vk.window, title_buf);
+    }
     s_vkw.pumps = 0;
     s_vkw.max_gap_us = 0;
     s_vkw.last_print_us = now;
