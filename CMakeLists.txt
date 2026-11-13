@@ -445,7 +445,8 @@ if(PS3RECOMP_BUILD_TESTS)
         libs/video/rsx_draw_queue.c
     )
     target_include_directories(test_draw_queue PRIVATE
-        "${CMAKE_CURRENT_SOURCE_DIR}/libs/video")
+        "${CMAKE_CURRENT_SOURCE_DIR}/libs/video"
+        "${CMAKE_CURRENT_SOURCE_DIR}/include")
     if(TARGET Threads::Threads)
         target_link_libraries(test_draw_queue PRIVATE Threads::Threads)
     endif()
