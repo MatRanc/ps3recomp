@@ -14,6 +14,7 @@
 #include <time.h>
 #include <xmmintrin.h>
 #include <sys/stat.h>
+#include "ps3emu/posix_win32.h"
 
 #if defined(__has_include)
 #  if __has_include("ps3_live_ctl.h")

@@ -39,6 +39,9 @@
 #  include <process.h>
 #  include <windows.h>
 #  define MKDIR(p) _mkdir(p)
+#  ifndef S_ISDIR
+#    define S_ISDIR(m) (((m) & _S_IFMT) == _S_IFDIR)
+#  endif
 #  define strcasecmp _stricmp
 #else
 #  include <dirent.h>

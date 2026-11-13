@@ -1,3 +1,15 @@
+#if defined(_MSC_VER)
+/* clang-cl: the includes below take the non-MSVC branches, the ones Linux
+ * takes. With _MSC_VER set, <immintrin.h> and spu_helpers.h pull in MSVC's
+ * intrin.h, whose multiversioned declarations clash with rtmintrin.h under
+ * the AVX2 target. The body below uses no _MSC_VER branch. */
+#  pragma push_macro("_MSC_VER")
+#  undef _MSC_VER
+#  define PS3_JOB_MSC_HIDDEN 1
+#endif
+
+#include <immintrin.h>
+
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
 #endif
@@ -8,7 +20,10 @@
 #endif
 #include "job_c690_native.h"
 #include "spu_helpers.h"
-#include <immintrin.h>
+#if defined(PS3_JOB_MSC_HIDDEN)
+#  pragma pop_macro("_MSC_VER")
+#  undef PS3_JOB_MSC_HIDDEN
+#endif
 
 #define BSWAP_MASK _mm_setr_epi8(3,2,1,0, 7,6,5,4, 11,10,9,8, 15,14,13,12)
 

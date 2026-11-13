@@ -31,13 +31,22 @@
 #include "thread_affinity.h"
 
 #include <ctype.h>
-#include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 #include "win32_compat.h"
+#include "ps3emu/posix_win32.h"
+
+#ifdef _WIN32
+/* Pinning reads sysfs and calls pthread_setaffinity_np, both Linux-only. On
+ * Windows the switch does nothing. */
+void ps3_thread_pin_link_anchor(void) {}
+void ps3_thread_pin_by_name(const char* name) { (void)name; }
+void ps3_thread_pin_spurs_lane(int lane) { (void)lane; }
+void ps3_thread_pin_poll(void) {}
+#else
 
 /* Live layout switch (libs/video's control file). Optional so a fixture that
  * compiles this file alone still links: the string getter is weak. */
@@ -500,3 +509,4 @@ void ps3_thread_pin_poll(void)
     }
     pthread_mutex_unlock(&s_threads_lock);
 }
+#endif /* _WIN32 */

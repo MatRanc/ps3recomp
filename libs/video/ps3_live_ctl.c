@@ -21,13 +21,12 @@
 
 #include <ctype.h>
 #include <errno.h>
-#include <pthread.h>
+#include "ps3emu/posix_win32.h"
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
-#include <unistd.h>
 
 static const char* const K_NAME[PS3_LIVE_COUNT] = {
     "PS3RECOMP_WALKER_FAST",

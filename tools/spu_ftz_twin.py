@@ -259,6 +259,23 @@ BOUNDARY_TOKENS = ("loc_", "goto ", "if (", "return;", "SPU_RET", "SPU_DIRECT",
 REG_LINE = ("    for (const spu_func_entry* e = spu_function_table; e->func; ++e)\n"
             "        spu_register_function(e->addr, e->func);")
 
+# The twins call the variant registry through a weak declaration, so the play
+# tree (no registry) links and registers nothing. Windows cannot use the weak
+# form: the registry lives in a static library, and a weak reference with a
+# default body keeps lld-link from pulling that member, so the twins' defaults
+# collide ("duplicate symbol"). spu_channels.c always defines the registry, so
+# Windows takes a plain extern and the reference resolves.
+_WEAK_REGISTRY_DECL = ("extern void spu_register_function_var(uint32_t, void (*)(spu_context*), int)\n"
+                       "    __attribute__((weak));\n")
+_REGISTRY_DECL = ("#if defined(_WIN32)\n"
+                  "extern void spu_register_function_var(uint32_t, void (*)(spu_context*), int);\n"
+                  "#else\n"
+                  + _WEAK_REGISTRY_DECL +
+                  "#endif\n")
+FTZ_PREAMBLE = FTZ_PREAMBLE.replace(_WEAK_REGISTRY_DECL, _REGISTRY_DECL)
+APPROX_PREAMBLE = APPROX_PREAMBLE.replace(_WEAK_REGISTRY_DECL, _REGISTRY_DECL)
+FTZ_PREAMBLE_LAZY = FTZ_PREAMBLE_LAZY.replace(_WEAK_REGISTRY_DECL, _REGISTRY_DECL)
+
 
 def rewrite_helpers(text: str) -> str:
     """Rename the six base float helpers to the hardware forms.

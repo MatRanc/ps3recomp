@@ -3,7 +3,7 @@
 #endif
 #include "vk_pipe_queue.h"
 
-#include "vk_win32_compat.h"
+#include "ps3emu/posix_win32.h"
 #include <stdlib.h>
 #include <string.h>
 

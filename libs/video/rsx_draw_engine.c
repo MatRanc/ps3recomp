@@ -10,6 +10,7 @@
  * needs: the shader disk cache, movie mode and its compositor, the a010
  * probe, and every YZ_PERF_PROFILE block.
  */
+#include "ps3emu/posix_win32.h"
 #include "rsx_draw_engine.h"
 
 #include "rsx_fp_decompiler.h"
@@ -32,8 +33,6 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdatomic.h>
-#include <sched.h>
-#include <pthread.h>
 #include <time.h>
 #include "ps3emu/log_first.h"
 #include "../../runtime/memory/vm.h"   /* vm_commit: the capture images pages */

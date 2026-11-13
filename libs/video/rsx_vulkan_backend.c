@@ -115,7 +115,16 @@ static void vk_pipe_create_done(const char* what, unsigned long long t0)
     vk_pipe_cache_tick();
 }
 
-#include "vk_win32_compat.h"
+#include "ps3emu/posix_win32.h"
+#ifndef _WIN32
+#  include <dlfcn.h>
+#endif
+
+static inline unsigned long long vk_mono_ns(void)
+{
+    struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t);
+    return (unsigned long long)t.tv_sec * 1000000000ull + (unsigned long long)t.tv_nsec;
+}
 
 /* ---------------------------------------------------------------------------
  * Run-time loaded entry points (Vulkan 1.0 core only)
@@ -3766,7 +3775,7 @@ static u32 vk_eng_surface_view(void* user, u32 surface, u32 remap, u32 rsx_forma
     for (u32 i = 1; i <= s_eobj_hi; i++)
         if (s_eobj[i].kind == VK_ENG_VIEW && s_eobj[i].surface == surface &&
             s_eobj[i].remap == remap && s_eobj[i].rsx_fmt == rsx_format) {
-            if (memo) s_view_memo[ms] = (typeof(s_view_memo[0])){ surface, remap, rsx_format, i };
+            if (memo) s_view_memo[ms] = (__typeof__(s_view_memo[0])){ surface, remap, rsx_format, i };
             return i;
         }
     const u32 hd = vk_eng_alloc();
@@ -3777,7 +3786,7 @@ static u32 vk_eng_surface_view(void* user, u32 surface, u32 remap, u32 rsx_forma
     }
     o->kind = VK_ENG_VIEW; o->fmt = t->fmt; o->w = t->w; o->h = t->h;
     o->surface = surface; o->remap = remap; o->rsx_fmt = rsx_format;
-    if (memo) s_view_memo[ms] = (typeof(s_view_memo[0])){ surface, remap, rsx_format, hd };
+    if (memo) s_view_memo[ms] = (__typeof__(s_view_memo[0])){ surface, remap, rsx_format, hd };
     return hd;
 }
 /* ---- cube render targets (PS3RECOMP_RSX_CUBE_RT) -------------------------

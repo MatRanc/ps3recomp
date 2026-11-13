@@ -6,11 +6,11 @@
  */
 #include "rsx_draw_queue.h"
 
-#include <pthread.h>
+#include "ps3emu/posix_win32.h"
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
-#include <sched.h>
+
 
 #if defined(__x86_64__) || defined(__i386__)
 #include <immintrin.h>
