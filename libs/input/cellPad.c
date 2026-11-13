@@ -38,7 +38,7 @@ static double pad_clock(unsigned long long t0_ms)
  * Backend selection
  * -----------------------------------------------------------------------*/
 
-#if defined(PS3RECOMP_PAD_USE_SDL2)
+#if defined(PS3RECOMP_PAD_USE_SDL2) || (defined(_WIN32) && defined(PS3RECOMP_RSX_VULKAN))
   #define PAD_BACKEND_SDL2  1
   #define PAD_BACKEND_XINPUT 0
 #elif defined(_WIN32)
@@ -49,11 +49,14 @@ static double pad_clock(unsigned long long t0_ms)
   #define PAD_BACKEND_XINPUT 0
 #endif
 
-#if PAD_BACKEND_XINPUT
+#ifdef _WIN32
   #ifndef WIN32_LEAN_AND_MEAN
     #define WIN32_LEAN_AND_MEAN
   #endif
   #include <windows.h>
+#endif
+
+#if PAD_BACKEND_XINPUT
   /* Types only. The exe must not import an XInput DLL: MinGW's libxinput is
    * xinput1_3.dll, which only the DirectX June 2010 redistributable installs,
    * so on a stock Windows 10/11 the exe did not start (0xC0000135). The DLL is
@@ -62,6 +65,9 @@ static double pad_clock(unsigned long long t0_ms)
 #endif
 
 #if PAD_BACKEND_SDL2
+  #ifndef SDL_MAIN_HANDLED
+    #define SDL_MAIN_HANDLED
+  #endif
   #include <SDL2/SDL.h>
 #endif
 
@@ -191,74 +197,13 @@ static void pad_rumble_levels(u8 small_on, u8 large, u16* lo, u16* hi)
     *hi = small_on ? 0xFFFFu : 0u;
 }
 
-/* ---------------------------------------------------------------------------
- * XInput backend
- * -----------------------------------------------------------------------*/
-
-#if PAD_BACKEND_XINPUT
-
-/* Deadzone for analog sticks (same as XINPUT_GAMEPAD_LEFT_THUMB_DEADZONE) */
-#define PAD_STICK_DEADZONE  7849
-#define PAD_TRIGGER_THRESHOLD 30
-
-/* XInput is resolved at run time. Only XInputGetState and XInputSetState are
- * called, and XInput9_1_0.dll exports both, so any of the three DLLs serves.
- * Loaded once, from System32 only (not the exe folder, the working directory
- * or PATH), and kept loaded until exit. No DLL, or one without the two entry
- * points, means every slot reads as unplugged. */
-typedef DWORD (WINAPI *pad_xi_get_state_fn)(DWORD, XINPUT_STATE*);
-typedef DWORD (WINAPI *pad_xi_set_state_fn)(DWORD, XINPUT_VIBRATION*);
-static pad_xi_get_state_fn p_xi_get_state;
-static pad_xi_set_state_fn p_xi_set_state;
-static int s_xi_tried;
-
-static int pad_xinput_load(void)
-{
-    static const wchar_t* const names[] = { L"XInput1_4.dll", L"XInput1_3.dll", L"XInput9_1_0.dll" };
-    if (s_xi_tried) return p_xi_get_state != NULL;
-    s_xi_tried = 1;
-    for (size_t k = 0; k < sizeof(names) / sizeof(names[0]); k++) {
-        HMODULE m = LoadLibraryExW(names[k], NULL, LOAD_LIBRARY_SEARCH_SYSTEM32);
-        pad_xi_get_state_fn g;
-        pad_xi_set_state_fn st;
-        if (!m) continue;
-        g  = (pad_xi_get_state_fn)(void (*)(void))GetProcAddress(m, "XInputGetState");
-        st = (pad_xi_set_state_fn)(void (*)(void))GetProcAddress(m, "XInputSetState");
-        if (!g || !st) { FreeLibrary(m); continue; }
-        p_xi_get_state = g;
-        p_xi_set_state = st;
-        printf("[cellPad] XInput from %ls\n", names[k]);
-        return 1;
-    }
-    printf("[cellPad] no XInput DLL (XInput1_4, XInput1_3, XInput9_1_0): no XInput pads\n");
-    return 0;
-}
-
-static u8 pad_xinput_stick_to_u8(short raw, short deadzone)
-{
-    float normalized;
-    if (raw > deadzone)
-        normalized = (float)(raw - deadzone) / (float)(32767 - deadzone);
-    else if (raw < -deadzone)
-        normalized = (float)(raw + deadzone) / (float)(32767 - deadzone);
-    else
-        normalized = 0.0f;
-
-    /* Map -1.0..1.0 to 0..255 with center at 128 */
-    int val = (int)(normalized * 127.0f) + 128;
-    if (val < 0) val = 0;
-    if (val > 255) val = 255;
-    return (u8)val;
-}
-
 /* Keyboard fallback for port 0.
  *
- * The only backend here is XInput, so on a machine with no controller plugged
- * in a title gets a pad that is reported present and never presses anything --
- * it can be watched but not played. That is what The Simpsons Arcade Game hit:
- * it reached its attract loop and no input existed to start a game.
+ * On a machine with no controller plugged in a title gets a pad that is
+ * reported present and never presses anything -- it can be watched but not
+ * played.
  *
- * Only fills in for port 0, only when XInput found nothing there, so a real
+ * Only fills in for port 0, only when the backend found nothing there, so a real
  * controller always wins and nothing changes for a port that has one. Keys are
  * read only while a window of THIS process is in the foreground, so typing in
  * another application does not drive the game. Set PAD_NO_KEYBOARD=1 to
@@ -320,10 +265,70 @@ static void pad_poll_keyboard(void)
 
     { static int said = 0;
       if (!said && btns) { said = 1;
-          printf("[cellPad] keyboard fallback active on port 0 (no XInput device)\n");
+          printf("[cellPad] keyboard fallback active on port 0 (no controller)\n");
           fflush(stdout); } }
 }
 #endif
+
+/* ---------------------------------------------------------------------------
+ * XInput backend
+ * -----------------------------------------------------------------------*/
+
+#if PAD_BACKEND_XINPUT
+
+/* Deadzone for analog sticks (same as XINPUT_GAMEPAD_LEFT_THUMB_DEADZONE) */
+#define PAD_STICK_DEADZONE  7849
+#define PAD_TRIGGER_THRESHOLD 30
+
+/* XInput is resolved at run time. Only XInputGetState and XInputSetState are
+ * called, and XInput9_1_0.dll exports both, so any of the three DLLs serves.
+ * Loaded once, from System32 only (not the exe folder, the working directory
+ * or PATH), and kept loaded until exit. No DLL, or one without the two entry
+ * points, means every slot reads as unplugged. */
+typedef DWORD (WINAPI *pad_xi_get_state_fn)(DWORD, XINPUT_STATE*);
+typedef DWORD (WINAPI *pad_xi_set_state_fn)(DWORD, XINPUT_VIBRATION*);
+static pad_xi_get_state_fn p_xi_get_state;
+static pad_xi_set_state_fn p_xi_set_state;
+static int s_xi_tried;
+
+static int pad_xinput_load(void)
+{
+    static const wchar_t* const names[] = { L"XInput1_4.dll", L"XInput1_3.dll", L"XInput9_1_0.dll" };
+    if (s_xi_tried) return p_xi_get_state != NULL;
+    s_xi_tried = 1;
+    for (size_t k = 0; k < sizeof(names) / sizeof(names[0]); k++) {
+        HMODULE m = LoadLibraryExW(names[k], NULL, LOAD_LIBRARY_SEARCH_SYSTEM32);
+        pad_xi_get_state_fn g;
+        pad_xi_set_state_fn st;
+        if (!m) continue;
+        g  = (pad_xi_get_state_fn)(void (*)(void))GetProcAddress(m, "XInputGetState");
+        st = (pad_xi_set_state_fn)(void (*)(void))GetProcAddress(m, "XInputSetState");
+        if (!g || !st) { FreeLibrary(m); continue; }
+        p_xi_get_state = g;
+        p_xi_set_state = st;
+        printf("[cellPad] XInput from %ls\n", names[k]);
+        return 1;
+    }
+    printf("[cellPad] no XInput DLL (XInput1_4, XInput1_3, XInput9_1_0): no XInput pads\n");
+    return 0;
+}
+
+static u8 pad_xinput_stick_to_u8(short raw, short deadzone)
+{
+    float normalized;
+    if (raw > deadzone)
+        normalized = (float)(raw - deadzone) / (float)(32767 - deadzone);
+    else if (raw < -deadzone)
+        normalized = (float)(raw + deadzone) / (float)(32767 - deadzone);
+    else
+        normalized = 0.0f;
+
+    /* Map -1.0..1.0 to 0..255 with center at 128 */
+    int val = (int)(normalized * 127.0f) + 128;
+    if (val < 0) val = 0;
+    if (val > 255) val = 255;
+    return (u8)val;
+}
 
 /* XInputGetState on a slot with nothing plugged in costs about 140 us (2 us on
  * a connected one), and the backend is polled at least once a frame: three
