@@ -2436,7 +2436,7 @@ void vk_hud_record_present(void)
         unsigned long long diff = now - s_last_present_us;
         float ms = (float)diff / 1000.0f;
         if (ms < 0.1f) ms = 0.1f;
-        if (ms > 50.0f) ms = 50.0f;
+        if (ms > 9999.0f) ms = 9999.0f;
         s_hud_history[s_hud_history_head] = ms;
         s_hud_history_head = (s_hud_history_head + 1) % HUD_GRAPH_SAMPLES;
         s_hud_last_ms = ms;
@@ -2452,7 +2452,7 @@ void vk_hud_draw(unsigned int fps)
         return;
     }
 
-    const int hud_w = 265;
+    const int hud_w = 275;
     const int hud_h = 130;
 
     POINT pt = {16, 16};
@@ -2533,7 +2533,7 @@ void vk_hud_draw(unsigned int fps)
     TextOutA(memDC, 178, 33, "max", 3);
 
     SetTextColor(memDC, RGB(60, 255, 120)); /* Min is green */
-    char min_val[16];
+    char min_val[32];
     snprintf(min_val, sizeof(min_val), "%.1fms", min_ms);
     TextOutA(memDC, 202, 21, min_val, (int)strlen(min_val));
 
@@ -2541,7 +2541,7 @@ void vk_hud_draw(unsigned int fps)
                        (max_ms <= 24.0f) ? RGB(180, 255, 60) :
                        (max_ms <= 35.0f) ? RGB(255, 180, 40) : RGB(255, 60, 60);
     SetTextColor(memDC, max_col);
-    char max_val[16];
+    char max_val[32];
     snprintf(max_val, sizeof(max_val), "%.1fms", max_ms);
     TextOutA(memDC, 202, 33, max_val, (int)strlen(max_val));
 
@@ -2638,7 +2638,7 @@ void vk_hud_init(HWND game_hwnd, const char* title, const char* gpu_name)
         WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
         "Ps3recomp_MangoHud", "MangoHud",
         WS_POPUP,
-        0, 0, 265, 130,
+        0, 0, 275, 130,
         game_hwnd, NULL, GetModuleHandle(NULL), NULL
     );
 
