@@ -94,6 +94,7 @@ void     ps3_load_prx_modules(void);
 
 extern const char* ppu_vfs_root;              /* host dir the PS3 mount points map into */
 void     ps3_host_quit(const char* why);      /* cellSysutil.c: REQUEST_EXITGAME, then exit 0 */
+void     cellGame_init_from_paramsfo(const char* sfo_path); /* libs/system/cellGame.c */
 
 /* sys_ppu_thread.c: the main thread's stack, as sys_ppu_thread_get_stack_information
  * reports it. Left at 0 it names VM_STACK_BASE, the first created thread's stack. */
@@ -565,6 +566,25 @@ int main(int argc, char** argv)
 
     derive_vfs_root(argv[1]);
     printf("[boot] VFS root: %s\n", ppu_vfs_root);
+
+    /* Read TITLE_ID, CATEGORY, TITLE, VERSION from the game's PARAM.SFO */
+    {
+        static const char* const kSfoLayouts[] = {
+            "%s/PS3_GAME/PARAM.SFO",   /* vfs root = disc root  */
+            "%s/../PARAM.SFO",         /* vfs root = .../USRDIR */
+            "%s/PARAM.SFO",            /* vfs root = game dir   */
+        };
+        char sfo[1100];
+        int found = 0;
+        for (size_t i = 0; i < sizeof kSfoLayouts / sizeof kSfoLayouts[0]; i++) {
+            snprintf(sfo, sizeof sfo, kSfoLayouts[i], ppu_vfs_root);
+            FILE* f = fopen(sfo, "rb");
+            if (f) { fclose(f); found = 1; break; }
+        }
+        if (!found)
+            snprintf(sfo, sizeof sfo, "%s/PS3_GAME/PARAM.SFO", ppu_vfs_root);
+        cellGame_init_from_paramsfo(sfo);
+    }
 
     ppu_recomp_register();   /* lifted function table -> address map */
     ps3_load_prx_modules();  /* this game's lifted system PRX, if it has any */

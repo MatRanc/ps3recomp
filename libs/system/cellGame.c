@@ -829,3 +829,31 @@ s32 cellGameContentErrorDialog(s32 type, s32 errNeedSizeKB, const char* dirName)
 
     return CELL_OK;
 }
+
+/* cellGamePatchCheck (NID 0xCE4374F6) -- checks whether a title update (patch)
+ * is applied and whether a newer patch is available via PSN.
+ *
+ * Arguments: (CellGameContentSize* size, void* reserved)
+ *   size     - optional; filled with disc-free / data-used sizes if non-NULL.
+ *   reserved - must be NULL per SDK.
+ *
+ * We are running offline (cellNetCtl reports NOT_INITIALIZED) and the patch is
+ * the EBOOT the user already decrypted, so there is nothing to check.
+ * Return CELL_OK: patch is current, no update needed.
+ *
+ * A missing handler returns CELL_OK anyway (see ppu_hle.cpp), but logging the
+ * call makes it visible in the game log and silences the [hle] unresolved NID
+ * warning that otherwise fires every boot. */
+s32 cellGamePatchCheck(CellGameContentSize* size, void* reserved)
+{
+    (void)reserved;
+    printf("[cellGame] PatchCheck() -> OK (offline)\n");
+
+    uint32_t size_ea = (uint32_t)(uintptr_t)size;
+    if (size_ea) {
+        vm_write32(size_ea + 0, (u32)content_free_kb()); /* hddFreeSizeKB */
+        vm_write32(size_ea + 4, (uint32_t)CELL_GAME_SIZEKB_NOTCALC); /* sizeKB */
+        vm_write32(size_ea + 8, 0);                      /* sysSizeKB */
+    }
+    return CELL_OK;
+}
