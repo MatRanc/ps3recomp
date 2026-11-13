@@ -362,6 +362,7 @@ static vk_state s_vk;
 static VkPipelineCache s_pipe_cache = VK_NULL_HANDLE;
 static char s_pipe_cache_path[1024];
 static unsigned long long s_pipe_cache_saved;
+static char s_vk_gpu_name[64];
 
 #define VK_LOG(...)  fprintf(stderr, "[RSX vulkan] " __VA_ARGS__)
 #define VK_CHECK(call, what)                                               \
@@ -651,6 +652,7 @@ static int vk_pick_device(void)
     /* Vulkan guarantees 4096; the engine's targets and textures may use what
      * the device really has (a title's 4608-wide target on RADV). */
     s_vk.max_dim = p.limits.maxImageDimension2D >= 4096u ? p.limits.maxImageDimension2D : 4096u;
+    snprintf(s_vk_gpu_name, sizeof(s_vk_gpu_name), "%s", p.deviceName);
     VK_LOG("using device %d: %s\n", best, p.deviceName);
     return 0;
 }
@@ -2191,6 +2193,10 @@ static void vk_window_drop(const char* why)
     }
     if (s_vk.surface && s_vk.instance && pvkDestroySurfaceKHR)
         pvkDestroySurfaceKHR(s_vk.instance, s_vk.surface, NULL);
+#ifdef _WIN32
+    void vk_hud_shutdown(void);
+    vk_hud_shutdown();
+#endif
     if (s_vk.window) {
         SDL_DestroyWindow(s_vk.window);
         SDL_QuitSubSystem(SDL_INIT_VIDEO);
@@ -2232,6 +2238,8 @@ static void vk_window_open(const char* title)
         ShowWindow(hwnd, SW_SHOWNORMAL);
         UpdateWindow(hwnd);
         SetForegroundWindow(hwnd);
+        void vk_hud_init(HWND game_hwnd, const char* title, const char* gpu_name);
+        vk_hud_init(hwnd, title, s_vk_gpu_name);
     }
 #endif
     unsigned n = 0;
@@ -2391,6 +2399,160 @@ static void vk_swapchain_lost(void)
  * holding every image (notready). Read and written with relaxed atomics from
  * the frame-clock and present threads; one line a second from the pump.
  * -------------------------------------------------------------------------*/
+#ifdef _WIN32
+static HWND s_hud_hwnd = NULL;
+static HWND s_game_hwnd = NULL;
+static char s_hud_title[64] = "MLB The Show 16";
+static char s_hud_gpu[64] = "Vulkan";
+
+static int vk_hud_on(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char* e = getenv("PS3RECOMP_HUD");
+        const char* m = getenv("MANGOHUD");
+        on = (e && *e == '1') || (m && *m == '1');
+    }
+    return on;
+}
+
+static LRESULT CALLBACK vk_hud_wndproc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
+{
+    if (msg == WM_ERASEBKGND) return 1;
+    return DefWindowProcA(hwnd, msg, wParam, lParam);
+}
+
+void vk_hud_draw(unsigned int fps)
+{
+    if (!s_hud_hwnd || !s_game_hwnd) return;
+    if (IsIconic(s_game_hwnd) || !IsWindowVisible(s_game_hwnd)) {
+        if (IsWindowVisible(s_hud_hwnd)) ShowWindow(s_hud_hwnd, SW_HIDE);
+        return;
+    }
+
+    POINT pt = {16, 16};
+    ClientToScreen(s_game_hwnd, &pt);
+    SetWindowPos(s_hud_hwnd, HWND_TOPMOST, pt.x, pt.y, 205, 78, SWP_NOACTIVATE | SWP_SHOWWINDOW);
+
+    HDC hdc = GetDC(s_hud_hwnd);
+    if (!hdc) return;
+    HDC memDC = CreateCompatibleDC(hdc);
+    HBITMAP memBm = CreateCompatibleBitmap(hdc, 205, 78);
+    HBITMAP oldBm = (HBITMAP)SelectObject(memDC, memBm);
+
+    RECT r = {0, 0, 205, 78};
+    HBRUSH bg = CreateSolidBrush(RGB(18, 20, 24));
+    FillRect(memDC, &r, bg);
+    DeleteObject(bg);
+
+    HPEN borderPen = CreatePen(PS_SOLID, 1, RGB(55, 62, 72));
+    HPEN oldPen = (HPEN)SelectObject(memDC, borderPen);
+    HBRUSH oldBrush = (HBRUSH)SelectObject(memDC, GetStockObject(NULL_BRUSH));
+    Rectangle(memDC, 0, 0, 205, 78);
+
+    HFONT fontBold = CreateFontA(14, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE,
+        ANSI_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+        CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, "Consolas");
+    HFONT fontSmall = CreateFontA(12, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+        ANSI_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+        CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, "Segoe UI");
+
+    SetBkMode(memDC, TRANSPARENT);
+
+    HFONT oldFont = (HFONT)SelectObject(memDC, fontSmall);
+    SetTextColor(memDC, RGB(160, 170, 185));
+    TextOutA(memDC, 10, 5, s_hud_title, (int)strlen(s_hud_title));
+
+    SelectObject(memDC, fontBold);
+    SetTextColor(memDC, RGB(220, 225, 235));
+    TextOutA(memDC, 10, 25, "FPS", 3);
+    SetTextColor(memDC, RGB(60, 255, 120)); /* Signature MangoHud green */
+    char fps_str[32];
+    snprintf(fps_str, sizeof(fps_str), "%u.0", fps);
+    TextOutA(memDC, 48, 25, fps_str, (int)strlen(fps_str));
+
+    SetTextColor(memDC, RGB(220, 225, 235));
+    TextOutA(memDC, 100, 25, "TIME", 4);
+    SetTextColor(memDC, RGB(0, 215, 255)); /* Signature MangoHud cyan */
+    char ms_str[32];
+    float ms = fps > 0 ? 1000.0f / (float)fps : 0.0f;
+    snprintf(ms_str, sizeof(ms_str), "%.1f ms", ms);
+    TextOutA(memDC, 142, 25, ms_str, (int)strlen(ms_str));
+
+    SelectObject(memDC, fontSmall);
+    SetTextColor(memDC, RGB(140, 150, 165));
+    TextOutA(memDC, 10, 51, s_hud_gpu, (int)strlen(s_hud_gpu));
+
+    BitBlt(hdc, 0, 0, 205, 78, memDC, 0, 0, SRCCOPY);
+
+    SelectObject(memDC, oldFont);
+    DeleteObject(fontBold);
+    DeleteObject(fontSmall);
+
+    SelectObject(memDC, oldBrush);
+    SelectObject(memDC, oldPen);
+    DeleteObject(borderPen);
+
+    SelectObject(memDC, oldBm);
+    DeleteObject(memBm);
+    DeleteDC(memDC);
+    ReleaseDC(s_hud_hwnd, hdc);
+}
+
+void vk_hud_init(HWND game_hwnd, const char* title, const char* gpu_name)
+{
+    if (!vk_hud_on() || !game_hwnd) return;
+    s_game_hwnd = game_hwnd;
+    if (title && *title) snprintf(s_hud_title, sizeof(s_hud_title), "%s", title);
+    if (gpu_name && *gpu_name) snprintf(s_hud_gpu, sizeof(s_hud_gpu), "Vulkan | %s", gpu_name);
+
+    WNDCLASSA wc = {0};
+    wc.lpfnWndProc = vk_hud_wndproc;
+    wc.hInstance = GetModuleHandle(NULL);
+    wc.lpszClassName = "Ps3recomp_MangoHud";
+    RegisterClassA(&wc);
+
+    s_hud_hwnd = CreateWindowExA(
+        WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+        "Ps3recomp_MangoHud", "MangoHud",
+        WS_POPUP,
+        0, 0, 205, 78,
+        game_hwnd, NULL, GetModuleHandle(NULL), NULL
+    );
+
+    if (s_hud_hwnd) {
+        SetLayeredWindowAttributes(s_hud_hwnd, 0, 215, LWA_ALPHA);
+        ShowWindow(s_hud_hwnd, SW_SHOWNOACTIVATE);
+        vk_hud_draw(60);
+    }
+}
+
+void vk_hud_sync_pos(void)
+{
+    if (!s_hud_hwnd || !s_game_hwnd) return;
+    if (IsIconic(s_game_hwnd) || !IsWindowVisible(s_game_hwnd)) {
+        if (IsWindowVisible(s_hud_hwnd)) ShowWindow(s_hud_hwnd, SW_HIDE);
+        return;
+    }
+    POINT pt = {16, 16};
+    ClientToScreen(s_game_hwnd, &pt);
+    RECT cur;
+    GetWindowRect(s_hud_hwnd, &cur);
+    if (cur.left != pt.x || cur.top != pt.y || !IsWindowVisible(s_hud_hwnd)) {
+        SetWindowPos(s_hud_hwnd, HWND_TOPMOST, pt.x, pt.y, 0, 0, SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    }
+}
+
+void vk_hud_shutdown(void)
+{
+    if (s_hud_hwnd) {
+        DestroyWindow(s_hud_hwnd);
+        s_hud_hwnd = NULL;
+    }
+    s_game_hwnd = NULL;
+}
+#endif
+
 static struct {
     unsigned long long last_pump_us, last_print_us, max_gap_us, q_max_us;
     unsigned pumps, enq, shown, noslot, notready;
@@ -2399,7 +2561,12 @@ static struct {
 static int vk_window_stats_on(void)
 {
     static int on = -1;
-    if (on < 0) { const char* e = getenv("PS3RECOMP_VK_PRESENT_STATS"); on = e && *e == '1'; }
+    if (on < 0) {
+        const char* e = getenv("PS3RECOMP_VK_PRESENT_STATS");
+        const char* m = getenv("MANGOHUD");
+        const char* h = getenv("PS3RECOMP_HUD");
+        on = (e && *e == '1') || (m && *m == '1') || (h && *h == '1');
+    }
     return on;
 }
 
@@ -2435,6 +2602,9 @@ static void vk_window_stats_pump(void)
         snprintf(title_buf, sizeof(title_buf), "ps3recomp - MLB The Show 16 | %u FPS", shown);
         SDL_SetWindowTitle(s_vk.window, title_buf);
     }
+#ifdef _WIN32
+    vk_hud_draw(shown);
+#endif
     s_vkw.pumps = 0;
     s_vkw.max_gap_us = 0;
     s_vkw.last_print_us = now;
@@ -6949,6 +7119,10 @@ int rsx_vulkan_backend_pump_messages(void)
 {
     if (!s_vk.windowed) return 0;
     vk_window_stats_pump();
+#ifdef _WIN32
+    void vk_hud_sync_pos(void);
+    vk_hud_sync_pos();
+#endif
     int quit = 0;
     SDL_Event e;
     while (SDL_PollEvent(&e)) {
