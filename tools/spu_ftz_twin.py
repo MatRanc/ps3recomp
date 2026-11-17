@@ -70,6 +70,7 @@ static inline u128 spu_hw_fnms(u128 a, u128 b, u128 c) { return spu_hw_st(_mm_fn
 #endif
 extern void spu_register_function_var(uint32_t, void (*)(spu_context*), int)
     __attribute__((weak));
+#define SPU_TWIN_VARIANT 1   /* which float twin a native hook is called from */
 """
 
 APPROX_PREAMBLE = r"""
@@ -128,6 +129,7 @@ static inline u128 spu_ap_fi(u128 a, u128 b) {
 #endif
 extern void spu_register_function_var(uint32_t, void (*)(spu_context*), int)
     __attribute__((weak));
+#define SPU_TWIN_VARIANT 2
 """
 
 # Opt-in extras for the _approx twin only (flags default off; the default output is unchanged).
