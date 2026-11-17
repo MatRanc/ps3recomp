@@ -157,6 +157,7 @@ SOA_INL u128 ap_fi(u128 a, u128 b)
 #define FREST ap_frest
 #define FI ap_fi
 #include "c690_soa_kernels.inc"
+#include "c690_output_kernels.inc"
 
 #define C690_IMAGE_ID 6
 
@@ -221,14 +222,45 @@ static void soa_report(const char* tag)
     fflush(stderr);
 }
 
+static int soa_is_out(uint32_t lsa)
+{
+    return lsa == 0x7998u || lsa == 0x8160u;
+}
+
+static int soa_out_run(spu_context* ctx, uint8_t* ls, uint32_t lsa, int variant, uint32_t* exit_pc)
+{
+    if (lsa == 0x7998u) { *exit_pc = soa_out_7998(ctx, ls); return 1; }
+    if (lsa == 0x8160u) {
+        switch (variant) {
+        case 0: *exit_pc = soa_out_8160_v0(ctx, ls); return 1;
+        case 1: *exit_pc = soa_out_8160_v1(ctx, ls); return 1;
+        case 2: *exit_pc = soa_out_8160_v2(ctx, ls); return 1;
+        }
+    }
+    return 0;
+}
+
 static void soa_shadow(spu_context* ctx, uint32_t lsa, int variant, void (*body)(spu_context*))
 {
     static SPU_THREAD_LOCAL uint8_t* t_ls;
     if (!t_ls && !(t_ls = (uint8_t*)malloc(SPU_LS_SIZE))) { body(ctx); return; }
     memcpy(t_ls, ctx->ls, SPU_LS_SIZE);
     const uint32_t sp = ctx->gpr[1]._u32[0] & SPU_LS_MASK;
-    const int ran = soa_run(ctx, t_ls, lsa, variant);
-    body(ctx);
+    int ran = 0;
+    uint32_t nat_pc = 0;
+    spu_context nat_ctx;
+    const int is_out = soa_is_out(lsa);
+    if (is_out) {
+        memcpy(nat_ctx.gpr, ctx->gpr, sizeof(nat_ctx.gpr));
+        ran = soa_out_run(&nat_ctx, t_ls, lsa, variant, &nat_pc);
+        const int saved_direct = g_spu_direct;
+        g_spu_direct = 0;
+        do { body(ctx); } while ((ctx->pc & SPU_LS_MASK) == lsa);
+        g_spu_direct = saved_direct;
+    } else {
+        ran = soa_run(ctx, t_ls, lsa, variant);
+        body(ctx);
+    }
     if (!ran) { __atomic_fetch_add(&s_fallback, 1ull, __ATOMIC_RELAXED); return; }
     /* The callee's frame below sp is dead and not reproduced. */
     const uint32_t dead = sp >= 0x60u ? sp - 0x60u : 0;
@@ -236,13 +268,22 @@ static void soa_shadow(spu_context* ctx, uint32_t lsa, int variant, void (*body)
     if (memcmp(t_ls, ctx->ls, dead) || memcmp(t_ls + sp, ctx->ls + sp, SPU_LS_SIZE - sp))
         for (size_t i = 0; i < SPU_LS_SIZE; i++)
             if ((i < dead || i >= sp) && t_ls[i] != ctx->ls[i]) { if (!bad++) first = i; }
+    int gpr_bad = -1;
+    if (is_out) {
+        if ((nat_pc & SPU_LS_MASK) != (ctx->pc & SPU_LS_MASK)) gpr_bad = -2;
+        else {
+            for (int r = 0; r < 128; r++) {
+                if (memcmp(&nat_ctx.gpr[r], &ctx->gpr[r], 16) != 0) { gpr_bad = r; break; }
+            }
+        }
+    }
     const unsigned long long n = __atomic_fetch_add(&s_shadow, 1ull, __ATOMIC_RELAXED) + 1ull;
-    if (bad) {
+    if (bad || gpr_bad != -1) {
         const unsigned long long m = __atomic_fetch_add(&s_mismatch, 1ull, __ATOMIC_RELAXED);
         if (m < 8) {
             const size_t b = first & ~(size_t)15;
-            fprintf(stderr, "[c690-soa] SHADOW MISMATCH lsa=0x%05X variant=%d bytes=%zu first=0x%05zX native ",
-                    lsa, variant, bad, first);
+            fprintf(stderr, "[c690-soa] SHADOW MISMATCH lsa=0x%05X variant=%d bytes=%zu first=0x%05zX gpr=%d pc=0x%X/0x%X native ",
+                    lsa, variant, bad, first, gpr_bad, nat_pc, ctx->pc);
             for (int i = 0; i < 16; i++) fprintf(stderr, "%02X", t_ls[b + i]);
             fprintf(stderr, " lifted ");
             for (int i = 0; i < 16; i++) fprintf(stderr, "%02X", ctx->ls[b + i]);
@@ -258,6 +299,17 @@ int c690_soa_try(spu_context* ctx, uint32_t lsa, int variant, void (*body)(spu_c
     if (__builtin_expect(!mode, 1)) return 0;
     if (!ctx || ctx->image_id != C690_IMAGE_ID || !ctx->ls) return 0;
     if (mode == 2) { soa_shadow(ctx, lsa, variant, body); return 1; }
+    if (soa_is_out(lsa)) {
+        uint32_t exit_pc = 0;
+        if (!soa_out_run(ctx, ctx->ls, lsa, variant, &exit_pc)) {
+            __atomic_fetch_add(&s_fallback, 1ull, __ATOMIC_RELAXED);
+            return 0;
+        }
+        __atomic_fetch_add(&s_native, 1ull, __ATOMIC_RELAXED);
+        ctx->pc = exit_pc;
+        g_spu_trampoline_fn = spu_indirect_branch;
+        return 1;
+    }
     if (!soa_run(ctx, ctx->ls, lsa, variant)) {
         __atomic_fetch_add(&s_fallback, 1ull, __ATOMIC_RELAXED);
         return 0;

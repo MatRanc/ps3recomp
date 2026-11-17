@@ -41,7 +41,7 @@ def main() -> int:
     assert s.count(head) == 1, "0xFDA0 wrapper head"
     s = s.replace(head, head + call % ("FDA0", p, "FDA0"))
 
-    for lsa in ("FA20", "FA58", "FCB8"):
+    for lsa in ("FA20", "FA58", "FCB8", "7998", "8160"):
         head = f"void {p}{lsa}(spu_context* ctx) {{\n"
         assert s.count(head) == 1, f"0x{lsa} definition"
         s = s.replace(head,
@@ -49,7 +49,7 @@ def main() -> int:
                       + f"        __attribute__((musttail)) return {p}{lsa}_body(ctx);\n}}\n"
                       + f"void {p}{lsa}_body(spu_context* ctx) {{\n")
 
-    i = min(s.index(f"void {p}{lsa}_body(spu_context* ctx);\n") for lsa in ("FA20", "FA58", "FCB8", "FDA0"))
+    i = min(s.index(f"void {p}{lsa}_body(spu_context* ctx);\n") for lsa in ("7998", "8160", "FA20", "FA58", "FCB8", "FDA0"))
 
     # Declarations go ahead of the first function that uses them.
     s = s[:i] + DECL + s[i:]
