@@ -54,6 +54,7 @@
 #include "ps3_live_ctl.h"
 #include "ps3emu/ps3_trace.h"   /* PS3RECOMP_TIMELINE: present and fence events */
 #include "rsx_tex_miss.h"
+#include "rsx_hud.h"
 #include "vk_dump_queue.h"
 #include "vk_pipe_queue.h"
 #include "ps3emu/thread_name.h"
@@ -308,18 +309,25 @@ typedef struct vk_state {
     float            max_aniso;       /* samplerAnisotropy limit, 0 without the feature */
     u32              max_dim;         /* maxImageDimension2D of the device  */
     int              windowed;
+    char             gpu_name[256];
     SDL_Window*      window;
     const char*      inst_exts[16];
     u32              inst_ext_count;
     VkSurfaceKHR     surface;
     VkSwapchainKHR   swapchain;
     VkExtent2D       sc_extent;
+    VkFormat         sc_format;
     u32              sc_count;
     VkImage          sc_images[8];
     VkSemaphore      sc_done[8];      /* per image: the present waits on it */
     VkSemaphore      sem_acquire[VK_PRESENT_SLOTS]; /* per slot, reused only once
                                        * its queued present has completed */
     double           hold_seconds;
+
+    rsx_hud_state    hud;
+    vk_image         hud_img;
+    vk_buffer        hud_stage[VK_PRESENT_SLOTS];
+    int              hud_img_ready;
 
     const rsx_state* state;           /* live RSX state, for draws       */
     u32              clear_argb;
@@ -603,6 +611,7 @@ static int vk_pick_device(void)
     /* Vulkan guarantees 4096; the engine's targets and textures may use what
      * the device really has (a title's 4608-wide target on RADV). */
     s_vk.max_dim = p.limits.maxImageDimension2D >= 4096u ? p.limits.maxImageDimension2D : 4096u;
+    snprintf(s_vk.gpu_name, sizeof s_vk.gpu_name, "%s", p.deviceName);
     VK_LOG("using device %d: %s\n", best, p.deviceName);
     return 0;
 }
@@ -2197,7 +2206,12 @@ static void vk_window_drop(const char* why)
             }
         if (s_vk.swapchain && pvkDestroySwapchainKHR)
             pvkDestroySwapchainKHR(s_vk.device, s_vk.swapchain, NULL);
+        for (u32 i = 0; i < VK_PRESENT_SLOTS; i++)
+            vk_destroy_buffer(&s_vk.hud_stage[i]);
+        vk_destroy_image(&s_vk.hud_img);
+        s_vk.hud_img_ready = 0;
     }
+    rsx_hud_shutdown(&s_vk.hud);
     if (s_vk.surface && s_vk.instance && pvkDestroySurfaceKHR)
         pvkDestroySurfaceKHR(s_vk.instance, s_vk.surface, NULL);
     if (s_vk.window) {
@@ -2313,6 +2327,7 @@ static int vk_create_swapchain(void)
     if (pm_env) {
         if (!strcmp(pm_env, "fifo")) present_mode = VK_PRESENT_MODE_FIFO_KHR;
         else if (!strcmp(pm_env, "mailbox")) present_mode = VK_PRESENT_MODE_MAILBOX_KHR;
+        else if (!strcmp(pm_env, "immediate")) present_mode = VK_PRESENT_MODE_IMMEDIATE_KHR;
     }
 
     static const VkCompositeAlphaFlagBitsKHR alphas[] = {
@@ -2357,6 +2372,7 @@ static int vk_create_swapchain(void)
         VK_CHECK(pvkCreateSemaphore(s_vk.device, &semi, NULL, &s_vk.sc_done[i]), "vkCreateSemaphore");
 
     s_vk.sc_extent = ext;
+    s_vk.sc_format = fmt.format;
     s_vk.sc_count = n;
     /* Leave one image unacquired: the presentation engine can be holding the
      * others, and exhausting the set makes some drivers return VK_NOT_READY
@@ -2365,7 +2381,8 @@ static int vk_create_swapchain(void)
     if (s_vk.present_slots > VK_PRESENT_SLOTS) s_vk.present_slots = VK_PRESENT_SLOTS;
     VK_LOG("window swapchain %ux%u, %u images, format %d, mode %s\n",
            ext.width, ext.height, n, (int)fmt.format,
-           present_mode == VK_PRESENT_MODE_MAILBOX_KHR ? "MAILBOX" : "FIFO");
+           present_mode == VK_PRESENT_MODE_MAILBOX_KHR ? "MAILBOX" :
+           present_mode == VK_PRESENT_MODE_IMMEDIATE_KHR ? "IMMEDIATE" : "FIFO");
     return 0;
 }
 
@@ -2395,7 +2412,10 @@ static struct {
 static int vk_window_stats_on(void)
 {
     static int on = -1;
-    if (on < 0) { const char* e = getenv("PS3RECOMP_VK_PRESENT_STATS"); on = e && *e == '1'; }
+    if (on < 0) {
+        const char* e = getenv("PS3RECOMP_VK_PRESENT_STATS");
+        on = (e && *e == '1') || rsx_hud_env_enabled();
+    }
     return on;
 }
 
@@ -2417,14 +2437,22 @@ static void vk_window_stats_pump(void)
     s_vkw.pumps++;
     if (!s_vkw.last_print_us) { s_vkw.last_print_us = now; return; }
     if (now - s_vkw.last_print_us < 1000000ull) return;
+    const unsigned int shown = __atomic_exchange_n(&s_vkw.shown, 0u, __ATOMIC_RELAXED);
     VK_LOG("window: %u pumps, max pump gap %llu ms | blits %u, shown %u, "
            "dropped %u no-slot + %u not-ready, longest vkQueuePresentKHR %llu ms\n",
            s_vkw.pumps, s_vkw.max_gap_us / 1000ull,
            __atomic_exchange_n(&s_vkw.enq, 0u, __ATOMIC_RELAXED),
-           __atomic_exchange_n(&s_vkw.shown, 0u, __ATOMIC_RELAXED),
+           shown,
            __atomic_exchange_n(&s_vkw.noslot, 0u, __ATOMIC_RELAXED),
            __atomic_exchange_n(&s_vkw.notready, 0u, __ATOMIC_RELAXED),
            __atomic_exchange_n(&s_vkw.q_max_us, 0ull, __ATOMIC_RELAXED) / 1000ull);
+    rsx_hud_set_fps(&s_vk.hud, shown);
+    if (s_vk.window && s_vk.hud.enabled) {
+        char title_buf[128];
+        snprintf(title_buf, sizeof title_buf, "ps3recomp - %s | %u FPS",
+                 s_vk.hud.title[0] ? s_vk.hud.title : "MLB The Show 16", shown);
+        SDL_SetWindowTitle(s_vk.window, title_buf);
+    }
     s_vkw.pumps = 0;
     s_vkw.max_gap_us = 0;
     s_vkw.last_print_us = now;
@@ -2579,6 +2607,7 @@ static void* vk_present_thread_main(void* arg)
         VkResult r = vk_queue_present(&pi);
         ps3_trace_end(tp0, PS3_TR_VK_PRESENT, frame, 0);
         if (q0) { vk_window_stats_max(&s_vkw.q_max_us, vk_now_us() - q0); VKW_ADD(shown); }
+        rsx_hud_record_present(&s_vk.hud, vk_now_us());
         cellGcm_flip_log_shown(frame);
         ps3_trace_instant(PS3_TR_IMAGE_SHOWN, frame, 0);
         if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR)
@@ -2705,6 +2734,60 @@ static int vk_present_new_only_on(void)
  * present to the presentation thread. */
 static int vk_stall_trace_on(void);
 
+static void vk_present_blit_hud(VkCommandBuffer cb, u32 idx, int slot)
+{
+    if (!s_vk.hud.enabled || !s_vk.hud_img.img || !s_vk.hud_stage[slot].ptr) return;
+    if (s_vk.sc_extent.width < RSX_HUD_MARGIN_X + RSX_HUD_W ||
+        s_vk.sc_extent.height < RSX_HUD_MARGIN_Y + RSX_HUD_H) return;
+
+    const int uploaded = rsx_hud_render_if_due(&s_vk.hud, vk_now_us(), s_vk.hud_stage[slot].ptr);
+    if (!s_vk.hud_img_ready && !uploaded) return;
+
+    if (uploaded) {
+        VkImageMemoryBarrier hb = {
+            .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+            .srcAccessMask = s_vk.hud_img_ready ? VK_ACCESS_TRANSFER_READ_BIT : 0,
+            .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+            .oldLayout = s_vk.hud_img_ready ? VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL : VK_IMAGE_LAYOUT_UNDEFINED,
+            .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .image = s_vk.hud_img.img,
+            .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 },
+        };
+        pvkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                              0, 0, NULL, 0, NULL, 1, &hb);
+        VkBufferImageCopy reg = {
+            .bufferOffset = 0, .bufferRowLength = 0, .bufferImageHeight = 0,
+            .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
+            .imageOffset = { 0, 0, 0 },
+            .imageExtent = { RSX_HUD_W, RSX_HUD_H, 1 },
+        };
+        pvkCmdCopyBufferToImage(cb, s_vk.hud_stage[slot].buf, s_vk.hud_img.img,
+                                VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &reg);
+        hb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        hb.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+        hb.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        hb.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+        pvkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                              0, 0, NULL, 0, NULL, 1, &hb);
+        s_vk.hud_img_ready = 1;
+    }
+
+    VkImageBlit hblit = {
+        .srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
+        .srcOffsets = { { 0, 0, 0 }, { RSX_HUD_W, RSX_HUD_H, 1 } },
+        .dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
+        .dstOffsets = {
+            { RSX_HUD_MARGIN_X, RSX_HUD_MARGIN_Y, 0 },
+            { RSX_HUD_MARGIN_X + RSX_HUD_W, RSX_HUD_MARGIN_Y + RSX_HUD_H, 1 },
+        },
+    };
+    pvkCmdBlitImage(cb, s_vk.hud_img.img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                    s_vk.sc_images[idx], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                    1, &hblit, VK_FILTER_NEAREST);
+}
+
 static void vk_present_window(void)
 {
     if (!s_vk.windowed || !s_vk.swapchain) return;
@@ -2793,6 +2876,7 @@ static void vk_present_window(void)
     pvkCmdBlitImage(cb, s_vk.color.img, VK_IMAGE_LAYOUT_GENERAL,
                     s_vk.sc_images[idx], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                     1, &blit, VK_FILTER_LINEAR);
+    vk_present_blit_hud(cb, idx, slot);
     b.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
     b.dstAccessMask = 0;
     b.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
@@ -2859,6 +2943,7 @@ static void vk_present_window(void)
     const unsigned long long q0 = vk_window_stats_on() ? vk_now_us() : 0;
     r = vk_queue_present(&pi);
     if (q0) { vk_window_stats_max(&s_vkw.q_max_us, vk_now_us() - q0); VKW_ADD(shown); }
+    rsx_hud_record_present(&s_vk.hud, vk_now_us());
     cellGcm_flip_log_shown(present_frame);
     if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR) vk_swapchain_lost();
     else if (r != VK_SUCCESS) VK_LOG("vkQueuePresentKHR failed (VkResult %d)\n", (int)r);
@@ -6610,6 +6695,28 @@ static int vk_init_all(u32 width, u32 height, const char* title)
         if (!ok || vk_create_swapchain()) {
             vk_window_drop("the swapchain could not be created");
         } else {
+            rsx_hud_init(&s_vk.hud, title, s_vk.gpu_name, vk_now_us());
+            if (s_vk.hud.enabled) {
+                int hud_ok = vk_create_image(&s_vk.hud_img, VK_FORMAT_R8G8B8A8_UNORM,
+                                             RSX_HUD_W, RSX_HUD_H,
+                                             VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+                                             VK_IMAGE_ASPECT_COLOR_BIT) == 0;
+                for (u32 i = 0; i < s_vk.present_slots && hud_ok; i++) {
+                    if (vk_create_host_buffer(&s_vk.hud_stage[i],
+                                              (VkDeviceSize)RSX_HUD_W * RSX_HUD_H * 4u,
+                                              VK_BUFFER_USAGE_TRANSFER_SRC_BIT) != 0)
+                        hud_ok = 0;
+                }
+                if (!hud_ok) {
+                    VK_LOG("native HUD image allocation failed; continuing without HUD\n");
+                    rsx_hud_shutdown(&s_vk.hud);
+                    for (u32 i = 0; i < VK_PRESENT_SLOTS; i++) vk_destroy_buffer(&s_vk.hud_stage[i]);
+                    vk_destroy_image(&s_vk.hud_img);
+                } else {
+                    VK_LOG("native HUD overlay enabled (%dx%d, gpu: %s)\n",
+                           RSX_HUD_W, RSX_HUD_H, s_vk.gpu_name);
+                }
+            }
             const char* pt = getenv("PS3RECOMP_VK_PRESENT_THREAD");
             if (!(pt && pt[0] == '0') && vk_present_thread_start())
                 VK_LOG("presentation thread could not start; presenting synchronously\n");
