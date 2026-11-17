@@ -1900,6 +1900,25 @@ static inline uint32_t spu_fn_hash(uint32_t addr)
 static int s_reg_image = 0;
 void spu_begin_image(int image_id) { s_reg_image = image_id; }
 
+/* Flat per-(image, variant) dispatch table: (lsa >> 2) -> spu_fn.
+ * Populated in first-registered-match-wins order; NULL falls back to
+ * spu_lookup() for variant fallback or id-0 wildcard matching. */
+#define SPU_FLAT_MAX_IMG 256
+#define SPU_FLAT_SLOTS   (SPU_LS_SIZE >> 2)
+static spu_fn* s_flat_exact[SPU_FLAT_MAX_IMG][3];
+
+static inline spu_fn spu_flat_get(int image_id, int variant, uint32_t addr)
+{
+    if (__builtin_expect((unsigned)image_id < SPU_FLAT_MAX_IMG &&
+                         (unsigned)variant < 3u &&
+                         (addr & 3u) == 0 && addr < SPU_LS_SIZE, 1)) {
+        spu_fn* tab = s_flat_exact[image_id][variant];
+        if (__builtin_expect(tab != NULL, 1))
+            return tab[addr >> 2];
+    }
+    return NULL;
+}
+
 void spu_register_function_var(uint32_t addr, spu_fn fn, int variant)
 {
     if (s_registry_count >= SPU_FN_REGISTRY_MAX) {
@@ -1932,6 +1951,13 @@ void spu_register_function_var(uint32_t addr, spu_fn fn, int variant)
     else
         s_hash_next[s_hash_tail[h] - 1] = i + 1;
     s_hash_tail[h] = i + 1;
+    if (s_reg_image > 0 && s_reg_image < SPU_FLAT_MAX_IMG &&
+        (unsigned)variant < 3u && (addr & 3u) == 0 && addr < SPU_LS_SIZE) {
+        if (!s_flat_exact[s_reg_image][variant])
+            s_flat_exact[s_reg_image][variant] = (spu_fn*)calloc(SPU_FLAT_SLOTS, sizeof(spu_fn));
+        if (s_flat_exact[s_reg_image][variant] && !s_flat_exact[s_reg_image][variant][addr >> 2])
+            s_flat_exact[s_reg_image][variant][addr >> 2] = fn;
+    }
     /* Published after the entry is linked: the dispatch cache keys its entries
      * by this count, so a lookup that sees the new count also finds the entry. */
     __atomic_store_n(&s_registry_count, i + 1, __ATOMIC_RELEASE);
@@ -2029,10 +2055,14 @@ typedef struct { uint32_t addr, gen; int image, variant; spu_fn fn; } spu_lookup
 static SPU_TLS spu_lookup_memo t_lookup_memo[SPU_LOOKUP_MEMO_SIZE];
 static spu_fn spu_lookup_memoized(uint32_t addr, int image_id)
 {
+    const int variant = g_spu_ftz_variant;
+    if (image_id > 0) {
+        spu_fn fast = spu_flat_get(image_id, variant, addr);
+        if (__builtin_expect(fast != NULL, 1)) return fast;
+    }
     spu_lookup_memo* m = &t_lookup_memo[((addr >> 2) ^ ((uint32_t)image_id * 0x9E3779B1u)) &
                                         (SPU_LOOKUP_MEMO_SIZE - 1)];
     const uint32_t gen = s_registry_count + 1;   /* +1: zero-init never matches */
-    const int variant = g_spu_ftz_variant;
     if (m->gen != gen || m->addr != addr || m->image != image_id ||
         m->variant != variant) {
         m->fn = spu_lookup(addr, image_id);
@@ -2277,6 +2307,16 @@ spu_lifted_fn spu_lifted_lookup(const spu_context* ctx, uint32_t lsa)
     if (__builtin_expect(g_c690_stats, 0)) c690_stats_on_lookup(ctx, lsa);
     const int mode = spu_dcache_mode();
     if (!mode || !ctx) return spu_lifted_lookup_full(ctx, lsa);
+    if (__builtin_expect(mode == 1 &&
+                         !(ctx->resident_code[0].image_id | ctx->resident_code[1].image_id |
+                           ctx->resident_code[2].image_id | ctx->resident_code[3].image_id), 1)) {
+        const int v = g_spu_ftz_variant;
+        spu_fn fn = NULL;
+        if (ctx->resident_task) fn = spu_flat_get(ctx->resident_task, v, lsa);
+        else if (ctx->resident_ovl) fn = spu_flat_get(ctx->resident_ovl, v, lsa);
+        else if (ctx->image_id > 0) fn = spu_flat_get(ctx->image_id, v, lsa);
+        if (__builtin_expect(fn != NULL, 1)) return (spu_lifted_fn)fn;
+    }
     spu_context* c = (spu_context*)ctx;
     uint32_t id = c->dcache_id;
     if (!id) {

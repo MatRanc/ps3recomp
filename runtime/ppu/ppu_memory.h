@@ -171,11 +171,20 @@ void        spu_coh_notify_write(uint32_t addr);
 extern uint32_t g_ww_lo, g_ww_hi;
 void ps3_ww_report_inline(uint32_t addr, uint64_t val, int width);
 
+#ifdef PS3RECOMP_STORE_DIAG
 #define PS3_WW_CHECK(a, v, w)                                                 \
     do {                                                                      \
         if ((a) >= g_ww_lo && (a) < g_ww_hi)                                  \
             ps3_ww_report_inline((uint32_t)(a), (uint64_t)(v), (w));          \
     } while (0)
+#define PS3_RESV_STORE_CHECK(addr)                                            \
+    do {                                                                      \
+        if (g_resv_store_active > 0) ppu_resv_break_store(addr);              \
+    } while (0)
+#else
+#define PS3_WW_CHECK(a, v, w)      do { (void)(a); (void)(v); (void)(w); } while (0)
+#define PS3_RESV_STORE_CHECK(addr) do { (void)(addr); } while (0)
+#endif
 
 static inline void vm_write8(uint32_t addr, uint8_t val)
 {
@@ -195,7 +204,7 @@ static inline void vm_write32(uint32_t addr, uint32_t val)
     PS3_WW_CHECK(addr, val, 4);
     uint32_t raw = ps3_bswap32(val);
     VM_WRITE_COH(addr, &raw, sizeof(raw));
-    if (g_resv_store_active > 0) ppu_resv_break_store(addr);
+    PS3_RESV_STORE_CHECK(addr);
 }
 
 static inline void vm_write64(uint32_t addr, uint64_t val)
@@ -203,7 +212,7 @@ static inline void vm_write64(uint32_t addr, uint64_t val)
     PS3_WW_CHECK(addr, val, 8);
     uint64_t raw = ps3_bswap64(val);
     VM_WRITE_COH(addr, &raw, sizeof(raw));
-    if (g_resv_store_active > 0) ppu_resv_break_store(addr);
+    PS3_RESV_STORE_CHECK(addr);
 }
 
 static inline void vm_write_f32(uint32_t addr, float val)
