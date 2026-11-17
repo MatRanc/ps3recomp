@@ -29,6 +29,7 @@
  *       o15 = TEX8. Unwritten outputs default to (0,0,0,1).
  */
 #include "rsx_vp_decompiler.h"
+#include "rsx_shader_spirv.h"
 #include <stdio.h>
 #include <string.h>
 
@@ -315,8 +316,191 @@ int rsx_vp_analyze_constants(const u8* ucode, u32 max_bytes,
     return -1;
 }
 
+static u32 vp_popcount16(u32 m)
+{
+    u32 c = 0;
+    m &= 0xFFFFu;
+    while (m) { m &= m - 1u; c++; }
+    return c;
+}
+
+static void vp_emit_pull_preamble(Out* o, u32 input_mask)
+{
+    char decl[256];
+    snprintf(decl, sizeof(decl),
+        "[[vk::binding(%u, 0)]] StructuredBuffer<uint> rsx_raw_vb;\n"
+        "[[vk::push_constant]] cbuffer RSXPullPC {\n"
+        "    uint4 rsx_pull_hdr0;\n"
+        "    uint4 rsx_pull_hdr1;\n"
+        "    uint4 rsx_pull_attrs[4];\n"
+        "};\n",
+        (unsigned)RSX_SPIRV_RAW_VB_BINDING);
+    emit(o, decl);
+    if (vp_popcount16(input_mask) > 8u)
+        return;
+
+    emit(o,
+        "uint rsx_pull_swap32(uint v) {\n"
+        "    return ((v >> 24u) & 0xFFu) | ((v >> 8u) & 0xFF00u) |\n"
+        "           ((v << 8u) & 0xFF0000u) | ((v << 24u) & 0xFF000000u);\n"
+        "}\n"
+        "uint rsx_pull_u32_be(uint b) {\n"
+        "    uint w = rsx_pull_hdr0.x + (b >> 2u);\n"
+        "    uint rem = b & 3u;\n"
+        "    uint r = (rem == 0u) ? rsx_raw_vb[w]\n"
+        "                         : ((rsx_raw_vb[w] >> (rem * 8u)) | (rsx_raw_vb[w + 1u] << (32u - rem * 8u)));\n"
+        "    return rsx_pull_swap32(r);\n"
+        "}\n"
+        "uint rsx_pull_u16_be(uint b) {\n"
+        "    uint w = rsx_pull_hdr0.x + (b >> 2u);\n"
+        "    uint rem = b & 3u;\n"
+        "    uint r = (rem <= 2u) ? ((rsx_raw_vb[w] >> (rem * 8u)) & 0xFFFFu)\n"
+        "                         : ((rsx_raw_vb[w] >> 24u) | ((rsx_raw_vb[w + 1u] & 0xFFu) << 8u));\n"
+        "    return ((r & 0xFFu) << 8u) | ((r >> 8u) & 0xFFu);\n"
+        "}\n"
+        "uint rsx_pull_u8(uint b) {\n"
+        "    return (rsx_raw_vb[rsx_pull_hdr0.x + (b >> 2u)] >> ((b & 3u) * 8u)) & 0xFFu;\n"
+        "}\n"
+        "float rsx_pull_f16(uint h) {\n"
+        "    uint s = (h >> 15u) << 31u;\n"
+        "    uint ex = (h >> 10u) & 0x1Fu;\n"
+        "    uint mn = h & 0x3FFu;\n"
+        "    uint o = (ex == 0u) ? s\n"
+        "                        : ((ex == 31u) ? (s | 0x7F800000u | (mn << 13u))\n"
+        "                                       : (s | ((ex + 112u) << 23u) | (mn << 13u)));\n"
+        "    return asfloat(o);\n"
+        "}\n"
+        "float rsx_pull_s16(uint h) {\n"
+        "    int s = (h >= 32768u) ? (int(h) - 65536) : int(h);\n"
+        "    return float(s);\n"
+        "}\n"
+        "float4 rsx_pull_attr(uint vbyte, uint2 ad) {\n"
+        "    uint b = vbyte + (ad.x & 0xFFFFu);\n"
+        "    uint tp = ad.y & 0xFFFFu;\n"
+        "    uint cnt = ad.y >> 16u;\n"
+        "    float4 val = float4(0.0, 0.0, 0.0, 1.0);\n"
+        "    if (tp == 2u) {\n"
+        "        if (cnt > 0u) val.x = asfloat(rsx_pull_u32_be(b));\n"
+        "        if (cnt > 1u) val.y = asfloat(rsx_pull_u32_be(b + 4u));\n"
+        "        if (cnt > 2u) val.z = asfloat(rsx_pull_u32_be(b + 8u));\n"
+        "        if (cnt > 3u) val.w = asfloat(rsx_pull_u32_be(b + 12u));\n"
+        "    } else if (tp == 3u) {\n"
+        "        if (cnt > 0u) val.x = rsx_pull_f16(rsx_pull_u16_be(b));\n"
+        "        if (cnt > 1u) val.y = rsx_pull_f16(rsx_pull_u16_be(b + 2u));\n"
+        "        if (cnt > 2u) val.z = rsx_pull_f16(rsx_pull_u16_be(b + 4u));\n"
+        "        if (cnt > 3u) val.w = rsx_pull_f16(rsx_pull_u16_be(b + 6u));\n"
+        "    } else if (tp == 4u) {\n"
+        "        if (cnt > 0u) val.x = float(rsx_pull_u8(b)) * (1.0 / 255.0);\n"
+        "        if (cnt > 1u) val.y = float(rsx_pull_u8(b + 1u)) * (1.0 / 255.0);\n"
+        "        if (cnt > 2u) val.z = float(rsx_pull_u8(b + 2u)) * (1.0 / 255.0);\n"
+        "        if (cnt > 3u) val.w = float(rsx_pull_u8(b + 3u)) * (1.0 / 255.0);\n"
+        "    } else if (tp == 1u) {\n"
+        "        if (cnt > 0u) val.x = rsx_pull_s16(rsx_pull_u16_be(b)) * (1.0 / 32767.0);\n"
+        "        if (cnt > 1u) val.y = rsx_pull_s16(rsx_pull_u16_be(b + 2u)) * (1.0 / 32767.0);\n"
+        "        if (cnt > 2u) val.z = rsx_pull_s16(rsx_pull_u16_be(b + 4u)) * (1.0 / 32767.0);\n"
+        "        if (cnt > 3u) val.w = rsx_pull_s16(rsx_pull_u16_be(b + 6u)) * (1.0 / 32767.0);\n"
+        "    } else if (tp == 6u) {\n"
+        "        uint w = rsx_pull_u32_be(b);\n"
+        "        int x = int(w & 0x7FFu); if ((x & 0x400) != 0) x -= 0x800;\n"
+        "        int y = int((w >> 11u) & 0x7FFu); if ((y & 0x400) != 0) y -= 0x800;\n"
+        "        int z = int((w >> 22u) & 0x3FFu); if ((z & 0x200) != 0) z -= 0x400;\n"
+        "        val = float4(float(x) * (1.0 / 1023.0), float(y) * (1.0 / 1023.0),\n"
+        "                     float(z) * (1.0 / 511.0), 1.0);\n"
+        "    } else if (tp == 7u) {\n"
+        "        if (cnt > 0u) val.x = float(rsx_pull_u8(b));\n"
+        "        if (cnt > 1u) val.y = float(rsx_pull_u8(b + 1u));\n"
+        "        if (cnt > 2u) val.z = float(rsx_pull_u8(b + 2u));\n"
+        "        if (cnt > 3u) val.w = float(rsx_pull_u8(b + 3u));\n"
+        "    } else if (tp == 5u) {\n"
+        "        if (cnt > 0u) val.x = rsx_pull_s16(rsx_pull_u16_be(b));\n"
+        "        if (cnt > 1u) val.y = rsx_pull_s16(rsx_pull_u16_be(b + 2u));\n"
+        "        if (cnt > 2u) val.z = rsx_pull_s16(rsx_pull_u16_be(b + 4u));\n"
+        "        if (cnt > 3u) val.w = rsx_pull_s16(rsx_pull_u16_be(b + 6u));\n"
+        "    }\n"
+        "    return val;\n"
+        "}\n");
+}
+
+static void vp_emit_pull_mode4_loads(Out* o, const char* var_name, u32 input_mask)
+{
+    char line[512];
+    emit(o, "        uint _b = rsx_pull_hdr0.x + _rsx_elem * rsx_pull_hdr1.w;\n");
+    u32 slot = 0;
+    for (u32 attr = 0; attr < 16u; attr++) {
+        if (!(input_mask & (1u << attr))) continue;
+        const u32 f = slot * 4u;
+        snprintf(line, sizeof(line),
+            "        %s[%u] = float4(asfloat(rsx_raw_vb[_b + %uu]), asfloat(rsx_raw_vb[_b + %uu]),\n"
+            "                        asfloat(rsx_raw_vb[_b + %uu]), asfloat(rsx_raw_vb[_b + %uu]));\n",
+            var_name, attr, f + 0u, f + 1u, f + 2u, f + 3u);
+        emit(o, line);
+        slot++;
+    }
+}
+
+static void vp_emit_pull_populate_v(Out* o, const char* var_name, u32 input_mask)
+{
+    char line[1024];
+    snprintf(line, sizeof(line),
+        "    float4 %s[16];\n"
+        "    [unroll] for (int _k=0;_k<16;_k++) %s[_k]=float4(0,0,0,1);\n"
+        "    uint _rsx_elem = rsx_vid - rsx_pull_hdr0.y;\n",
+        var_name, var_name);
+    emit(o, line);
+
+    const u32 nbits = vp_popcount16(input_mask);
+    if (nbits > 8u) {
+        emit(o, "    {\n");
+        vp_emit_pull_mode4_loads(o, var_name, input_mask);
+        emit(o, "    }\n");
+        return;
+    }
+
+    emit(o, "    if (rsx_pull_hdr0.w == 4u) {\n");
+    vp_emit_pull_mode4_loads(o, var_name, input_mask);
+    if (input_mask == ((1u << 0) | (1u << 3) | (1u << 8))) {
+        snprintf(line, sizeof(line),
+            "    } else if (rsx_pull_hdr0.w == 0u) {\n"
+            "        uint _w = rsx_pull_hdr0.x + _rsx_elem * 6u;\n"
+            "        %s[0] = float4(asfloat(rsx_pull_swap32(rsx_raw_vb[_w+0u])), asfloat(rsx_pull_swap32(rsx_raw_vb[_w+1u])), asfloat(rsx_pull_swap32(rsx_raw_vb[_w+2u])), 1.0);\n"
+            "        %s[8] = float4(asfloat(rsx_pull_swap32(rsx_raw_vb[_w+3u])), asfloat(rsx_pull_swap32(rsx_raw_vb[_w+4u])), 0.0, 1.0);\n"
+            "        uint _rc = rsx_raw_vb[_w+5u];\n"
+            "        %s[3] = float4(float(_rc & 0xFFu), float((_rc >> 8u) & 0xFFu), float((_rc >> 16u) & 0xFFu), float((_rc >> 24u) & 0xFFu)) * (1.0 / 255.0);\n",
+            var_name, var_name, var_name);
+        emit(o, line);
+        snprintf(line, sizeof(line),
+            "    } else if (rsx_pull_hdr0.w == 2u) {\n"
+            "        uint _w = rsx_pull_hdr0.x + _rsx_elem * 5u;\n"
+            "        %s[0] = float4(asfloat(rsx_pull_swap32(rsx_raw_vb[_w+0u])), asfloat(rsx_pull_swap32(rsx_raw_vb[_w+1u])), 0.0, 1.0);\n"
+            "        %s[8] = float4(asfloat(rsx_pull_swap32(rsx_raw_vb[_w+2u])), asfloat(rsx_pull_swap32(rsx_raw_vb[_w+3u])), 0.0, 1.0);\n"
+            "        uint _rc = rsx_raw_vb[_w+4u];\n"
+            "        %s[3] = float4(float(_rc & 0xFFu), float((_rc >> 8u) & 0xFFu), float((_rc >> 16u) & 0xFFu), float((_rc >> 24u) & 0xFFu)) * (1.0 / 255.0);\n",
+            var_name, var_name, var_name);
+        emit(o, line);
+    } else if (input_mask == ((1u << 0) | (1u << 1))) {
+        snprintf(line, sizeof(line),
+            "    } else if (rsx_pull_hdr0.w == 1u) {\n"
+            "        uint _w = rsx_pull_hdr0.x + _rsx_elem * 4u;\n"
+            "        %s[0] = float4(asfloat(rsx_pull_swap32(rsx_raw_vb[_w+0u])), asfloat(rsx_pull_swap32(rsx_raw_vb[_w+1u])), 0.0, 1.0);\n"
+            "        %s[1] = float4(asfloat(rsx_pull_swap32(rsx_raw_vb[_w+2u])), asfloat(rsx_pull_swap32(rsx_raw_vb[_w+3u])), 0.0, 1.0);\n",
+            var_name, var_name);
+        emit(o, line);
+    }
+    emit(o, "    } else {\n        uint _vb = _rsx_elem * rsx_pull_hdr0.z;\n");
+    u32 slot = 0;
+    for (u32 attr = 0; attr < 16u; attr++) {
+        if (!(input_mask & (1u << attr))) continue;
+        snprintf(line, sizeof(line),
+            "        %s[%u] = rsx_pull_attr(_vb, rsx_pull_attrs[%u].%s);\n",
+            var_name, attr, slot >> 1u, (slot & 1u) ? "zw" : "xy");
+        emit(o, line);
+        slot++;
+    }
+    emit(o, "    }\n");
+}
+
 static int rsx_vp_decompile_impl(
-    const u8* ucode, u32 max_bytes, u32 vtex_mask, int compact_inputs,
+    const u8* ucode, u32 max_bytes, u32 vtex_mask, int input_mode,
     u32 input_mask, char* out, u32 out_size);
 
 int rsx_vp_decompile(const u8* ucode, u32 max_bytes, char* out, u32 out_size)
@@ -346,8 +530,24 @@ int rsx_vp_decompile_compact_ex(
         ucode, max_bytes, vtex_mask, 1, input_mask, out, out_size);
 }
 
+int rsx_vp_decompile_pull_ex(
+    const u8* ucode, u32 max_bytes, u32 vtex_mask, u32 input_mask,
+    char* out, u32 out_size)
+{
+    rsx_vp_input_analysis analysis;
+    if (rsx_vp_analyze_inputs(ucode, max_bytes, &analysis) < 0 ||
+        !analysis.exact ||
+        !analysis.input_mask ||
+        (analysis.input_mask & ~(input_mask & 0xFFFFu)) != 0)
+        input_mask = 0xFFFFu;
+    else
+        input_mask = analysis.input_mask;
+    return rsx_vp_decompile_impl(
+        ucode, max_bytes, vtex_mask, 2, input_mask, out, out_size);
+}
+
 static int rsx_vp_decompile_impl(
-    const u8* ucode, u32 max_bytes, u32 vtex_mask, int compact_inputs,
+    const u8* ucode, u32 max_bytes, u32 vtex_mask, int input_mode,
     u32 input_mask, char* out, u32 out_size)
 {
     if (!ucode || !out || out_size < 256) return -1;
@@ -623,7 +823,9 @@ static int rsx_vp_decompile_impl(
 
     /* ---- assemble full shader ---- */
     Out o = { out, out_size, 0, 0 };
-    if (!compact_inputs) {
+    if (input_mode == 2) {
+        vp_emit_pull_preamble(&o, input_mask);
+    } else if (input_mode == 0) {
         emit(&o,
             /* All 16 RSX vertex attributes arrive as float4 (the harness
              * fetches and converts them on the CPU). */
@@ -684,24 +886,29 @@ static int rsx_vp_decompile_impl(
         emit(&o, decl);
     }
 
-    emit(&o, "VSOutput main(VSInput input) {\n");
-    if (!compact_inputs) {
-        emit(&o,
-            "    float4 v[16];\n"
-            "    v[0]=input.a0;  v[1]=input.a1;  v[2]=input.a2;  v[3]=input.a3;\n"
-            "    v[4]=input.a4;  v[5]=input.a5;  v[6]=input.a6;  v[7]=input.a7;\n"
-            "    v[8]=input.a8;  v[9]=input.a9;  v[10]=input.a10; v[11]=input.a11;\n"
-            "    v[12]=input.a12; v[13]=input.a13; v[14]=input.a14; v[15]=input.a15;\n");
+    if (input_mode == 2) {
+        emit(&o, "VSOutput main(uint rsx_vid : SV_VertexID) {\n");
+        vp_emit_pull_populate_v(&o, "v", input_mask);
     } else {
-        emit(&o,
-            "    float4 v[16];\n"
-            "    [unroll] for (int _k=0;_k<16;_k++) v[_k]=float4(0,0,0,1);\n");
-        for (u32 attr = 0; attr < 16; attr++) {
-            if (!(input_mask & (1u << attr))) continue;
-            char assignment[64];
-            snprintf(assignment, sizeof(assignment),
-                     "    v[%u]=input.a%u;\n", attr, attr);
-            emit(&o, assignment);
+        emit(&o, "VSOutput main(VSInput input) {\n");
+        if (input_mode == 0) {
+            emit(&o,
+                "    float4 v[16];\n"
+                "    v[0]=input.a0;  v[1]=input.a1;  v[2]=input.a2;  v[3]=input.a3;\n"
+                "    v[4]=input.a4;  v[5]=input.a5;  v[6]=input.a6;  v[7]=input.a7;\n"
+                "    v[8]=input.a8;  v[9]=input.a9;  v[10]=input.a10; v[11]=input.a11;\n"
+                "    v[12]=input.a12; v[13]=input.a13; v[14]=input.a14; v[15]=input.a15;\n");
+        } else {
+            emit(&o,
+                "    float4 v[16];\n"
+                "    [unroll] for (int _k=0;_k<16;_k++) v[_k]=float4(0,0,0,1);\n");
+            for (u32 attr = 0; attr < 16; attr++) {
+                if (!(input_mask & (1u << attr))) continue;
+                char assignment[64];
+                snprintf(assignment, sizeof(assignment),
+                         "    v[%u]=input.a%u;\n", attr, attr);
+                emit(&o, assignment);
+            }
         }
     }
     emit(&o,
@@ -736,6 +943,51 @@ static int rsx_vp_decompile_impl(
     (void)n_flow_skipped;
     if (o.overflow) return -1;
     return instrs;
+}
+
+int rsx_vp_wrap_pull_vs(const char* vs_hlsl, char* out, u32 out_size)
+{
+    if (!vs_hlsl || !out || out_size < 256) return -1;
+    const char* vsin = strstr(vs_hlsl, "struct VSInput");
+    const char* main_sig = strstr(vs_hlsl, "VSOutput main(VSInput input) {");
+    if (!vsin || !main_sig || vsin > main_sig) return -1;
+    const char* vsin_end = strstr(vsin, "};\n");
+    if (!vsin_end || vsin_end > main_sig) return -1;
+    vsin_end += 3;
+
+    Out o = { out, out_size, 0, 0 };
+    if (vsin > vs_hlsl) {
+        size_t head = (size_t)(vsin - vs_hlsl);
+        if (head >= out_size) return -1;
+        memcpy(out, vs_hlsl, head);
+        o.len = (u32)head;
+        out[o.len] = '\0';
+    }
+    vp_emit_pull_preamble(&o, 0xFFFFu);
+    emit(&o,
+        "struct VSInput {\n"
+        "    float4 a0;  float4 a1;  float4 a2;  float4 a3;\n"
+        "    float4 a4;  float4 a5;  float4 a6;  float4 a7;\n"
+        "    float4 a8;  float4 a9;  float4 a10; float4 a11;\n"
+        "    float4 a12; float4 a13; float4 a14; float4 a15;\n"
+        "};\n");
+    {
+        const size_t mid = (size_t)(main_sig - vsin_end);
+        if (o.len + mid >= out_size) return -1;
+        memcpy(out + o.len, vsin_end, mid);
+        o.len += (u32)mid;
+        out[o.len] = '\0';
+    }
+    emit(&o, "VSOutput main(uint rsx_vid : SV_VertexID) {\n");
+    vp_emit_pull_populate_v(&o, "_pv", 0xFFFFu);
+    emit(&o,
+        "    VSInput input;\n"
+        "    input.a0=_pv[0];  input.a1=_pv[1];  input.a2=_pv[2];  input.a3=_pv[3];\n"
+        "    input.a4=_pv[4];  input.a5=_pv[5];  input.a6=_pv[6];  input.a7=_pv[7];\n"
+        "    input.a8=_pv[8];  input.a9=_pv[9];  input.a10=_pv[10]; input.a11=_pv[11];\n"
+        "    input.a12=_pv[12]; input.a13=_pv[13]; input.a14=_pv[14]; input.a15=_pv[15];\n");
+    emit(&o, main_sig + strlen("VSOutput main(VSInput input) {"));
+    return o.overflow ? -1 : 0;
 }
 
 /* See rsx_vp_decompiler.h. The distances go after the last declared output,

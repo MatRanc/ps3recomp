@@ -92,6 +92,17 @@ int rsx_vp_decompile_compact_ex(
     const u8* ucode, u32 max_bytes, u32 vtex_mask, u32 input_mask,
     char* out, u32 out_size);
 
+/* Direct vertex-pulling variant: replaces ATTRn vertex-input stage bindings
+ * with SV_VertexID + StructuredBuffer<uint> rsx_raw_vb (binding 2) and a
+ * PullPC push-constant header covering raw modes 0..3 and CPU-packed mode 4. */
+int rsx_vp_decompile_pull_ex(
+    const u8* ucode, u32 max_bytes, u32 vtex_mask, u32 input_mask,
+    char* out, u32 out_size);
+
+/* Build the fixed-function fallback vertex shader in vertex-pulling form
+ * from a standard ATTRn VS template (used when no guest VP is resident). */
+int rsx_vp_wrap_pull_vs(const char* vs_hlsl, char* out, u32 out_size);
+
 /* User clip planes. RSX vertex programs write the six clip distances into
  * o5.yzw and o6.yzw (o5.x is fog, o6.x the point size); which planes count,
  * and which side of each is kept, is NV4097_SET_USER_CLIP_PLANE_CONTROL
