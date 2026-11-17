@@ -41,6 +41,13 @@ static inline __attribute__((always_inline)) __m256 native_fma_fast256(__m256 a,
 }
 
 static inline __attribute__((always_inline)) __m256i native_cflts256(__m256i x, int i8) {
+    if (__builtin_constant_p(i8) && (i8 & 0xFF) >= 127 && (i8 & 0xFF) <= 173) {
+        const float sc = (float)(1ULL << (173 - (i8 & 0xFF)));
+        const __m256i v = _mm256_cvttps_epi32(_mm256_mul_ps(_mm256_castsi256_ps(x), _mm256_set1_ps(sc)));
+        const __m256i neg = _mm256_srai_epi32(x, 31);
+        const __m256i fix = _mm256_andnot_si256(neg, _mm256_cmpeq_epi32(v, _mm256_set1_epi32((int)0x80000000u)));
+        return _mm256_xor_si256(v, fix);
+    }
     const __m256i be = _mm256_and_si256(_mm256_srli_epi32(x, 23), _mm256_set1_epi32(0xFF));
     const __m256i m = _mm256_or_si256(_mm256_and_si256(x, _mm256_set1_epi32(0x7FFFFF)), _mm256_set1_epi32(0x800000));
     const __m256i sh = _mm256_add_epi32(be, _mm256_set1_epi32(23 - (i8 & 0xFF)));

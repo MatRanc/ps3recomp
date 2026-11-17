@@ -32,19 +32,10 @@ SOA_INL __m128i out_shufb(__m128i A, __m128i B, __m128i C)
 
 SOA_INL __m256i out_cflts256_142(__m256i x)
 {
-    const __m256i be = _mm256_and_si256(_mm256_srli_epi32(x, 23), _mm256_set1_epi32(0xFF));
-    const __m256i m = _mm256_or_si256(_mm256_and_si256(x, _mm256_set1_epi32(0x7FFFFF)), _mm256_set1_epi32(0x800000));
-    const __m256i sh = _mm256_add_epi32(be, _mm256_set1_epi32(23 - 142));
-    const __m256i lsh = _mm256_max_epi32(sh, _mm256_setzero_si256());
-    const __m256i rsh = _mm256_max_epi32(_mm256_sub_epi32(_mm256_setzero_si256(), sh), _mm256_setzero_si256());
-    __m256i v = _mm256_blendv_epi8(_mm256_srlv_epi32(m, rsh), _mm256_sllv_epi32(m, lsh),
-                                   _mm256_cmpgt_epi32(sh, _mm256_set1_epi32(-1)));
+    const __m256i v = _mm256_cvttps_epi32(_mm256_mul_ps(_mm256_castsi256_ps(x), _mm256_set1_ps(2147483648.0f)));
     const __m256i neg = _mm256_srai_epi32(x, 31);
-    const __m256i isz = _mm256_cmpeq_epi32(be, _mm256_setzero_si256());
-    v = _mm256_sub_epi32(_mm256_xor_si256(v, neg), neg);
-    const __m256i sat = _mm256_xor_si256(_mm256_set1_epi32(0x7FFFFFFF), neg);
-    v = _mm256_blendv_epi8(v, sat, _mm256_cmpgt_epi32(sh, _mm256_set1_epi32(7)));
-    return _mm256_andnot_si256(isz, v);
+    const __m256i fix = _mm256_andnot_si256(neg, _mm256_cmpeq_epi32(v, _mm256_set1_epi32((int)0x80000000u)));
+    return _mm256_xor_si256(v, fix);
 }
 
 static uint32_t soa_out_7998(spu_context* ctx, uint8_t* ls)

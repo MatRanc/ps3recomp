@@ -38,11 +38,21 @@ for suf in "" _ftz _approx; do
         -o "$OUT/test_native_soa$suf" \
         "$ROOT/tools/c690_ref/test_native_soa.c" "$OUT/stubs$suf.o" "$OUT/reg$suf.c" \
         $MODS "$ROOT/runtime/spu/c690_native_soa.c" \
+        "$ROOT/runtime/spu/job_c690_native.c" \
         "$ROOT/runtime/spu/c690_native_screen.c" "$ROOT/runtime/spu/c690_cull_fix.c" \
         "$ROOT/runtime/spu/c690_holes.c" -lm
-    "$OUT/test_native_soa$suf" "$STAGE"/*_in.bin || rc=1
-    # Whole 0x21 commands (PS3RECOMP_C690_21_CAPTURE corpus), when present.
-    if [ -n "${CMD21:-}" ]; then "$OUT/test_native_soa$suf" --cmd 13080 "$CMD21"/p*_in.bin || rc=1; fi
+    if [ "${BUILD_ONLY:-0}" != "1" ]; then
+        "$OUT/test_native_soa$suf" "$STAGE"/*_in.bin || rc=1
+        # Whole 0x21 commands (PS3RECOMP_C690_21_CAPTURE corpus), when present.
+        if [ -n "${CMD21:-}" ]; then "$OUT/test_native_soa$suf" --cmd 13080 "$CMD21"/p*_in.bin || rc=1; fi
+        if [ -n "${FN_TESTS:-}" ]; then
+            for fn in $FN_TESTS; do
+                if [ -d "${FN_CORPUS:-}/0x$fn" ]; then
+                    "$OUT/test_native_soa$suf" --fn "$fn" "${FN_CORPUS}/0x$fn"/0* || rc=1
+                fi
+            done
+        fi
+    fi
     v=$((v + 1))
 done
 exit $rc

@@ -2228,17 +2228,20 @@ static void spu_jobcap_probe(const spu_context* ctx, uint32_t lsa)
 }
 
 /* SPU_FN_CAPTURE=<lsa>[,<lsa>...][:<dir>]: dump the full LS + all 128 GPRs +
- * pc the first time each listed function is dispatched. This is the input half
- * of the offline per-function replay harness (see tests/test_job_c690_replay.c).
- * A single LSA keeps the old layout, <dir>/ls.bin; a comma-separated list
- * writes <dir>/0x<lsa>/{ls.bin,gpr.bin,pc.txt}. The directory defaults to ".". */
-#define SPU_FNCAP_MAX 16
+ * pc when each listed function is dispatched.
+ * Optional modifiers:
+ *   SPU_FN_CAPTURE_PER=<n>         capture up to n calls per LSA (default 1, max 16)
+ *   SPU_FN_CAPTURE_TRIGGER=<path>  wait until <path> exists before capturing */
+#define SPU_FNCAP_MAX 32
 void spu_fncap_capture(const spu_context* ctx, uint32_t lsa)
 {
-    static int inited = 0, on = 0, multi = 0, nlsas = 0;
+    static int inited = 0, on = 0, multi = 0, nlsas = 0, per_cap = 1;
     static uint32_t lsas[SPU_FNCAP_MAX];
-    static int done[SPU_FNCAP_MAX];
+    static int counts[SPU_FNCAP_MAX];
     static const char* dir = ".";
+    static const char* trig_path = NULL;
+    static int trig_ready = 1;
+    static unsigned trig_checks = 0;
     if (!inited) {
         inited = 1;
         const char* e = getenv("SPU_FN_CAPTURE");
@@ -2255,18 +2258,48 @@ void spu_fncap_capture(const spu_context* ctx, uint32_t lsa)
                 p++;
             }
             if (*p == ':') dir = p + 1;
+            const char* pe = getenv("SPU_FN_CAPTURE_PER");
+            if (pe && atoi(pe) > 1) {
+                per_cap = atoi(pe);
+                if (per_cap > 16) per_cap = 16;
+                multi = 1;
+            }
+            const char* te = getenv("SPU_FN_CAPTURE_TRIGGER");
+            if (te && *te) {
+                trig_path = te;
+                __atomic_store_n(&trig_ready, 0, __ATOMIC_RELAXED);
+            }
             on = nlsas > 0;
         }
     }
     if (!on) return;
+    if (!__atomic_load_n(&trig_ready, __ATOMIC_RELAXED)) {
+        if ((__atomic_fetch_add(&trig_checks, 1u, __ATOMIC_RELAXED) & 63u) != 0) return;
+        FILE* tf = fopen(trig_path, "rb");
+        if (!tf) return;
+        fclose(tf);
+        __atomic_store_n(&trig_ready, 1, __ATOMIC_RELEASE);
+    }
     int idx = -1;
-    for (int i = 0; i < nlsas; i++)
-        if (!done[i] && lsas[i] == lsa) { idx = i; break; }
+    for (int i = 0; i < nlsas; i++) {
+        if (lsas[i] == lsa) {
+            if (__atomic_load_n(&counts[i], __ATOMIC_RELAXED) < per_cap) idx = i;
+            break;
+        }
+    }
     if (idx < 0) return;
-    done[idx] = 1;
+    int slot = __atomic_fetch_add(&counts[idx], 1, __ATOMIC_RELAXED);
+    if (slot >= per_cap) return;
     char path[512], fdir[512];
     if (multi) {
-        snprintf(fdir, sizeof fdir, "%s/0x%05X", dir, lsa);
+        if (per_cap > 1) {
+            char pdir[512];
+            snprintf(pdir, sizeof pdir, "%s/0x%05X", dir, lsa);
+            CreateDirectoryA(pdir, NULL);
+            snprintf(fdir, sizeof fdir, "%s/0x%05X/%02d", dir, lsa, slot);
+        } else {
+            snprintf(fdir, sizeof fdir, "%s/0x%05X", dir, lsa);
+        }
         CreateDirectoryA(fdir, NULL);
     } else {
         snprintf(fdir, sizeof fdir, "%s", dir);
@@ -2279,8 +2312,8 @@ void spu_fncap_capture(const spu_context* ctx, uint32_t lsa)
     if (f) { fwrite(ctx->gpr, 1, sizeof(ctx->gpr), f); fclose(f); }
     snprintf(path, sizeof path, "%s/pc.txt", fdir);
     f = fopen(path, "w");
-    if (f) { fprintf(f, "lsa=0x%05X pc=0x%05X image=%d\n", lsa, ctx->pc, ctx->image_id); fclose(f); }
-    fprintf(stderr, "[fncap] captured lsa=0x%05X -> %s\n", lsa, fdir);
+    if (f) { fprintf(f, "lsa=0x%05X pc=0x%05X image=%d slot=%d\n", lsa, ctx->pc, ctx->image_id, slot); fclose(f); }
+    fprintf(stderr, "[fncap] captured lsa=0x%05X slot=%d -> %s\n", lsa, slot, fdir);
 }
 
 spu_lifted_fn spu_lifted_lookup(const spu_context* ctx, uint32_t lsa)
