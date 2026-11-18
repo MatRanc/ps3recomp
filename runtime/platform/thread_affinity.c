@@ -95,6 +95,7 @@ typedef struct {
     pthread_t pt;
 #ifdef _WIN32
     HANDLE    hThread;
+    DWORD     tid;        /* the slot's identity on Windows, see register_and_apply */
 #endif
     int       role;
     int       lane;
@@ -487,7 +488,19 @@ static void register_and_apply(int role, int lane)
     pin_thread* slot = NULL;
     for (int i = 0; i < PIN_MAX_THREADS; i++) {
         if (!s_threads[i].used) continue;
+#ifdef _WIN32
+        /* Not pthread_equal: the Windows shim's pthread_self() is the
+         * GetCurrentThread() pseudo-handle, the same value in every thread,
+         * so every thread matched the first slot. Each registration then
+         * closed the previous registrant's duplicated handle while that
+         * thread could still be about to pass it to SetThreadAffinityMask
+         * (apply_to_thread runs after the unlock): a stale handle, which an
+         * AppContainer's strict handle checks turn into an unhandled
+         * STATUS_INVALID_HANDLE (0xC0000008) as the "spurs pm" lanes start. */
+        if (s_threads[i].tid == GetCurrentThreadId()) { slot = &s_threads[i]; break; }
+#else
         if (pthread_equal(s_threads[i].pt, self)) { slot = &s_threads[i]; break; }
+#endif
     }
     if (!slot) {
         for (int i = 0; i < PIN_MAX_THREADS; i++)
@@ -497,6 +510,7 @@ static void register_and_apply(int role, int lane)
         slot->used = 1;
         slot->pt = self;
 #ifdef _WIN32
+        slot->tid = GetCurrentThreadId();
         if (slot->hThread) CloseHandle(slot->hThread);
         DuplicateHandle(GetCurrentProcess(), GetCurrentThread(),
                         GetCurrentProcess(), &slot->hThread,
