@@ -181,6 +181,35 @@ if(APPLE)
         "${CMAKE_CURRENT_SOURCE_DIR}/libs/video/rsx_metal_backend.m"
         PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
     message(STATUS "  Metal:        RSX backend enabled (rsx_metal_backend.m)")
+
+    # The in-game menu / HUD (libs/video/ps3_overlay.mm, from the Resistance
+    # and inFAMOUS ports) on Dear ImGui (third_party/imgui, v1.92.9b, MIT):
+    # the core and its Metal renderer. The backend has only weak stand-ins
+    # for the menu's hooks (so its own tests build without it), and nothing
+    # else references the menu's object, so every executable that links the
+    # library is told to keep it (-u): an archive member nobody needs is
+    # otherwise left out.
+    enable_language(OBJCXX)
+    set(PS3_IMGUI_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/imgui")
+    target_sources(ps3recomp_runtime PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/libs/video/ps3_overlay.mm"
+        "${PS3_IMGUI_DIR}/imgui.cpp"
+        "${PS3_IMGUI_DIR}/imgui_draw.cpp"
+        "${PS3_IMGUI_DIR}/imgui_tables.cpp"
+        "${PS3_IMGUI_DIR}/imgui_widgets.cpp"
+        "${PS3_IMGUI_DIR}/backends/imgui_impl_metal.mm")
+    # The include path only for these files (the folder holds a VERSION.txt
+    # and other names that must not shadow system headers elsewhere).
+    set_source_files_properties(
+        "${CMAKE_CURRENT_SOURCE_DIR}/libs/video/ps3_overlay.mm"
+        "${PS3_IMGUI_DIR}/backends/imgui_impl_metal.mm"
+        PROPERTIES COMPILE_OPTIONS "-fobjc-arc" INCLUDE_DIRECTORIES "${PS3_IMGUI_DIR}")
+    set_source_files_properties(
+        "${PS3_IMGUI_DIR}/imgui.cpp" "${PS3_IMGUI_DIR}/imgui_draw.cpp"
+        "${PS3_IMGUI_DIR}/imgui_tables.cpp" "${PS3_IMGUI_DIR}/imgui_widgets.cpp"
+        PROPERTIES COMPILE_OPTIONS "-w" INCLUDE_DIRECTORIES "${PS3_IMGUI_DIR}")   # upstream code
+    target_link_options(ps3recomp_runtime INTERFACE "LINKER:-u,_ps3_overlay_link_anchor")
+    message(STATUS "  Overlay:      in-game menu enabled (ps3_overlay.mm, Dear ImGui)")
 endif()
 
 if(PS3RECOMP_RSX_VULKAN)
@@ -515,6 +544,17 @@ if(PS3RECOMP_BUILD_TESTS)
         libs/video/rsx_dispatch.c)
     target_include_directories(test_vertex_current_color PRIVATE include libs/video)
     add_test(NAME vertex_current_color COMMAND test_vertex_current_color)
+
+    # Vertex dedupe: the direct-map, identity and hash paths give the same
+    # unique references and occurrence map as a naive reference.
+    add_executable(test_vertex_remap
+        libs/video/tests/test_vertex_remap.c
+        libs/video/rsx_vertex_compact.c
+        libs/video/rsx_dispatch.c)
+    target_include_directories(test_vertex_remap PRIVATE include libs/video)
+    add_test(NAME vertex_remap COMMAND test_vertex_remap)
+    add_test(NAME vertex_remap_hash COMMAND test_vertex_remap)
+    set_tests_properties(vertex_remap_hash PROPERTIES ENVIRONMENT PS3RECOMP_VTX_REMAP_HASH=1)
 
 
     find_package(Python3 3.10 COMPONENTS Interpreter QUIET)

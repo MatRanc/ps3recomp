@@ -4,6 +4,7 @@
 
 #include "sys_memory.h"
 #include <stdio.h>
+#include <stdlib.h>   /* getenv: PS3_MAPPER_WIDE, PS3_MEMTRACE */
 #include <string.h>
 #include "../../include/ps3emu/log_first.h"   /* relative: tools/test_*memory*.py compile this file alone */
 
@@ -357,27 +358,54 @@ int64_t sys_memory_container_get_size(ppu_context* ctx)
  * -----------------------------------------------------------------------*/
 /* Mapper reservation and legacy direct mapping share their own cursor.
  * Called with the allocator lock held. */
-static uint32_t mapper_address(uint64_t requested, uint64_t alignment)
+/* PS3_MAPPER_WIDE=1 (needs PS3_MMAPPER_TRACK=1): room for a title that
+ * reserves a lot of address space.
+ * Afro Samurai asks for one 512 MB and five 256 MB reservations, all 256 MB
+ * aligned -- the console (and RPCS3, which searches 0x20000000..0xC0000000
+ * bottom-up) has room for them; here two came back ENOMEM and the title then
+ * failed a 78 MB allocation at level load. Wide mode leaves the sys_vm window
+ * to the mapper -- only for titles that never call sys_vm (Afro Samurai does
+ * not). The cursor still only moves up: the title routes free() by address,
+ * taking [first reservation, last reservation end) as its pools' range, so the
+ * reservations must ascend (first-fit put one below the first and the title
+ * handed a pool block to libc free, which aborted). Off by default: it changes
+ * where every title's reservations land. */
+static int mapper_wide(void)
+{
+    static int on = -1;
+    if (on < 0) { const char* e = getenv("PS3_MAPPER_WIDE"); on = (e && e[0] == '1') ? 1 : 0; }
+    return on;
+}
+
+static uint32_t mapper_address(uint64_t requested, uint64_t alignment, int reservation)
 {
     if (!requested || requested > UINT32_MAX || !alignment ||
         alignment > UINT32_MAX || (alignment & (alignment - 1u))) return 0;
+    /* Only real reservations get the sys_vm window. */
+    const int wide = mapper_wide() && reservation;
     uint64_t addr = ((uint64_t)s_mapper_bump_ptr + alignment - 1u) & ~(alignment - 1u);
     uint64_t size = (requested + alignment - 1u) & ~(alignment - 1u);
     /* A reservation owns its entire aligned span. Recheck after every skip:
      * an alignment adjustment can move it into another runtime-owned window. */
+    /* Wide: a reservation may enclose the HLE heap, audio and sys_vm windows
+     * (only the inject window stays out). The tracked mapper marks those
+     * windows owned, so nothing inside a reservation is ever mapped over them;
+     * that is what lets six ascending reservations fit below the RSX window. */
     const uint64_t reserved[][2] = {
+        { VM_HLE_INJECT_BASE, (uint64_t)VM_HLE_INJECT_BASE + VM_HLE_INJECT_SIZE },
         { VM_HLE_HEAP_BASE, (uint64_t)VM_HLE_HEAP_BASE + VM_HLE_HEAP_SIZE },
         { VM_AUDIO_BASE, (uint64_t)VM_AUDIO_BASE + VM_AUDIO_SIZE },
         { VM_SYS_VM_BASE, (uint64_t)VM_SYS_VM_BASE + VM_SYS_VM_SIZE },
-        { VM_HLE_INJECT_BASE, (uint64_t)VM_HLE_INJECT_BASE + VM_HLE_INJECT_SIZE }
     };
+    const size_t nres = wide ? 1u : sizeof(reserved) / sizeof(reserved[0]);
     for (;;) {
         uint64_t next = s_image_query ? s_image_query(addr, addr + size) : addr;
-        for (size_t i = 0; i < sizeof(reserved) / sizeof(reserved[0]); ++i)
+        for (size_t i = 0; i < nres; ++i)
             if (addr < reserved[i][1] && reserved[i][0] < addr + size &&
                 reserved[i][1] > next) next = reserved[i][1];
         if (next == addr) break;
         addr = (next + alignment - 1u) & ~(alignment - 1u);
+        if (addr + size > SYS_MAPPER_END) return 0;
     }
     if (!size || addr + size > SYS_MAPPER_END || vm_commit((uint32_t)addr, (uint32_t)size) != CELL_OK)
         return 0;
@@ -397,12 +425,15 @@ int64_t sys_mmapper_allocate_address(ppu_context* ctx)
     int slot = -1;
     for (int i = 0; i < SYS_MEMORY_ALLOC_MAX; ++i)
         if (!s_mapper_reservations[i].start) { slot = i; break; }
-    uint32_t addr = slot < 0 ? 0 : mapper_address(size, alignment);
+    uint32_t addr = slot < 0 ? 0 : mapper_address(size, alignment, 1);
     if (addr) {
         mapper_reservation* r = &s_mapper_reservations[slot];
         r->start = r->next = addr; r->end = s_mapper_bump_ptr;
     }
     bump_unlock();
+    if (getenv("PS3_MEMTRACE") || !addr)
+        fprintf(stderr, "[mmapper] allocate_address(size=0x%llX align=0x%llX) -> 0x%08X%s\n",
+                (unsigned long long)size, (unsigned long long)alignment, addr, addr ? "" : " ENOMEM");
     if (!addr) return (int64_t)(int32_t)CELL_ENOMEM;
     if (out) write_be32(out, addr);
     return CELL_OK;
@@ -435,6 +466,26 @@ int64_t sys_mmapper_search_map_address(uint32_t start, uint32_t size, uint32_t* 
     found->next = (uint32_t)end;
     *out = (uint32_t)addr;
     bump_unlock(); return CELL_OK;
+}
+
+/* The reservation a search_and_map with this `start` searches: the one that
+ * contains it, or the first one when start is 0. For the tracked mapper
+ * (PS3_MMAPPER_TRACK, runtime/ppu/ppu_sysprx.cpp), which does its own first-fit
+ * placement inside these bounds instead of advancing `next`. */
+int sys_mmapper_reservation_bounds(uint32_t start, uint32_t* lo, uint32_t* hi)
+{
+    int ok = 0;
+    bump_lock();
+    for (int i = 0; i < SYS_MEMORY_ALLOC_MAX; ++i) {
+        const mapper_reservation* r = &s_mapper_reservations[i];
+        if (!r->start) continue;
+        if ((!start) || (start >= r->start && start < r->end)) {
+            *lo = r->start; *hi = r->end; ok = 1;
+            break;
+        }
+    }
+    bump_unlock();
+    return ok;
 }
 
 /* ---------------------------------------------------------------------------
@@ -517,7 +568,7 @@ int64_t sys_mmapper_allocate_memory(ppu_context* ctx)
         return (int64_t)(int32_t)CELL_EINVAL;
 
     bump_lock();
-    uint32_t addr = mapper_address(size, VM_PAGE_SIZE);
+    uint32_t addr = mapper_address(size, VM_PAGE_SIZE, 0);
     bump_unlock();
     if (!addr) return (int64_t)(int32_t)CELL_ENOMEM;
 

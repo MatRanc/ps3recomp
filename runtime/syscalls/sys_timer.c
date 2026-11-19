@@ -17,6 +17,9 @@
 #ifdef __APPLE__
 #include <mach/mach_time.h>
 #endif
+#ifndef _WIN32
+#include <sched.h>
+#endif
 #include "ps3emu/thread_name.h"
 
 /* ---------------------------------------------------------------------------
@@ -276,11 +279,20 @@ int64_t sys_timer_usleep(ppu_context* ctx)
         } while (qpc_now.QuadPart < qpc_deadline);
     }
 #else
-    if (usec > 0) {
+    if (usec >= 200) {
         struct timespec ts;
         ts.tv_sec  = (time_t)(usec / 1000000);
         ts.tv_nsec = (long)((usec % 1000000) * 1000);
         nanosleep(&ts, NULL);
+    } else if (usec > 0) {
+        /* Sub-200us sleep: nanosleep on macOS adds ~50-200us timer slack,
+         * turning a guest's 10us SPU-completion poll (func_001882B4) into
+         * a multi-hundred-us stall per poll iteration. Yield-spin to the
+         * exact mach_absolute_time deadline, matching the Win32 path above. */
+        const uint64_t deadline = host_monotonic_ns() + usec * 1000ULL;
+        do {
+            sched_yield();
+        } while (host_monotonic_ns() < deadline);
     }
 #endif
 

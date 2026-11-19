@@ -30,6 +30,8 @@ extern "C" {
 #endif
 
 extern uint8_t* vm_base;
+/* Read-only PT_LOAD of the main ELF (ppu_loader.cpp); 0/0 before load. */
+extern uint32_t g_ps3_ro_image_lo, g_ps3_ro_image_hi;
 
 /* Guard against a guest DMA whose effective address lands in reserved-but-
  * uncommitted guest memory (the 4 GB VM is MEM_RESERVE; only main mem / RSX /
@@ -265,7 +267,10 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
           int malformed = (size == 0) || (size > 0x4000)
                        || (size >= 16 && (size & 15))
                        || (((lsa ^ (uint32_t)ea) & 15) != 0)
-                       || (mfc_is_put(cmd) && (uint32_t)ea < 0x10000u);
+                       || (mfc_is_put(cmd) && (uint32_t)ea < 0x10000u)
+                       || (mfc_is_put(cmd) && g_ps3_ro_image_hi &&
+                           (uint32_t)ea < g_ps3_ro_image_hi &&
+                           (uint32_t)ea + size > g_ps3_ro_image_lo);
           if (malformed) {
               static int _n = 0;
               if (PS3_LOG_FIRST(_n, 8))
@@ -275,6 +280,16 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
                           lsa, (uint32_t)ea, size);
               return 0;
           } } }
+    { static int s_wf = -1; if (s_wf < 0) s_wf = getenv("SPU_WATCH_FIFO") ? 1 : 0;
+      if (s_wf && mfc_is_put(cmd) && (uint32_t)ea >= 0x10000000u && (uint32_t)ea < 0x10100000u) {
+          uint32_t w0 = 0;
+          if (size >= 4) {
+              const uint8_t* p = spu->ls + (lsa & SPU_LS_MASK);
+              w0 = ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) | p[3];
+          }
+          fprintf(stderr, "[spu-fifo-put] img=%d ea=0x%08X (io=0x%06X) size=%u w0=0x%08X\n",
+                  spu->image_id, (uint32_t)ea, (uint32_t)ea - 0x10000000u, size, w0);
+      } }
     /* SPU_DMACHK=1: report transfers that break the MFC rules the guest's own
      * dma.h asserts on -- size 0 or > 16 KB, size not a multiple of 16 for
      * transfers of 16+ bytes, or LSA/EA not sharing 16-byte alignment. */
@@ -1327,7 +1342,7 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
      * time. Below that, back off 1 ms per repeat rather than spinning. */
     /* One thread-local object: every Darwin TLV access is a call, and this
      * runs on every MFC command. */
-    { static SPU_THREAD_LOCAL struct { uint32_t last_ea, last_lsa, rep; unsigned long long since; } t_rep;
+    { static SPU_THREAD_LOCAL struct { uint32_t last_ea, last_lsa, rep; unsigned long long since, last; } t_rep;
 #define s_last_ea  t_rep.last_ea
 #define s_last_lsa t_rep.last_lsa
 #define s_rep      t_rep.rep
@@ -1350,6 +1365,14 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
       if ((uint32_t)ea == s_last_ea && lsa == s_last_lsa) {
           if (++s_rep >= s_limit) {
               unsigned long long now = ps3_ms_now();
+              /* A wedged job repeats back-to-back (<= ~1 ms apart with the
+               * back-off below). A gap means the job returned and ran again
+               * later -- e.g. DX:HR's 560-byte completion job does one 16-byte
+               * PUT per frame -- so restart the episode instead of halting a
+               * healthy job after 30 s of frames. 5 ms sits between a wedged
+               * loop (~1 ms per repeat) and one frame (>= 16 ms at 60 fps). */
+              if (s_since && now - t_rep.last > 5u) s_since = 0;
+              t_rep.last = now;
               if (!s_since) {
                   s_since = now;
                   if (s_log) spu_dma_repeat_log_start(spu);

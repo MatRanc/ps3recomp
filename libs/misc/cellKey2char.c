@@ -98,7 +98,8 @@ s32 cellKey2CharOpen(u32 arrangement, CellKey2CharHandle* handle)
 
 s32 cellKey2CharClose(CellKey2CharHandle handle)
 {
-    printf("[cellKey2char] Close(handle=%u)\n", handle);
+    { static int _n = 0; if (_n < 16) { _n++;
+        printf("[cellKey2char] Close(handle=%u)\n", handle); } }
 
     if (handle >= MAX_K2C_HANDLES || !s_contexts[handle].in_use)
         return (s32)CELL_K2C_ERROR_INVALID_HANDLE;

@@ -186,7 +186,34 @@ static int audio_backend_init(void)
     want.samples  = CELL_AUDIO_BLOCK_SAMPLES;
     want.callback = NULL; /* We'll use SDL_QueueAudio */
 
-    s_sdl_audio_dev = SDL_OpenAudioDevice(NULL, 0, &want, &have, 0);
+    /* PS3_AUDIO_DEVICE=<part of a name>: that output instead of the system's
+     * default; the first device whose name contains it, ignoring case. With
+     * no match the default plays and the log lists the outputs there are. */
+    const char* dev_name = NULL;
+    { const char* e = getenv("PS3_AUDIO_DEVICE");
+      if (e && *e) {
+          const int n = SDL_GetNumAudioDevices(0);
+          for (int i = 0; i < n && !dev_name; i++) {
+              const char* d = SDL_GetAudioDeviceName(i, 0);
+              if (d && strcasestr(d, e)) dev_name = d;
+          }
+          printf("[cellAudio] PS3_AUDIO_DEVICE=%s: %s%s\n", e,
+                 dev_name ? "using " : "no such output, using the default",
+                 dev_name ? dev_name : "");
+          if (!dev_name) {
+              for (int i = 0; i < n; i++) {
+                  const char* d = SDL_GetAudioDeviceName(i, 0);
+                  printf("[cellAudio]   output %d: %s\n", i, d ? d : "(unnamed)");
+              }
+          }
+      } }
+    s_sdl_audio_dev = SDL_OpenAudioDevice(dev_name, 0, &want, &have, 0);
+    if (s_sdl_audio_dev == 0 && dev_name) {
+        /* The named output would not open: the default, as with no match. */
+        printf("[cellAudio] PS3_AUDIO_DEVICE: %s would not open (%s), using the default\n",
+               dev_name, SDL_GetError());
+        s_sdl_audio_dev = SDL_OpenAudioDevice(NULL, 0, &want, &have, 0);
+    }
     if (s_sdl_audio_dev == 0) {
         printf("[cellAudio] SDL_OpenAudioDevice failed: %s\n", SDL_GetError());
         return -1;
@@ -204,11 +231,64 @@ static void audio_backend_shutdown(void)
     }
 }
 
+/* The host output's level from the environment's values (NULL = unset):
+ * PS3_AUDIO_VOLUME=0..100, 100 and above or unset = 1.0 (untouched), 0 and
+ * below = silence; PS3_AUDIO_MUTE or PS3_MUTE set to a non-zero number =
+ * silence whatever the volume. */
+static float audio_gain_from(const char* volume, const char* mute, const char* mute2)
+{
+    float gain = 1.0f;
+    if (volume && *volume) {
+        const int pct = atoi(volume);
+        gain = pct <= 0 ? 0.0f : pct >= 100 ? 1.0f : (float)pct / 100.0f;
+    }
+    if ((mute && atoi(mute)) || (mute2 && atoi(mute2))) gain = 0.0f;
+    return gain;
+}
+
+/* PS3_AUDIO_MUTE=1 (or PS3_MUTE=1): silence at the device, nothing else changes
+ * -- the title still has a working cellAudio, paced as before. PS3_AUDIO_VOLUME=
+ * 0..100: the host output's level, applied to what is queued. Read once. */
+/* The in-game menu (libs/video/ps3_overlay.mm) changes the volume live:
+ * s_host_gain < 0 until the variables are read. A mute from the environment
+ * reads as volume 0 there. */
+static volatile float s_host_gain = -1.0f;
+static volatile int   s_host_volume = 100;
+static float audio_host_gain(void)
+{
+    float gain = s_host_gain;
+    if (gain < 0.0f) {
+        gain = audio_gain_from(getenv("PS3_AUDIO_VOLUME"), getenv("PS3_AUDIO_MUTE"),
+                               getenv("PS3_MUTE"));
+        s_host_volume = (int)(gain * 100.0f + 0.5f);
+        s_host_gain = gain;
+    }
+    return gain;
+}
+int cellAudio_host_volume(void) { audio_host_gain(); return s_host_volume; }
+void cellAudio_host_set_volume(int pct)
+{
+    pct = pct < 0 ? 0 : pct > 100 ? 100 : pct;
+    s_host_volume = pct;
+    s_host_gain = (float)pct / 100.0f;
+}
+
 static void audio_backend_submit(const float* stereo_samples, u32 num_samples)
 {
-    if (s_sdl_audio_dev) {
+    if (!s_sdl_audio_dev) return;
+    const float gain = audio_host_gain();
+    if (gain == 1.0f) {   /* the mixed block itself, not a copy */
         SDL_QueueAudio(s_sdl_audio_dev, stereo_samples,
                        num_samples * 2 * sizeof(float));
+        return;
+    }
+    float scaled[CELL_AUDIO_BLOCK_SAMPLES * 2];
+    while (num_samples) {
+        const u32 n = num_samples < CELL_AUDIO_BLOCK_SAMPLES ? num_samples : CELL_AUDIO_BLOCK_SAMPLES;
+        for (u32 i = 0; i < n * 2; i++) scaled[i] = stereo_samples[i] * gain;
+        SDL_QueueAudio(s_sdl_audio_dev, scaled, n * 2 * sizeof(float));
+        stereo_samples += n * 2;
+        num_samples -= n;
     }
 }
 
@@ -516,6 +596,20 @@ static void audio_mix_one_block(void)
                 left = right = ld_be_f32(&src[s]) * level;
             }
 
+            /* PS3_AUDIO_DOWNMIX=itu: the ITU-R BS.775 stereo fold-down --
+             * centre and surround at -3 dB (side and back averaged into one
+             * surround pair), LFE dropped -- instead of the sum below, which
+             * adds the LFE to both sides and both surround pairs at 0.8. */
+            static int itu = -1;
+            if (itu < 0) { const char* e = getenv("PS3_AUDIO_DOWNMIX"); itu = e && !strcmp(e, "itu"); }
+            if (nch == 8 && itu) {
+                const float* q = &src[s * 8];
+                const float c  = ld_be_f32(&q[2]) * level * 0.7071f;
+                const float sl = (ld_be_f32(&q[4]) + ld_be_f32(&q[6])) * level * 0.5f * 0.7071f;
+                const float sr = (ld_be_f32(&q[5]) + ld_be_f32(&q[7])) * level * 0.5f * 0.7071f;
+                left  += c + sl;
+                right += c + sr;
+            } else
             /* If 7.1, mix center and other channels into stereo */
             if (nch == 8) {
                 float center = ld_be_f32(&src[s * 8 + 2]) * level * 0.707f;
@@ -531,6 +625,24 @@ static void audio_mix_one_block(void)
             s_mix_buffer[s * 2 + 0] += left;
             s_mix_buffer[s * 2 + 1] += right;
         }
+        /* AUDIO_RAW8=<file> (diagnostic): port 0's interleaved channels as
+         * host-endian floats, for an offline downmix comparison. */
+        { static FILE* rf = (FILE*)-1;
+          if (rf == (FILE*)-1) { const char* e = getenv("AUDIO_RAW8"); rf = e ? fopen(e, "wb") : NULL; }
+          if (rf && p == 0 && nch == 8) {
+              float tmp[CELL_AUDIO_BLOCK_SAMPLES * 8];
+              for (u32 i = 0; i < CELL_AUDIO_BLOCK_SAMPLES * 8; i++) tmp[i] = ld_be_f32(&src[i]);
+              fwrite(tmp, sizeof tmp, 1, rf); } }
+        /* AUDIO_CHRMS=1: every ~5 s, the RMS of each channel of each port
+         * (which speakers the guest's mixer is actually feeding). */
+        { static int on = -1; if (on < 0) on = getenv("AUDIO_CHRMS") ? 1 : 0;
+          if (on && nch <= 8) { static double acc[CELL_AUDIO_PORT_MAX][8]; static unsigned nb[CELL_AUDIO_PORT_MAX];
+            for (u32 s2 = 0; s2 < CELL_AUDIO_BLOCK_SAMPLES; s2++)
+                for (u32 c = 0; c < nch; c++) { const double v = ld_be_f32(&src[s2 * nch + c]); acc[p][c] += v * v; }
+            if (++nb[p] >= 940) {
+                fprintf(stderr, "[audio-ch] port %d rms:", p);
+                for (u32 c = 0; c < nch; c++) fprintf(stderr, " %.4f", sqrt(acc[p][c] / (nb[p] * (double)CELL_AUDIO_BLOCK_SAMPLES)));
+                fprintf(stderr, "\n"); memset(acc[p], 0, sizeof acc[p]); nb[p] = 0; } } }
 
         /* Firmware clears a ring-buffer block after consuming it. Besides
          * preventing stale PCM from replaying when a producer stalls, the
@@ -547,6 +659,14 @@ static void audio_mix_one_block(void)
 
     mutex_unlock(&s_audio_mutex);
 
+    /* PS3_AUDIO_DOWNMIX=itu also rounds peaks off above 0.8 (tanh knee)
+     * instead of cutting them flat at 1.0. */
+    { const char* e = getenv("PS3_AUDIO_DOWNMIX");
+      if (e && !strcmp(e, "itu"))
+          for (u32 i = 0; i < CELL_AUDIO_BLOCK_SAMPLES * 2; i++) {
+              const float x = s_mix_buffer[i], ax = fabsf(x);
+              if (ax > 0.8f) s_mix_buffer[i] = copysignf(0.8f + 0.2f * tanhf((ax - 0.8f) / 0.2f), x);
+          } }
     /* Clip to [-1.0, 1.0] */
     for (u32 i = 0; i < CELL_AUDIO_BLOCK_SAMPLES * 2; i++) {
         if (s_mix_buffer[i] > 1.0f) s_mix_buffer[i] = 1.0f;
@@ -678,13 +798,47 @@ static unsigned __stdcall audio_mix_thread_func(void* arg)
     return 0;
 }
 #else
+static uint64_t audio_clock_ns(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+}
+
 static void* audio_mix_thread_func(void* arg)
 {
     (void)arg;
+    ps3_thread_name("audio mix");
     printf("[cellAudio] Mixing thread started\n");
+#ifdef __APPLE__
+    pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+#endif
 
-    unsigned long blocks = 0; float peak = 0.0f;
+    /* Pace to the exact PS3 audio block clock: 256 samples @ 48000 Hz = 5,333.33 us
+     * (187.5 blocks/s). The old usleep(2000)/usleep(5000) loop mixed at ~230 blocks/s
+     * whenever the SDL queue dipped under 4 blocks, outrunning the guest FMOD mixer
+     * and reading zeroed ring blocks (audible gaps / jumpy audio). */
+    uint64_t t0_ns = audio_clock_ns();
+    unsigned long long blocks = 0;
+    float peak = 0.0f;
     while (s_mix_thread_running) {
+        const uint64_t now_ns = audio_clock_ns();
+        const uint64_t due_ns = t0_ns + (blocks * (uint64_t)CELL_AUDIO_BLOCK_SAMPLES * 1000000000ULL) / CELL_AUDIO_SAMPLE_RATE;
+        if (now_ns < due_ns) {
+            const uint64_t rem_us = (due_ns - now_ns) / 1000ULL;
+            usleep(rem_us > 1500 ? (useconds_t)(rem_us - 500) : (useconds_t)(rem_us > 100 ? rem_us : 100));
+            continue;
+        }
+        /* More than 50 ms behind: resync clock anchor rather than bursting blocks. */
+        if (now_ns - due_ns > 50000000ULL) {
+            t0_ns = now_ns - (blocks * (uint64_t)CELL_AUDIO_BLOCK_SAMPLES * 1000000000ULL) / CELL_AUDIO_SAMPLE_RATE;
+        }
+        /* Back-pressure if host SDL queue accumulates (> 8 blocks = ~42 ms). */
+        if (audio_backend_queued_samples() > CELL_AUDIO_BLOCK_SAMPLES * 8) {
+            usleep(1000);
+            continue;
+        }
+        blocks++;
         audio_mix_one_block();
         audio_dump_mix();
         audio_backend_submit(s_mix_buffer, CELL_AUDIO_BLOCK_SAMPLES);
@@ -693,15 +847,8 @@ static void* audio_mix_thread_func(void* arg)
         { static int pk_on = -1; if (pk_on < 0) pk_on = getenv("AUDIO_PEAK") ? 1 : 0;
           if (pk_on) {
               const float pk = audio_mix_peak(); if (pk > peak) peak = pk;
-              if (++blocks % 188 == 0) { fprintf(stderr, "[audio-peak] %lu s: peak %.4f\n", blocks / 188, peak); peak = 0.0f; }
+              if (blocks % 188 == 0) { fprintf(stderr, "[audio-peak] %llu s: peak %.4f\n", blocks / 188, peak); peak = 0.0f; }
           } }
-
-        u32 queued = audio_backend_queued_samples();
-        if (queued > CELL_AUDIO_BLOCK_SAMPLES * 4) {
-            usleep(5000);
-        } else {
-            usleep(2000);
-        }
     }
 
     printf("[cellAudio] Mixing thread stopped\n");

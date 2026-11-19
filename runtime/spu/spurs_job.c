@@ -180,8 +180,12 @@ int spu_run_spurs_job(spu_lifted_entry_fn entry, int image_id,
         return -1;
     }
 
-    uint8_t* ls = (uint8_t*)calloc(1, SPU_LS_SIZE);
-    if (!ls) return -1;
+    static SPURS_JOB_TLS spu_context* s_tls_job_ctx;
+    if (!s_tls_job_ctx) s_tls_job_ctx = (spu_context*)malloc(sizeof(spu_context));
+    spu_context* pctx = s_tls_job_ctx;
+    if (!pctx) return -1;
+    spu_context_init(pctx, 0);
+    uint8_t* ls = pctx->ls;
 
     /* ---- binary at LS 0 (PIC, so delta 0 keeps the lifted addresses) ---- */
     memcpy(ls, vm_base + ea_bin, size_bin);
@@ -226,10 +230,14 @@ int spu_run_spurs_job(spu_lifted_entry_fn entry, int image_id,
 
     /* ---- input DMA list -> ioBuffer, each entry 16-byte aligned ---------- */
     uint32_t io_cur = io_ls, io_used = 0;
+    /* Where each input lands, for the older context's per-buffer pointer
+     * array (SPURS_JOB_CTX_V1 below). */
+    uint32_t in_ls[26] = { 0 };
     for (uint32_t i = 0; i < n_dma; i++) {
         uint64_t e   = g64(dma_base + i * 8u);
         uint32_t sz  = (uint32_t)((e >> 32) & 0x7FFFu);
         uint32_t eal = (uint32_t)e;
+        if (i < 26) in_ls[i] = io_cur;
         if (!sz || !eal) continue;
         if (!io_ls || io_cur + sz > SPU_LS_SIZE) break;
         memcpy(ls + io_cur, vm_base + eal, sz);
@@ -241,7 +249,8 @@ int spu_run_spurs_job(spu_lifted_entry_fn entry, int image_id,
      * jm2 keeps these in its own bss (outside job memory); we load the job at
      * LS 0, so the top of LS is the equivalent free space. */
     uint32_t desc_ls = SPU_LS_SIZE - 0x400;     /* descriptors are <= 1024 B */
-    uint32_t ctx_ls  = desc_ls - 0x40;          /* CellSpursJobContext2, 48 B */
+    /* 0x80 bytes: room for the older context layout below (SPURS_JOB_CTX_V1). */
+    uint32_t ctx_ls  = desc_ls - 0x80;          /* CellSpursJobContext2, 48 B */
     uint32_t dsz     = job_desc_size ? job_desc_size : 256u;
     if (dsz > 0x400) dsz = 0x400;
     if (p > ctx_ls)
@@ -284,6 +293,35 @@ int spu_run_spurs_job(spu_lifted_entry_fn entry, int image_id,
     ls32(ls, ctx_ls + JC_DMA_TAG,  JOB_DMA_TAG);
     ls32(ls, ctx_ls + JC_EA_JOB_DESCRIPTOR,     0);
     ls32(ls, ctx_ls + JC_EA_JOB_DESCRIPTOR + 4, job_ea);
+    /* SPURS_JOB_CTX_V1=1: also fill the fields an older job crt reads past the
+     * 48-byte Context2. Afro Samurai's skinning job (8B2B4776E3A079D8) treats
+     * the context as 26 buffer pointers (inputs, then cache buffers) followed
+     * by u16 numIoBuffer at +0x68, u16 numCacheBuffer at +0x6A and the u32
+     * dmaTag at +0x74, and halts on its own guard (tag <= 31, aligned LSA/EA)
+     * when they are wrong. With them unset those reads landed in the parked
+     * descriptor: tag = an EA, so every run halted at 0x1D4, and the odd run
+     * whose garbage passed the guard PUT its whole local store to EA 0,
+     * overwriting the PPU text (and the switch tables in it) from 0x10000.
+     * The pointer array is one LS pointer per input buffer, then one per
+     * cache buffer: for a single input it matches Context2 (ioBuffer at +0,
+     * cacheBuffer[i] at +4+4i), but the skinning jobs Afro Samurai queues in
+     * a JOBLIST carry two inputs, and with input 1's slot holding the cache
+     * buffer they skinned from the wrong data (the shards in cutscenes). */
+    { const char* v1 = ps3_env_once("SPURS_JOB_CTX_V1");
+      if (v1 && *v1 == '1') {
+        uint32_t k = 0;
+        for (uint32_t i = 0; i < n_dma && k < 26; i++, k++)
+            ls32(ls, ctx_ls + k * 4u, in_ls[i]);
+        for (uint32_t j = 0; j < n_cache && j < 4 && k < 26; j++, k++)
+            ls32(ls, ctx_ls + k * 4u, cache_ls[j]);
+        ls16(ls, ctx_ls + 0x68, (uint16_t)n_dma);
+        ls16(ls, ctx_ls + 0x6A, (uint16_t)n_cache);
+        ls32(ls, ctx_ls + 0x6C, out_ls);
+        ls32(ls, ctx_ls + 0x70, s_ls);
+        ls32(ls, ctx_ls + 0x74, JOB_DMA_TAG);
+        ls32(ls, ctx_ls + 0x78, 0);
+        ls32(ls, ctx_ls + 0x7C, job_ea);
+    } }
 
     { static int _n = 0;
       if (PS3_LOG_FIRST(_n, 4))
@@ -364,10 +402,8 @@ int spu_run_spurs_job(spu_lifted_entry_fn entry, int image_id,
     }
 
     /* ---- enter the job -------------------------------------------------- */
-    spu_context ctx;
-    spu_context_init(&ctx, 0);
+#define ctx (*pctx)
     ctx.image_id = image_id;
-    memcpy(ctx.ls, ls, SPU_LS_SIZE);
     /* SPU stack grows down. A function saves its link register in its
      * caller's frame, at 16($sp), so the entry's first store lands 16 bytes
      * above $sp. The cache buffers start right at stack_top: with $sp at
@@ -375,7 +411,13 @@ int spu_run_spurs_job(spu_lifted_entry_fn entry, int image_id,
      * cacheBuffer[0] (Twisted Metal's Edge jobs read their viewport there and
      * got width = height = 0). Leave the caller's 32-byte frame inside the
      * stack. */
-    ctx.gpr[1]._u32[0] = (stack_top - 32u) & ~15u;
+    uint32_t sp = (stack_top - 32u) & ~15u;
+    uint32_t stk_base = s_ls + size_scr;
+    ctx.gpr[1]._u32[0] = sp;
+    /* SPU ABI: word 1 of $sp holds available stack bytes for -mstack-check
+     * guards (ai $sp,$sp,-N; xswd $t,$sp; heqi $t,-1). Leaving it 0 caused
+     * every job compiled with stack checks to HALT-ASSERT on its first frame. */
+    ctx.gpr[1]._u32[1] = (sp > stk_base) ? (sp - stk_base) : 0u;
     /* Link register: where the job returns when it is done. The job manager
      * would pass an address inside itself; 0 makes the job re-enter its own
      * entry at LS 0 and run a bogus second lap. */
@@ -452,8 +494,7 @@ int spu_run_spurs_job(spu_lifted_entry_fn entry, int image_id,
     }
 
     spu_mfc_release(&ctx);
-    spu_coh_unregister(&ctx);   /* stack local: out of the reserver set */
-    { extern void spu_mfc_release(spu_context*); spu_mfc_release(&ctx); }
-    free(ls);
+    spu_coh_unregister(&ctx);   /* out of the reserver set */
+#undef ctx
     return 0;
 }

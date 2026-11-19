@@ -119,6 +119,15 @@ int SDL_PeepEvents(SDL_Event* ev, int n, SDL_eventaction action, Uint32 lo, Uint
 Uint32 SDL_WasInit(Uint32 flags) { (void)flags; return flags; }
 int SDL_InitSubSystem(Uint32 flags) { (void)flags; return 0; }
 const char* SDL_GetError(void) { return "fake"; }
+/* Not DualSenses: no trigger effects, no light bar, no gyro (test_pad_dualsense.c). */
+SDL_GameControllerType SDL_GameControllerGetType(SDL_GameController* gc) { (void)gc; return SDL_CONTROLLER_TYPE_XBOXONE; }
+int SDL_GameControllerSendEffect(SDL_GameController* gc, const void* d, int n) { (void)gc; (void)d; (void)n; assert(!"no effect for a plain pad"); return -1; }
+void SDL_GameControllerSetPlayerIndex(SDL_GameController* gc, int i) { (void)gc; (void)i; }
+SDL_bool SDL_GameControllerHasLED(SDL_GameController* gc) { (void)gc; return SDL_FALSE; }
+int SDL_GameControllerSetLED(SDL_GameController* gc, Uint8 r, Uint8 g, Uint8 b) { (void)gc; (void)r; (void)g; (void)b; return -1; }
+SDL_bool SDL_GameControllerHasSensor(SDL_GameController* gc, SDL_SensorType t) { (void)gc; (void)t; return SDL_FALSE; }
+int SDL_GameControllerSetSensorEnabled(SDL_GameController* gc, SDL_SensorType t, SDL_bool on) { (void)gc; (void)t; (void)on; return -1; }
+int SDL_GameControllerGetSensorData(SDL_GameController* gc, SDL_SensorType t, float* d, int n) { (void)gc; (void)t; (void)d; (void)n; return -1; }
 
 /* ---- helpers ---------------------------------------------------------------- */
 static void poll_once(void)

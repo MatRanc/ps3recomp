@@ -102,6 +102,16 @@ int rsx_fp_apply_unnorm_scale(char* hlsl, u32 hlsl_size, u32 unnorm_mask,
  * point is not found, the grid is already applied, or the buffer is short. */
 int rsx_fp_apply_wpos_grid(char* hlsl, u32 capacity, u32 sx, u32 sy);
 
+/* PS3_RES_SCALE (the Metal backend): the engine's render targets are `scale`
+ * times the guest's size, so SV_POSITION counts scaled pixels; WPOS is
+ * divided back to the guest's window coordinates (before the window origin
+ * and pixel-centre convention apply), and a comparison lookup with
+ * unnormalised coordinates is taken to the scaled map's texels. 1 (the
+ * default) leaves every program byte-identical. Set once, before the first
+ * decompile. */
+void  rsx_fp_set_wpos_scale(float scale);
+float rsx_fp_wpos_scale(void);
+
 /* Decode NV4097_SET_ALPHA_REF for the active surface color format. Ordinary
  * integer render targets use the low 8 bits as UNORM8; W16Z16Y16X16 uses a
  * half float and X32/W32Z32Y32X32 use a 32-bit float. */

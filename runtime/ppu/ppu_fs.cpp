@@ -211,6 +211,8 @@ static void host_path(char* out, size_t cap, const char* guest)
     ps3_vfs_ps3game_fallback(out, cap);
 }
 
+extern "C" void ppu_dump_guest_stack(ppu_context*, const char*);   /* ppu_loader.cpp */
+
 /* ---- fd / dir handle tables ---- */
 #define FS_MAX 256
 static FILE* g_files[FS_MAX];
@@ -263,6 +265,14 @@ static FILE* fd_file(int fd)
 {
     return fd >= 0 && fd < FS_MAX ? __atomic_load_n(&g_files[fd], __ATOMIC_ACQUIRE) : nullptr;
 }
+/* The other half of the split filesystem: lv2's sys_fs_* syscalls keep their
+ * own descriptor table (runtime/syscalls/sys_fs.c) and fall back to this one
+ * for a descriptor they did not open. A title can open through cellFsOpen and
+ * hand the descriptor to code that reads it with the raw syscalls -- Afro
+ * Samurai gives Bink its movie fd (BINKFILEHANDLE), and Bink lseeks/reads it
+ * with lv2 818/802, which knew nothing of it, so every movie failed to open. */
+extern "C" FILE* ppu_fs_file_for_fd(int fd) { return fd_file(fd); }
+
 static DIR* fd_dir(int fd)
 {
     return fd >= 0 && fd < FS_MAX ? __atomic_load_n(&g_dirs[fd], __ATOMIC_ACQUIRE) : nullptr;
@@ -339,7 +349,11 @@ static void cellFsOpen(ppu_context* ctx)
            * one caller level says nothing about WHICH subsystem wanted the file.
            * Dump the guest call chain for the opens that matter. */
           { const char* want = ps3_env_once("FS_STACK");
-            if (want && *want && strstr(gpath, want)) ydkj_host_bt("fs-open");
+            if (want && *want && strstr(gpath, want)) {
+                /* The guest chain too: the host one names only lifted C frames. */
+                ydkj_host_bt("fs-open");
+                ppu_dump_guest_stack(ctx, "fs-open");
+            }
           } }
       else fprintf(stderr, "[fs] open '%s' -> fd %d\n", gpath, fd); }
     if (ps3_env_once("PS3_FSLOG_BT") && strstr(gpath, ".usm")) {

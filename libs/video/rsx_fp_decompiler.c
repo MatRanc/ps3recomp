@@ -359,6 +359,12 @@ static void decode_src(u32 w, int abs_bit, Src* s)
     s->swz[4] = '\0';
 }
 
+/* PS3_RES_SCALE: see rsx_fp_set_wpos_scale. 1 leaves every program exactly
+ * what it was. */
+static float s_fp_wpos_scale = 1.0f;
+void  rsx_fp_set_wpos_scale(float scale) { s_fp_wpos_scale = (scale > 0.0f) ? scale : 1.0f; }
+float rsx_fp_wpos_scale(void) { return s_fp_wpos_scale; }
+
 /* HLSL expression for the interpolated input selected by OPDEST.INPUT_SRC.
  * The backend's passthrough VS forwards COL0/COL1/FOG/TEXCOORD0..7; WPOS maps
  * to SV_POSITION (screen-space — an approximation of the RSX window coord). */
@@ -512,6 +518,141 @@ u32 rsx_fp_texture_units(const u8* ucode, u32 max_bytes)
     return units;
 }
 
+/* NV40 half registers alias the full ones: R<n> is H<2n> (.x/.y) and
+ * H<2n+1> (.z/.w), two halves per 32-bit component, .x/.z in the low 16 bits
+ * (the order PK2H uses). Programs rely on it: DX:HR's SSAO writes view depth
+ * to H0.x, 0 to H0.y and unpacks R0.x with UP4UB to store the pair as bytes.
+ * The decompiler keeps r[] and h[] apart, so R0.x was a stale value and the
+ * whole AO chain -- and every environment surface multiplied by it -- went
+ * to garbage/black. After each write, mirror the written components into
+ * the aliased register; the shader compiler drops mirrors nothing reads. */
+static void fp_alias_sync(Out* o, int dst_half, u32 idx, const char* m)
+{
+    char line[256];
+    for (const char* c = m; *c; c++) {
+        const u32 ci = (u32)(*c == 'x' ? 0 : *c == 'y' ? 1 : *c == 'z' ? 2 : 3);
+        if (dst_half) {
+            const u32 rn = idx >> 1, rc = (idx & 1u) * 2u + (ci >> 1), sh = (ci & 1u) * 16u;
+            snprintf(line, sizeof line,
+                     "    r[%u].%c = asfloat((asuint(r[%u].%c) & %s) | (f32tof16(h[%u].%c) << %u)); //AS\n",
+                     rn, "xyzw"[rc], rn, "xyzw"[rc], sh ? "0x0000FFFFu" : "0xFFFF0000u",
+                     idx, *c, sh);
+        } else {
+            const u32 hk = idx * 2u + (ci >> 1), hc = (ci & 1u) * 2u;
+            if (hk >= 48u) continue;
+            snprintf(line, sizeof line,
+                     "    h[%u].%c%c = float2(f16tof32(asuint(r[%u].%c) & 0xFFFFu), f16tof32(asuint(r[%u].%c) >> 16)); //AS\n",
+                     hk, "xyzw"[hc], "xyzw"[hc + 1], idx, *c, idx, *c);
+        }
+        out_puts(o, line);
+    }
+}
+
+/* Drop the alias mirrors (lines ending in //AS) nothing reads. Mirroring
+ * every write doubled shader text and the compile that runs on the FIFO
+ * thread (10 s stalls on first use). Straight-line programs (no branch or
+ * loop, which is every DX:HR program) get per-component backward liveness:
+ * a mirror stays only if a later line reads what it wrote before something
+ * overwrites it. With flow control, a mirror stays if its register is read
+ * anywhere. */
+static u32 fp_swz_mask(const char* q)
+{
+    u32 m = 0;
+    for (int i = 0; i < 4 && q[i] >= 'w' && q[i] <= 'z'; i++)
+        m |= 1u << (q[i] == 'w' ? 3 : q[i] - 'x');
+    return m ? m : 0xFu;
+}
+
+static int fp_is_mirror(const char* t, const char* end)
+{
+    return end - t >= 4 && !strncmp(end - 4, "//AS", 4);
+}
+
+/* Reads and writes of r[]/h[] on one non-mirror line. */
+static void fp_line_regs(const char* t, const char* end, u8 rd[2][64], u8 wr[2][64])
+{
+    const int predicated = strstr(t, "? _v.") && strstr(t, "? _v.") < end;
+    for (const char* q = t; q + 3 < end; q++) {
+        if ((q[0] != 'r' && q[0] != 'h') || q[1] != '[' ||
+            (q > t && ((q[-1] >= 'a' && q[-1] <= 'z') || q[-1] == '_'))) continue;
+        char* e = NULL;
+        const unsigned long n = strtoul(q + 2, &e, 10);
+        if (!e || *e != ']' || n >= 64) continue;
+        const int f = q[0] == 'h';
+        if (e[1] == ')' && e[2] == '.') rd[f][n] |= (u8)fp_swz_mask(e + 3);
+        else if (e[1] == '.') {
+            const u32 m = fp_swz_mask(e + 2);
+            const char* a = e + 2; while (*a >= 'w' && *a <= 'z') a++;
+            if (!strncmp(a, " = ", 3) && !predicated) wr[f][n] |= (u8)m;
+            else rd[f][n] |= (u8)m;
+        } else rd[f][n] |= 0xF;
+    }
+}
+
+static void fp_alias_prune(Out* o)
+{
+    if (!o->ok) return;
+    char* buf = o->p;
+    const int flow = strstr(buf, "[loop]") || strstr(buf, "} else {") || strstr(buf, " break;") ||
+                     strstr(buf, ") {\n");
+    /* line starts */
+    u32 nl = 0;
+    for (const char* c = buf; *c; c++) if (*c == '\n') nl++;
+    const char** ls = (const char**)malloc((nl + 2) * sizeof *ls);
+    u8* keep = (u8*)malloc(nl + 2);
+    if (!ls || !keep) { free(ls); free(keep); return; }
+    u32 n = 0;
+    for (const char* c = buf; *c;) { ls[n++] = c; const char* e = strchr(c, '\n'); c = e ? e + 1 : c + strlen(c); }
+    ls[n] = buf + strlen(buf);
+    u8 live[2][64]; memset(live, 0, sizeof live);
+    if (flow)   /* any read anywhere keeps the register's mirrors */
+        for (u32 i = 0; i < n; i++) {
+            const char* end = ls[i + 1] - (ls[i + 1] > ls[i] && ls[i + 1][-1] == '\n');
+            if (fp_is_mirror(ls[i], end)) continue;
+            u8 rd[2][64] = {{0}}, wr[2][64] = {{0}};
+            fp_line_regs(ls[i], end, rd, wr);
+            for (int f = 0; f < 2; f++) for (int k = 0; k < 64; k++) live[f][k] |= rd[f][k] ? 0xF : 0;
+        }
+    for (u32 i = n; i-- > 0;) {
+        const char* t = ls[i];
+        const char* end = ls[i + 1] - (ls[i + 1] > t && ls[i + 1][-1] == '\n');
+        keep[i] = 1;
+        if (fp_is_mirror(t, end)) {
+            const char* q = t; while (*q == ' ') q++;
+            char* e = NULL;
+            const unsigned long dn = strtoul(q + 2, &e, 10);
+            const int df = q[0] == 'h';
+            const u32 dm = fp_swz_mask(e + 2);
+            if (dn >= 64 || !(live[df][dn] & dm)) { keep[i] = 0; continue; }
+            if (flow) continue;
+            /* source: the one register of the other file the mirror reads */
+            const char* s2 = strstr(q + 4, df ? "(r[" : "(h[");
+            if (df) {                      /* h[k].ab = halves of r[n].c */
+                live[1][dn] &= (u8)~dm;
+                if (s2) { const unsigned long sn = strtoul(s2 + 3, &e, 10);
+                          if (sn < 64) live[0][sn] |= (u8)fp_swz_mask(e + 2); }
+            } else {                       /* r[n].c merges h[k].c: old r stays live */
+                if (s2) { const unsigned long sn = strtoul(s2 + 3, &e, 10);
+                          if (sn < 64) live[1][sn] |= (u8)fp_swz_mask(e + 2); }
+            }
+            continue;
+        }
+        if (flow) continue;
+        u8 rd[2][64] = {{0}}, wr[2][64] = {{0}};
+        fp_line_regs(t, end, rd, wr);
+        for (int f = 0; f < 2; f++) for (int k = 0; k < 64; k++)
+            live[f][k] = (u8)((live[f][k] & ~wr[f][k]) | rd[f][k]);
+    }
+    char* w = buf;
+    for (u32 i = 0; i < n; i++) {
+        const size_t len = (size_t)(ls[i + 1] - ls[i]);
+        if (keep[i]) { memmove(w, ls[i], len); w += len; }
+    }
+    *w = '\0';
+    o->len = (u32)(w - buf);
+    free(ls); free(keep);
+}
+
 static void fp_shadow_helper(Out* p, u32 unit, u32 cube_mask,
                               const rsx_fp_shadow_desc* d)
 {
@@ -522,19 +663,39 @@ static void fp_shadow_helper(Out* p, u32 unit, u32 cube_mask,
     const char* cmp[] = { "0.0", "depth < reference", "depth == reference",
         "depth <= reference", "depth > reference", "depth != reference",
         "depth >= reference", "1.0" };
+    /* RSX_FP_SHADOW_ONE=1 (diagnostic): every depth comparison passes, i.e.
+     * nothing is in shadow -- to tell a wrong shadow map from wrong shading. */
+    static int s_shadow_one = -1;
+    if (s_shadow_one < 0) { const char* e = getenv("RSX_FP_SHADOW_ONE"); s_shadow_one = (e && *e == '1') ? 1 : 0; }
     snprintf(text, sizeof text,
         "float _rsx_shadow_cmp%u(float reference, float depth) { return (float)(%s); }\n"
         "float4 _rsx_shadow%u(float3 coordinate) {\n"
+        /* The RSX clamps a non-finite coordinate to a texel and compares
+         * a finite depth; here inf/NaN went through floor() and lerp() to a
+         * NaN that the output's NaN guard turned into black for the whole
+         * pixel (DX:HR's environment: every surface black). Bit test, not
+         * isnan(): Metal compiles with fast math. Lit, as an out-of-map
+         * lookup is. */
+        "    if (any((asuint(coordinate) & 0x7F800000u) == 0x7F800000u)) return (float4)1.0;\n"
         "    float reference = saturate(coordinate.z);\n",
-        unit, cmp[d->func], unit);
+        unit, s_shadow_one ? "1.0" : cmp[d->func], unit);
     out_puts(p, text);
     if (d->linear || d->unnormalized) {
         snprintf(text, sizeof text, "    uint width, height; %s.GetDimensions(width, height);\n"
+            "    if (width == 0u || height == 0u) return (float4)1.0;   /* nothing bound: no 0/0 */\n"
             "    float2 size = float2(width, height);\n", tex);
         out_puts(p, text);
     }
-    out_puts(p, d->unnormalized ? "    float2 uv = coordinate.xy / size;\n" :
-                                     "    float2 uv = coordinate.xy;\n");
+    /* PS3_RES_SCALE: a comparison map is a depth target, which the engine
+     * makes the guest's size times the scale, while unnormalised coordinates
+     * count the guest's texels: take them to the map's own texels first. */
+    if (d->unnormalized && s_fp_wpos_scale != 1.0f) {
+        snprintf(text, sizeof text, "    float2 uv = coordinate.xy * %.9g / size;\n",
+                 (double)s_fp_wpos_scale);
+        out_puts(p, text);
+    } else
+        out_puts(p, d->unnormalized ? "    float2 uv = coordinate.xy / size;\n" :
+                                         "    float2 uv = coordinate.xy;\n");
     if (!d->linear) {
         snprintf(text, sizeof text,
             "    float depth = %s.SampleLevel(rsx_samp[%u], uv, 0.0).r;\n"
@@ -1204,6 +1365,7 @@ static int rsx_fp_decompile_internal(
                 out_puts(&o, "    }\n");
             }
 
+            if (has_dest && !is_never) fp_alias_sync(&o, dst_half, dst_idx, m);
             if (has_dest) {
                 const int target = fp_export_target(dst_idx, dst_half);
                 if (target >= 0) wrote[dst_half][target] = 1;
@@ -1327,7 +1489,23 @@ static int rsx_fp_decompile_internal(
      * The draw engine passes the window height in fp_alpha.y when the origin is
      * BOTTOM (0 otherwise) and a pixel-center bias in fp_alpha.z (-0.5 for INTEGER
      * centers, 0 for HALF). A backend that leaves both 0 gets the host position. */
-    if (strstr(o.p, "_rsx_wpos("))
+    /* PS3_RES_SCALE: SV_POSITION counts the scaled target's pixels; WPOS is
+     * the guest's window coordinate, so x and y are divided back first, and
+     * the origin and the pixel-centre bias (both in the guest's pixels) apply
+     * to that. At a scale of 1 the macro is the text it always was. */
+    if (strstr(o.p, "_rsx_wpos(") && s_fp_wpos_scale != 1.0f) {
+        char wpos[320];
+        const double k = 1.0 / (double)s_fp_wpos_scale;
+        if (buffered)
+            snprintf(wpos, sizeof wpos,
+                "#define _rsx_wpos(p) float4((p).x * %.9g + fp_alpha.z, "
+                "(fp_alpha.y != 0.0 ? fp_alpha.y - (p).y * %.9g : (p).y * %.9g) + fp_alpha.z, (p).z, (p).w)\n",
+                k, k, k);
+        else
+            snprintf(wpos, sizeof wpos,
+                "#define _rsx_wpos(p) float4((p).x * %.9g, (p).y * %.9g, (p).z, (p).w)\n", k, k);
+        out_puts(&p, wpos);
+    } else if (strstr(o.p, "_rsx_wpos("))
         out_puts(&p, buffered
             ? "#define _rsx_wpos(p) float4((p).x + fp_alpha.z, "
               "(fp_alpha.y != 0.0 ? fp_alpha.y - (p).y : (p).y) + fp_alpha.z, (p).z, (p).w)\n"
@@ -1405,6 +1583,7 @@ static int rsx_fp_decompile_internal(
                      "PSOutput main(PSInput input) {\n");
     }
 
+    fp_alias_prune(&o);
     if (!o.ok || !p.ok) return -1;
     if (o.len + p.len + 1 > out_size) return -1;
     memmove(out + p.len, out, o.len + 1);

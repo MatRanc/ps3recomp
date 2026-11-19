@@ -845,6 +845,19 @@ static atomic_flag s_gcm_pumping = ATOMIC_FLAG_INIT;
 #define GCM_PUMP_LEAVE()     atomic_flag_clear_explicit(&s_gcm_pumping, memory_order_release)
 #endif
 
+/* Queue handler (cellGcmSetQueueHandler): RPCS3 calls it with arg 1 on every
+ * flip command, before the flip (rsx_methods.cpp flip_command). DX:HR posts
+ * its SemWGPU frame semaphore from it; without it the main thread blocks
+ * after the first two frames. Counted, not a bit, so flips don't coalesce.
+ * ponytail: __atomic builtins (clang/gcc only), MSVC would need Interlocked. */
+static int s_queue_calls = 0;
+static void gcm_note_queue_flip(void)
+{
+    if (!s_queue_handler) return;
+    __atomic_fetch_add(&s_queue_calls, 1, __ATOMIC_SEQ_CST);
+    GCM_PENDING_SET(4);
+}
+
 /* Called by the vblank ticker thread. NO guest code -- advance the vblank count
  * and mark a vblank+flip tick pending for the main thread to deliver. */
 static u32 s_fifo_getoff;   /* tentative: defined below */
@@ -980,6 +993,10 @@ void ppu_gcm_pump(void)
         ydkj_restore_handler_opd(s_vblank_handler_opd, s_vblank_handler_code);
         g_ps3_guest_caller(s_vblank_handler_opd, (uint64_t)s_vblank_count,
                            0, 0, 0, 0, 0, 0, 0);
+    }
+    if ((p & 4) && s_queue_handler && g_ps3_guest_caller) {
+        for (int n = __atomic_exchange_n(&s_queue_calls, 0, __ATOMIC_SEQ_CST); n > 0; n--)
+            g_ps3_guest_caller((u32)(size_t)s_queue_handler, 1, 0, 0, 0, 0, 0, 0, 0);
     }
     if (p & 2) {
         /* Delivery waits for a guest thread to reach an HLE call or a timer
@@ -2574,6 +2591,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
                 /* Queued by _cellGcmSetFlipCommand, which already did the
                  * guest-visible half of the request. */
                 gcm_set_current_display_buffer(w & 7u);
+                gcm_note_queue_flip();
                 s_flip_pending = 1;
                 s_flip_request_count++;
                 /* Not past `queued`: a resync may already have written off
@@ -2731,6 +2749,17 @@ static void gcm_rsx_process_fifo_unlocked(void)
                         ps3_ft_span(PS3_FT_SEMA, 0, s_sema_offset, v, s_ft_sema_t0, ps3_ft_now());
                         s_ft_sema_t0 = 0;
                     }
+                    if (m == 0x68u) {   /* GCM_SEMA_STATS: each distinct acquire offset, once */
+                        static int st = -1; if (st < 0) st = getenv("GCM_SEMA_STATS") ? 1 : 0;
+                        static u32 seen[32]; static u32 miss[32]; static int ns;
+                        if (st) { int k = 0; for (; k < ns; k++) if (seen[k] == s_sema_offset) break;
+                            if (k == ns && ns < 32) { seen[ns++] = s_sema_offset;
+                                fprintf(stderr, "[SEMA-ACQ] first acquire off=0x%X want=0x%08X label=0x%08X\n",
+                                        s_sema_offset, v, vm_read32(la)); }
+                            if (k < 32 && vm_read32(la) != v && (++miss[k] & (miss[k] - 1)) == 0)
+                                fprintf(stderr, "[SEMA-ACQ] off=0x%X unsatisfied x%u (want 0x%08X have 0x%08X)\n",
+                                        s_sema_offset, miss[k], v, vm_read32(la)); }
+                    }
                     if (m == 0x64u)      s_sema_offset = v;
                     else if (m == 0x6Cu) {
                         /* The RSX has fetched past a RELEASE before its
@@ -2768,6 +2797,20 @@ static void gcm_rsx_process_fifo_unlocked(void)
                 extern unsigned long long ps3_ms_now(void);
                 const unsigned long long now = ps3_ms_now();
                 if (!b_t0 || b_off != s_sema_offset || b_val != v) { b_off = s_sema_offset; b_val = v; b_t0 = now; }
+                { static unsigned long long st_t0, st_last; static u32 st_n, st_give; static unsigned long long st_ms;
+                  /* GCM_SEMA_STATS=1: every 5 s, how many acquires blocked and for how long. */
+                  static int st_on = -1; if (st_on < 0) st_on = getenv("GCM_SEMA_STATS") ? 1 : 0;
+                  if (st_on) {
+                      if (b_t0 == now) st_n++;
+                      if (!st_t0) st_t0 = now;
+                      if (blk_ms && now - b_t0 >= blk_ms) st_give++;
+                      if (now - st_last >= 1) { st_ms += now - st_last > 50 ? 0 : now - st_last; }
+                      st_last = now;
+                      if (now - st_t0 >= 5000) {
+                          fprintf(stderr, "[SEMA-STATS] 5s: %u blocking acquires, ~%llu ms blocked, %u gave up\n",
+                                  st_n, st_ms, st_give);
+                          st_t0 = now; st_n = 0; st_give = 0; st_ms = 0; }
+                  } }
                 if (!blk_ms || now - b_t0 < blk_ms) {
                     if (PS3_FT_ON() && !s_ft_sema_t0) s_ft_sema_t0 = ps3_ft_now();
                     sem_blocked = 1; break;
@@ -2926,7 +2969,18 @@ static void gcm_rsx_process_fifo_unlocked(void)
                  * same reason the live engine does, and masks them itself. */
                 if (wdiag) { static int eng = -1;
                   if (eng < 0) eng = rsx_draw_engine_enabled();
-                  if (eng) rsx_draw_engine_method((subch << 13) | m, vm_read32(dea)); }
+                  /* GCM_ENGINE_3D_SUBCH=1: only what the walker itself routes as
+                   * 3D (subchannel 0, 1 unless GCM_SUBCH1_2D, and the driver
+                   * methods). The engine strips the subchannel, so a title's 2D
+                   * objects landed in the NV4097 register file: Afro Samurai's
+                   * NV3089 blits on subchannel 5 write 0x0304/0x0308/0x030C
+                   * (operation, clip point, clip size), which read back as
+                   * alpha test off, func 0x10004 -- and its foliage cards, whose
+                   * alpha test the title had set once, drew as dark rectangles. */
+                  static int only3d = -1;
+                  if (only3d < 0) { const char* e = getenv("GCM_ENGINE_3D_SUBCH"); only3d = e && *e == '1'; }
+                  if (eng && (!only3d || subch == 0 || (subch == 1 && !s1_2d) || ((subch << 13) | m) >= 0xE000u))
+                      rsx_draw_engine_method((subch << 13) | m, vm_read32(dea)); }
 
                 /* RSX_LIVE_FEED_DBG=1: what the FIFO actually carries. Counted
                  * for any run, live engine or not, so the method stream and the
@@ -3445,6 +3499,7 @@ static s32 gcm_flip_request(u32 bufferId, int in_fifo)
      * the drain does this half when it reaches it (see the 0xFEAD case). */
     if (!in_fifo) {
         gcm_set_current_display_buffer(bufferId);
+        gcm_note_queue_flip();
         s_flip_pending = 1;   /* ticker: present BEFORE the next drain */
         s_flip_request_count++;
         s_flip_direct_pending = 1;
@@ -3560,6 +3615,31 @@ s32 cellGcmSetPrepareFlip(void* ctx, u32 bufferId)
 
     printf("[cellGcmSys] SetPrepareFlip(bufferId=%u)\n", bufferId);
 
+    /* Completing the flip here, at call time, also runs the flip handler at
+     * call time and returns 0. Two opt-in alternatives:
+     *
+     * GCM_PREPAREFLIP_FIFO=1: queue the flip in the command stream, as
+     * _cellGcmSetFlipCommand does, so it happens once the RSX has executed the
+     * frame and completes on the next tick (pair with GCM_FLIPCB_ONTICK=1). */
+    { static int pf = -1; if (pf < 0) { const char* e = getenv("GCM_PREPAREFLIP_FIFO"); pf = e && *e == '1'; }
+      if (pf && gcm_flip_into_fifo((u32)(uintptr_t)ctx, bufferId))
+          return gcm_flip_request(bufferId, 1);
+      /* GCM_PREPAREFLIP_FIFO=2: prepare only. The title flips the prepared
+       * buffer itself with cellGcmSetFlipImmediate from its vblank handler
+       * (Afro Samurai: every 2nd vblank, once the frame's ready label names a
+       * buffer other than the one shown), so a prepare is not a flip. */
+      { static int p2 = -1; if (p2 < 0) { const char* e = getenv("GCM_PREPAREFLIP_FIFO"); p2 = e && *e == '2'; }
+        if (p2) { static unsigned n; static unsigned long long t0; extern unsigned long long ps3_ms_now(void);
+                  static int dbg = -1; if (dbg < 0) dbg = getenv("GCM_FLIPCOUNT") ? 1 : 0;
+                  if (dbg) { unsigned long long now = ps3_ms_now(); if (!t0) t0 = now; n++;
+                      if (now - t0 >= 5000) { fprintf(stderr, "[prepflip] %.1f/s\n", n * 1000.0 / (now - t0)); n = 0; t0 = now; } }
+                  /* libgcm returns the prepared buffer id; the title folds it
+                   * into its frame-ready label, which its vblank handler reads
+                   * to choose what cellGcmSetFlipImmediate flips. CELL_OK (0)
+                   * named buffer 0 every frame -- the one already shown -- so
+                   * the vblank handler never flipped. */
+                  return (s32)bufferId; } } }
+
     gcm_set_current_display_buffer(bufferId);
     s_flip_status = CELL_GCM_FLIP_STATUS_DONE;
     s_flip_request_count++;
@@ -3578,6 +3658,15 @@ s32 cellGcmSetPrepareFlip(void* ctx, u32 bufferId)
 /* NID: 0x1BFAB6EE */
 CellGcmDisplayInfo* cellGcmGetDisplayBufferByFlipIndex(u32 index)
 {
+    /* GCM_PREPAREFLIP_FIFO=2: the title's flip handler indexes its per-buffer
+     * "display buffer free" labels with this result, so it is the buffer id
+     * (or -1), not a host pointer. */
+    { static int p2 = -1;
+      if (p2 < 0) { const char* e = getenv("GCM_PREPAREFLIP_FIFO"); p2 = e && *e == '2'; }
+      if (p2) {
+          const u32 b = index % CELL_GCM_MAX_DISPLAY_BUFFER_NUM;
+          return (CellGcmDisplayInfo*)(intptr_t)(s_display_buffer_set[b] ? (s32)b : -1);
+      } }
     u32 id = index % CELL_GCM_MAX_DISPLAY_BUFFER_NUM;
     return &s_display_buffers[id];
 }
@@ -3742,8 +3831,12 @@ s32 cellGcmAddressToOffset(u32 address, u32* offset)
      * The Orange Box's chooser asks for exactly this, and the page it burned was
      * the one the following cellGcmMapMainMemory would otherwise have taken. */
     if (address < 0x100000u) {
-        printf("[cellGcmSys] AddressToOffset REFUSED: ea 0x%08X is not a mappable "
-               "address (page 0)\n", address);
+        static u32 s_refused = 0;
+        s_refused++;
+        if (s_refused <= 10 || (s_refused % 10000u) == 0) {
+            printf("[cellGcmSys] AddressToOffset REFUSED: ea 0x%08X is not a mappable "
+                   "address (page 0) [count=%u]\n", address, s_refused);
+        }
         vm_write32(off_ea, 0);
         return CELL_GCM_ERROR_INVALID_VALUE;
     }
@@ -4337,6 +4430,12 @@ s32 cellGcmSetDefaultFifoSize(u32 size)
 /* NID: 0x21397818 */
 s32 _cellGcmSetFlipCommand(void* ctx, u32 bufferId)
 {
+    if (getenv("FLIP_DBG")) {   /* ponytail: debug, which buffer the flip lands in */
+        const u32 c = (u32)(uintptr_t)ctx;
+        fprintf(stderr, "[FLIP] _SetFlipCommand ctx=0x%08X begin=%08X end=%08X cur=%08X io=%08X\n",
+                c, c ? vm_read32(c) : 0, c ? vm_read32(c + 4) : 0, c ? vm_read32(c + 8) : 0,
+                c ? gcm_ea2io(vm_read32(c + 8)) : 0);
+    }
     if (gcm_flip_into_fifo((u32)(uintptr_t)ctx, bufferId))
         return gcm_flip_request(bufferId, 1);
     return cellGcmSetFlipCommand(bufferId);

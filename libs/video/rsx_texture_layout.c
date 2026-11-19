@@ -372,8 +372,15 @@ void rsx_texture_component_remap(u32 control1, u32 rsx_fmt, u8 out[4])
     static const u8 lanes_g8b8[4]  = {1, 0, 1, 0};
     static const u8 lanes_b8[4]    = {RSX_REMAP_ONE, 0, 0, 0};
     static const u8 lanes_depth[4] = {0, 0, 0, 0};
+    /* Y16_X16_FLOAT: Y is the high half of the big-endian word, X the low
+     * half, and the decode keeps memory order (resource 0 = Y, 1 = X). The
+     * sampler presents X first: X,Y,X,Y. DX:HR packs view depth / AO into
+     * the low half (PK2H and H-register aliasing put .x there) and reads it
+     * back through .x; reading resource 0 handed it the other half. */
+    static const u8 lanes_y16x16f[4] = {0, 1, 0, 1};
     const u32 base = rsx_fmt & 0x9Fu;
-    const u8* src2res = (base == 0x8Bu) ? lanes_g8b8
+    const u8* src2res = (base == 0x9Fu) ? lanes_y16x16f
+                      : (base == 0x8Bu) ? lanes_g8b8
                       : (base == 0x81u || base == 0x94u) ? lanes_b8
                       : (base >= 0x90u && base <= 0x93u) ? lanes_depth : lanes_argb;
 

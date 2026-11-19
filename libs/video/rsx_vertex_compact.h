@@ -44,6 +44,13 @@ typedef struct rsx_vertex_remap {
     rsx_vertex_remap_slot* slots;
     u32 slot_capacity;
     u32 generation;
+    /* Direct map for a draw whose references share one base index and span
+     * a small vertex range: unique index and generation tag per vertex_id -
+     * direct_lo, no hashing or probing. */
+    u32* direct_value;
+    u32* direct_tag;
+    u32 direct_capacity;
+    u32 direct_generation;
 } rsx_vertex_remap;
 
 typedef struct rsx_vertex_fetch_attr {

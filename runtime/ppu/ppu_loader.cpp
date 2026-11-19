@@ -3334,6 +3334,17 @@ extern "C" void lv2_syscall(ppu_context* ctx)
         uint32_t start  = (uint32_t)ctx->gpr[3];
         uint32_t mem_id = (uint32_t)ctx->gpr[4];
         uint32_t outp   = (uint32_t)ctx->gpr[6];
+        /* PS3_MMAPPER_TRACK=1: first-fit over what is really mapped
+         * (runtime/ppu/ppu_sysprx.cpp), so unmapped space is reused. */
+        extern int ps3_mmapper_tracked(void);
+        extern int64_t ps3_mmapper_search_and_map_tracked(uint32_t, uint32_t, uint32_t*);
+        if (ps3_mmapper_tracked()) {
+            uint32_t va = 0;
+            int64_t rc = ps3_mmapper_search_and_map_tracked(start, mem_id, &va);
+            if (rc == CELL_OK && outp) vm_write32(outp, va);
+            ctx->gpr[3] = (uint64_t)rc;
+            return;
+        }
         uint32_t size = ps3_mmapper_block_size(mem_id);
         if (!size) size = 0x100000u;
         uint32_t va = 0;
@@ -3545,6 +3556,8 @@ extern "C" void lv2_syscall(ppu_context* ctx)
     }
 }
 
+extern "C" { uint32_t g_ps3_ro_image_lo, g_ps3_ro_image_hi; }
+
 /* ---------------------------------------------------------------------------
  * Minimal big-endian ELF64 loader: copies PT_LOAD segments into vm_base at
  * their vaddrs and zero-fills BSS (memsz > filesz). Returns e_entry (an OPD
@@ -3653,6 +3666,13 @@ extern "C" uint32_t ppu_load_elf(const char* path)
         if (p_memsz > p_filesz)
             memset(vm_base + (uint32_t)p_vaddr + (uint32_t)p_filesz, 0, (size_t)(p_memsz - p_filesz));
         g_ppu_image_ranges.push_back({p_vaddr, p_vaddr + (p_memsz > p_filesz ? p_memsz : p_filesz)});
+        /* Non-writable segment (text + rodata, incl. inline switch tables):
+         * lv2 maps it read-only, so an SPU DMA PUT into it faults on hardware
+         * instead of landing. Remember it for the MFC (spu_dma.h). */
+        if (!(be32(ph + 4) & 2u /*PF_W*/) && !g_ps3_ro_image_hi) {
+            g_ps3_ro_image_lo = (uint32_t)p_vaddr;
+            g_ps3_ro_image_hi = (uint32_t)(p_vaddr + p_memsz);
+        }
         loaded++;
     }
     free(file);

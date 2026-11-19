@@ -38,6 +38,7 @@
 #include <spirv_cross_c.h>
 #include <functional>
 #include <mutex>
+#include <unistd.h>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -359,6 +360,19 @@ bool translate(const char* hlsl, int stage, std::string& msl, char* log, u32 log
 
 extern "C" int rsx_hlsl_to_msl_available(void) { return 1; }
 
+/* 1 when a translation of this HLSL is already in memory or in the
+ * PS3RECOMP_MSL_CACHE directory, i.e. rsx_hlsl_to_msl will not run glslang. */
+extern "C" int rsx_hlsl_to_msl_cached(const char* hlsl, int stage)
+{
+    if (!hlsl) return 0;
+    Cache& c = cache();
+    std::lock_guard<std::mutex> guard(c.lock);
+    const std::string key = cache_key(hlsl, stage);
+    if (c.map.find(key) != c.map.end()) return 1;
+    const std::string& dir = cache_dir(c);
+    return !dir.empty() && access(cache_path(dir, key).c_str(), R_OK) == 0;
+}
+
 extern "C" int rsx_hlsl_to_msl(const char* hlsl, int stage,
                                char* out, u32 out_size,
                                char* log, u32 log_size)
@@ -430,6 +444,8 @@ extern "C" void rsx_hlsl_to_msl_cache_stats(RsxMslCacheStats* out)
 }
 
 extern "C" void rsx_hlsl_to_msl_cache_reset(void) {}
+
+extern "C" int rsx_hlsl_to_msl_cached(const char* hlsl, int stage) { (void)hlsl; (void)stage; return 0; }
 
 extern "C" int rsx_hlsl_to_msl(const char* hlsl, int stage,
                                char* out, u32 out_size,

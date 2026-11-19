@@ -957,7 +957,15 @@ static s32 savedata_execute_run(const char* dirName, int is_save,
     if (cbResult.result < 0) {
         printf("[cellSaveData] stat callback returned error %d\n", cbResult.result);
         free(fileList);
-        if (cbResult.result == CELL_SAVEDATA_CBRESULT_ERR_NODATA)
+        /* Firmware (and RPCS3's savedata_op) answer every negative callback
+         * result, ERR_NODATA included, with CELL_SAVEDATA_ERROR_CBRESULT --
+         * that is what a title checks for "no profile yet, make one".
+         * SAVEDATA_CBRESULT_STRICT=1 does that (Afro Samurai otherwise reports
+         * its missing save as damaged and refuses to go on); the NODATA
+         * mapping stays the default for the titles already relying on it. */
+        static int s_strict = -1;
+        if (s_strict < 0) { const char* e = getenv("SAVEDATA_CBRESULT_STRICT"); s_strict = (e && *e == '1') ? 1 : 0; }
+        if (!s_strict && cbResult.result == CELL_SAVEDATA_CBRESULT_ERR_NODATA)
             return CELL_SAVEDATA_ERROR_NODATA;
         return CELL_SAVEDATA_ERROR_CBRESULT;
     }

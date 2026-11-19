@@ -391,7 +391,17 @@ int rsx_vertex_fetch_many(
         case RSX_VTX_TYPE_SINT16:
             RSX_FETCH_LOOP(v[c] = (float)(s16)((src[c * 2] << 8) | src[c * 2 + 1]))
             break;
-        default:   /* RSX_VTX_TYPE_CMP32: one packed word, whatever the size */
+        case RSX_VTX_TYPE_CMP32:   /* one packed 11:11:10 word, whatever the size;
+                                    * rsx_vertex_decode_element's decode, in the loop */
+            RSX_FETCH_LOOP(if (c == 0) {
+                const u32 word = ((u32)src[0] << 24) | ((u32)src[1] << 16) |
+                                 ((u32)src[2] << 8) | (u32)src[3];
+                v[0] = (float)((s32)(word << 21) >> 21) / 1023.0f;
+                v[1] = (float)((s32)(word << 10) >> 21) / 1023.0f;
+                v[2] = (float)((s32)word >> 22) / 511.0f;
+            })
+            break;
+        default:
             for (u32 i = 0; i < count; i++)
                 if (!rsx_vertex_fetch_attr_value(plan, attr, &refs[i],
                         (float*)(out + (size_t)i * stride + slot * 16u)))
@@ -430,6 +440,71 @@ int rsx_vertex_remap_build(
             return 0;
         remap->occurrence_to_unique = occurrences;
         remap->occurrence_capacity = count;
+    }
+
+    /* The common draw: one base index and a vertex range not much wider than
+     * the reference count (an indexed mesh, or a plain sequential run). Same
+     * result as the hash below -- unique vertices in first-use order -- from
+     * a direct map, and a sequential run is the identity outright.
+     * PS3RECOMP_VTX_REMAP_HASH=1 keeps every draw on the hash (A/B). */
+    static int hash_only = -1;
+    if (hash_only < 0) {
+        const char* e = getenv("PS3RECOMP_VTX_REMAP_HASH");
+        hash_only = e && *e == '1';
+    }
+    if (!hash_only) {
+        const u32 base = refs[0].base_index;
+        u32 lo = refs[0].vertex_id, hi = lo;
+        int same_base = 1, sequential = 1;
+        for (u32 i = 1; i < count; i++) {
+            const u32 v = refs[i].vertex_id;
+            same_base &= refs[i].base_index == base;
+            sequential &= v == refs[0].vertex_id + i;
+            if (v < lo) lo = v;
+            if (v > hi) hi = v;
+        }
+        const u64 range = (u64)hi - lo + 1u;
+        if (same_base && sequential) {
+            for (u32 i = 0; i < count; i++)
+                remap->occurrence_to_unique[i] = i;
+            return 1;                        /* *unique_count = count */
+        }
+        if (same_base && range <= (1u << 20) && range <= (u64)count * 8u + 65536u) {
+            if (range > remap->direct_capacity) {
+                u32* value = (u32*)realloc(remap->direct_value, (size_t)range * sizeof(u32));
+                if (!value)
+                    return 0;
+                remap->direct_value = value;
+                u32* tag = (u32*)realloc(remap->direct_tag, (size_t)range * sizeof(u32));
+                if (!tag)
+                    return 0;
+                remap->direct_tag = tag;
+                memset(remap->direct_tag, 0, (size_t)range * sizeof(u32));
+                remap->direct_capacity = (u32)range;
+                remap->direct_generation = 0u;
+            }
+            if (++remap->direct_generation == 0u) {
+                memset(remap->direct_tag, 0, (size_t)remap->direct_capacity * sizeof(u32));
+                remap->direct_generation = 1u;
+            }
+            const u32 gen = remap->direct_generation;
+            u32* const tag = remap->direct_tag;
+            u32* const value = remap->direct_value;
+            u32* const occ = remap->occurrence_to_unique;
+            u32 unique = 0;
+            for (u32 occurrence = 0; occurrence < count; occurrence++) {
+                const rsx_vertex_ref ref = refs[occurrence];
+                const u32 k = ref.vertex_id - lo;
+                if (tag[k] != gen) {
+                    tag[k] = gen;
+                    value[k] = unique;
+                    refs[unique++] = ref;
+                }
+                occ[occurrence] = value[k];
+            }
+            *unique_count = unique;
+            return 1;
+        }
     }
 
     if (count > UINT_MAX / 2u)
@@ -501,6 +576,8 @@ void rsx_vertex_remap_destroy(rsx_vertex_remap* remap)
         return;
     free(remap->occurrence_to_unique);
     free(remap->slots);
+    free(remap->direct_value);
+    free(remap->direct_tag);
     memset(remap, 0, sizeof(*remap));
 }
 

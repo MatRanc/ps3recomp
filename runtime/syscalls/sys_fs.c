@@ -517,6 +517,18 @@ int64_t sys_fs_open(ppu_context* ctx)
     return CELL_OK;
 }
 
+
+/* A descriptor this table does not hold may be a cellFs one (ppu_fs.cpp): a
+ * title opens a file through cellFsOpen and hands the fd to code that reads it
+ * with the raw syscalls (Afro Samurai's Bink, BINKFILEHANDLE). Weak, so the
+ * runtime still links on its own (tests, harnesses without ppu_fs.cpp). */
+#if defined(_MSC_VER)
+static FILE* lv2_fs_foreign_file(int fd) { (void)fd; return NULL; }
+#else
+extern FILE* ppu_fs_file_for_fd(int fd) __attribute__((weak));
+static FILE* lv2_fs_foreign_file(int fd) { return ppu_fs_file_for_fd ? ppu_fs_file_for_fd(fd) : NULL; }
+#endif
+
 /* ---------------------------------------------------------------------------
  * sys_fs_read
  *
@@ -533,12 +545,16 @@ int64_t sys_fs_read(ppu_context* ctx)
     uint32_t nread_addr = LV2_ARG_PTR(ctx, 3);
 
     int slot = fd - 3;
-    if (slot < 0 || slot >= SYS_FS_FD_MAX)
-        return (int64_t)(int32_t)CELL_EBADF;
-
-    sys_fs_fd_info* f = &g_sys_fs_fds[slot];
-    if (!f->active || !f->fp)
-        return (int64_t)(int32_t)CELL_EBADF;
+    sys_fs_fd_info* f = (slot >= 0 && slot < SYS_FS_FD_MAX) ? &g_sys_fs_fds[slot] : NULL;
+    if (!f || !f->active || !f->fp) {
+        FILE* ff = lv2_fs_foreign_file(fd);
+        if (!ff) return (int64_t)(int32_t)CELL_EBADF;
+        void* fbuf = vm_to_host(buf_addr);
+        if (size) vm_commit(buf_addr, (uint32_t)size);
+        size_t fn = fread(fbuf, 1, (size_t)size, ff);
+        if (nread_addr) write_be64(nread_addr, (uint64_t)fn);
+        return CELL_OK;
+    }
 
     void* buf = vm_to_host(buf_addr);
     long pos_before = ftell(f->fp);
@@ -671,19 +687,22 @@ int64_t sys_fs_lseek(ppu_context* ctx)
     uint32_t pos_addr  = LV2_ARG_PTR(ctx, 3);
 
     int slot = fd - 3;
-    if (slot < 0 || slot >= SYS_FS_FD_MAX) {
-        /* Invalid fd — return position 0 instead of EBADF.
-         * The CRT may call lseek on uninitialized FILE structures. */
-        if (pos_addr)
-            write_be64(pos_addr, 0);
-        return 0;
-    }
-
-    sys_fs_fd_info* f = &g_sys_fs_fds[slot];
-    if (!f->active || !f->fp) {
-        if (pos_addr)
-            write_be64(pos_addr, 0);
-        return 0;
+    sys_fs_fd_info* sf = (slot >= 0 && slot < SYS_FS_FD_MAX) ? &g_sys_fs_fds[slot] : NULL;
+    sys_fs_fd_info foreign;
+    sys_fs_fd_info* f = sf;
+    if (!sf || !sf->active || !sf->fp) {
+        /* A cellFs descriptor (ppu_fs.cpp) handed to the raw syscall. */
+        FILE* ff = lv2_fs_foreign_file(fd);
+        if (!ff) {
+            /* Invalid fd — return position 0 instead of EBADF.
+             * The CRT may call lseek on uninitialized FILE structures. */
+            if (pos_addr)
+                write_be64(pos_addr, 0);
+            return 0;
+        }
+        memset(&foreign, 0, sizeof foreign);
+        foreign.active = 1; foreign.fp = ff;
+        f = &foreign;
     }
 
     int origin;
@@ -798,19 +817,17 @@ int64_t sys_fs_fstat(ppu_context* ctx)
     uint32_t stat_addr = LV2_ARG_PTR(ctx, 1);
 
     int slot = fd - 3;
-    if (slot < 0 || slot >= SYS_FS_FD_MAX)
-        return (int64_t)(int32_t)CELL_EBADF;
-
-    sys_fs_fd_info* f = &g_sys_fs_fds[slot];
-    if (!f->active || !f->fp)
+    sys_fs_fd_info* f = (slot >= 0 && slot < SYS_FS_FD_MAX) ? &g_sys_fs_fds[slot] : NULL;
+    FILE* sfp = (f && f->active && f->fp) ? f->fp : lv2_fs_foreign_file(fd);   /* cellFs fd */
+    if (!sfp)
         return (int64_t)(int32_t)CELL_EBADF;
 
     struct stat st;
 #ifdef _WIN32
-    int fno = _fileno(f->fp);
+    int fno = _fileno(sfp);
     if (_fstat64(fno, (struct _stat64*)&st) != 0)
 #else
-    int fno = fileno(f->fp);
+    int fno = fileno(sfp);
     if (fstat(fno, &st) != 0)
 #endif
     {

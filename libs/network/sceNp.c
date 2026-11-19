@@ -5,6 +5,10 @@
  * The username defaults to "PS3Player" but is configurable.
  */
 
+#include <sys/stat.h>
+#include <string.h>
+#include <stdio.h>
+#include <stdlib.h>
 #include "sceNp.h"
 #include <stdio.h>
 #include <string.h>
@@ -418,6 +422,17 @@ static s32 np_drm_is_available(const u8* k_licensee, const char* drm_path)
     /* A NULL klicensee is legal for content that needs none; nothing to record. */
     if (k) edat_add_klicensee(k);
     fprintf(stderr, "[sceNp] DRM availability check: %s\n", path ? path : "(null)");
+    /* A file that is not installed has no licence: report not-found so the guest skips
+     * optional DLC (DX:HR probes dlcpack/contentupdate EDATs, and treats a later
+     * failed open of an "available" one as fatal). Only /dev_hdd0 paths are checked. */
+    if (path && !strncmp(path, "/dev_hdd0/", 10)) {
+        const char* root = getenv("PS3_HDD0_ROOT");
+        if (root && *root) {
+            char host[1024]; struct stat st;
+            snprintf(host, sizeof host, "%s/%s", root, path + 10);
+            if (stat(host, &st) != 0) return (s32)0x80010006; /* CELL_ENOENT */
+        }
+    }
     return CELL_OK;
 }
 

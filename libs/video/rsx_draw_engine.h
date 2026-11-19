@@ -300,6 +300,13 @@ typedef struct rsx_draw_backend {
                                      float depth_value, u8 stencil,
                                      u32 x, u32 y, u32 w, u32 h);
 
+    /* Optional. An R8G8B8A8 colour surface's top-left w x h reinterpreted as
+     * Y16_X16_FLOAT (0x9F): in command order, converts each pixel's 4 bytes
+     * (guest A,R,G,B -> Y = (A<<8)|R, X = (G<<8)|B as IEEE 754 half floats)
+     * into a fresh RG16Float texture (channel 0 = Y, channel 1 = X, matching
+     * lanes_y16x16f) without stalling the GPU for a guest-memory readback. */
+    u32  (*color_as_y16x16f)(void* user, u32 surface, u32 w, u32 h);
+
 } rsx_draw_backend;
 
 /* ---- the engine --------------------------------------------------------- */

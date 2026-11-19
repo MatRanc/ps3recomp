@@ -1055,6 +1055,186 @@ s32 sys_prx_exitspawn_with_level(void)
     return CELL_OK;
 }
 
+/* ---------------------------------------------------------------------------
+ * Memory pools (sys_mempool_*)
+ *
+ * libsre carves a fixed-block pool out of memory the caller already owns:
+ *
+ *     sys_mempool_create(&pool, addr, size, block_size)
+ *
+ * and asks how much of it is still free. A pool owns no memory of its own -- it
+ * is a header over the caller's buffer -- so the honest model is the block
+ * arithmetic. Titles that only ask for the count (create and get_count) use
+ * their own allocator; titles that import the allocate / free entries (Afro
+ * Samurai: try_allocate_block, free_block, destroy) get the blocks handed out
+ * here, from a host-side free stack over the caller's buffer, as on firmware:
+ * block i is addr + i * block_size. Without those entries the generic
+ * unresolved path answered 0 -- "pool empty" -- to every allocation.
+ * -----------------------------------------------------------------------*/
+#define MAX_MEMPOOLS 1024
+
+typedef struct {
+    int in_use;
+    u32 addr, size, block_size, blocks;
+    u32 alloc_blocks;
+    u32* free_stack;     /* indices of free blocks; free_top of them valid */
+    u32 free_top;
+    u32 handle;          /* what the title holds; unique per create */
+} sys_mempool_t;
+
+static sys_mempool_t s_mempools[MAX_MEMPOOLS];
+static u32 s_mempool_gen = 0;
+
+/* Handles are 0x5 | generation | slot, never reused soon after a destroy, as
+ * lv2's ids are not. Reusing the slot number as the handle let a title that
+ * still held a destroyed pool's handle reach the NEXT pool created in that
+ * slot -- Afro Samurai's 16-byte class destroyed the 32-byte class's pool that
+ * way, with its blocks in use. A stale handle now names no pool. */
+#define MEMPOOL_SLOT_BITS 10u
+static sys_mempool_t* mempool_get(u32 pool)
+{
+    const u32 i = pool & ((1u << MEMPOOL_SLOT_BITS) - 1u);
+    if ((pool >> 28) != 0x5u || i >= MAX_MEMPOOLS || !s_mempools[i].in_use ||
+        s_mempools[i].handle != pool) return NULL;
+    return &s_mempools[i];
+}
+
+s32 sys_mempool_create(u32* pool, u32 addr, u32 size, u32 block_size)
+{
+    u32* hp = (u32*)yz_g2h(pool);
+    if (!hp || !block_size || !size || block_size > size) return CELL_EINVAL;
+
+    slot_lock();
+    for (int i = 0; i < MAX_MEMPOOLS; i++) {
+        sys_mempool_t* mp = &s_mempools[i];
+        if (mp->in_use) continue;
+        const u32 blocks = size / block_size;
+        u32* stack = (u32*)malloc((size_t)blocks * sizeof(u32));
+        if (!stack) break;
+        /* Hand out low addresses first: block 0 on top. */
+        for (u32 b = 0; b < blocks; b++) stack[b] = blocks - 1 - b;
+        mp->in_use = 1;
+        mp->addr = addr;
+        mp->size = size;
+        mp->block_size = block_size;
+        mp->blocks = blocks;
+        mp->alloc_blocks = 0;
+        mp->free_stack = stack;
+        mp->free_top = blocks;
+        /* Guest memory is big-endian: a store through the host pointer wrote
+         * the handle byte-swapped (0x50000100 read back as 0x00010050), so a
+         * title that hands it back to the allocate entries named a pool that
+         * did not exist, got no block, and created pools without end. */
+        const u32 gen = (++s_mempool_gen) & ((1u << (28u - MEMPOOL_SLOT_BITS)) - 1u);
+        const u32 handle = 0x50000000u | (gen << MEMPOOL_SLOT_BITS) | (u32)i;   /* opaque pool handle */
+        mp->handle = handle;
+        vm_write32((u32)(uintptr_t)pool, handle);
+        slot_unlock();
+        printf("[sysPrxForUser] sys_mempool_create(addr=0x%08X size=0x%X "
+               "block=0x%X) -> pool=0x%08X blocks=%u\n",
+               addr, size, block_size, handle, blocks);
+        return CELL_OK;
+    }
+    slot_unlock();
+    return CELL_EINVAL;
+}
+
+/* u64 sys_mempool_get_count(pool): the number of FREE blocks, as the return
+ * value (lv2/RPCS3), not through a pointer. Afro Samurai records it as the
+ * pool's size right after create and calls it again after every free_block,
+ * destroying the pool once "free >= size". Answering CELL_OK (0) through a
+ * pointer it never passed made size 0, so the first free destroyed the pool
+ * with every other block still in use -- including a registry the main thread
+ * later read zeros out of. */
+u64 sys_mempool_get_count(u32 pool)
+{
+    slot_lock();
+    sys_mempool_t* mp = mempool_get(pool);
+    const u64 n = mp ? (u64)(mp->blocks - mp->alloc_blocks) : (u64)(s64)(s32)CELL_EINVAL;
+    slot_unlock();
+    return n;
+}
+
+/* sys_mempool_try_allocate_block(pool) -> block EA, or 0 when none is free. */
+u64 sys_mempool_try_allocate_block(u32 pool)
+{
+    u64 ea = 0;
+    slot_lock();
+    sys_mempool_t* mp = mempool_get(pool);
+    if (mp && mp->free_top) {
+        const u32 b = mp->free_stack[--mp->free_top];
+        mp->alloc_blocks++;
+        ea = mp->addr + b * mp->block_size;
+        { static unsigned long s_nalloc = 0;
+          if (getenv("SYS_MEMPOOL_LOG") && (++s_nalloc & 0x3FFF) == 1)
+              fprintf(stderr, "[sysPrxForUser] sys_mempool_try_allocate_block #%lu (pool 0x%08X, %u/%u used)\n",
+                     s_nalloc, pool, mp->alloc_blocks, mp->blocks); }
+    } else if (getenv("SYS_MEMPOOL_LOG")) {
+        static int s_nmiss = 0;
+        if (s_nmiss++ < 12)
+            fprintf(stderr, "[sysPrxForUser] sys_mempool_try_allocate_block(pool=0x%08X) -> 0 (%s)\n",
+                    pool, mp ? "pool full" : "unknown pool");
+    }
+    slot_unlock();
+    return ea;
+}
+
+/* sys_mempool_allocate_block(pool): as try_allocate, but waits for a block. */
+u64 sys_mempool_allocate_block(u32 pool)
+{
+    if (!mempool_get(pool)) return 0;
+    for (;;) {
+        const u64 ea = sys_mempool_try_allocate_block(pool);
+        if (ea || !mempool_get(pool)) return ea;
+#ifdef _WIN32
+        Sleep(1);
+#else
+        usleep(1000);
+#endif
+    }
+}
+
+s32 sys_mempool_free_block(u32 pool, u32 block)
+{
+    s32 rc = CELL_EINVAL;
+    slot_lock();
+    sys_mempool_t* mp = mempool_get(pool);
+    if (mp && block >= mp->addr && block - mp->addr < mp->blocks * mp->block_size &&
+        (block - mp->addr) % mp->block_size == 0 && mp->free_top < mp->blocks) {
+        mp->free_stack[mp->free_top++] = (block - mp->addr) / mp->block_size;
+        mp->alloc_blocks--;
+        rc = CELL_OK;
+        { static unsigned long s_nfree = 0;
+          if (getenv("SYS_MEMPOOL_LOG") && (++s_nfree & 0x3FFF) == 1)
+              fprintf(stderr, "[sysPrxForUser] sys_mempool_free_block #%lu\n", s_nfree); }
+    }
+    slot_unlock();
+    if (rc != CELL_OK) {
+        static int _n = 0;
+        if (PS3_LOG_FIRST(_n, 8))
+            printf("[sysPrxForUser] sys_mempool_free_block(pool=0x%08X block=0x%08X) -> EINVAL\n",
+                   pool, block);
+    }
+    return rc;
+}
+
+void sys_mempool_destroy(u32 pool)
+{
+    slot_lock();
+    sys_mempool_t* mp = mempool_get(pool);
+    if (mp && getenv("SYS_MEMPOOL_LOG")) {
+        static int s_nd = 0;
+        if (s_nd++ < 24)
+            fprintf(stderr, "[sysPrxForUser] sys_mempool_destroy(pool=0x%08X addr=0x%08X block=0x%X) with %u/%u blocks still allocated\n",
+                    pool, mp->addr, mp->block_size, mp->alloc_blocks, mp->blocks);
+    }
+    if (mp) {
+        free(mp->free_stack);
+        memset(mp, 0, sizeof *mp);
+    }
+    slot_unlock();
+}
+
 s32 sys_prx_get_module_id_by_name(const char* name, u64 flags, u32* id)
 {
     (void)flags;

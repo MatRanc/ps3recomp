@@ -47,6 +47,9 @@ int rsx_hlsl_to_msl_available(void);
  *   log      : receives a diagnostic on failure (may be NULL).
  * Returns 0 on success, -1 on failure (bad input, a front-end error, an
  * output buffer too small, or the stub). */
+/* 1 when the translation is already cached (memory or disk): no glslang run. */
+int rsx_hlsl_to_msl_cached(const char* hlsl, int stage);
+
 int rsx_hlsl_to_msl(const char* hlsl, int stage,
                     char* out, u32 out_size,
                     char* log, u32 log_size);

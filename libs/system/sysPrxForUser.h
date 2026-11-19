@@ -167,6 +167,12 @@ s32   _sys_heap_free(sys_heap_t heap, void* ptr);
  * PRX utilities
  * -----------------------------------------------------------------------*/
 
+s32 sys_mempool_create(u32* pool, u32 addr, u32 size, u32 block_size);
+u64 sys_mempool_get_count(u32 pool);
+u64 sys_mempool_try_allocate_block(u32 pool);
+u64 sys_mempool_allocate_block(u32 pool);
+s32 sys_mempool_free_block(u32 pool, u32 block);
+void sys_mempool_destroy(u32 pool);
 s32 sys_prx_exitspawn_with_level(void);
 s32 sys_prx_get_module_id_by_name(const char* name, u64 flags, u32* id);
 

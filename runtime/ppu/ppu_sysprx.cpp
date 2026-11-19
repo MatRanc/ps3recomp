@@ -255,8 +255,22 @@ static void lwm_release(struct LwmSlot* sl)
 volatile int g_nd_inpump = 0;
 /* syscalls/sys_ppu_thread.c: this thread is about to wait (PS3_PRIO_START). */
 extern "C" void ppu_thread_note_block(uint64_t tid);
+/* PS3_LWM_WATCH=0xA,0xB,...: log every lock/unlock on these lwmutexes
+ * (ponytail: debug only, linear scan of <=8 addrs). */
+static int lwm_watched(uint32_t a){
+    static uint32_t w[8]; static int n=-1;
+    if(n<0){ n=0; const char* e=getenv("PS3_LWM_WATCH"); while(e&&*e&&n<8){ char* q; w[n++]=(uint32_t)strtoul(e,&q,0); e=(*q==',')?q+1:q; if(q==e&&*q!=',') break; } }
+    for(int i=0;i<n;i++) if(w[i]==a) return 1; return 0;
+}
+static void lwm_watch_log(const char* op, ppu_context* ctx){
+    uint32_t a=(uint32_t)ctx->gpr[3];
+    if(!lwm_watched(a)) return;
+    fprintf(stderr,"[LWM-WATCH] %s tid=%llu lwm=0x%08X owner=%u recur=%u attr=0x%X lr=0x%08llX\n",op,
+        (unsigned long long)ctx->thread_id,a,vm_read32(a+LWM_OWNER),vm_read32(a+LWM_RECUR),vm_read32(a+LWM_ATTR),(unsigned long long)ctx->lr);
+}
 static void sys_lwmutex_lock(ppu_context* ctx)
 {
+    lwm_watch_log("lock", ctx);
     uint32_t lwm = (uint32_t)ctx->gpr[3];
     uint32_t self = LWM_SELF(ctx);
     /* lv2 ABI: r4 = timeout in microseconds, 0 = infinite. The real kernel
@@ -311,7 +325,7 @@ static int sys_lwmutex_lock_fast(ppu_context* ctx)
 {
     const uint32_t lwm = (uint32_t)ctx->gpr[3];
     struct LwmSlot* sl = lwm_slot(lwm);
-    if (!sl || lwm_trace()) return 0;
+    if (!sl || lwm_trace() || lwm_watched(lwm)) return 0;
     const uint32_t self = LWM_SELF(ctx);
     if (vm_read32(lwm + LWM_OWNER) == self && vm_read32(lwm + LWM_RECUR) > 0)
         vm_write32(lwm + LWM_RECUR, vm_read32(lwm + LWM_RECUR) + 1);
@@ -353,6 +367,7 @@ static void sys_lwmutex_trylock(ppu_context* ctx)
 }
 static void sys_lwmutex_unlock(ppu_context* ctx)
 {
+    lwm_watch_log("unlock", ctx);
     uint32_t lwm = (uint32_t)ctx->gpr[3];
     uint32_t rc = vm_read32(lwm + LWM_RECUR);
     if (rc > 1) {                       /* recursive hold: count down, keep the lock */
@@ -456,6 +471,11 @@ static void sys_ppu_thread_get_id(ppu_context* ctx)
     ctx->gpr[3] = 0;
 }
 
+static void sys_prx_register_library(ppu_context* ctx) { ctx->gpr[3] = 0; } /* nothing consumes the registration */
+/* Guest PRXs (DX:HR's encrypted DFEngine.sprx) cannot be loaded; say so, so the
+ * caller takes its no-module path instead of start_module(garbage). */
+static void sys_prx_load_module(ppu_context* ctx) { ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)0x8001112Eu; } /* CELL_PRX_ERROR_UNKNOWN_MODULE */
+
 /* sys_mmapper_allocate_memory(u32 size, u64 flags, vm::ptr<u32> mem_id) ->
  * hand back a unique opaque id; the backing is the flat VM, so the later
  * search_and_map just needs a non-zero id to track. */
@@ -463,8 +483,230 @@ static void sys_ppu_thread_get_id(ppu_context* ctx)
  * without overlap. Ids are dense from 0x1000. */
 static uint32_t s_mm_sizes[256];
 static uint32_t s_mmapper_next_id = 0x1000;
+
+/* ---------------------------------------------------------------------------
+ * PS3_MMAPPER_TRACK=1: a mapper that keeps track of what is mapped where.
+ *
+ * Untracked, map/unmap/free are no-ops and search_and_map is a cursor that only
+ * moves forward in 1 MB steps -- right for a title that maps a few heaps once.
+ * Afro Samurai is not that title. It builds its small-block allocator out of
+ * 256 KB mempools it creates, empties and destroys all the time (allocate,
+ * search_and_map, ..., unmap, free), and its page heap places 1 MB pages itself
+ * with map_memory inside a reservation it also searches. Untracked, the cursor
+ * (a) handed search_and_map pages the page heap had already mapped -- a block
+ * array was memset over live objects and the main thread then looped for ever
+ * on a zeroed list node -- and (b) never got freed space back, so after a few
+ * hundred pools it ran off the end at 0xC0000000, answered 0, and the title
+ * abort()ed.
+ *
+ * Tracked: every mapping owns its 64 KB units in s_page_owner, search_and_map is
+ * first-fit inside the reservation at the memory's page size (flags 0x400 = 1 MB,
+ * otherwise 64 KB), unmap releases the units and reports the id, free_memory
+ * recycles the id. Mapping does not clear the range (see mt_place); a memory
+ * mapped again somewhere else carries its contents along. Off by
+ * default: it moves where other titles' mappings land.
+ * -----------------------------------------------------------------------*/
+static int mmapper_track(void)
+{
+    static int on = -1;
+    if (on < 0) { const char* e = getenv("PS3_MMAPPER_TRACK"); on = (e && e[0] == '1') ? 1 : 0; }
+    return on;
+}
+
+#define MT_MAX    65536u
+#define MT_UNIT   0x10000u     /* ownership granularity: the smallest lv2 page */
+struct mt_mem {
+    uint32_t size, page, last_at;
+    uint8_t  used, mapped, ever;
+};
+static mt_mem   s_mt[MT_MAX];
+static uint32_t s_mt_free[MT_MAX];
+static uint32_t s_mt_free_n = 0, s_mt_hi = 0;
+static uint32_t s_page_owner[0x100000000ull / MT_UNIT];   /* mem id, 0 = free */
+static SRWLOCK  s_mt_lock = SRWLOCK_INIT;
+
+extern "C" int sys_mmapper_reservation_bounds(uint32_t start, uint32_t* lo, uint32_t* hi);
+
+static inline uint32_t mt_slot(uint32_t mem_id)
+{
+    const uint32_t s = mem_id - 0x1000u;
+    return (s < s_mt_hi && s_mt[s].used) ? s : 0xFFFFFFFFu;
+}
+
+/* Lock held. Runtime-owned windows are never handed to the title, even when a
+ * reservation encloses them (PS3_MAPPER_WIDE, runtime/syscalls/sys_memory.c). */
+static void mt_premark(void)
+{
+    static int done = 0;
+    if (done) return;
+    done = 1;
+    const uint32_t win[][2] = {
+        { VM_HLE_HEAP_BASE, VM_HLE_HEAP_SIZE }, { VM_AUDIO_BASE, VM_AUDIO_SIZE },
+        { VM_HLE_INJECT_BASE, VM_HLE_INJECT_SIZE },
+    };
+    for (unsigned w = 0; w < sizeof win / sizeof win[0]; w++)
+        for (uint64_t a = win[w][0] & ~(MT_UNIT - 1u); a < (uint64_t)win[w][0] + win[w][1]; a += MT_UNIT)
+            s_page_owner[a / MT_UNIT] = 0xFFFFFFFFu;
+}
+
+static uint32_t mt_alloc(uint32_t size, uint64_t flags)
+{
+    AcquireSRWLockExclusive(&s_mt_lock);
+    mt_premark();
+    uint32_t s = s_mt_free_n ? s_mt_free[--s_mt_free_n] : (s_mt_hi < MT_MAX ? s_mt_hi++ : 0xFFFFFFFFu);
+    if (s != 0xFFFFFFFFu) {
+        s_mt[s].size = size;
+        s_mt[s].page = (flags & 0x400u) ? 0x100000u : ((flags & 0x200u) ? 0x10000u : 0x100000u);
+        s_mt[s].last_at = 0;
+        s_mt[s].used = 1; s_mt[s].mapped = 0; s_mt[s].ever = 0;
+    }
+    ReleaseSRWLockExclusive(&s_mt_lock);
+    return s == 0xFFFFFFFFu ? 0 : 0x1000u + s;
+}
+
+/* Lock held. Give the memory its units at `at` and its contents there. */
+static void mt_place(uint32_t s, uint32_t at)
+{
+    const uint32_t id = 0x1000u + s, span = (s_mt[s].size + MT_UNIT - 1u) & ~(MT_UNIT - 1u);
+    for (uint32_t a = at; a - at < span; a += MT_UNIT) s_page_owner[a / MT_UNIT] = id;
+    vm_commit(at, span);
+    /* No zeroing. lv2 does not clear the pages it hands out again, and Afro
+     * Samurai builds objects in a freshly mapped arena that still expect what
+     * the range held before (zeroed, their callback descriptors were NULL and
+     * every call through them went nowhere). Pages never used are zero anyway:
+     * the arena is a fresh anonymous mapping. PS3_MMAPPER_ZERO=1 clears them.
+     * A memory mapped again at another address carries its contents along. */
+    static int s_zero = -1;
+    if (s_zero < 0) { const char* e = getenv("PS3_MMAPPER_ZERO"); s_zero = (e && e[0] == '1') ? 1 : 0; }
+    if (!s_mt[s].ever) { if (s_zero) memset(vm_base + at, 0, s_mt[s].size); }
+    else if (s_mt[s].last_at != at) memmove(vm_base + at, vm_base + s_mt[s].last_at, s_mt[s].size);
+    if (getenv("PS3_MEMTRACE"))
+        fprintf(stderr, "[mmapper] place id 0x%X size 0x%X page 0x%X at 0x%08X%s\n",
+                0x1000u + s, s_mt[s].size, s_mt[s].page, at, s_mt[s].ever ? " (remap)" : "");
+    s_mt[s].ever = 1; s_mt[s].mapped = 1; s_mt[s].last_at = at;
+}
+
+/* sys_mmapper_search_and_map (lv2 337), tracked. ppu_loader.cpp routes here. */
+extern "C" int64_t ps3_mmapper_search_and_map_tracked(uint32_t start, uint32_t mem_id, uint32_t* va)
+{
+    uint32_t lo, hi;
+    if (!sys_mmapper_reservation_bounds(start, &lo, &hi)) return (int64_t)(int32_t)0x80010002u;  /* EINVAL */
+    AcquireSRWLockExclusive(&s_mt_lock);
+    const uint32_t s = mt_slot(mem_id);
+    if (s == 0xFFFFFFFFu || s_mt[s].mapped) {
+        ReleaseSRWLockExclusive(&s_mt_lock);
+        return (int64_t)(int32_t)(s == 0xFFFFFFFFu ? 0x80010005u /* ESRCH */ : 0x8001000Au /* EBUSY */);
+    }
+    const uint64_t page = s_mt[s].page;
+    const uint64_t span = (s_mt[s].size + MT_UNIT - 1u) & ~(uint64_t)(MT_UNIT - 1u);
+    /* Next-fit: start where the last search in this reservation ended and wrap
+     * once. First-fit handed a just-unmapped range straight back, and Afro
+     * Samurai still touches a mempool's memory right after destroying and
+     * unmapping it (it frees its 16-byte pool with live-looking blocks in it),
+     * so the next pool at the same address had a stale descriptor written into
+     * it and render init read a NULL out of it. The console evidently does not
+     * reuse the range that soon: the title runs there. */
+    enum { ROVERS = 64 };
+    static uint32_t s_rover_lo[ROVERS], s_rover_at[ROVERS];
+    int ri = -1;
+    for (int i = 0; i < ROVERS; i++) {
+        if (s_rover_lo[i] == lo) { ri = i; break; }
+        if (!s_rover_lo[i]) { s_rover_lo[i] = lo; s_rover_at[i] = lo; ri = i; break; }
+    }
+    const uint64_t first = ((uint64_t)lo + page - 1u) & ~(page - 1u);
+    static int s_firstfit = -1;
+    if (s_firstfit < 0) { const char* e = getenv("PS3_MMAPPER_FIRSTFIT"); s_firstfit = (e && e[0] == '1') ? 1 : 0; }
+    uint64_t from = (ri >= 0 && !s_firstfit) ? (((uint64_t)s_rover_at[ri] + page - 1u) & ~(page - 1u)) : first;
+    if (from < first || from + span > hi) from = first;
+    for (int pass = 0; pass < 2; pass++) {
+        const uint64_t stop = pass ? from : (uint64_t)hi;
+        for (uint64_t a = pass ? first : from; a + span <= hi && (pass == 0 || a < stop); a += page) {
+            uint64_t u = a;
+            while (u < a + span && !s_page_owner[u / MT_UNIT]) u += MT_UNIT;
+            if (u < a + span) { a = ((u + MT_UNIT + page - 1u) & ~(page - 1u)) - page; continue; }
+            mt_place(s, (uint32_t)a);
+            if (ri >= 0) s_rover_at[ri] = (uint32_t)(a + span);
+            ReleaseSRWLockExclusive(&s_mt_lock);
+            *va = (uint32_t)a;
+            return 0;
+        }
+    }
+    ReleaseSRWLockExclusive(&s_mt_lock);
+    { static int n = 0; if (PS3_LOG_FIRST(n, 4))
+        fprintf(stderr, "[mmapper] search_and_map: no room for 0x%X in 0x%08X..0x%08X\n",
+                s_mt[s].size, lo, hi); }
+    return (int64_t)(int32_t)0x80010004u;   /* ENOMEM */
+}
+
+/* sys_mmapper_map_memory(u32 addr, u32 mem_id, u64 flags) */
+static void sys_mmapper_map_memory_tracked(ppu_context* ctx)
+{
+    if (!mmapper_track()) { ctx->gpr[3] = 0; return; }
+    const uint32_t addr = (uint32_t)ctx->gpr[3], mem_id = (uint32_t)ctx->gpr[4];
+    AcquireSRWLockExclusive(&s_mt_lock);
+    const uint32_t s = mt_slot(mem_id);
+    uint32_t rc = 0;
+    if (s == 0xFFFFFFFFu) rc = 0x80010005u;                 /* ESRCH */
+    else if (s_mt[s].mapped || (addr & (MT_UNIT - 1u))) rc = 0x8001000Au;   /* EBUSY */
+    else {
+        const uint32_t span = (s_mt[s].size + MT_UNIT - 1u) & ~(MT_UNIT - 1u);
+        for (uint32_t a = addr; a - addr < span; a += MT_UNIT)
+            if (s_page_owner[a / MT_UNIT]) { rc = 0x8001000Au; break; }
+        if (!rc) mt_place(s, addr);
+    }
+    ReleaseSRWLockExclusive(&s_mt_lock);
+    if (rc) { static int n = 0; if (PS3_LOG_FIRST(n, 8))
+        fprintf(stderr, "[mmapper] map_memory(0x%08X, id 0x%X) -> 0x%08X\n", addr, mem_id, rc); }
+    ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)rc;
+}
+
+/* sys_mmapper_unmap_memory(u32 addr, u32* mem_id) */
+static void sys_mmapper_unmap_memory_tracked(ppu_context* ctx)
+{
+    if (!mmapper_track()) { ctx->gpr[3] = 0; return; }
+    const uint32_t addr = (uint32_t)ctx->gpr[3], out = (uint32_t)ctx->gpr[4];
+    AcquireSRWLockExclusive(&s_mt_lock);
+    const uint32_t id = s_page_owner[addr / MT_UNIT];
+    const uint32_t s = id ? mt_slot(id) : 0xFFFFFFFFu;
+    uint32_t rc = 0x80010002u;                              /* EINVAL: nothing mapped there */
+    if (s != 0xFFFFFFFFu && s_mt[s].mapped && s_mt[s].last_at == addr) {
+        const uint32_t span = (s_mt[s].size + MT_UNIT - 1u) & ~(MT_UNIT - 1u);
+        for (uint32_t a = addr; a - addr < span; a += MT_UNIT) s_page_owner[a / MT_UNIT] = 0;
+        s_mt[s].mapped = 0;
+        rc = 0;
+    }
+    ReleaseSRWLockExclusive(&s_mt_lock);
+    if (rc || getenv("PS3_MEMTRACE")) { static int n = 0; if (PS3_LOG_FIRST(n, 64))
+        fprintf(stderr, "[mmapper] unmap_memory(0x%08X) -> id 0x%X rc 0x%08X\n", addr, id, rc); }
+    if (!rc && out) vm_write32(out, id);
+    ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)rc;
+}
+
+/* sys_mmapper_free_memory(u32 mem_id) */
+static void sys_mmapper_free_memory_tracked(ppu_context* ctx)
+{
+    if (!mmapper_track()) { ctx->gpr[3] = 0; return; }
+    const uint32_t mem_id = (uint32_t)ctx->gpr[3];
+    AcquireSRWLockExclusive(&s_mt_lock);
+    const uint32_t s = mt_slot(mem_id);
+    uint32_t rc = 0;
+    if (s == 0xFFFFFFFFu) rc = 0x80010005u;                 /* ESRCH */
+    else if (s_mt[s].mapped) rc = 0x8001000Au;              /* EBUSY: still mapped */
+    else { s_mt[s].used = 0; s_mt_free[s_mt_free_n++] = s; }
+    ReleaseSRWLockExclusive(&s_mt_lock);
+    if (rc || getenv("PS3_MEMTRACE")) { static int n = 0; if (PS3_LOG_FIRST(n, 64))
+        fprintf(stderr, "[mmapper] free_memory(id 0x%X) -> rc 0x%08X\n", mem_id, rc); }
+    ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)rc;
+}
+
+extern "C" int ps3_mmapper_tracked(void) { return mmapper_track(); }
+
 extern "C" uint32_t ps3_mmapper_block_size(uint32_t mem_id)
 {
+    if (mmapper_track()) {
+        const uint32_t s = mt_slot(mem_id);
+        return s == 0xFFFFFFFFu ? 0 : s_mt[s].size;
+    }
     uint32_t i = mem_id - 0x1000u;
     return (i < 256) ? s_mm_sizes[i] : 0;
 }
@@ -480,6 +722,12 @@ static void sys_mmapper_allocate_memory(ppu_context* ctx)
 {
     uint32_t size       = (uint32_t)ctx->gpr[3];
     uint32_t mem_id_ptr = (uint32_t)ctx->gpr[5];
+    if (mmapper_track()) {
+        const uint32_t tid = mt_alloc(size, ctx->gpr[4]);
+        if (tid && mem_id_ptr) vm_write32(mem_id_ptr, tid);
+        ctx->gpr[3] = tid ? 0 : (uint64_t)(int64_t)(int32_t)0x80010004u;   /* ENOMEM */
+        return;
+    }
     uint32_t id         = mmapper_new_id(size);
     if (getenv("PS3_MEMTRACE"))
         fprintf(stderr, "[mmapper] allocate_memory(size=0x%X flags=0x%llX id_ptr=0x%X) -> id 0x%X\n",
@@ -494,6 +742,12 @@ static void sys_mmapper_allocate_memory_from_container(ppu_context* ctx)
 {
     uint32_t size = (uint32_t)ctx->gpr[3];
     uint32_t mem_id_ptr = (uint32_t)ctx->gpr[6];
+    if (mmapper_track()) {
+        const uint32_t tid = mt_alloc(size, ctx->gpr[5]);
+        if (tid && mem_id_ptr) vm_write32(mem_id_ptr, tid);
+        ctx->gpr[3] = tid ? 0 : (uint64_t)(int64_t)(int32_t)0x80010004u;   /* ENOMEM */
+        return;
+    }
     uint32_t id = mmapper_new_id(size);
     if (getenv("PS3_MEMTRACE"))
         fprintf(stderr, "[mmapper] alloc_from_container(size=0x%X cid=0x%X flags=0x%llX id_ptr=0x%X) -> id 0x%X\n",
@@ -990,11 +1244,14 @@ extern "C" void ppu_sysprx_register(void)
     /* Thread id + memory manager (high-frequency boot imports). The flat VM
      * means map/unmap/free are no-ops: the memory already exists everywhere. */
     ps3_hle_register_ctx(ps3_compute_nid("sys_ppu_thread_get_id"),      "sys_ppu_thread_get_id",      sys_ppu_thread_get_id);
+    ps3_hle_register_ctx(ps3_compute_nid("sys_prx_register_library"), "sys_prx_register_library", sys_prx_register_library);
+    ps3_hle_register_ctx(ps3_compute_nid("sys_prx_load_module"),      "sys_prx_load_module",      sys_prx_load_module);
     ps3_hle_register_ctx(ps3_compute_nid("sys_ppu_thread_create"),      "sys_ppu_thread_create",      hle_ppu_thread_create);
     ps3_hle_register_ctx(ps3_compute_nid("sys_ppu_thread_exit"),        "sys_ppu_thread_exit",        hle_ppu_thread_exit);
     ps3_hle_register_ctx(ps3_compute_nid("sys_mmapper_allocate_memory"), "sys_mmapper_allocate_memory", sys_mmapper_allocate_memory);
     ps3_hle_register_ctx(ps3_compute_nid("sys_mmapper_allocate_memory_from_container"), "sys_mmapper_allocate_memory_from_container", sys_mmapper_allocate_memory_from_container);
-    ps3_hle_register_ctx(ps3_compute_nid("sys_mmapper_map_memory"),     "sys_mmapper_map_memory",     crt_ok);
-    ps3_hle_register_ctx(ps3_compute_nid("sys_mmapper_unmap_memory"),   "sys_mmapper_unmap_memory",   crt_ok);
-    ps3_hle_register_ctx(ps3_compute_nid("sys_mmapper_free_memory"),    "sys_mmapper_free_memory",    crt_ok);
+    /* No-ops unless PS3_MMAPPER_TRACK=1 (see mmapper_track above). */
+    ps3_hle_register_ctx(ps3_compute_nid("sys_mmapper_map_memory"),     "sys_mmapper_map_memory",     sys_mmapper_map_memory_tracked);
+    ps3_hle_register_ctx(ps3_compute_nid("sys_mmapper_unmap_memory"),   "sys_mmapper_unmap_memory",   sys_mmapper_unmap_memory_tracked);
+    ps3_hle_register_ctx(ps3_compute_nid("sys_mmapper_free_memory"),    "sys_mmapper_free_memory",    sys_mmapper_free_memory_tracked);
 }

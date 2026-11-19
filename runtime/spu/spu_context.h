@@ -433,6 +433,10 @@ typedef struct spu_context {
      * spu_coh_reserve_fast). Written under that lock, read by the context's
      * own thread. */
     int coh_listed;
+
+    /* Private MFC slot owned by this context (spu_channels.c), so mfc_for
+     * skips the global registry lock after the first channel access. */
+    void* mfc_slot;
 } spu_context;
 
 /* event_status is written from more than one host thread: the SPU's own

@@ -274,7 +274,7 @@ static uint64_t spu_workload_content_hash(const uint8_t* p, size_t n)
 }
 static uint64_t spu_workload_fingerprint_cached(const uint8_t* image, size_t n)
 {
-    enum { SLOTS = 8 };
+    enum { SLOTS = 32 };
     static struct { const uint8_t* image; size_t n; uint64_t content, fp; } s_fp[SLOTS];
     static unsigned s_next;
 #ifdef _WIN32
@@ -286,10 +286,15 @@ static uint64_t spu_workload_fingerprint_cached(const uint8_t* image, size_t n)
 #define FP_LOCK()   pthread_mutex_lock(&s_fp_lock)
 #define FP_UNLOCK() pthread_mutex_unlock(&s_fp_lock)
 #endif
-    const uint64_t content = spu_workload_content_hash(image, n);
+    uint64_t head = 0, tail = 0;
+    if (n >= 16) {
+        memcpy(&head, image, 8);
+        memcpy(&tail, image + n - 8, 8);
+    }
     FP_LOCK();
     for (unsigned i = 0; i < SLOTS; ++i)
-        if (s_fp[i].image == image && s_fp[i].n == n && s_fp[i].content == content) {
+        if (s_fp[i].image == image && s_fp[i].n == n &&
+            (n < 16 || s_fp[i].content == (head ^ (tail * 0x100000001B3ull)))) {
             const uint64_t fp = s_fp[i].fp;
             FP_UNLOCK();
             return fp;
@@ -298,7 +303,9 @@ static uint64_t spu_workload_fingerprint_cached(const uint8_t* image, size_t n)
     const uint64_t fp = spu_workload_fingerprint(image, n);
     FP_LOCK();
     const unsigned slot = s_next++ % SLOTS;
-    s_fp[slot].image = image; s_fp[slot].n = n; s_fp[slot].content = content; s_fp[slot].fp = fp;
+    s_fp[slot].image = image; s_fp[slot].n = n;
+    s_fp[slot].content = (n >= 16) ? (head ^ (tail * 0x100000001B3ull)) : spu_workload_content_hash(image, n);
+    s_fp[slot].fp = fp;
     FP_UNLOCK();
 #undef FP_LOCK
 #undef FP_UNLOCK
@@ -1021,7 +1028,14 @@ static DWORD WINAPI spu_async_thread(LPVOID p) {
     return 0;
 }
 #else
-static void* spu_async_thread(void* p) { spu_async_run((spu_async_job*)p); return NULL; }
+static void* spu_async_thread(void* p)
+{
+#ifdef __APPLE__
+    pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+#endif
+    spu_async_run((spu_async_job*)p);
+    return NULL;
+}
 #endif
 
 int spu_workload_dispatch_job(const uint8_t* image, uint32_t image_size,
@@ -1302,6 +1316,21 @@ int spu_taskset_consume_wake(uint32_t taskset_ea)
 }
 
 /* Signal every task of `taskset_ea` currently parked. Returns how many. */
+/* Signal EVERY task parked in WAIT_SIGNAL. The push handler's fallback: an
+ * unread entry sitting in the queue while its only consumer sleeps is the
+ * worse state to be left in. */
+int spu_taskset_signal_parked_force(void)
+{
+    int n = 0;
+    for (int i = 0; i < SPU_PARKED_MAX; i++) {
+        uint64_t k = s_parked[i];
+        if (!k) continue;
+        spu_taskset_signal_task((uint32_t)(k >> 32), (uint32_t)(k & 0xFFFFFFFFu) - 1u);
+        n++;
+    }
+    return n;
+}
+
 /* Wake only the task parked on `wait_obj` (0 = any task of the taskset).
  * The guest names its wait object in the WAIT_SIGNAL argument, and for YDKJ`s
  * CRI tasks the flag the PPU sets is exactly wait_obj + 0x80 -- so a Set can
