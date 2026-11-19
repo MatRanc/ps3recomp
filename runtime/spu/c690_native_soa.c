@@ -253,10 +253,17 @@ static void soa_shadow(spu_context* ctx, uint32_t lsa, int variant, void (*body)
     if (is_out) {
         memcpy(nat_ctx.gpr, ctx->gpr, sizeof(nat_ctx.gpr));
         ran = soa_out_run(&nat_ctx, t_ls, lsa, variant, &nat_pc);
-        const int saved_direct = g_spu_direct;
-        g_spu_direct = 0;
+        /* Stop the lifted reference at the function's own exit, as the kernel does.
+         * ctx->steps == 0 keeps every SPU_DIRECT of this context on the trampoline
+         * path (the self-loop goto stays, like the kernel's continue). Not
+         * g_spu_direct: it is process-wide, so saving and restoring it here raced
+         * with the other SPU threads in shadow mode -- a lifted body could chain past
+         * its exit (0x7998 -> 0x78C0 -> 0x7960: an exit-PC mismatch with identical
+         * LS), and the flag could be left at 0 for the rest of the run. */
+        const uint32_t saved_steps = ctx->steps;
+        ctx->steps = 0;
         do { body(ctx); } while ((ctx->pc & SPU_LS_MASK) == lsa);
-        g_spu_direct = saved_direct;
+        ctx->steps = saved_steps;
     } else {
         ran = soa_run(ctx, t_ls, lsa, variant);
         body(ctx);
