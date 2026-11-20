@@ -206,6 +206,14 @@ s32 cellKbGetData(u32 port_no, CellKbData* data)
     return CELL_OK;
 }
 
+/* cellKbRead(port, data) -- NID 0xFF0A21B7, the SDK's name for the same read.
+ * Unresolved, the generic path answered CELL_OK without writing CellKbData, so
+ * the guest read stack garbage as key events (MLB 0x00533D7C, Afro Samurai). */
+s32 cellKbRead(u32 port_no, CellKbData* data)
+{
+    return cellKbGetData(port_no, data);
+}
+
 /* Guest CellKbInfo layout (big-endian): +0x00 max_connect u32, +0x04
  * now_connect u32, +0x08 info u32, +0x0C status[] u8 PER KEYBOARD (bytes,
  * not u32s -- SDK/RPCS3 layout). */
