@@ -4,7 +4,9 @@
 Wraps 0xFA20 (clear), 0xFA58 (normals) and 0xFCB8 (normalize), and adds the
 same call to the existing 0xFDA0 (tangents) wrapper that patch_cull_hooks.py
 installs. The hook is a weak reference, so a runtime without the kernels still
-links and runs the lifted bodies.
+links and runs the lifted bodies. On Windows it is a plain extern: a COFF weak
+external does not load the defining archive member and would stay 0 (the
+runtime defines c690_soa_try in every build, a stub without FMA/SSSE3).
 
 Run on the base module, after patch_cull_hooks.py and before
 tools/spu_ftz_twin.py (the twins are derived from the patched base and get
@@ -20,7 +22,14 @@ DECL = TAG + """
 #ifndef SPU_TWIN_VARIANT
 #define SPU_TWIN_VARIANT 0
 #endif
+#if defined(_WIN32)
+/* COFF: a weak external never loads the archive member that defines it, so the
+ * reference resolves to 0 and the kernels never run (same reason as the twin
+ * registry in tools/spu_ftz_twin.py). The runtime always defines it. */
+extern int c690_soa_try(spu_context*, uint32_t, int, void (*)(spu_context*));
+#else
 extern int c690_soa_try(spu_context*, uint32_t, int, void (*)(spu_context*)) __attribute__((weak));
+#endif
 """
 
 
