@@ -6,7 +6,11 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#ifdef _WIN32
+#include "ps3emu/posix_win32.h"   /* pthread_mutex_* on SRWLOCK (Windows port) */
+#else
 #include <pthread.h>
+#endif
 
 #define RSX_HUD_W 275
 #define RSX_HUD_H 130
@@ -237,7 +241,11 @@ static inline void rsx_hud_init(rsx_hud_state* h, const char* title, const char*
         } else {
             time_t now = time(NULL);
             struct tm tm_now;
+#ifdef _WIN32
+            localtime_s(&tm_now, &now);   /* MSVC CRT: no localtime_r (as cellRtc.c) */
+#else
             localtime_r(&now, &tm_now);
+#endif
             char stamp[32];
             strftime(stamp, sizeof stamp, "%Y-%m-%d_%H-%M-%S", &tm_now);
             snprintf(path, sizeof path, "%s/MyGameRecomp_%s.csv", csv_env, stamp);
