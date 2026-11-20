@@ -1672,6 +1672,16 @@ SPU__XE_INLINE u128 spu_frsqest(u128 a) {
 /* cflts/cfltu: the 24-bit significand shifted by be - 150 + (173 - i8), saturated. */
 SPU__XE_INLINE __m128i spu__xe_cfl(u128 a, int i8, int is_unsigned) {
     const __m128i x = spu__xe_ld(a);
+    if (!is_unsigned && __builtin_constant_p(i8)) {
+        const int u8 = i8 & 0xFF;
+        if (u8 >= 127 && u8 <= 173) {
+            const float sc = (float)(1ULL << (173 - u8));
+            const __m128i v = _mm_cvttps_epi32(_mm_mul_ps(_mm_castsi128_ps(x), _mm_set1_ps(sc)));
+            const __m128i neg = _mm_srai_epi32(x, 31);
+            const __m128i fix = _mm_andnot_si128(neg, _mm_cmpeq_epi32(v, _mm_set1_epi32((int)0x80000000u)));
+            return _mm_xor_si128(v, fix);
+        }
+    }
     const __m128i be = _mm_and_si128(_mm_srli_epi32(x, 23), _mm_set1_epi32(0xFF));
     const __m128i m = _mm_or_si128(_mm_and_si128(x, _mm_set1_epi32(0x7FFFFF)), _mm_set1_epi32(0x800000));
     const __m128i sh = _mm_add_epi32(be, _mm_set1_epi32(23 - (i8 & 0xFF)));     /* be - 150 + 173 - i8 */

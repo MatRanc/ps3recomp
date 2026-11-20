@@ -112,6 +112,7 @@ enum {
     PS3_LIVE_ENG_PROG_MEMO,             /* PS3RECOMP_ENG_PROG_MEMO: reuse a fragment program's size/hash and a vertex program's input analysis while their bytes compare equal */
     PS3_LIVE_ENG_ANISO,                 /* PS3RECOMP_ENG_ANISO: the Vulkan engine sampler applies the guest's max anisotropy (TEXTURE_CONTROL0 [6:4]) on linear units */
     PS3_LIVE_ENG_SWZ_RT,                /* PS3RECOMP_ENG_SWZ_RT: store a whole raster-type-2 (swizzled) colour target back in Morton order */
+    PS3_LIVE_C690_SOA,                  /* PS3RECOMP_C690_SOA: native c690 normal/tangent kernels (1 on, 2 shadow-compare) */
     PS3_LIVE_COUNT
 };
 

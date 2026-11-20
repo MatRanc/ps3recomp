@@ -39,6 +39,7 @@ extern "C" {
 
 #define RSX_SPIRV_VPCONST_BINDING  0u
 #define RSX_SPIRV_PSCONST_BINDING  1u
+#define RSX_SPIRV_RAW_VB_BINDING   2u
 #define RSX_SPIRV_TEXTURE_BINDING  16u
 #define RSX_SPIRV_SAMPLER_BINDING  48u
 
@@ -92,7 +93,7 @@ void rsx_hlsl_to_spirv_cache_reset(void);
  * translate(), or the SPIR-V legalisation changes. The glslang version is
  * also part of every file, so a glslang update is a miss too.
  */
-#define RSX_SHADER_TRANSLATOR_VERSION 1u
+#define RSX_SHADER_TRANSLATOR_VERSION 2u
 
 int rsx_hlsl_to_spirv_keyed(u64 guest_key, const char* hlsl, int stage,
                             u32* words, u32 max_words, u32* out_words,

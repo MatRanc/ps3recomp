@@ -122,7 +122,7 @@ void c690_corpus_stage_exit(const spu_context* c, uint32_t l) { (void)c; (void)l
 int c690_native_cull_maybe(void) { return 0; }
 int c690_native_cull_enter(spu_context* c) { (void)c; return 0; }
 void c690_native_cull_leave(spu_context* c) { (void)c; }
-void native_spu_func_00007C18(spu_context* c) { (void)c; }
+__attribute__((weak)) void native_spu_func_00007C18(spu_context* c) { (void)c; }
 
 void jobmod_c690c2f7b09a_eF5B8_spu_func_000132E0_body(spu_context* ctx);
 

@@ -1900,6 +1900,25 @@ static inline uint32_t spu_fn_hash(uint32_t addr)
 static int s_reg_image = 0;
 void spu_begin_image(int image_id) { s_reg_image = image_id; }
 
+/* Flat per-(image, variant) dispatch table: (lsa >> 2) -> spu_fn.
+ * Populated in first-registered-match-wins order; NULL falls back to
+ * spu_lookup() for variant fallback or id-0 wildcard matching. */
+#define SPU_FLAT_MAX_IMG 256
+#define SPU_FLAT_SLOTS   (SPU_LS_SIZE >> 2)
+static spu_fn* s_flat_exact[SPU_FLAT_MAX_IMG][3];
+
+static inline spu_fn spu_flat_get(int image_id, int variant, uint32_t addr)
+{
+    if (__builtin_expect((unsigned)image_id < SPU_FLAT_MAX_IMG &&
+                         (unsigned)variant < 3u &&
+                         (addr & 3u) == 0 && addr < SPU_LS_SIZE, 1)) {
+        spu_fn* tab = s_flat_exact[image_id][variant];
+        if (__builtin_expect(tab != NULL, 1))
+            return tab[addr >> 2];
+    }
+    return NULL;
+}
+
 void spu_register_function_var(uint32_t addr, spu_fn fn, int variant)
 {
     if (s_registry_count >= SPU_FN_REGISTRY_MAX) {
@@ -1932,6 +1951,13 @@ void spu_register_function_var(uint32_t addr, spu_fn fn, int variant)
     else
         s_hash_next[s_hash_tail[h] - 1] = i + 1;
     s_hash_tail[h] = i + 1;
+    if (s_reg_image > 0 && s_reg_image < SPU_FLAT_MAX_IMG &&
+        (unsigned)variant < 3u && (addr & 3u) == 0 && addr < SPU_LS_SIZE) {
+        if (!s_flat_exact[s_reg_image][variant])
+            s_flat_exact[s_reg_image][variant] = (spu_fn*)calloc(SPU_FLAT_SLOTS, sizeof(spu_fn));
+        if (s_flat_exact[s_reg_image][variant] && !s_flat_exact[s_reg_image][variant][addr >> 2])
+            s_flat_exact[s_reg_image][variant][addr >> 2] = fn;
+    }
     /* Published after the entry is linked: the dispatch cache keys its entries
      * by this count, so a lookup that sees the new count also finds the entry. */
     __atomic_store_n(&s_registry_count, i + 1, __ATOMIC_RELEASE);
@@ -2029,10 +2055,14 @@ typedef struct { uint32_t addr, gen; int image, variant; spu_fn fn; } spu_lookup
 static SPU_TLS spu_lookup_memo t_lookup_memo[SPU_LOOKUP_MEMO_SIZE];
 static spu_fn spu_lookup_memoized(uint32_t addr, int image_id)
 {
+    const int variant = g_spu_ftz_variant;
+    if (image_id > 0) {
+        spu_fn fast = spu_flat_get(image_id, variant, addr);
+        if (__builtin_expect(fast != NULL, 1)) return fast;
+    }
     spu_lookup_memo* m = &t_lookup_memo[((addr >> 2) ^ ((uint32_t)image_id * 0x9E3779B1u)) &
                                         (SPU_LOOKUP_MEMO_SIZE - 1)];
     const uint32_t gen = s_registry_count + 1;   /* +1: zero-init never matches */
-    const int variant = g_spu_ftz_variant;
     if (m->gen != gen || m->addr != addr || m->image != image_id ||
         m->variant != variant) {
         m->fn = spu_lookup(addr, image_id);
@@ -2198,17 +2228,20 @@ static void spu_jobcap_probe(const spu_context* ctx, uint32_t lsa)
 }
 
 /* SPU_FN_CAPTURE=<lsa>[,<lsa>...][:<dir>]: dump the full LS + all 128 GPRs +
- * pc the first time each listed function is dispatched. This is the input half
- * of the offline per-function replay harness (see tests/test_job_c690_replay.c).
- * A single LSA keeps the old layout, <dir>/ls.bin; a comma-separated list
- * writes <dir>/0x<lsa>/{ls.bin,gpr.bin,pc.txt}. The directory defaults to ".". */
-#define SPU_FNCAP_MAX 16
+ * pc when each listed function is dispatched.
+ * Optional modifiers:
+ *   SPU_FN_CAPTURE_PER=<n>         capture up to n calls per LSA (default 1, max 16)
+ *   SPU_FN_CAPTURE_TRIGGER=<path>  wait until <path> exists before capturing */
+#define SPU_FNCAP_MAX 32
 void spu_fncap_capture(const spu_context* ctx, uint32_t lsa)
 {
-    static int inited = 0, on = 0, multi = 0, nlsas = 0;
+    static int inited = 0, on = 0, multi = 0, nlsas = 0, per_cap = 1;
     static uint32_t lsas[SPU_FNCAP_MAX];
-    static int done[SPU_FNCAP_MAX];
+    static int counts[SPU_FNCAP_MAX];
     static const char* dir = ".";
+    static const char* trig_path = NULL;
+    static int trig_ready = 1;
+    static unsigned trig_checks = 0;
     if (!inited) {
         inited = 1;
         const char* e = getenv("SPU_FN_CAPTURE");
@@ -2225,18 +2258,48 @@ void spu_fncap_capture(const spu_context* ctx, uint32_t lsa)
                 p++;
             }
             if (*p == ':') dir = p + 1;
+            const char* pe = getenv("SPU_FN_CAPTURE_PER");
+            if (pe && atoi(pe) > 1) {
+                per_cap = atoi(pe);
+                if (per_cap > 16) per_cap = 16;
+                multi = 1;
+            }
+            const char* te = getenv("SPU_FN_CAPTURE_TRIGGER");
+            if (te && *te) {
+                trig_path = te;
+                __atomic_store_n(&trig_ready, 0, __ATOMIC_RELAXED);
+            }
             on = nlsas > 0;
         }
     }
     if (!on) return;
+    if (!__atomic_load_n(&trig_ready, __ATOMIC_RELAXED)) {
+        if ((__atomic_fetch_add(&trig_checks, 1u, __ATOMIC_RELAXED) & 63u) != 0) return;
+        FILE* tf = fopen(trig_path, "rb");
+        if (!tf) return;
+        fclose(tf);
+        __atomic_store_n(&trig_ready, 1, __ATOMIC_RELEASE);
+    }
     int idx = -1;
-    for (int i = 0; i < nlsas; i++)
-        if (!done[i] && lsas[i] == lsa) { idx = i; break; }
+    for (int i = 0; i < nlsas; i++) {
+        if (lsas[i] == lsa) {
+            if (__atomic_load_n(&counts[i], __ATOMIC_RELAXED) < per_cap) idx = i;
+            break;
+        }
+    }
     if (idx < 0) return;
-    done[idx] = 1;
+    int slot = __atomic_fetch_add(&counts[idx], 1, __ATOMIC_RELAXED);
+    if (slot >= per_cap) return;
     char path[512], fdir[512];
     if (multi) {
-        snprintf(fdir, sizeof fdir, "%s/0x%05X", dir, lsa);
+        if (per_cap > 1) {
+            char pdir[512];
+            snprintf(pdir, sizeof pdir, "%s/0x%05X", dir, lsa);
+            CreateDirectoryA(pdir, NULL);
+            snprintf(fdir, sizeof fdir, "%s/0x%05X/%02d", dir, lsa, slot);
+        } else {
+            snprintf(fdir, sizeof fdir, "%s/0x%05X", dir, lsa);
+        }
         CreateDirectoryA(fdir, NULL);
     } else {
         snprintf(fdir, sizeof fdir, "%s", dir);
@@ -2249,8 +2312,8 @@ void spu_fncap_capture(const spu_context* ctx, uint32_t lsa)
     if (f) { fwrite(ctx->gpr, 1, sizeof(ctx->gpr), f); fclose(f); }
     snprintf(path, sizeof path, "%s/pc.txt", fdir);
     f = fopen(path, "w");
-    if (f) { fprintf(f, "lsa=0x%05X pc=0x%05X image=%d\n", lsa, ctx->pc, ctx->image_id); fclose(f); }
-    fprintf(stderr, "[fncap] captured lsa=0x%05X -> %s\n", lsa, fdir);
+    if (f) { fprintf(f, "lsa=0x%05X pc=0x%05X image=%d slot=%d\n", lsa, ctx->pc, ctx->image_id, slot); fclose(f); }
+    fprintf(stderr, "[fncap] captured lsa=0x%05X slot=%d -> %s\n", lsa, slot, fdir);
 }
 
 spu_lifted_fn spu_lifted_lookup(const spu_context* ctx, uint32_t lsa)
@@ -2277,6 +2340,16 @@ spu_lifted_fn spu_lifted_lookup(const spu_context* ctx, uint32_t lsa)
     if (__builtin_expect(g_c690_stats, 0)) c690_stats_on_lookup(ctx, lsa);
     const int mode = spu_dcache_mode();
     if (!mode || !ctx) return spu_lifted_lookup_full(ctx, lsa);
+    if (__builtin_expect(mode == 1 &&
+                         !(ctx->resident_code[0].image_id | ctx->resident_code[1].image_id |
+                           ctx->resident_code[2].image_id | ctx->resident_code[3].image_id), 1)) {
+        const int v = g_spu_ftz_variant;
+        spu_fn fn = NULL;
+        if (ctx->resident_task) fn = spu_flat_get(ctx->resident_task, v, lsa);
+        else if (ctx->resident_ovl) fn = spu_flat_get(ctx->resident_ovl, v, lsa);
+        else if (ctx->image_id > 0) fn = spu_flat_get(ctx->image_id, v, lsa);
+        if (__builtin_expect(fn != NULL, 1)) return (spu_lifted_fn)fn;
+    }
     spu_context* c = (spu_context*)ctx;
     uint32_t id = c->dcache_id;
     if (!id) {

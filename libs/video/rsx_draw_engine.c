@@ -28,6 +28,9 @@
 #include "rsx_draw_queue.h"
 #include "ps3_live_ctl.h"
 #include "ps3emu/ps3_trace.h"   /* PS3RECOMP_TIMELINE: readback done */
+#if defined(__AVX2__) && !defined(RSX_NO_SIMD)
+#include <immintrin.h>
+#endif
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -615,6 +618,13 @@ static struct {
     /* The vertices are converted at the draw, into the backend's own memory
      * (draw_fill), not into verts at the fetch. */
     int fetch_deferred;
+    /* Direct GPU vertex pull state: populated in dc_fetch when the draw spans
+     * a single contiguous <=4MB vertex range, skipping remap + plan prepare. */
+    u32 plain_first, plain_last;
+    int plain_valid;
+    int plain_contiguous;
+    int pull_ready;
+    rsx_vtx_gpu_desc pull_desc;
 
     /* INLINE_ARRAY stream for this group, when the vertices came down the
      * FIFO rather than from a vertex array. */
@@ -2041,23 +2051,43 @@ u32 rsx_draw_engine_topology_index_count(u32 primitive, u32 source_refs,
     }
 }
 
-static u32 eng_topology_vertex(const u32* occurrence_to_unique, u32 occurrence)
+static u32 eng_topology_vertex(const u32* occurrence_to_unique,
+                               const rsx_vertex_ref* raw_refs, u32 occurrence)
 {
+    if (raw_refs)
+        return (raw_refs[occurrence].vertex_id + raw_refs[occurrence].base_index) & 0x000FFFFFu;
     return occurrence_to_unique ? occurrence_to_unique[occurrence] : occurrence;
 }
 
-void rsx_draw_engine_write_topology_indices(u32 primitive, u32 source_refs,
-                                            const u32* cuts, u32 cut_count,
-                                            const u32* occurrence_to_unique,
-                                            u32* indices)
+static void eng_write_topology_indices_ex(u32 primitive, u32 source_refs,
+                                          const u32* cuts, u32 cut_count,
+                                          const u32* occurrence_to_unique,
+                                          const rsx_vertex_ref* raw_refs,
+                                          u32* indices)
 {
     u32 write = 0;
     const u32 segments = cut_count + 1;
     switch (primitive) {
     case RSX_PRIMITIVE_TRIANGLES: {
         const u32 count = source_refs - source_refs % 3u;
-        for (u32 o = 0; o < count; o++)
-            indices[write++] = eng_topology_vertex(occurrence_to_unique, o);
+        u32 o = 0;
+        if (raw_refs) {
+#if defined(__AVX2__) && !defined(RSX_NO_SIMD)
+            const __m256i mask20 = _mm256_set1_epi32(0x000FFFFF);
+            for (; o + 8u <= count; o += 8u) {
+                const __m256i a = _mm256_loadu_si256((const __m256i*)(raw_refs + o));
+                const __m256i b = _mm256_loadu_si256((const __m256i*)(raw_refs + o + 4u));
+                const __m256i sum = _mm256_hadd_epi32(a, b);
+                const __m256i ord = _mm256_permute4x64_epi64(sum, 0xD8);
+                _mm256_storeu_si256((__m256i*)(indices + o), _mm256_and_si256(ord, mask20));
+            }
+#endif
+            for (; o < count; o++)
+                indices[o] = (raw_refs[o].vertex_id + raw_refs[o].base_index) & 0x000FFFFFu;
+        } else {
+            for (; o < count; o++)
+                indices[o] = eng_topology_vertex(occurrence_to_unique, NULL, o);
+        }
         break;
     }
     case RSX_PRIMITIVE_TRIANGLE_STRIP:
@@ -2070,11 +2100,11 @@ void rsx_draw_engine_write_topology_indices(u32 primitive, u32 source_refs,
              * keeps one winding. */
             for (u32 i = 0; i + 2 < count; i++) {
                 indices[write++] = eng_topology_vertex(
-                    occurrence_to_unique, begin + i + (i & 1u));
+                    occurrence_to_unique, raw_refs, begin + i + (i & 1u));
                 indices[write++] = eng_topology_vertex(
-                    occurrence_to_unique, begin + i + 1u - (i & 1u));
+                    occurrence_to_unique, raw_refs, begin + i + 1u - (i & 1u));
                 indices[write++] = eng_topology_vertex(
-                    occurrence_to_unique, begin + i + 2u);
+                    occurrence_to_unique, raw_refs, begin + i + 2u);
             }
         }
         break;
@@ -2088,9 +2118,9 @@ void rsx_draw_engine_write_topology_indices(u32 primitive, u32 source_refs,
                                        &begin, &count);
             if (count < 3) continue;
             for (u32 i = 1; i + 1 < count; i++) {
-                indices[write++] = eng_topology_vertex(occurrence_to_unique, begin);
-                indices[write++] = eng_topology_vertex(occurrence_to_unique, begin + i);
-                indices[write++] = eng_topology_vertex(occurrence_to_unique, begin + i + 1u);
+                indices[write++] = eng_topology_vertex(occurrence_to_unique, raw_refs, begin);
+                indices[write++] = eng_topology_vertex(occurrence_to_unique, raw_refs, begin + i);
+                indices[write++] = eng_topology_vertex(occurrence_to_unique, raw_refs, begin + i + 1u);
             }
         }
         break;
@@ -2106,29 +2136,38 @@ void rsx_draw_engine_write_topology_indices(u32 primitive, u32 source_refs,
              * again from the segment's own first vertex. This is the
              * expansion the vtable path's emit_vertices performs. */
             for (u32 q = 0; q + 3 < count; q += 2) {
-                indices[write++] = eng_topology_vertex(occurrence_to_unique, begin + q);
-                indices[write++] = eng_topology_vertex(occurrence_to_unique, begin + q + 1u);
-                indices[write++] = eng_topology_vertex(occurrence_to_unique, begin + q + 2u);
-                indices[write++] = eng_topology_vertex(occurrence_to_unique, begin + q + 1u);
-                indices[write++] = eng_topology_vertex(occurrence_to_unique, begin + q + 3u);
-                indices[write++] = eng_topology_vertex(occurrence_to_unique, begin + q + 2u);
+                indices[write++] = eng_topology_vertex(occurrence_to_unique, raw_refs, begin + q);
+                indices[write++] = eng_topology_vertex(occurrence_to_unique, raw_refs, begin + q + 1u);
+                indices[write++] = eng_topology_vertex(occurrence_to_unique, raw_refs, begin + q + 2u);
+                indices[write++] = eng_topology_vertex(occurrence_to_unique, raw_refs, begin + q + 1u);
+                indices[write++] = eng_topology_vertex(occurrence_to_unique, raw_refs, begin + q + 3u);
+                indices[write++] = eng_topology_vertex(occurrence_to_unique, raw_refs, begin + q + 2u);
             }
         }
         break;
     case RSX_PRIMITIVE_QUADS:
         for (u32 q = 0; q < source_refs / 4u; q++) {
             const u32 base = q * 4u;
-            indices[write++] = eng_topology_vertex(occurrence_to_unique, base);
-            indices[write++] = eng_topology_vertex(occurrence_to_unique, base + 1u);
-            indices[write++] = eng_topology_vertex(occurrence_to_unique, base + 2u);
-            indices[write++] = eng_topology_vertex(occurrence_to_unique, base + 2u);
-            indices[write++] = eng_topology_vertex(occurrence_to_unique, base + 3u);
-            indices[write++] = eng_topology_vertex(occurrence_to_unique, base);
+            indices[write++] = eng_topology_vertex(occurrence_to_unique, raw_refs, base);
+            indices[write++] = eng_topology_vertex(occurrence_to_unique, raw_refs, base + 1u);
+            indices[write++] = eng_topology_vertex(occurrence_to_unique, raw_refs, base + 2u);
+            indices[write++] = eng_topology_vertex(occurrence_to_unique, raw_refs, base + 2u);
+            indices[write++] = eng_topology_vertex(occurrence_to_unique, raw_refs, base + 3u);
+            indices[write++] = eng_topology_vertex(occurrence_to_unique, raw_refs, base);
         }
         break;
     default:
         break;
     }
+}
+
+void rsx_draw_engine_write_topology_indices(u32 primitive, u32 source_refs,
+                                            const u32* cuts, u32 cut_count,
+                                            const u32* occurrence_to_unique,
+                                            u32* indices)
+{
+    eng_write_topology_indices_ex(primitive, source_refs, cuts, cut_count,
+                                  occurrence_to_unique, NULL, indices);
 }
 
 /* Does this primitive become an indexed triangle list, and is the index buffer
@@ -5600,13 +5639,21 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
     int vi = 1, fi = 1;
     u32 nconst = 0;
     if (fixed) {
-        snprintf(s_vs_hlsl, sizeof s_vs_hlsl, "%s", kEngFixedVS);
+        if (g.be->vertex_pull) {
+            if (rsx_vp_wrap_pull_vs(kEngFixedVS, s_vs_hlsl, sizeof s_vs_hlsl) < 0)
+                vi = -1;
+        } else {
+            snprintf(s_vs_hlsl, sizeof s_vs_hlsl, "%s", kEngFixedVS);
+        }
         snprintf(s_ps_hlsl, sizeof s_ps_hlsl, "%s", kEngFixedPS);
     } else {
         rsx_vp_set_branch_bits(vp_branch_bits);
-        vi = rsx_vp_decompile_compact_ex(vp_uc, vp_instrs * 16u, vtex_mask,
-                                         layout->mask, s_vs_hlsl,
-                                         sizeof s_vs_hlsl);
+        vi = g.be->vertex_pull
+            ? rsx_vp_decompile_pull_ex(vp_uc, vp_instrs * 16u, vtex_mask,
+                                       layout->mask, s_vs_hlsl, sizeof s_vs_hlsl)
+            : rsx_vp_decompile_compact_ex(vp_uc, vp_instrs * 16u, vtex_mask,
+                                          layout->mask, s_vs_hlsl,
+                                          sizeof s_vs_hlsl);
         if (vi > 0 && ucp && rsx_vp_apply_user_clip(s_vs_hlsl, sizeof s_vs_hlsl, ucp) < 0) {
             vi = -1;
             static u32 said;
@@ -5754,12 +5801,59 @@ static void dc_reset(void)
     dc.refs_remapped = 0;
     dc.fetch_ok = 1;
     dc.fetch_deferred = 0;
+    dc.plain_first = UINT32_MAX;
+    dc.plain_last = 0;
+    dc.plain_valid = 1;
+    dc.plain_contiguous = 1;
+    dc.pull_ready = 0;
     dc.inl = NULL;
     dc.inl_bytes = 0;
     dc.n_immediate = 0;
 }
 
-static int dc_push_ref(u32 vertex_id, u32 base_index)
+static inline void dc_note_elem_local(u32 elem, u32* p_first, u32* p_last,
+                                      int* contig, int* has_prev, u32* prev_elem)
+{
+    if (*has_prev && *contig && elem != *prev_elem + 1u)
+        *contig = 0;
+    if (elem < *p_first) *p_first = elem;
+    if (elem > *p_last)  *p_last  = elem;
+    *prev_elem = elem;
+    *has_prev = 1;
+}
+
+static inline int dc_push_index_elem(const u8* run, u32 i, int is_u32, u32 base_index,
+                                     int restart_en, u32 restart_val, int want_hash,
+                                     rsx_vertex_ref* out, u32* np, u64* hp,
+                                     u32* p_first, u32* p_last, int* contig,
+                                     int* has_prev, u32* prev_elem)
+{
+    const u32 index = is_u32
+        ? (((u32)run[4u * i] << 24) | ((u32)run[4u * i + 1u] << 16) |
+           ((u32)run[4u * i + 2u] << 8) | run[4u * i + 3u])
+        : (u32)((run[2u * i] << 8) | run[2u * i + 1u]);
+    if (restart_en && index == restart_val) {
+        dc.n_refs = *np;
+        if (!rsx_restart_cut_push(&dc.cuts, &dc.n_cuts, &dc.cap_cuts, *np)) return 0;
+        *contig = 0;
+        return 1;
+    }
+    const u32 elem = (index + base_index) & 0x000FFFFFu;
+    dc_note_elem_local(elem, p_first, p_last, contig, has_prev, prev_elem);
+    out[*np].vertex_id = index;
+    out[*np].base_index = base_index;
+    if (want_hash) *hp = eng_refs_hash_ref(*hp, index, base_index);
+    (*np)++;
+    return 1;
+}
+
+static inline void dc_note_elem(u32 elem, u32 prev_elem, int has_prev)
+{
+    dc_note_elem_local(elem, &dc.plain_first, &dc.plain_last,
+                       &dc.plain_contiguous, &has_prev, &prev_elem);
+}
+
+static int dc_push_ref(u32 vertex_id, u32 base_index, int want_hash)
 {
     if (dc.n_refs >= dc.cap_refs) {
         const u32 next = dc.cap_refs ? dc.cap_refs * 2u : 4096u;
@@ -5769,9 +5863,14 @@ static int dc_push_ref(u32 vertex_id, u32 base_index)
         dc.refs = r;
         dc.cap_refs = next;
     }
+    const u32 elem = (vertex_id + base_index) & 0x000FFFFFu;
+    const u32 prev = dc.n_refs
+        ? ((dc.refs[dc.n_refs - 1u].vertex_id + dc.refs[dc.n_refs - 1u].base_index) & 0x000FFFFFu)
+        : 0u;
+    dc_note_elem(elem, prev, dc.n_refs > 0);
     dc.refs[dc.n_refs].vertex_id = vertex_id;
     dc.refs[dc.n_refs].base_index = base_index;
-    if (s_refs_hash_fast)
+    if (want_hash)
         dc.refs_hash = eng_refs_hash_ref(dc.refs_hash, vertex_id, base_index);
     dc.n_refs++;
     return 1;
@@ -5794,52 +5893,138 @@ static int dc_reserve_refs(u32 more)
 }
 
 /* A run of big-endian indices appended as references in one pass: the
- * capacity is reserved up front and the loop works on locals, which the
- * per-index dc_push_ref (reloading dc after every store) could not. A
- * restart sentinel still cuts the strip where it stands. */
+ * capacity is reserved up front and the loop works on locals (with AVX2
+ * byte-swap + min/max element tracking when hashing is skipped for direct
+ * pull). A restart sentinel still cuts the strip where it stands. */
 static int dc_push_index_run(const u8* run, u32 count, int is_u32, u32 base_index,
-                             int restart_en, u32 restart_val)
+                             int restart_en, u32 restart_val, int want_hash)
 {
     if (!dc_reserve_refs(count)) return 0;
     rsx_vertex_ref* out = dc.refs;
     u32 n = dc.n_refs;
-    const int hash = s_refs_hash_fast;
+    const int hash = want_hash;
     u64 h = dc.refs_hash;
-    if (is_u32) {
-        for (u32 i = 0; i < count; i++) {
-            const u8* p = run + (size_t)i * 4u;
-            const u32 index = ((u32)p[0] << 24) | ((u32)p[1] << 16) | ((u32)p[2] << 8) | p[3];
-            if (restart_en && index == restart_val) {
-                dc.n_refs = n;
-                if (!rsx_restart_cut_push(&dc.cuts, &dc.n_cuts, &dc.cap_cuts, n)) return 0;
-                continue;
+    u32 p_first = dc.plain_first;
+    u32 p_last  = dc.plain_last;
+    int contig  = dc.plain_contiguous;
+    int has_prev = (n > 0);
+    u32 prev_elem = has_prev
+        ? ((out[n - 1u].vertex_id + out[n - 1u].base_index) & 0x000FFFFFu)
+        : 0u;
+    u32 i = 0;
+
+#if defined(__AVX2__) && !defined(RSX_NO_SIMD)
+    if (!hash && count >= 8u) {
+        const __m256i base_v = _mm256_set1_epi32((int)base_index);
+        const __m256i mask20 = _mm256_set1_epi32(0x000FFFFF);
+        const __m256i seq07  = _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7);
+        __m256i vmin = _mm256_set1_epi32((int)0xFFFFFFFFu);
+        __m256i vmax = _mm256_setzero_si256();
+        int simd_ran = 0;
+
+        if (is_u32) {
+            const __m256i bswap32 = _mm256_setr_epi8(
+                3,2,1,0, 7,6,5,4, 11,10,9,8, 15,14,13,12,
+                3,2,1,0, 7,6,5,4, 11,10,9,8, 15,14,13,12);
+            const __m256i rval32 = _mm256_set1_epi32((int)restart_val);
+            while (i + 8u <= count) {
+                const __m256i raw   = _mm256_loadu_si256((const __m256i*)(run + (size_t)i * 4u));
+                const __m256i idx32 = _mm256_shuffle_epi8(raw, bswap32);
+                if (restart_en && _mm256_movemask_epi8(_mm256_cmpeq_epi32(idx32, rval32)) != 0) {
+                    for (u32 j = 0; j < 8u; j++, i++) {
+                        if (!dc_push_index_elem(run, i, 1, base_index, 1, restart_val, 0,
+                                                out, &n, &h, &p_first, &p_last,
+                                                &contig, &has_prev, &prev_elem))
+                            return 0;
+                    }
+                    continue;
+                }
+                const __m256i elem = _mm256_and_si256(_mm256_add_epi32(idx32, base_v), mask20);
+                vmin = _mm256_min_epu32(vmin, elem);
+                vmax = _mm256_max_epu32(vmax, elem);
+                simd_ran = 1;
+                if (contig) {
+                    const u32 e0 = (u32)_mm_cvtsi128_si32(_mm256_castsi256_si128(elem));
+                    const __m256i exp = _mm256_add_epi32(_mm256_set1_epi32((int)e0), seq07);
+                    if ((has_prev && e0 != prev_elem + 1u) ||
+                        _mm256_movemask_epi8(_mm256_cmpeq_epi32(elem, exp)) != -1) {
+                        contig = 0;
+                    } else {
+                        prev_elem = (u32)_mm256_extract_epi32(elem, 7);
+                    }
+                }
+                has_prev = 1;
+                const __m256i lo = _mm256_unpacklo_epi32(idx32, base_v);
+                const __m256i hi = _mm256_unpackhi_epi32(idx32, base_v);
+                _mm256_storeu_si256((__m256i*)(out + n + 0), _mm256_permute2x128_si256(lo, hi, 0x20));
+                _mm256_storeu_si256((__m256i*)(out + n + 4), _mm256_permute2x128_si256(lo, hi, 0x31));
+                n += 8u;
+                i += 8u;
             }
-            out[n].vertex_id = index; out[n].base_index = base_index;
-            if (hash) h = eng_refs_hash_ref(h, index, base_index);
-            n++;
-        }
-    } else if (!restart_en) {
-        for (u32 i = 0; i < count; i++) {
-            const u32 index = (u32)((run[2u * i] << 8) | run[2u * i + 1u]);
-            out[n + i].vertex_id = index; out[n + i].base_index = base_index;
-            if (hash) h = eng_refs_hash_ref(h, index, base_index);
-        }
-        n += count;
-    } else {
-        for (u32 i = 0; i < count; i++) {
-            const u32 index = (u32)((run[2u * i] << 8) | run[2u * i + 1u]);
-            if (index == restart_val) {
-                dc.n_refs = n;
-                if (!rsx_restart_cut_push(&dc.cuts, &dc.n_cuts, &dc.cap_cuts, n)) return 0;
-                continue;
+        } else {
+            const __m128i bswap16 = _mm_setr_epi8(1,0, 3,2, 5,4, 7,6, 9,8, 11,10, 13,12, 15,14);
+            const __m128i rval16  = _mm_set1_epi16((short)(u16)restart_val);
+            while (i + 8u <= count) {
+                const __m128i raw = _mm_loadu_si128((const __m128i*)(run + (size_t)i * 2u));
+                const __m128i sw  = _mm_shuffle_epi8(raw, bswap16);
+                if (restart_en && _mm_movemask_epi8(_mm_cmpeq_epi16(sw, rval16)) != 0) {
+                    for (u32 j = 0; j < 8u; j++, i++) {
+                        if (!dc_push_index_elem(run, i, 0, base_index, 1, restart_val, 0,
+                                                out, &n, &h, &p_first, &p_last,
+                                                &contig, &has_prev, &prev_elem))
+                            return 0;
+                    }
+                    continue;
+                }
+                const __m256i idx32 = _mm256_cvtepu16_epi32(sw);
+                const __m256i elem  = _mm256_and_si256(_mm256_add_epi32(idx32, base_v), mask20);
+                vmin = _mm256_min_epu32(vmin, elem);
+                vmax = _mm256_max_epu32(vmax, elem);
+                simd_ran = 1;
+                if (contig) {
+                    const u32 e0 = (u32)_mm_cvtsi128_si32(_mm256_castsi256_si128(elem));
+                    const __m256i exp = _mm256_add_epi32(_mm256_set1_epi32((int)e0), seq07);
+                    if ((has_prev && e0 != prev_elem + 1u) ||
+                        _mm256_movemask_epi8(_mm256_cmpeq_epi32(elem, exp)) != -1) {
+                        contig = 0;
+                    } else {
+                        prev_elem = (u32)_mm256_extract_epi32(elem, 7);
+                    }
+                }
+                has_prev = 1;
+                const __m256i lo = _mm256_unpacklo_epi32(idx32, base_v);
+                const __m256i hi = _mm256_unpackhi_epi32(idx32, base_v);
+                _mm256_storeu_si256((__m256i*)(out + n + 0), _mm256_permute2x128_si256(lo, hi, 0x20));
+                _mm256_storeu_si256((__m256i*)(out + n + 4), _mm256_permute2x128_si256(lo, hi, 0x31));
+                n += 8u;
+                i += 8u;
             }
-            out[n].vertex_id = index; out[n].base_index = base_index;
-            if (hash) h = eng_refs_hash_ref(h, index, base_index);
-            n++;
         }
+        if (simd_ran) {
+            __m128i lo_min = _mm_min_epu32(_mm256_castsi256_si128(vmin), _mm256_extracti128_si256(vmin, 1));
+            lo_min = _mm_min_epu32(lo_min, _mm_shuffle_epi32(lo_min, 0x4E));
+            lo_min = _mm_min_epu32(lo_min, _mm_shuffle_epi32(lo_min, 0xB1));
+            const u32 smin = (u32)_mm_cvtsi128_si32(lo_min);
+            __m128i lo_max = _mm_max_epu32(_mm256_castsi256_si128(vmax), _mm256_extracti128_si256(vmax, 1));
+            lo_max = _mm_max_epu32(lo_max, _mm_shuffle_epi32(lo_max, 0x4E));
+            lo_max = _mm_max_epu32(lo_max, _mm_shuffle_epi32(lo_max, 0xB1));
+            const u32 smax = (u32)_mm_cvtsi128_si32(lo_max);
+            if (smin < p_first) p_first = smin;
+            if (smax > p_last)  p_last  = smax;
+        }
+    }
+#endif
+
+    for (; i < count; i++) {
+        if (!dc_push_index_elem(run, i, is_u32, base_index, restart_en, restart_val, hash,
+                                out, &n, &h, &p_first, &p_last, &contig, &has_prev, &prev_elem))
+            return 0;
     }
     dc.refs_hash = h;
     dc.n_refs = n;
+    dc.plain_first = p_first;
+    dc.plain_last  = p_last;
+    dc.plain_contiguous = contig;
     return 1;
 }
 
@@ -5896,6 +6081,10 @@ static int dc_fill_verts(void* ctx, void* dst)
 static int dc_convert_verts(void)
 {
     const unsigned long long wp2 = wp2_t0();
+    if (dc.pull_ready) {
+        rsx_vertex_fetch_plan_prepare(&dc.fetch_plan, dc.refs, dc.n_refs);
+        dc.pull_ready = 0;
+    }
     if (!dc_reserve_verts((u64)dc.n_refs * dc.layout.stride))
         return 0;
     const int ok = rsx_vertex_fetch_many(&dc.fetch_plan, dc.refs, dc.n_refs,
@@ -6114,6 +6303,13 @@ static int dc_remap_memo_restore(const eng_remap_memo* m)
  * than fetching a phantom vertex wherever the restart sentinel appears, then
  * collapse repeated references and fetch each unique vertex once.
  * rsx_live_draw.c's fetch_batches_hoisted (4165-4292). */
+static int eng_try_raw_pull_span(rsx_vtx_gpu_desc* desc,
+                                 const rsx_vertex_layout_plan* l,
+                                 const rsx_vertex_fetch_plan* p,
+                                 const u8* (*ptr_fn)(void*, u32, u32, u32),
+                                 void* ptr_user, u32 count,
+                                 u32 first, u32 last, int contiguous);
+
 static void dc_fetch(const rsx_vertex_layout_plan* layout, int allow_remap, int refs_only)
 {
     const unsigned long long wp2_refs = wp2_t0();
@@ -6131,9 +6327,34 @@ static void dc_fetch(const rsx_vertex_layout_plan* layout, int allow_remap, int 
         wp2_add(WPROF2_FETCH_REFS, wp2_refs);
         return;
     }
-    for (u32 b = 0; b < dc.n_arr && dc.fetch_ok; b++)
-        for (u32 i = 0; i < dc.arr[b].count && dc.fetch_ok; i++)
-            if (!dc_push_ref(dc.arr[b].first + i, 0)) dc.fetch_ok = 0;
+    const int pull_candidate = !refs_only && g.be && g.be->vertex_pull &&
+                               g.be->draw_fill && s_vtx_direct && !dc.inl &&
+                               layout->count >= 1 && layout->count <= 8;
+    const int want_hash = s_refs_hash_fast && !pull_candidate && !refs_only;
+
+    for (u32 b = 0; b < dc.n_arr && dc.fetch_ok; b++) {
+        const u32 f = dc.arr[b].first, c = dc.arr[b].count;
+        if (!want_hash) {
+            if (!dc_reserve_refs(c)) { dc.fetch_ok = 0; break; }
+            u32 n = dc.n_refs;
+            int has_prev = (n > 0);
+            u32 prev = has_prev ? ((dc.refs[n - 1u].vertex_id + dc.refs[n - 1u].base_index) & 0x000FFFFFu) : 0u;
+            for (u32 i = 0; i < c; i++) {
+                const u32 vid = f + i;
+                const u32 elem = vid & 0x000FFFFFu;
+                dc_note_elem(elem, prev, has_prev);
+                prev = elem;
+                has_prev = 1;
+                dc.refs[n].vertex_id = vid;
+                dc.refs[n].base_index = 0u;
+                n++;
+            }
+            dc.n_refs = n;
+        } else {
+            for (u32 i = 0; i < c && dc.fetch_ok; i++)
+                if (!dc_push_ref(f + i, 0, want_hash)) dc.fetch_ok = 0;
+        }
+    }
 
     if (dc.n_idx && dc.fetch_ok) {
         const u32 base_index = rsx_dsp_vertex_data_base_index(&g.rsx);
@@ -6155,7 +6376,7 @@ static void dc_fetch(const rsx_vertex_layout_plan* layout, int allow_remap, int 
                 start + bytes <= 0x100000000ull)
                 run = eng_guest_ptr(NULL, ia_loc, (u32)start, (u32)bytes);
             if (run) {
-                if (!dc_push_index_run(run, count, ia.is_u32, base_index, restart_en, restart_val))
+                if (!dc_push_index_run(run, count, ia.is_u32, base_index, restart_en, restart_val, want_hash))
                     dc.fetch_ok = 0;
                 continue;
             }
@@ -6170,9 +6391,10 @@ static void dc_fetch(const rsx_vertex_layout_plan* layout, int allow_remap, int 
                     if (!rsx_restart_cut_push(&dc.cuts, &dc.n_cuts, &dc.cap_cuts,
                                               dc.n_refs))
                         dc.fetch_ok = 0;
+                    dc.plain_contiguous = 0;
                     continue;
                 }
-                if (!dc_push_ref(index, base_index)) dc.fetch_ok = 0;
+                if (!dc_push_ref(index, base_index, want_hash)) dc.fetch_ok = 0;
             }
         }
     }
@@ -6183,12 +6405,29 @@ static void dc_fetch(const rsx_vertex_layout_plan* layout, int allow_remap, int 
     dc.n_source_refs = dc.n_refs;
     dc.layout = *layout;
     if (refs_only) {
-        /* M3: stop after the reference build. The worker does the remap,
-         * span resolve, topology/index rebuild and conversion from these
-         * references. */
+        /* M3: stop after the reference build. The worker does the direct-pull
+         * check or remap, span resolve, topology/index rebuild and conversion
+         * from these references. */
         rsx_vertex_fetch_plan_init(&dc.fetch_plan, &g.rsx, layout, NULL, NULL);
         wp2_add(WPROF2_FETCH_PLAN, wp2_plan);
         return;
+    }
+
+    if (pull_candidate && dc.n_source_refs > 0 && (allow_remap || dc.plain_contiguous)) {
+        rsx_vertex_fetch_plan_init(&dc.fetch_plan, &g.rsx, layout, eng_guest_ptr, NULL);
+        if (eng_try_raw_pull_span(&dc.pull_desc, layout, &dc.fetch_plan,
+                                  eng_guest_ptr, NULL, dc.n_source_refs,
+                                  dc.plain_first, dc.plain_last,
+                                  dc.plain_contiguous)) {
+            dc.pull_ready = 1;
+            dc.fetch_deferred = 1;
+            dc.refs_remapped = 0;
+            dc.n_verts = dc.plain_contiguous
+                ? dc.n_source_refs
+                : (dc.plain_last - dc.plain_first + 1u);
+            wp2_add(WPROF2_FETCH_PLAN, wp2_plan);
+            return;
+        }
     }
 
     /* Cut 1. An inline stream has no plan to reuse and an immediate group
@@ -6203,7 +6442,7 @@ static void dc_fetch(const rsx_vertex_layout_plan* layout, int allow_remap, int 
     u64 refs_key = 0;
     if (fast_cacheable || remap_cacheable) {
 #ifdef ENG_HAVE_FAST_REFS_HASH
-        if (s_refs_hash_fast) {
+        if (want_hash) {
             /* Folded while the list was built; only eng_refs_key()'s tail
              * (the count) is left. */
             refs_key = eng_fnv1a(&dc.n_source_refs, sizeof dc.n_source_refs,
@@ -7374,6 +7613,137 @@ static u64 s_eng_other_layout = 0;
 
 static u32 s_gpu_remap_buf[65536];
 
+static u32 eng_detect_raw_layout_mode(const rsx_vertex_layout_plan* l,
+                                      const rsx_vertex_fetch_plan* p,
+                                      u32 src_stride, const u32 offs[8],
+                                      u32 min_off)
+{
+    /* Mode 0: Fast MLB 3D Mesh (Interleaved Pos3 + UV2 + Color4, Stride 24) */
+    if (l->count == 3 && l->attrs[0] == 0 && l->attrs[1] == 3 && l->attrs[2] == 8 &&
+        src_stride == 24 &&
+        p->attr[0].desc.type == RSX_VTX_TYPE_FLOAT  && p->attr[0].desc.size == 3 &&
+        p->attr[3].desc.type == RSX_VTX_TYPE_UNORM8 && p->attr[3].desc.size == 4 &&
+        p->attr[8].desc.type == RSX_VTX_TYPE_FLOAT  && p->attr[8].desc.size == 2 &&
+        offs[0] == min_off && offs[2] == min_off + 12u && offs[1] == min_off + 20u) {
+        return 0u;
+    }
+    /* Mode 2: Fast MLB 2D UI with Color (Interleaved Pos2 + UV2 + Color4, Stride 20) */
+    if (l->count == 3 && l->attrs[0] == 0 && l->attrs[1] == 3 && l->attrs[2] == 8 &&
+        src_stride == 20 &&
+        p->attr[0].desc.type == RSX_VTX_TYPE_FLOAT  && p->attr[0].desc.size == 2 &&
+        p->attr[8].desc.type == RSX_VTX_TYPE_FLOAT  && p->attr[8].desc.size == 2 &&
+        p->attr[3].desc.type == RSX_VTX_TYPE_UNORM8 && p->attr[3].desc.size == 4 &&
+        offs[0] == min_off && offs[2] == min_off + 8u && offs[1] == min_off + 16u) {
+        return 2u;
+    }
+    /* Mode 1: Fast MLB 2D UI (Interleaved Pos2 + UV2, Stride 16) */
+    if (l->count == 2 && l->attrs[0] == 0 && l->attrs[1] == 1 &&
+        src_stride == 16 &&
+        p->attr[0].desc.type == RSX_VTX_TYPE_FLOAT && p->attr[0].desc.size == 2 &&
+        p->attr[1].desc.type == RSX_VTX_TYPE_FLOAT && p->attr[1].desc.size == 2 &&
+        offs[0] == min_off && offs[1] == min_off + 8u) {
+        return 1u;
+    }
+    return 3u;
+}
+
+static int eng_try_raw_pull_span(rsx_vtx_gpu_desc* desc,
+                                 const rsx_vertex_layout_plan* l,
+                                 const rsx_vertex_fetch_plan* p,
+                                 const u8* (*ptr_fn)(void*, u32, u32, u32),
+                                 void* ptr_user, u32 count,
+                                 u32 first, u32 last, int contiguous)
+{
+    memset(desc, 0, sizeof *desc);
+    __atomic_fetch_add(&s_eng_calls, 1, __ATOMIC_RELAXED);
+    if (!count || !l || !l->count || l->count > 8u || !p || p->inline_data || !ptr_fn) {
+        __atomic_fetch_add(&s_eng_other_layout, 1, __ATOMIC_RELAXED);
+        return 0;
+    }
+    const rsx_vertex_fetch_attr* a0 = &p->attr[l->attrs[0]];
+    const u32 src_stride = a0->stride;
+    const u32 loc0 = a0->desc.location;
+    if (!src_stride) {
+        __atomic_fetch_add(&s_eng_other_layout, 1, __ATOMIC_RELAXED);
+        return 0;
+    }
+
+    u32 offs[8];
+    u32 min_off = UINT32_MAX;
+    for (u32 i = 0; i < l->count; i++) {
+        const u32 attr_id = l->attrs[i];
+        const rsx_vertex_fetch_attr* a = &p->attr[attr_id];
+        if (!a->desc.type || a->desc.type > RSX_VTX_TYPE_UINT8 ||
+            !a->desc.size || !a->elem_size || a->stride != src_stride ||
+            a->desc.location != loc0 ||
+            !rsx_vertex_freq_plain(a->desc.frequency, (p->divider_mask >> attr_id) & 1u)) {
+            __atomic_fetch_add(&s_eng_other_layout, 1, __ATOMIC_RELAXED);
+            return 0;
+        }
+        offs[i] = rsx_dsp_resolve_vertex_offset(p->base_offset, a->desc.offset);
+        if (offs[i] < min_off) min_off = offs[i];
+    }
+    for (u32 i = 0; i < l->count; i++) {
+        const rsx_vertex_fetch_attr* a = &p->attr[l->attrs[i]];
+        const u32 diff = offs[i] - min_off;
+        if (diff >= src_stride || (u64)diff + a->elem_size > src_stride) {
+            __atomic_fetch_add(&s_eng_other_layout, 1, __ATOMIC_RELAXED);
+            return 0;
+        }
+    }
+
+    if (last < first) {
+        __atomic_fetch_add(&s_eng_not_contiguous, 1, __ATOMIC_RELAXED);
+        return 0;
+    }
+    const u64 span = (u64)(last - first) + 1ull;
+    const u64 raw_bytes = span * (u64)src_stride;
+    if (!raw_bytes || raw_bytes > 4u * 1024u * 1024u ||
+        (!contiguous && span > 128u && span > (u64)count * 2ull)) {
+        __atomic_fetch_add(&s_eng_not_contiguous, 1, __ATOMIC_RELAXED);
+        return 0;
+    }
+
+    const u64 start = (u64)min_off + (u64)first * (u64)src_stride;
+    if (start + raw_bytes > 0x100000000ull) {
+        __atomic_fetch_add(&s_eng_not_contiguous, 1, __ATOMIC_RELAXED);
+        return 0;
+    }
+    const u8* min_base = ptr_fn(ptr_user, loc0, (u32)start, (u32)raw_bytes);
+    if (!min_base) {
+        __atomic_fetch_add(&s_eng_other_layout, 1, __ATOMIC_RELAXED);
+        return 0;
+    }
+
+    const u32 mode = eng_detect_raw_layout_mode(l, p, src_stride, offs, min_off);
+    if (mode == 3u) {
+        desc->num_attrs = l->count;
+        for (u32 i = 0; i < l->count; i++) {
+            const u32 attr_id = l->attrs[i];
+            const rsx_vertex_fetch_attr* a = &p->attr[attr_id];
+            const u32 off = offs[i] - min_off;
+            desc->attrs[i].src_off_dst_slot = (attr_id << 16u) | (off & 0xFFFFu);
+            desc->attrs[i].type_count = ((u32)a->desc.size << 16u) | ((u32)a->desc.type & 0xFFFFu);
+        }
+    }
+
+    desc->vertex_count = contiguous ? count : (u32)span;
+    desc->gpu_eligible = 1;
+    desc->layout_mode  = mode;
+    desc->flags        = 0;
+    desc->src_stride   = src_stride;
+    desc->dst_stride   = (mode == 0u) ? 12u : (mode == 1u) ? 8u : (mode == 2u) ? 12u : (l->stride / 4u);
+    desc->first_vertex = first;
+    desc->raw_data     = min_base;
+    desc->raw_bytes    = (u32)raw_bytes;
+    if (!contiguous) __atomic_fetch_add(&s_eng_eligible_remap, 1, __ATOMIC_RELAXED);
+    if (mode == 0u)      __atomic_fetch_add(&s_eng_eligible_m0, 1, __ATOMIC_RELAXED);
+    else if (mode == 1u) __atomic_fetch_add(&s_eng_eligible_m1, 1, __ATOMIC_RELAXED);
+    else if (mode == 2u) __atomic_fetch_add(&s_eng_eligible_m2, 1, __ATOMIC_RELAXED);
+    else                 __atomic_fetch_add(&s_eng_eligible_m3, 1, __ATOMIC_RELAXED);
+    return 1;
+}
+
 static void eng_check_gpu_vertex_offload_ex(rsx_vtx_gpu_desc* desc, u32 uploaded,
                                             int deferred,
                                             const rsx_vertex_layout_plan* l,
@@ -7381,169 +7751,24 @@ static void eng_check_gpu_vertex_offload_ex(rsx_vtx_gpu_desc* desc, u32 uploaded
                                             const rsx_vertex_ref* refs,
                                             u32* remap_buf)
 {
+    (void)l; (void)p; (void)refs; (void)remap_buf;
     memset(desc, 0, sizeof(*desc));
     desc->vertex_count = uploaded;
-    __atomic_fetch_add(&s_eng_calls, 1, __ATOMIC_RELAXED);
-    if (!uploaded || !deferred || !refs || uploaded > 65536) {
+    if (!deferred) {
+        __atomic_fetch_add(&s_eng_calls, 1, __ATOMIC_RELAXED);
         __atomic_fetch_add(&s_eng_not_deferred, 1, __ATOMIC_RELAXED);
-        return;
     }
-
-    if (l->count == 0 || l->count > 8) {
-        __atomic_fetch_add(&s_eng_other_layout, 1, __ATOMIC_RELAXED);
-        return;
-    }
-
-    /* Check that all active attributes have valid stable_base and consistent stride */
-    const rsx_vertex_fetch_attr* a0 = &p->attr[l->attrs[0]];
-    if (!a0->stable_base || !a0->stride) {
-        __atomic_fetch_add(&s_eng_other_layout, 1, __ATOMIC_RELAXED);
-        return;
-    }
-
-    const u32 src_stride = a0->stride;
-    const u8* min_base = a0->stable_base;
-    for (u32 i = 1; i < l->count; i++) {
-        const rsx_vertex_fetch_attr* a = &p->attr[l->attrs[i]];
-        if (!a->stable_base || a->stride != src_stride) {
-            __atomic_fetch_add(&s_eng_other_layout, 1, __ATOMIC_RELAXED);
-            return;
-        }
-        if (a->stable_base < min_base) {
-            min_base = a->stable_base;
-        }
-    }
-
-    /* All attributes must reside within [min_base, min_base + src_stride) */
-    for (u32 i = 0; i < l->count; i++) {
-        const rsx_vertex_fetch_attr* a = &p->attr[l->attrs[i]];
-        ptrdiff_t diff = a->stable_base - min_base;
-        if (diff < 0 || diff >= (ptrdiff_t)src_stride) {
-            __atomic_fetch_add(&s_eng_other_layout, 1, __ATOMIC_RELAXED);
-            return;
-        }
-    }
-
-    u32 mode = 3; /* Generic Descriptor Unpack default */
-
-    /* Mode 0: Fast MLB 3D Mesh (Interleaved Pos3 + UV2 + Color4, Stride 24) */
-    if (l->count == 3 && l->attrs[0] == 0 && l->attrs[1] == 3 && l->attrs[2] == 8 &&
-        src_stride == 24 &&
-        p->attr[0].desc.type == RSX_VTX_TYPE_FLOAT  && p->attr[0].desc.size == 3 &&
-        p->attr[3].desc.type == RSX_VTX_TYPE_UNORM8 && p->attr[3].desc.size == 4 &&
-        p->attr[8].desc.type == RSX_VTX_TYPE_FLOAT  && p->attr[8].desc.size == 2 &&
-        p->attr[0].stable_base == min_base &&
-        p->attr[8].stable_base == min_base + 12 &&
-        p->attr[3].stable_base == min_base + 20) {
-        mode = 0;
-    }
-    /* Mode 2: Fast MLB 2D UI with Color (Interleaved Pos2 + UV2 + Color4, Stride 20) */
-    else if (l->count == 3 && l->attrs[0] == 0 && l->attrs[1] == 3 && l->attrs[2] == 8 &&
-             src_stride == 20 &&
-             p->attr[0].desc.type == RSX_VTX_TYPE_FLOAT  && p->attr[0].desc.size == 2 &&
-             p->attr[8].desc.type == RSX_VTX_TYPE_FLOAT  && p->attr[8].desc.size == 2 &&
-             p->attr[3].desc.type == RSX_VTX_TYPE_UNORM8 && p->attr[3].desc.size == 4 &&
-             p->attr[0].stable_base == min_base &&
-             p->attr[8].stable_base == min_base + 8 &&
-             p->attr[3].stable_base == min_base + 16) {
-        mode = 2;
-    }
-    /* Mode 1: Fast MLB 2D UI (Interleaved Pos2 + UV2, Stride 16) */
-    else if (l->count == 2 && l->attrs[0] == 0 && l->attrs[1] == 1 &&
-             src_stride == 16 &&
-             p->attr[0].desc.type == RSX_VTX_TYPE_FLOAT && p->attr[0].desc.size == 2 &&
-             p->attr[1].desc.type == RSX_VTX_TYPE_FLOAT && p->attr[1].desc.size == 2 &&
-             p->attr[0].stable_base == min_base &&
-             p->attr[1].stable_base == min_base + 8) {
-        mode = 1;
-    }
-
-    /* Populate attribute descriptors for Mode 3 */
-    if (mode == 3) {
-        desc->num_attrs = l->count;
-        for (u32 i = 0; i < l->count; i++) {
-            const u32 attr_id = l->attrs[i];
-            const rsx_vertex_fetch_attr* a = &p->attr[attr_id];
-            u32 slot = (u32)l->slot_by_attr[attr_id];
-            u32 off = (u32)(a->stable_base - min_base);
-            desc->attrs[i].src_off_dst_slot = (slot << 16u) | (off & 0xFFFFu);
-            desc->attrs[i].type_count = ((u32)a->desc.size << 16u) | ((u32)a->desc.type & 0xFFFFu);
-        }
-    }
-
-    /* Destination stride in floats: each slot is 16 bytes = 4 floats */
-    const u32 dst_stride = (mode == 0) ? 12 : (mode == 1) ? 8 : (mode == 2) ? 12 : (l->stride / 4u);
-
-    /* Check contiguous refs */
-    int contiguous = 1;
-    if (uploaded > 1) {
-        const u32 f = refs[0].vertex_id;
-        const u32 b = refs[0].base_index;
-        for (u32 i = 1; i < uploaded; i++) {
-            if (refs[i].vertex_id != f + i || refs[i].base_index != b) {
-                contiguous = 0;
-                break;
-            }
-        }
-    }
-
-    if (contiguous) {
-        desc->gpu_eligible = 1;
-        desc->layout_mode = mode;
-        desc->flags = 0;
-        desc->src_stride = src_stride;
-        desc->dst_stride = dst_stride;
-        desc->raw_data = min_base;
-        desc->raw_bytes = uploaded * src_stride;
-        if (mode == 0) __atomic_fetch_add(&s_eng_eligible_m0, 1, __ATOMIC_RELAXED);
-        else if (mode == 1) __atomic_fetch_add(&s_eng_eligible_m1, 1, __ATOMIC_RELAXED);
-        else if (mode == 2) __atomic_fetch_add(&s_eng_eligible_m2, 1, __ATOMIC_RELAXED);
-        else __atomic_fetch_add(&s_eng_eligible_m3, 1, __ATOMIC_RELAXED);
-        return;
-    }
-
-    /* Non-contiguous / indexed vertex remap offload */
-    if (a0->stable_last < a0->stable_first) {
-        __atomic_fetch_add(&s_eng_not_contiguous, 1, __ATOMIC_RELAXED);
-        return;
-    }
-
-    const u32 span = a0->stable_last - a0->stable_first + 1;
-    const u32 raw_bytes = span * src_stride;
-    /* Safety bounds: reject if span exceeds 4 MB or is excessively sparse */
-    if (raw_bytes > 4u * 1024u * 1024u || (span > 4096u && span > uploaded * 8u)) {
-        __atomic_fetch_add(&s_eng_not_contiguous, 1, __ATOMIC_RELAXED);
-        return;
-    }
-
-    const u32 first = a0->stable_first;
-    const u32 max_elem = span - 1u;
-    for (u32 i = 0; i < uploaded; i++) {
-        const u32 elem = ((refs[i].vertex_id + refs[i].base_index) & 0x000FFFFFu) - first;
-        if (elem > max_elem) {
-            __atomic_fetch_add(&s_eng_not_contiguous, 1, __ATOMIC_RELAXED);
-            return;
-        }
-        remap_buf[i] = elem;
-    }
-
-    desc->gpu_eligible = 1;
-    desc->layout_mode = mode;
-    desc->flags = 1; /* remap enabled */
-    desc->src_stride = src_stride;
-    desc->dst_stride = dst_stride;
-    desc->raw_data = min_base;
-    desc->raw_bytes = raw_bytes;
-    desc->remap_indices = s_gpu_remap_buf;
-    __atomic_fetch_add(&s_eng_eligible_remap, 1, __ATOMIC_RELAXED);
-    if (mode == 0) __atomic_fetch_add(&s_eng_eligible_m0, 1, __ATOMIC_RELAXED);
-    else if (mode == 1) __atomic_fetch_add(&s_eng_eligible_m1, 1, __ATOMIC_RELAXED);
-    else if (mode == 2) __atomic_fetch_add(&s_eng_eligible_m2, 1, __ATOMIC_RELAXED);
-    else __atomic_fetch_add(&s_eng_eligible_m3, 1, __ATOMIC_RELAXED);
+    /* Draws eligible for raw GPU pulling already populated desc via
+     * eng_try_raw_pull_span; everything else uses Mode 4 CPU-packed slots. */
 }
 
 static void eng_check_gpu_vertex_offload(rsx_vtx_gpu_desc* desc, u32 uploaded)
 {
+    if (dc.pull_ready) {
+        *desc = dc.pull_desc;
+        desc->vertex_count = uploaded;
+        return;
+    }
     eng_check_gpu_vertex_offload_ex(desc, uploaded, dc.fetch_deferred, &dc.layout,
                                     &dc.fetch_plan, dc.refs, s_gpu_remap_buf);
 }
@@ -7641,6 +7866,8 @@ typedef struct {
     u32 off_src;
     u32 n_cuts;
     u32 off_cuts;
+    u32 plain_first, plain_last;
+    int plain_contiguous;
     rsx_vertex_fetch_plan plan_init;
 
     /* Vertex plan snapshot (pointers replaced by span offsets). */
@@ -8352,6 +8579,57 @@ static int eng_mt_prepare_one(const eng_draw_pkt* p, eng_worker* w, eng_prep* ou
         return 0;
     memcpy(w->refs, (const u8*)p + p->off_src, (size_t)n * sizeof(rsx_vertex_ref));
 
+    w->plan = p->plan_init;
+    w->plan.guest_ptr = eng_guest_ptr_worker;
+    w->plan.guest_user = NULL;
+
+    const u32* cuts = p->n_cuts ? (const u32*)((const u8*)p + p->off_cuts) : NULL;
+    if (g.be && g.be->vertex_pull && g.be->draw_fill && s_vtx_direct &&
+        (p->allow_remap || p->plain_contiguous) &&
+        eng_try_raw_pull_span(&out->gpu, L, &w->plan, eng_guest_ptr_worker, NULL,
+                              n, p->plain_first, p->plain_last, p->plain_contiguous)) {
+        if (eng_mt_snapshot_on()) {
+            u8* dst = eng_w_bump(w, out->gpu.raw_bytes);
+            if (!dst) { __atomic_fetch_add(&s_mt.snapshot_fail, 1, __ATOMIC_RELAXED); return 0; }
+            memcpy(dst, out->gpu.raw_data, out->gpu.raw_bytes);
+            out->gpu.raw_data = dst;
+            __atomic_fetch_add(&s_mt.snapshots, 1, __ATOMIC_RELAXED);
+        }
+        int indexed = 0;
+        u32 n_draw = n;
+        u32 topology = p->topology;
+        if (p->rebuild) {
+            const int effective_remap = (!p->plain_contiguous || p->n_cuts > 0);
+            if (!eng_topology_rebuild(p->prim, effective_remap, &indexed)) return 0;
+            n_draw = indexed
+                ? rsx_draw_engine_topology_index_count(p->prim, n, cuts, p->n_cuts)
+                : n - n % 3u;
+        } else {
+            const rsx_topology topo = rsx_primitive_topology(p->prim);
+            if (topo == RSX_TOPOLOGY_UNSUPPORTED) return 0;
+            topology = (u32)topo;
+        }
+        if (!n_draw) return 0;
+        out->deferred = 1;
+        out->indexed = indexed;
+        out->n_draw = n_draw;
+        out->uploaded = indexed
+            ? (p->plain_contiguous ? n : (p->plain_last - p->plain_first + 1u))
+            : n_draw;
+        out->gpu.vertex_count = out->uploaded;
+        out->topology = topology;
+        if (indexed) {
+            u32* idx = (u32*)eng_w_bump(w, (u64)n_draw * sizeof(u32));
+            if (!idx) return 0;
+            eng_write_topology_indices_ex(p->prim, n, cuts, p->n_cuts,
+                                          NULL, w->refs, idx);
+            out->idx = idx;
+        }
+        out->verts = NULL;
+        out->ok = 1;
+        return 1;
+    }
+
     u32 unique = n;
     int remapped = 0;
     if (s_vtx_remap && p->allow_remap && n > 1) {
@@ -8361,16 +8639,12 @@ static int eng_mt_prepare_one(const eng_draw_pkt* p, eng_worker* w, eng_prep* ou
             return 0;
     }
     w->n_unique = unique;
-    w->plan = p->plan_init;
-    w->plan.guest_ptr = eng_guest_ptr_worker;
-    w->plan.guest_user = NULL;
     rsx_vertex_fetch_plan_prepare(&w->plan, w->refs, unique);
 
     const int deferred = g.be->draw_fill && s_vtx_direct && L->stride &&
                          !rsx_vertex_fetch_plan_can_fail(&w->plan);
     out->deferred = deferred;
 
-    const u32* cuts = p->n_cuts ? (const u32*)((const u8*)p + p->off_cuts) : NULL;
     int indexed = 0;
     u32 n_draw = n;
     u32 topology = p->topology;
@@ -8393,9 +8667,9 @@ static int eng_mt_prepare_one(const eng_draw_pkt* p, eng_worker* w, eng_prep* ou
     if (indexed) {
         u32* idx = (u32*)eng_w_bump(w, (u64)n_draw * sizeof(u32));
         if (!idx) return 0;
-        rsx_draw_engine_write_topology_indices(
+        eng_write_topology_indices_ex(
             p->prim, n, cuts, p->n_cuts,
-            remapped ? w->remap.occurrence_to_unique : NULL, idx);
+            remapped ? w->remap.occurrence_to_unique : NULL, NULL, idx);
         out->idx = idx;
     }
 
@@ -8727,7 +9001,9 @@ static void sink_end_work(void* user, const rsx_dispatch* r)
     u32 n_draw = dc.n_source_refs;
     const unsigned long long w2_index = wp2_t0();
     if (!workerable && rebuild) {
-        if (!eng_topology_rebuild(prim, dc.refs_remapped, &indexed)) {
+        const int effective_remap =
+            dc.refs_remapped || (dc.pull_ready && (!dc.plain_contiguous || dc.n_cuts > 0));
+        if (!eng_topology_rebuild(prim, effective_remap, &indexed)) {
             wp2_add(WPROF2_INDEX, w2_index);
             return;
         }
@@ -8806,9 +9082,10 @@ static void sink_end_work(void* user, const rsx_dispatch* r)
     if (indexed) {
         const unsigned long long w2 = wp2_t0();
         if (!dc_reserve_indices(n_draw)) { wp2_add(WPROF2_INDEX, w2); return; }
-        rsx_draw_engine_write_topology_indices(
+        eng_write_topology_indices_ex(
             prim, dc.n_source_refs, dc.cuts, dc.n_cuts,
             dc.refs_remapped ? dc.ref_remap.occurrence_to_unique : NULL,
+            dc.pull_ready ? dc.refs : NULL,
             g.indices);
         wp2_add(WPROF2_INDEX, w2);
     }
@@ -8904,8 +9181,11 @@ static void sink_end_work(void* user, const rsx_dispatch* r)
         p->topology = (u32)topology;
         p->stride = layout.stride;
         if (workerable) {
-            /* The worker resolves the remap/plan/index/convert itself. */
+            /* The worker resolves direct-pull or remap/plan/index/convert itself. */
             p->n_src = dc.n_source_refs;
+            p->plain_first = dc.plain_first;
+            p->plain_last = dc.plain_last;
+            p->plain_contiguous = dc.plain_contiguous;
             p->plan_init = dc.fetch_plan;
             p->plan_init.guest_ptr = NULL;
             p->plan_init.guest_user = NULL;
@@ -9139,6 +9419,10 @@ mt_done:
 static int dc_source_is_mesh(void)
 {
     if (dc.n_immediate || dc.inl || dc.fetch_plan.inline_data) return 0;
+    if (dc.pull_ready && dc.pull_desc.raw_data) {
+        const uintptr_t ea = (uintptr_t)dc.pull_desc.raw_data - (uintptr_t)vm_base;
+        if (ea >= ENG_MESH_EA_LO && ea < ENG_MESH_EA_HI) return 1;
+    }
     for (u32 a = 0; a < RSX_DSP_NUM_VERTEX_ATTR; a++) {
         const u8* b = dc.fetch_plan.attr[a].stable_base;
         if (!b) continue;

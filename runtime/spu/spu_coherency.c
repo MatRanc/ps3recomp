@@ -134,38 +134,125 @@ static unsigned char s_coh_bitmap[SPU_COH_BITMAP_SZ];
  * the lock-line lock. Nodes are removed before their context's lifetime ends. */
 typedef struct spu_coh_entry {
     spu_context* ctx;
+    uint32_t held_line;
+    int has_held;
     struct spu_coh_entry* next;
 } spu_coh_entry;
 static spu_coh_entry* s_coh_ctxs;
 static spu_coh_watch* s_coh_watches;
 
+/* Per-line holder refcounts (all access under g_lockline). When the last
+ * holder of a 128-byte line drops it, its bit in s_coh_bitmap is cleared so
+ * subsequent PPU stores to that line skip spu_lockline_lock and the fence. */
+typedef struct {
+    uint32_t line;
+    uint32_t count;
+    uint8_t state;   /* 0 empty, 1 occupied, 2 tombstone */
+} spu_coh_hold_slot;
+
+static spu_coh_hold_slot* s_hold_tab = NULL;
+static size_t s_hold_cap = 0;
+static size_t s_hold_live = 0;
+static size_t s_hold_fill = 0;   /* occupied + tombstones */
+
+static void coh_hold_rehash(size_t new_cap)
+{
+    spu_coh_hold_slot* nt = (spu_coh_hold_slot*)calloc(new_cap, sizeof(*nt));
+    if (!nt) abort();
+    const size_t mask = new_cap - 1;
+    for (size_t i = 0; i < s_hold_cap; i++) {
+        if (s_hold_tab[i].state != 1) continue;
+        size_t j = (s_hold_tab[i].line * 0x9E3779B1u) & mask;
+        while (nt[j].state == 1) j = (j + 1) & mask;
+        nt[j] = s_hold_tab[i];
+    }
+    free(s_hold_tab);
+    s_hold_tab = nt;
+    s_hold_cap = new_cap;
+    s_hold_fill = s_hold_live;
+}
+
+static void coh_hold_inc(uint32_t line)
+{
+    if (!s_hold_tab || (s_hold_fill + 1) * 10 >= s_hold_cap * 7)
+        coh_hold_rehash(s_hold_cap ? (s_hold_live * 2 >= s_hold_cap ? s_hold_cap * 2 : s_hold_cap) : 1024u);
+    const size_t mask = s_hold_cap - 1;
+    size_t j = (line * 0x9E3779B1u) & mask;
+    size_t tomb = (size_t)-1;
+    for (;;) {
+        spu_coh_hold_slot* s = &s_hold_tab[j];
+        if (s->state == 0) {
+            const size_t dst = (tomb != (size_t)-1) ? tomb : j;
+            if (tomb == (size_t)-1) s_hold_fill++;
+            s_hold_live++;
+            s_hold_tab[dst].line = line;
+            s_hold_tab[dst].count = 1;
+            s_hold_tab[dst].state = 1;
+            s_coh_bitmap[line >> 3] |= (unsigned char)(1u << (line & 7));
+            return;
+        }
+        if (s->state == 1 && s->line == line) {
+            s->count++;
+            return;
+        }
+        if (s->state == 2 && tomb == (size_t)-1) tomb = j;
+        j = (j + 1) & mask;
+    }
+}
+
+static void coh_hold_dec(uint32_t line)
+{
+    if (!s_hold_tab) return;
+    const size_t mask = s_hold_cap - 1;
+    size_t j = (line * 0x9E3779B1u) & mask;
+    for (size_t n = 0; n < s_hold_cap; n++, j = (j + 1) & mask) {
+        spu_coh_hold_slot* s = &s_hold_tab[j];
+        if (s->state == 0) return;
+        if (s->state == 1 && s->line == line) {
+            if (--s->count == 0) {
+                s->state = 2;
+                s_hold_live--;
+                s_coh_bitmap[line >> 3] &= (unsigned char)~(1u << (line & 7));
+            }
+            return;
+        }
+    }
+}
+
 unsigned long g_spu_lr_raise = 0;
 
 void spu_coh_reserve(spu_context* ctx, uint32_t ea)
 {
-    /* Read before writing. The kernel reserves the same few lines over and
-     * over, and a store of the same value still takes the cache line away
-     * from every other core: each PPU store then missed on the pointer and on
-     * the bitmap byte. */
     uint32_t line = ea >> SPU_COH_LINE_SHIFT;
-    const unsigned char bit = (unsigned char)(1u << (line & 7));
-    if (!(s_coh_bitmap[line >> 3] & bit))
-        s_coh_bitmap[line >> 3] |= bit;
     if (!g_spu_coh_bits)
         g_spu_coh_bits = s_coh_bitmap;
 
-    if (!ctx) return;
-    for (spu_coh_entry* entry = s_coh_ctxs; entry; entry = entry->next)
-        if (entry->ctx == ctx) { __atomic_store_n(&ctx->coh_listed, 1, __ATOMIC_RELAXED); return; }
-    spu_coh_entry* entry = (spu_coh_entry*)malloc(sizeof(*entry));
-    if (!entry) {
-        fprintf(stderr, "[spu-coh] cannot register reservation holder %p\n", (void*)ctx);
-        fflush(stderr);
-        abort(); /* A missed holder loses invalidation events, including ABA. */
+    if (!ctx) {
+        coh_hold_inc(line);
+        return;
     }
-    entry->ctx = ctx;
-    entry->next = s_coh_ctxs;
-    s_coh_ctxs = entry;
+    spu_coh_entry* entry = NULL;
+    for (spu_coh_entry* e = s_coh_ctxs; e; e = e->next)
+        if (e->ctx == ctx) { entry = e; break; }
+    if (!entry) {
+        entry = (spu_coh_entry*)malloc(sizeof(*entry));
+        if (!entry) {
+            fprintf(stderr, "[spu-coh] cannot register reservation holder %p\n", (void*)ctx);
+            fflush(stderr);
+            abort(); /* A missed holder loses invalidation events, including ABA. */
+        }
+        entry->ctx = ctx;
+        entry->held_line = 0;
+        entry->has_held = 0;
+        entry->next = s_coh_ctxs;
+        s_coh_ctxs = entry;
+    }
+    if (!entry->has_held || entry->held_line != line) {
+        if (entry->has_held) coh_hold_dec(entry->held_line);
+        coh_hold_inc(line);
+        entry->held_line = line;
+        entry->has_held = 1;
+    }
     __atomic_store_n(&ctx->coh_listed, 1, __ATOMIC_RELAXED);
 }
 
@@ -187,6 +274,7 @@ void spu_coh_watch_remove(spu_coh_watch* watch)
     for (spu_coh_watch** link = &s_coh_watches; *link; link = &(*link)->next) {
         if (*link != watch) continue;
         *link = watch->next;
+        coh_hold_dec(watch->line >> SPU_COH_LINE_SHIFT);
         watch->next = NULL;
         return;
     }
@@ -221,6 +309,7 @@ void spu_coh_unregister(spu_context* ctx)
         if ((*link)->ctx != ctx) continue;
         spu_coh_entry* entry = *link;
         *link = entry->next;
+        if (entry->has_held) coh_hold_dec(entry->held_line);
         free(entry);
         break;
     }
@@ -246,6 +335,7 @@ void spu_coh_forget_range(uintptr_t lo, uintptr_t hi)
                 fprintf(stderr, "[spu-coh] leaked ctx %p (img=%d) dropped at thread exit\n",
                         (void*)c, entry->ctx->image_id);
             *link = entry->next;
+            if (entry->has_held) coh_hold_dec(entry->held_line);
             free(entry);
         } else {
             link = &entry->next;
@@ -335,8 +425,9 @@ static inline int spu_coh_holds(const spu_context* c, uint32_t line)
 
 int spu_coh_reserve_fast(spu_context* ctx, uint32_t ea)
 {
+    const uint32_t line = ea & ~127u;
     if (!ctx || !__atomic_load_n(&ctx->coh_listed, __ATOMIC_RELAXED) ||
-        !spu_coh_is_reserved(ea))
+        !spu_coh_holds(ctx, line) || !spu_coh_is_reserved(ea))
         return 0;
     /* Retire any older reservation before retargeting it. The fence is what
      * the argument above rests on. */
@@ -350,6 +441,7 @@ int spu_coh_reserve_fast(spu_context* ctx, uint32_t ea)
 void spu_coh_notify_write_except(uint32_t ea, const void* self)
 {
     uint32_t line = ea & ~127u;
+    uint32_t line_idx = ea >> SPU_COH_LINE_SHIFT;
     ppu_resv_break_line(ea);
     spu_coh_writer_fence();
     spu_coh_wake_watches(line);
@@ -359,6 +451,10 @@ void spu_coh_notify_write_except(uint32_t ea, const void* self)
         if (spu_coh_holds(c, line)) {
             SPU_EVENT_SET(c, SPU_EVENT_LR);
             __atomic_store_n(&c->resv_valid, 0, __ATOMIC_RELAXED);
+            if (entry->has_held && entry->held_line == line_idx) {
+                coh_hold_dec(line_idx);
+                entry->has_held = 0;
+            }
             g_spu_lr_raise++;
             spu_ch_wake(c);
         }
@@ -368,6 +464,7 @@ void spu_coh_notify_write_except(uint32_t ea, const void* self)
 void spu_coh_notify_write(uint32_t ea)
 {
     uint32_t line = ea & ~127u;
+    uint32_t line_idx = ea >> SPU_COH_LINE_SHIFT;
     ppu_resv_break_line(ea);
     spu_coh_writer_fence();
     spu_coh_wake_watches(line);
@@ -377,6 +474,10 @@ void spu_coh_notify_write(uint32_t ea)
         if (spu_coh_holds(c, line)) {
             SPU_EVENT_SET(c, SPU_EVENT_LR);
             __atomic_store_n(&c->resv_valid, 0, __ATOMIC_RELAXED);   /* reservation lost, PUTLLC must fail */
+            if (entry->has_held && entry->held_line == line_idx) {
+                coh_hold_dec(line_idx);
+                entry->has_held = 0;
+            }
             /* SPU_PUTLLC_WHY=1: name the agent that killed it. A PUTLLC that
              * always fails for "no reservation" is useless without knowing who
              * took it away -- a peer SPU, or the PPU committing to the line. */

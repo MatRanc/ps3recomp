@@ -41,6 +41,12 @@
 
 #define C690_IMAGE_ID 6
 
+/* The generated modules reference c690_soa_try weakly (an older runtime must
+ * still link), and a weak reference does not extract an archive member; this
+ * file is always extracted, so it carries the strong one. */
+#include "c690_native_soa.h"
+static void* const s_soa_anchor __attribute__((used)) = (void*)c690_soa_try;
+
 static unsigned long long s_native_calls, s_fallbacks;
 static unsigned long long s_shadow_calls, s_shadow_mismatches;
 static unsigned long long s_shadow_ls_bad, s_shadow_gpr_bad;

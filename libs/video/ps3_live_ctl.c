@@ -110,6 +110,7 @@ static const char* const K_NAME[PS3_LIVE_COUNT] = {
     "PS3RECOMP_ENG_PROG_MEMO",
     "PS3RECOMP_ENG_ANISO",
     "PS3RECOMP_ENG_SWZ_RT",
+    "PS3RECOMP_C690_SOA",
 };
 
 static _Atomic int s_val[PS3_LIVE_COUNT];
