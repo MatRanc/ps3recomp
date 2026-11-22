@@ -2974,6 +2974,20 @@ static void jcs_park(long long t0)
     __atomic_add_fetch(&s_jcs_parks, 1, __ATOMIC_RELAXED);
     __atomic_add_fetch(&s_jcs_park_us, jcs_now_us() - t0, __ATOMIC_RELAXED);
 }
+/* Job time inside chain walkers: total, and the slowest single JOB / parallel
+ * JOB run of the window with its chain (to see what a streaming dip waits on). */
+static volatile long long s_jcs_job_us, s_jcs_max_us;
+static volatile u32 s_jcs_max_jc;
+static volatile long long s_jcs_chain_us[MAX_JOBCHAINS];
+static void jcs_job(u32 jc_ea, long long t0)
+{
+    if (!jcs_on()) return;
+    const long long d = jcs_now_us() - t0;
+    __atomic_add_fetch(&s_jcs_job_us, d, __ATOMIC_RELAXED);
+    for (int c = 0; c < MAX_JOBCHAINS; c++)
+        if (s_jobchains[c].jc_ea == jc_ea) { __atomic_add_fetch(&s_jcs_chain_us[c], d, __ATOMIC_RELAXED); break; }
+    if (d > s_jcs_max_us) { s_jcs_max_us = d; s_jcs_max_jc = jc_ea; } /* ponytail: racy max, fine for a probe */
+}
 static void jcs_report(void)
 {
     static long long last;
@@ -2982,10 +2996,26 @@ static void jcs_report(void)
     if (!last) { last = now; return; }
     if (now - last < 5000000) return;
     last = now;
-    fprintf(stderr, "[jc-stats] 5s: walker threads %ld, parks %ld, parked %.1f ms total\n",
+    const u32 mjc = s_jcs_max_jc;
+    const char* mname = "";
+    for (int c = 0; c < MAX_JOBCHAINS; c++)
+        if (mjc && s_jobchains[c].jc_ea == mjc) { mname = s_jobchains[c].name; break; }
+    fprintf(stderr, "[jc-stats] 5s: walker threads %ld, parks %ld, parked %.1f ms total, "
+            "jobs %.1f ms total, slowest %.1f ms (jc=0x%08X %s)\n",
             __atomic_exchange_n(&s_jcs_threads, 0, __ATOMIC_RELAXED),
             __atomic_exchange_n(&s_jcs_parks, 0, __ATOMIC_RELAXED),
-            __atomic_exchange_n(&s_jcs_park_us, 0, __ATOMIC_RELAXED) / 1000.0);
+            __atomic_exchange_n(&s_jcs_park_us, 0, __ATOMIC_RELAXED) / 1000.0,
+            __atomic_exchange_n(&s_jcs_job_us, 0, __ATOMIC_RELAXED) / 1000.0,
+            __atomic_exchange_n(&s_jcs_max_us, 0, __ATOMIC_RELAXED) / 1000.0, mjc, mname);
+    s_jcs_max_jc = 0;
+    /* Per-chain job time this window (chains above 100 ms). */
+    char buf[512]; int o = 0;
+    for (int c = 0; c < MAX_JOBCHAINS && o < (int)sizeof buf - 64; c++) {
+        const long long us = __atomic_exchange_n(&s_jcs_chain_us[c], 0, __ATOMIC_RELAXED);
+        if (us >= 100000)
+            o += snprintf(buf + o, sizeof buf - o, " %s/%X=%lld", s_jobchains[c].name, s_jobchains[c].jc_ea & 0xFFFF, us / 1000);
+    }
+    if (o) fprintf(stderr, "[jc-stats]   per-chain ms:%s\n", buf);
 }
 
 static int jg_wait(u32 ea, u32 jc_ea)
@@ -3347,7 +3377,9 @@ static void jc_execute(u32 entry_ea, u32 jc_ea, u32 size_desc)
                     run_eas[n] = (u32)(c & ~7ull);
                 }
                 if (n > 1) {
+                    const long long jt0 = jcs_on() ? jcs_now_us() : 0;
                     jc_run_list_parallel(jc_ea, 0, size_desc, n, jobs, jpar, run_eas);
+                    jcs_job(jc_ea, jt0); jcs_report();
                     jobs += (int)n;
                     idle = 0;
                     pc += 8u * n; continue;
@@ -3355,7 +3387,9 @@ static void jc_execute(u32 entry_ea, u32 jc_ea, u32 size_desc)
             }
             { extern u32 g_spurs_job_ls_handle; g_spurs_job_ls_handle = jc_ea; }
             int idx = jobs++;
+            const long long jt0 = jcs_on() ? jcs_now_us() : 0;
             jc_run_one_job((u32)(cmd & ~7ull), idx, size_desc);
+            jcs_job(jc_ea, jt0); jcs_report();
             idle = 0;                    /* real work: the chain is healthy */
             /* Signal per JOB, not per lap. The application waits once for each
              * unit of work it queued -- this title notified the guard 7 times
