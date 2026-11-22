@@ -2928,6 +2928,66 @@ static int jg_wait_forever(void)
     return on;
 }
 
+/* SPURS_JC_NO_PARK=<name,name,...> (experiment, DX:HR session 8): chains named
+ * here leave at END instead of parking under SPURS_JG_WAIT_FOREVER -- for the
+ * one-shot "ResolveDecompressor" chains that are created, run once, shut down
+ * and joined for every streaming chunk, while the ring chains ("Rendering",
+ * "ShaderPatch") keep the wait. Unset: every chain parks, as before. */
+static int jc_no_park(const char* name)
+{
+    static const char* list = (const char*)1;
+    if (list == (const char*)1) list = getenv("SPURS_JC_NO_PARK");
+    if (!list || !name || !*name) return 0;
+    const size_t n = strlen(name);
+    for (const char* p = list; *p;) {
+        const char* c = strchr(p, ',');
+        const size_t len = c ? (size_t)(c - p) : strlen(p);
+        if (len == n && !strncmp(p, name, n)) return 1;
+        if (!c) break;
+        p = c + 1;
+    }
+    return 0;
+}
+/* SPURS_JC_STATS=1: every 5 s, how many chain walker threads were started and
+ * how long walkers sat parked at END / self-NEXT (to see whether streaming
+ * bursts line up with chain churn). */
+static volatile long s_jcs_threads, s_jcs_parks;
+static volatile long long s_jcs_park_us;
+static long long jcs_now_us(void)
+{
+#ifdef _WIN32
+    return (long long)GetTickCount64() * 1000;
+#else
+    struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t);
+    return (long long)t.tv_sec * 1000000 + t.tv_nsec / 1000;
+#endif
+}
+static int jcs_on(void)
+{
+    static int on = -1;
+    if (on < 0) { const char* e = getenv("SPURS_JC_STATS"); on = (e && e[0] == '1') ? 1 : 0; }
+    return on;
+}
+static void jcs_park(long long t0)
+{
+    if (!jcs_on()) return;
+    __atomic_add_fetch(&s_jcs_parks, 1, __ATOMIC_RELAXED);
+    __atomic_add_fetch(&s_jcs_park_us, jcs_now_us() - t0, __ATOMIC_RELAXED);
+}
+static void jcs_report(void)
+{
+    static long long last;
+    if (!jcs_on()) return;
+    const long long now = jcs_now_us();
+    if (!last) { last = now; return; }
+    if (now - last < 5000000) return;
+    last = now;
+    fprintf(stderr, "[jc-stats] 5s: walker threads %ld, parks %ld, parked %.1f ms total\n",
+            __atomic_exchange_n(&s_jcs_threads, 0, __ATOMIC_RELAXED),
+            __atomic_exchange_n(&s_jcs_parks, 0, __ATOMIC_RELAXED),
+            __atomic_exchange_n(&s_jcs_park_us, 0, __ATOMIC_RELAXED) / 1000.0);
+}
+
 static int jg_wait(u32 ea, u32 jc_ea)
 {
     int i = jg_find(ea);
@@ -3312,7 +3372,9 @@ static void jc_execute(u32 entry_ea, u32 jc_ea, u32 size_desc)
                 int slot = -1;
                 for (int c = 0; c < MAX_JOBCHAINS; c++)
                     if (s_jobchains[c].jc_ea == jc_ea) { slot = c; break; }
+                if (slot >= 0 && jc_no_park(s_jobchains[slot].name)) slot = -1;
                 if (slot >= 0) {
+                    const long long jcs_t0 = jcs_on() ? jcs_now_us() : 0;
 #ifdef _WIN32
                     s_jobchains[slot].park_cmd = cmd;
                     s_jobchains[slot].park_pc  = pc;
@@ -3338,6 +3400,7 @@ static void jc_execute(u32 entry_ea, u32 jc_ea, u32 size_desc)
                     pthread_cond_broadcast(&s_jobchains[slot].cond);
                     pthread_mutex_unlock(&s_jobchains[slot].mtx);
 #endif
+                    jcs_park(jcs_t0);
                     if (s_jobchains[slot].shutdown_req && vm_read64(pc) == cmd) return;
                     idle = 0;
                     continue;
@@ -3360,6 +3423,8 @@ static void jc_execute(u32 entry_ea, u32 jc_ea, u32 size_desc)
                     int slot = -1;
                     for (int c = 0; c < MAX_JOBCHAINS; c++)
                         if (s_jobchains[c].jc_ea == jc_ea) { slot = c; break; }
+                    if (slot >= 0 && jc_no_park(s_jobchains[slot].name)) slot = -1;
+                    const long long jcs_t0 = (slot >= 0 && jcs_on()) ? jcs_now_us() : 0;
                     if (slot >= 0) {
 #ifdef _WIN32
                         s_jobchains[slot].park_cmd = cmd;
@@ -3386,6 +3451,7 @@ static void jc_execute(u32 entry_ea, u32 jc_ea, u32 size_desc)
                         pthread_cond_broadcast(&s_jobchains[slot].cond);
                         pthread_mutex_unlock(&s_jobchains[slot].mtx);
 #endif
+                        jcs_park(jcs_t0);
                     }
                     if (slot >= 0 && s_jobchains[slot].running &&
                         (!s_jobchains[slot].shutdown_req || vm_read64(pc) != cmd)) {
@@ -3541,6 +3607,7 @@ static s32 jc_start(u64 jc_ea, const char* who)
         /* Coalesce: a chain already being walked must not start twice. */
         if (_InterlockedCompareExchange(&s_jobchains[i].running, 1, 0) == 0) {
             s_jobchains[i].shutdown_req = 0;
+            if (jcs_on()) { __atomic_add_fetch(&s_jcs_threads, 1, __ATOMIC_RELAXED); jcs_report(); }
             HANDLE th = CreateThread(NULL, 1u << 20, jc_thread, (LPVOID)(intptr_t)i, 0, NULL);
             if (th) CloseHandle(th);
             else s_jobchains[i].running = 0;
